@@ -104,8 +104,7 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after_ms(resp.headers())
-                        .or_else(|| parse_retry_after_seconds(resp.headers().get(RETRY_AFTER)));
+                    let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
                         let parsed = if self.cfg.stream {
@@ -367,8 +366,7 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after_ms(resp.headers())
-                        .or_else(|| parse_retry_after_seconds(resp.headers().get(RETRY_AFTER)));
+                    let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
                         return parse_non_streaming_payload(&body);
@@ -416,8 +414,7 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after_ms(resp.headers())
-                        .or_else(|| parse_retry_after_seconds(resp.headers().get(RETRY_AFTER)));
+                    let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
                         return parse_fim_non_streaming_payload(&body);
@@ -477,8 +474,7 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after_ms(resp.headers())
-                        .or_else(|| parse_retry_after_seconds(resp.headers().get(RETRY_AFTER)));
+                    let retry_after = parse_retry_after(resp.headers());
 
                     if status.is_success() {
                         let mut content_out = String::new();
@@ -604,8 +600,7 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after_ms(resp.headers())
-                        .or_else(|| parse_retry_after_seconds(resp.headers().get(RETRY_AFTER)));
+                    let retry_after = parse_retry_after(resp.headers());
 
                     if status.is_success() {
                         let mut content_out = String::new();
@@ -859,8 +854,7 @@ impl ApiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after_ms(resp.headers())
-                        .or_else(|| parse_retry_after_seconds(resp.headers().get(RETRY_AFTER)));
+                    let retry_after = parse_retry_after(resp.headers());
 
                     if status.is_success() {
                         // Read SSE line-by-line, invoking callback for each delta
@@ -1274,6 +1268,11 @@ fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let ms = value.parse::<f64>().ok()?;
     // Convert ms to seconds, rounding up (at least 1s for any positive value)
     Some(((ms / 1000.0).ceil() as u64).max(1))
+}
+
+/// Combined retry-after parser: tries `retry-after-ms` first, then `Retry-After`.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    parse_retry_after_ms(headers).or_else(|| parse_retry_after_seconds(headers.get(RETRY_AFTER)))
 }
 
 fn parse_retry_after_seconds(header: Option<&reqwest::header::HeaderValue>) -> Option<u64> {

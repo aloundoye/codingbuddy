@@ -543,7 +543,8 @@ impl MemoryManager {
         }
 
         // Validate snapshot_root is within the runtime directory to prevent path traversal
-        let expected_root = runtime_dir(&self.workspace);
+        let expected_root = std::fs::canonicalize(runtime_dir(&self.workspace))
+            .unwrap_or_else(|_| runtime_dir(&self.workspace));
         if let Ok(canonical) = std::fs::canonicalize(&snapshot_root)
             && !canonical.starts_with(&expected_root)
         {

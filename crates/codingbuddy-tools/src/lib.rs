@@ -3601,11 +3601,11 @@ fn detect_diagnostics_command(
     target: Option<&str>,
 ) -> Result<(String, &'static str)> {
     if workspace.join("Cargo.toml").exists() {
-        let cmd = match target {
-            Some(_) => "cargo check --message-format=json 2>&1".to_string(),
-            None => "cargo check --message-format=json 2>&1".to_string(),
-        };
-        return Ok((cmd, "rustc"));
+        // cargo check always checks the whole workspace; target is unused for Rust.
+        return Ok((
+            "cargo check --message-format=json 2>&1".to_string(),
+            "rustc",
+        ));
     }
     if workspace.join("tsconfig.json").exists() {
         return Ok(("npx tsc --noEmit --pretty false 2>&1".to_string(), "tsc"));
@@ -3726,40 +3726,9 @@ fn parse_ruff_json(output: &str) -> Vec<serde_json::Value> {
 }
 
 /// Compute Levenshtein edit distance between two strings.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let (m, n) = (a_chars.len(), b_chars.len());
-    if m == 0 {
-        return n;
-    }
-    if n == 0 {
-        return m;
-    }
-    let mut prev = (0..=n).collect::<Vec<_>>();
-    let mut curr = vec![0; n + 1];
-    for i in 1..=m {
-        curr[0] = i;
-        for j in 1..=n {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
-                0
-            } else {
-                1
-            };
-            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[n]
-}
-
 /// Normalized similarity between two strings (0.0 = completely different, 1.0 = identical).
 fn levenshtein_similarity(a: &str, b: &str) -> f64 {
-    let max_len = a.len().max(b.len());
-    if max_len == 0 {
-        return 1.0;
-    }
-    1.0 - (levenshtein(a, b) as f64 / max_len as f64)
+    strsim::normalized_levenshtein(a, b)
 }
 
 /// Result of a fuzzy match: byte offsets and the strategy name.
@@ -3804,6 +3773,26 @@ fn fuzzy_match_search(content: &str, search: &str) -> Option<FuzzyMatch> {
     None
 }
 
+/// Convert a line-index range to byte offsets in the original content.
+/// `line_idx` is the starting line, `line_count` is how many lines the match spans.
+/// Each line's byte length includes the `\n` separator; the trailing newline of
+/// the last matched line is excluded.
+fn lines_to_byte_range(
+    content_lines: &[&str],
+    content_len: usize,
+    line_idx: usize,
+    line_count: usize,
+) -> (usize, usize) {
+    let start: usize = content_lines[..line_idx].iter().map(|l| l.len() + 1).sum();
+    let end = start
+        + content_lines[line_idx..line_idx + line_count]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+        - 1;
+    (start, end.min(content_len))
+}
+
 /// Strategy 1: Match lines ignoring per-line leading/trailing whitespace.
 fn fuzzy_line_trimmed(content: &str, search: &str) -> Option<FuzzyMatch> {
     let search_lines: Vec<&str> = search.lines().collect();
@@ -3830,19 +3819,8 @@ fn fuzzy_line_trimmed(content: &str, search: &str) -> Option<FuzzyMatch> {
     }
 
     let line_idx = matches[0];
-    let start = content_lines[..line_idx]
-        .iter()
-        .map(|l| l.len() + 1)
-        .sum::<usize>();
-    let end = start
-        + content_lines[line_idx..line_idx + search_lines.len()]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-        - 1; // exclude trailing newline of last matched line
-
-    // Clamp end to content length (handles last line without trailing newline)
-    let end = end.min(content.len());
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
 
     Some(FuzzyMatch {
         start,
@@ -3891,17 +3869,8 @@ fn fuzzy_block_anchor(content: &str, search: &str) -> Option<FuzzyMatch> {
     }
 
     let line_idx = matches[0];
-    let start = content_lines[..line_idx]
-        .iter()
-        .map(|l| l.len() + 1)
-        .sum::<usize>();
-    let end = start
-        + content_lines[line_idx..line_idx + search_lines.len()]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-        - 1;
-    let end = end.min(content.len());
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
 
     Some(FuzzyMatch {
         start,
@@ -3952,12 +3921,10 @@ fn fuzzy_whitespace_normalized(content: &str, search: &str) -> Option<FuzzyMatch
     let norm_start = norm_matches[0];
     let norm_end = norm_start + norm_search.len();
 
-    let mut orig_pos = 0;
     let mut norm_pos = 0;
     let mut orig_start = 0;
     let mut orig_end = 0;
     let mut prev_ws = false;
-    let content_bytes = content.as_bytes();
 
     for (i, ch) in content.char_indices() {
         if norm_pos == norm_start {
@@ -3976,13 +3943,10 @@ fn fuzzy_whitespace_normalized(content: &str, search: &str) -> Option<FuzzyMatch
             orig_end = i + ch.len_utf8();
             break;
         }
-        orig_pos = i;
     }
     if orig_end == 0 {
         orig_end = content.len();
     }
-
-    let _ = (orig_pos, content_bytes); // suppress unused warnings
 
     Some(FuzzyMatch {
         start: orig_start,
@@ -4058,17 +4022,8 @@ fn fuzzy_indentation_flexible(content: &str, search: &str) -> Option<FuzzyMatch>
     }
 
     let line_idx = matches[0];
-    let start = content_lines[..line_idx]
-        .iter()
-        .map(|l| l.len() + 1)
-        .sum::<usize>();
-    let end = start
-        + content_lines[line_idx..line_idx + search_lines.len()]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-        - 1;
-    let end = end.min(content.len());
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
 
     Some(FuzzyMatch {
         start,
@@ -4177,17 +4132,8 @@ fn fuzzy_context_aware(content: &str, search: &str) -> Option<FuzzyMatch> {
     }
 
     let line_idx = matches[0];
-    let start = content_lines[..line_idx]
-        .iter()
-        .map(|l| l.len() + 1)
-        .sum::<usize>();
-    let end = start
-        + content_lines[line_idx..line_idx + search_lines.len()]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-        - 1;
-    let end = end.min(content.len());
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
 
     Some(FuzzyMatch {
         start,
@@ -5816,14 +5762,6 @@ mod tests {
     }
 
     // ── Fuzzy edit matching tests ────────────────────────────────────────
-
-    #[test]
-    fn levenshtein_basic() {
-        assert_eq!(levenshtein("kitten", "sitting"), 3);
-        assert_eq!(levenshtein("", "abc"), 3);
-        assert_eq!(levenshtein("abc", ""), 3);
-        assert_eq!(levenshtein("abc", "abc"), 0);
-    }
 
     #[test]
     fn fuzzy_line_trimmed_matches_with_different_indentation() {

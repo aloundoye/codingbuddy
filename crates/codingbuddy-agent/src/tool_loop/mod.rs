@@ -143,6 +143,8 @@ pub struct ToolUseLoop<'a> {
     pinned_directives: Vec<String>,
     /// Pre-computed workspace path string for hook inputs (avoids repeated allocation).
     workspace_path_str: String,
+    /// Whether `cleanup_old_tool_outputs` has run this session (at most once).
+    tool_output_cleanup_done: bool,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -191,6 +193,7 @@ impl<'a> ToolUseLoop<'a> {
             doom_loop_tracker: DoomLoopTracker::default(),
             pinned_directives: Vec::new(),
             workspace_path_str,
+            tool_output_cleanup_done: false,
         }
     }
 
@@ -285,8 +288,12 @@ impl<'a> ToolUseLoop<'a> {
         });
     }
 
-    /// Clean up old tool output files (>7 days).
-    fn cleanup_old_tool_outputs(&self) {
+    /// Clean up old tool output files (>7 days). Runs at most once per session.
+    fn cleanup_old_tool_outputs(&mut self) {
+        if self.tool_output_cleanup_done {
+            return;
+        }
+        self.tool_output_cleanup_done = true;
         let output_dir = std::path::Path::new(&self.workspace_path_str)
             .join(".codingbuddy")
             .join("tool_outputs");
@@ -309,7 +316,7 @@ impl<'a> ToolUseLoop<'a> {
     /// Persist a large tool output to disk and return a hint for the truncated message.
     /// Writes to `.codingbuddy/tool_outputs/<hash>.txt` so the model can re-read it.
     const LARGE_OUTPUT_THRESHOLD: usize = 50_000; // 50KB
-    fn persist_large_output(&self, tool_name: &str, raw_output: &str) -> Option<String> {
+    fn persist_large_output(&mut self, tool_name: &str, raw_output: &str) -> Option<String> {
         if raw_output.len() < Self::LARGE_OUTPUT_THRESHOLD {
             return None;
         }

@@ -27,9 +27,7 @@ pub struct ModelInfo {
 struct PartialDownloadState {
     model_id: String,
     hf_repo: String,
-    /// Files that have been fully downloaded and verified.
-    completed_files: Vec<String>,
-    /// SHA-256 digests of completed files.
+    /// SHA-256 digests of completed files (filename → digest).
     completed_digests: BTreeMap<String, String>,
 }
 
@@ -348,7 +346,6 @@ impl ModelManager {
                 .unwrap_or_else(|| PartialDownloadState {
                     model_id: model_id.to_string(),
                     hf_repo: hf_repo.to_string(),
-                    completed_files: Vec::new(),
                     completed_digests: BTreeMap::new(),
                 });
 
@@ -361,7 +358,7 @@ impl ModelManager {
             progress_cb(i, total);
 
             // Skip files already completed in a previous run
-            if partial.completed_files.contains(&filename.to_string()) {
+            if partial.completed_digests.contains_key(*filename) {
                 continue;
             }
 
@@ -398,7 +395,6 @@ impl ModelManager {
                                 .completed_digests
                                 .insert(filename.to_string(), digest);
                         }
-                        partial.completed_files.push(filename.to_string());
                         // Persist partial state after each file completes
                         let _ = self.save_partial_state(&partial);
                         last_error = None;

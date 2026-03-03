@@ -219,63 +219,13 @@ pub enum SlashCommand {
     Unknown { name: String, args: Vec<String> },
 }
 
-/// Shell-style argument tokenizer that respects double and single quotes.
-///
-/// - `"quoted string"` → single token `quoted string` (quotes removed)
-/// - `'single quoted'` → single token `single quoted` (quotes removed)
-/// - Backslash escapes within double quotes: `\"`, `\\`
-/// - Unquoted tokens split on whitespace as usual
-fn tokenize_shell_args(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
-    let mut in_double_quote = false;
-    let mut in_single_quote = false;
-
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if !in_single_quote => {
-                in_double_quote = !in_double_quote;
-            }
-            '\'' if !in_double_quote => {
-                in_single_quote = !in_single_quote;
-            }
-            '\\' if in_double_quote => {
-                // Escape next character in double quotes
-                if let Some(&next) = chars.peek() {
-                    if matches!(next, '"' | '\\') {
-                        current.push(next);
-                        chars.next();
-                    } else {
-                        current.push('\\');
-                    }
-                } else {
-                    current.push('\\');
-                }
-            }
-            c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => {
-                current.push(c);
-            }
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
 impl SlashCommand {
     pub fn parse(input: &str) -> Option<Self> {
         let line = input.trim();
         if !line.starts_with('/') {
             return None;
         }
-        let tokens = tokenize_shell_args(&line[1..]);
+        let tokens = shell_words::split(&line[1..]).unwrap_or_default();
         let mut parts = tokens.iter().map(String::as_str);
         let name = parts.next()?.to_ascii_lowercase();
         let args = parts.map(ToString::to_string).collect::<Vec<_>>();
