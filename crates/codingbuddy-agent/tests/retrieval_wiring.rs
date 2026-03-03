@@ -1,80 +1,11 @@
 //! Tests for retrieval pipeline wiring (P8 Batch 4).
 
-use anyhow::{Result, anyhow};
 use codingbuddy_agent::tool_loop::{
     RetrievalContext, RetrieverCallback, ToolLoopConfig, ToolUseLoop,
 };
-use codingbuddy_core::{
-    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, StreamChunk,
-    TokenUsage,
-};
-use codingbuddy_llm::LlmClient;
-use std::collections::VecDeque;
+use codingbuddy_core::{ChatMessage, LlmResponse, LlmToolCall, StreamChunk, TokenUsage};
+use codingbuddy_testkit::{ScriptedLlm, scripted_text_response as text_response};
 use std::sync::{Arc, Mutex};
-
-// ── Scripted LLM ──
-
-struct ScriptedLlm {
-    responses: Mutex<VecDeque<LlmResponse>>,
-    requests: Mutex<Vec<Vec<ChatMessage>>>,
-}
-
-impl ScriptedLlm {
-    fn new(responses: Vec<LlmResponse>) -> Self {
-        Self {
-            responses: Mutex::new(VecDeque::from(responses)),
-            requests: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl LlmClient for ScriptedLlm {
-    fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
-        Err(anyhow!("not used"))
-    }
-    fn complete_streaming(&self, _req: &LlmRequest, _cb: StreamCallback) -> Result<LlmResponse> {
-        Err(anyhow!("not used"))
-    }
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        self.requests.lock().unwrap().push(req.messages.clone());
-        self.responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| anyhow!("exhausted"))
-    }
-    fn complete_chat_streaming(
-        &self,
-        req: &ChatRequest,
-        _cb: StreamCallback,
-    ) -> Result<LlmResponse> {
-        self.complete_chat(req)
-    }
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
-        Err(anyhow!("not used"))
-    }
-    fn complete_fim_streaming(
-        &self,
-        _req: &codingbuddy_core::FimRequest,
-        _cb: StreamCallback,
-    ) -> Result<LlmResponse> {
-        Err(anyhow!("not used"))
-    }
-}
-
-fn text_response(text: &str) -> LlmResponse {
-    LlmResponse {
-        text: text.to_string(),
-        finish_reason: "stop".to_string(),
-        reasoning_content: String::new(),
-        tool_calls: vec![],
-        usage: Some(TokenUsage {
-            prompt_tokens: 100,
-            completion_tokens: 50,
-            ..Default::default()
-        }),
-    }
-}
 
 /// A mock ToolHost that accepts everything.
 struct NoopToolHost;
@@ -131,7 +62,7 @@ fn retrieval_context_added_before_llm() {
     assert_eq!(result.response, "Done");
 
     // Check that the retrieval context was injected as a System message
-    let requests = llm.requests.lock().unwrap();
+    let requests = llm.captured_messages();
     assert!(!requests.is_empty());
     let first_request_messages = &requests[0];
 
@@ -181,7 +112,7 @@ fn retrieval_respects_budget() {
 
     // Verify context was truncated: budget is 10_000/5 = 2000 tokens
     // Each chunk is ~2500 tokens, so at most 0-1 chunks should be injected
-    let requests = llm.requests.lock().unwrap();
+    let requests = llm.captured_messages();
     let first_request = &requests[0];
     let retrieval_msgs: Vec<_> = first_request
         .iter()

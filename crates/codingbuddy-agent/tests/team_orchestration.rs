@@ -1,80 +1,11 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
-use codingbuddy_core::{ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback};
+use codingbuddy_core::{LlmResponse, LlmToolCall};
 use codingbuddy_llm::LlmClient;
-use std::collections::VecDeque;
+use codingbuddy_testkit::ScriptedLlm;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
-
-struct ScriptedLlm {
-    responses: Mutex<VecDeque<LlmResponse>>,
-}
-
-impl ScriptedLlm {
-    fn new(responses: Vec<LlmResponse>) -> Self {
-        Self {
-            responses: Mutex::new(responses.into()),
-        }
-    }
-
-    fn next_response(&self) -> anyhow::Result<LlmResponse> {
-        let mut guard = self
-            .responses
-            .lock()
-            .map_err(|_| anyhow!("scripted llm mutex poisoned"))?;
-        guard
-            .pop_front()
-            .ok_or_else(|| anyhow!("scripted llm exhausted"))
-    }
-}
-
-impl LlmClient for ScriptedLlm {
-    fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!("complete() not used in team orchestration tests"))
-    }
-
-    fn complete_streaming(
-        &self,
-        _req: &LlmRequest,
-        _cb: StreamCallback,
-    ) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_streaming() not used in team orchestration tests"
-        ))
-    }
-
-    fn complete_chat(&self, _req: &ChatRequest) -> anyhow::Result<LlmResponse> {
-        self.next_response()
-    }
-
-    fn complete_chat_streaming(
-        &self,
-        _req: &ChatRequest,
-        _cb: StreamCallback,
-    ) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_chat_streaming() not used in team orchestration tests"
-        ))
-    }
-
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_fim() not used in team orchestration tests"
-        ))
-    }
-
-    fn complete_fim_streaming(
-        &self,
-        _req: &codingbuddy_core::FimRequest,
-        _cb: StreamCallback,
-    ) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_fim_streaming() not used in team orchestration tests"
-        ))
-    }
-}
 
 fn git(workspace: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git")

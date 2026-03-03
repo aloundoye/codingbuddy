@@ -1,11 +1,114 @@
 use anyhow::Result;
 use codingbuddy_agent::{AgentEngine, ChatOptions};
+use codingbuddy_core::{
+    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, TokenUsage,
+};
+use codingbuddy_llm::LlmClient;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
+
+// ── Scripted LLM for tool-use loop testing ───────────────────────────────
+
+/// A scripted LLM client that pops pre-defined responses from a queue.
+///
+/// Optionally captures all `ChatRequest` messages for post-test inspection.
+/// This is the canonical mock — integration tests should use this instead of
+/// defining their own.
+pub struct ScriptedLlm {
+    responses: Mutex<VecDeque<LlmResponse>>,
+    captured: Mutex<Vec<Vec<ChatMessage>>>,
+}
+
+impl ScriptedLlm {
+    /// Create a new scripted LLM with the given response queue.
+    pub fn new(responses: Vec<LlmResponse>) -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::from(responses)),
+            captured: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Return all message histories captured from `complete_chat` calls.
+    pub fn captured_messages(&self) -> Vec<Vec<ChatMessage>> {
+        self.captured.lock().expect("captured lock").clone()
+    }
+}
+
+impl LlmClient for ScriptedLlm {
+    fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
+        Err(anyhow::anyhow!("complete() not used in scripted tests"))
+    }
+    fn complete_streaming(&self, _req: &LlmRequest, _cb: StreamCallback) -> Result<LlmResponse> {
+        Err(anyhow::anyhow!(
+            "complete_streaming() not used in scripted tests"
+        ))
+    }
+    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.captured
+            .lock()
+            .expect("captured lock")
+            .push(req.messages.clone());
+        self.responses
+            .lock()
+            .expect("responses lock")
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("scripted llm exhausted"))
+    }
+    fn complete_chat_streaming(
+        &self,
+        req: &ChatRequest,
+        _cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.complete_chat(req)
+    }
+    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+        Err(anyhow::anyhow!("complete_fim() not used in scripted tests"))
+    }
+    fn complete_fim_streaming(
+        &self,
+        _req: &codingbuddy_core::FimRequest,
+        _cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        Err(anyhow::anyhow!(
+            "complete_fim_streaming() not used in scripted tests"
+        ))
+    }
+}
+
+/// Build a text-only LLM response (no tool calls).
+pub fn scripted_text_response(text: &str) -> LlmResponse {
+    LlmResponse {
+        text: text.to_string(),
+        finish_reason: "stop".to_string(),
+        reasoning_content: String::new(),
+        tool_calls: vec![],
+        usage: Some(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            ..Default::default()
+        }),
+    }
+}
+
+/// Build an LLM response containing tool calls.
+pub fn scripted_tool_response(calls: Vec<LlmToolCall>) -> LlmResponse {
+    LlmResponse {
+        text: String::new(),
+        finish_reason: "tool_calls".to_string(),
+        reasoning_content: String::new(),
+        tool_calls: calls,
+        usage: Some(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            ..Default::default()
+        }),
+    }
+}
 
 // ── Scenario-based mock LLM server ──────────────────────────────────────
 

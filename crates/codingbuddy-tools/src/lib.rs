@@ -5072,4 +5072,80 @@ mod tests {
         let args = json!({"anything": "goes"});
         assert!(validate_tool_args_schema("mcp__unknown__tool", &args, &tools).is_ok());
     }
+
+    #[test]
+    fn mcp_tool_routing_splits_name_correctly() {
+        let (workspace, mut host) = temp_host();
+        let captured_server = Arc::new(Mutex::new(String::new()));
+        let captured_tool = Arc::new(Mutex::new(String::new()));
+        let captured_args = Arc::new(Mutex::new(json!(null)));
+        let cs = captured_server.clone();
+        let ct = captured_tool.clone();
+        let ca = captured_args.clone();
+
+        host.set_mcp_executor(Arc::new(move |server_id, tool_name, args| {
+            *cs.lock().unwrap() = server_id.to_string();
+            *ct.lock().unwrap() = tool_name.to_string();
+            *ca.lock().unwrap() = args.clone();
+            Ok(json!({"result": "ok"}))
+        }));
+
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "mcp__github__search".to_string(),
+                args: json!({"arguments": {"query": "test"}}),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success, "MCP tool call should succeed");
+        assert_eq!(*captured_server.lock().unwrap(), "github");
+        assert_eq!(*captured_tool.lock().unwrap(), "search");
+        assert_eq!(*captured_args.lock().unwrap(), json!({"query": "test"}));
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn mcp_tool_without_executor_returns_error() {
+        let (workspace, host) = temp_host();
+        // No MCP executor set — should fail
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "mcp__github__search".to_string(),
+                args: json!({"arguments": {"query": "test"}}),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success, "should fail without executor");
+        let err = result.output["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("no MCP executor"),
+            "error should mention missing executor: {err}"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn mcp_tool_invalid_name_returns_error() {
+        let (workspace, mut host) = temp_host();
+        host.set_mcp_executor(Arc::new(|_, _, _| Ok(json!({"ok": true}))));
+
+        // "mcp__noseparator" has no second "__" — should fail to split
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "mcp__noseparator".to_string(),
+                args: json!({}),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success, "should fail with invalid MCP name");
+        let err = result.output["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("invalid MCP tool name"),
+            "error should mention invalid name: {err}"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
 }

@@ -12,6 +12,7 @@ tempfile.workspace = true
 uuid.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-agent = { path = "../codingbuddy-agent" }
+codingbuddy-llm = { path = "../codingbuddy-llm" }
 
 [dev-dependencies]
 reqwest = { workspace = true }
