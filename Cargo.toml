@@ -22,6 +22,7 @@ members = [
   "crates/codingbuddy-context",
   "crates/codingbuddy-errors",
   "crates/codingbuddy-local-ml",
+  "crates/codingbuddy-lsp",
 ]
 resolver = "2"
 

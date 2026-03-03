@@ -556,6 +556,7 @@ dependencies = [
  "codingbuddy-index",
  "codingbuddy-llm",
  "codingbuddy-local-ml",
+ "codingbuddy-lsp",
  "codingbuddy-mcp",
  "codingbuddy-memory",
  "codingbuddy-observe",
@@ -787,6 +788,16 @@ dependencies = [
  "tree-sitter-typescript",
  "usearch",
  "uuid",
+]
+
+[[package]]
+name = "codingbuddy-lsp"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
