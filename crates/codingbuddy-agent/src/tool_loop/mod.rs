@@ -264,11 +264,43 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Invalidate cache entries for a given path (after a write tool modifies it).
+    /// Uses exact path match or path-prefix match to avoid over-invalidation
+    /// (e.g. modifying `/foo/test.rs` should not invalidate `/foo/other_test.rs`).
     fn cache_invalidate_path(&mut self, path: &str) {
         self.tool_cache.retain(|_key, entry| {
-            // Invalidate any cached entry whose original args contain this path
-            !entry.raw_key.contains(path)
+            // Check if the raw key contains the exact path as a JSON string value.
+            // JSON-encoded paths are wrapped in quotes: "path": "/foo/bar.rs"
+            let quoted = format!("\"{path}\"");
+            !entry.raw_key.contains(&quoted)
         });
+    }
+
+    /// Persist a large tool output to disk and return a hint for the truncated message.
+    /// Writes to `.codingbuddy/tool_outputs/<hash>.txt` so the model can re-read it.
+    const LARGE_OUTPUT_THRESHOLD: usize = 50_000; // 50KB
+    fn persist_large_output(&self, tool_name: &str, raw_output: &str) -> Option<String> {
+        if raw_output.len() < Self::LARGE_OUTPUT_THRESHOLD {
+            return None;
+        }
+        let output_dir = std::path::Path::new(&self.workspace_path_str)
+            .join(".codingbuddy")
+            .join("tool_outputs");
+        if std::fs::create_dir_all(&output_dir).is_err() {
+            return None;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw_output.hash(&mut hasher);
+        let hash = hasher.finish();
+        let filename = format!("{tool_name}_{hash:016x}.txt");
+        let path = output_dir.join(&filename);
+        if std::fs::write(&path, raw_output).is_ok() {
+            Some(format!(
+                "\n[Full output saved to .codingbuddy/tool_outputs/{filename} — use fs_read to view]"
+            ))
+        } else {
+            None
+        }
     }
 
     /// Set the stream callback for real-time UI updates.
@@ -385,13 +417,49 @@ impl<'a> ToolUseLoop<'a> {
             (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
 
         loop {
-            // Check turn limit
+            // Check turn limit — on final turn, ask for a text-only summary.
             if turns >= self.config.max_turns {
+                // Inject a final system message asking for text-only summary
+                self.messages.push(ChatMessage::System {
+                    content: "MAXIMUM STEPS REACHED. Tools are now disabled. Respond with text only: \
+                        summarize what you accomplished, what remains incomplete, and any recommendations."
+                        .to_string(),
+                });
+                // Make one final LLM call with no tools to get a summary
+                let summary_request = ChatRequest {
+                    messages: self.messages.clone(),
+                    model: self.config.model.clone(),
+                    tools: Vec::new(),
+                    tool_choice: ToolChoice::none(),
+                    max_tokens: 2048,
+                    temperature: None,
+                    top_p: None,
+                    presence_penalty: None,
+                    frequency_penalty: None,
+                    logprobs: None,
+                    top_logprobs: None,
+                    thinking: None,
+                    images: vec![],
+                    response_format: None,
+                };
+                let summary_text = match self.llm.complete_chat(&summary_request) {
+                    Ok(resp) => {
+                        if let Some(u) = &resp.usage {
+                            total_usage.prompt_tokens += u.prompt_tokens;
+                            total_usage.completion_tokens += u.completion_tokens;
+                        }
+                        resp.text
+                    }
+                    Err(_) => String::new(),
+                };
+                if !summary_text.is_empty() {
+                    self.emit(StreamChunk::ContentDelta(summary_text.clone()));
+                }
                 self.emit(StreamChunk::Done {
                     reason: Some("max turns reached".to_string()),
                 });
                 return Ok(ToolLoopResult {
-                    response: String::new(),
+                    response: summary_text,
                     tool_calls_made,
                     finish_reason: "max_turns".to_string(),
                     usage: total_usage,
@@ -450,6 +518,10 @@ impl<'a> ToolUseLoop<'a> {
             // Build and send the LLM request
             turns += 1;
             let request = self.build_request();
+            // Images only need to be sent once — clear after first turn to save tokens.
+            if turns == 1 && !self.config.images.is_empty() {
+                self.config.images.clear();
+            }
 
             // Emit model routing event when the model changes (escalation/de-escalation)
             if request.model != last_model {
@@ -654,40 +726,102 @@ impl<'a> ToolUseLoop<'a> {
             // Execute independent read-only tools in parallel using thread scope.
             // This avoids blocking on I/O-bound tools (file reads, greps) sequentially.
             if parallel_calls.len() > 1 {
-                // Execute the raw tool calls in parallel, collecting results
-                // Each thread captures its own duration for accurate timing.
+                // Pre-validate, check circuit breaker, and look up cache BEFORE entering
+                // thread scope (these require &mut self which is not Sync).
+                let mut pre_validated: Vec<(
+                    LlmToolCall,               // repaired call
+                    Option<serde_json::Value>, // cached result (Some = skip execution)
+                    Option<String>,            // validation/breaker error (Some = skip execution)
+                )> = Vec::with_capacity(parallel_calls.len());
+
+                for llm_call in &parallel_calls {
+                    let repaired = tool_bridge::repair_tool_name(&llm_call.name, &self.tools);
+                    let effective_name = repaired.unwrap_or_else(|| llm_call.name.clone());
+                    let effective_call = if effective_name != llm_call.name {
+                        LlmToolCall {
+                            id: llm_call.id.clone(),
+                            name: effective_name,
+                            arguments: llm_call.arguments.clone(),
+                        }
+                    } else {
+                        (*llm_call).clone()
+                    };
+                    let parsed_args: serde_json::Value =
+                        serde_json::from_str(&effective_call.arguments).unwrap_or_default();
+
+                    // Schema validation
+                    if let Err(e) = codingbuddy_tools::validate_tool_args_schema(
+                        &effective_call.name,
+                        &parsed_args,
+                        &self.tools,
+                    ) {
+                        pre_validated.push((
+                            effective_call,
+                            None,
+                            Some(format!("Validation error: {e}")),
+                        ));
+                        continue;
+                    }
+
+                    // Circuit breaker check
+                    if let Some(state) = self.circuit_breaker.get(&effective_call.name)
+                        && state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD
+                        && state.cooldown_remaining > 0
+                    {
+                        let err = format!(
+                            "Tool '{}' is temporarily disabled due to repeated failures. Try a different approach.",
+                            effective_call.name
+                        );
+                        pre_validated.push((effective_call, None, Some(err)));
+                        continue;
+                    }
+
+                    // Cache lookup
+                    let cached = self.cache_lookup(&effective_call.name, &parsed_args);
+                    pre_validated.push((effective_call, cached, None));
+                }
+
+                // Execute in parallel — only calls that passed pre-validation and aren't cached.
+                // Threads return (index, result, elapsed_ms) to avoid cloning effective_call.
                 let tool_host = &self.tool_host;
-                let tools = &self.tools;
                 let parallel_results: Vec<_> = std::thread::scope(|s| {
-                    let handles: Vec<_> = parallel_calls
+                    let handles: Vec<_> = pre_validated
                         .iter()
-                        .map(|llm_call| {
+                        .enumerate()
+                        .map(|(idx, (effective_call, cached, error))| {
                             s.spawn(move || {
+                                // Return pre-computed error
+                                if let Some(err_msg) = error {
+                                    let error_result = codingbuddy_core::ToolResult {
+                                        invocation_id: uuid::Uuid::nil(),
+                                        success: false,
+                                        output: serde_json::json!(err_msg),
+                                    };
+                                    return (idx, error_result, 0u64);
+                                }
+
+                                // Return cached result
+                                if let Some(cached_val) = cached {
+                                    let result = codingbuddy_core::ToolResult {
+                                        invocation_id: uuid::Uuid::nil(),
+                                        success: true,
+                                        output: cached_val.clone(),
+                                    };
+                                    return (idx, result, 0u64);
+                                }
+
+                                // Execute the tool
                                 let start = Instant::now();
-                                // Repair tool name
-                                let repaired = tool_bridge::repair_tool_name(&llm_call.name, tools);
-                                let effective_name =
-                                    repaired.unwrap_or_else(|| llm_call.name.clone());
-                                let effective_call = if effective_name != llm_call.name {
-                                    LlmToolCall {
-                                        id: llm_call.id.clone(),
-                                        name: effective_name,
-                                        arguments: llm_call.arguments.clone(),
-                                    }
-                                } else {
-                                    (*llm_call).clone()
-                                };
                                 let internal =
-                                    tool_bridge::llm_tool_call_to_internal(&effective_call);
+                                    tool_bridge::llm_tool_call_to_internal(effective_call);
                                 let proposal = tool_host.propose(internal);
-                                // Read-only tools are auto-approved
                                 let approved = ApprovedToolCall {
                                     invocation_id: proposal.invocation_id,
                                     call: proposal.call,
                                 };
                                 let result = tool_host.execute(approved);
                                 let elapsed = start.elapsed().as_millis() as u64;
-                                (effective_call, result, elapsed)
+                                (idx, result, elapsed)
                             })
                         })
                         .collect();
@@ -700,11 +834,6 @@ impl<'a> ToolUseLoop<'a> {
                                     .map(|s| s.as_str())
                                     .or_else(|| panic_payload.downcast_ref::<&str>().copied())
                                     .unwrap_or("unknown panic");
-                                let error_call = LlmToolCall {
-                                    id: String::new(),
-                                    name: "parallel_tool_panic".to_string(),
-                                    arguments: String::new(),
-                                };
                                 let error_result = codingbuddy_core::ToolResult {
                                     invocation_id: uuid::Uuid::nil(),
                                     success: false,
@@ -712,14 +841,26 @@ impl<'a> ToolUseLoop<'a> {
                                         "Internal error: parallel tool execution panicked: {panic_msg}"
                                     )),
                                 };
-                                (error_call, error_result, 0u64)
+                                // Use usize::MAX as sentinel for panicked threads
+                                (usize::MAX, error_result, 0u64)
                             })
                         })
                         .collect()
                 });
 
-                // Process results sequentially (updates messages, cache, events)
-                for (effective_call, result, par_duration) in &parallel_results {
+                // Process results sequentially (updates messages, cache, events).
+                // Look up effective_call from pre_validated by index.
+                for (idx, result, par_duration) in &parallel_results {
+                    let effective_call = if *idx < pre_validated.len() {
+                        &pre_validated[*idx].0
+                    } else {
+                        // Panicked thread — emit error with placeholder
+                        self.messages.push(ChatMessage::Tool {
+                            tool_call_id: String::new(),
+                            content: result.output.to_string(),
+                        });
+                        continue;
+                    };
                     let args: serde_json::Value = serde_json::from_str(&effective_call.arguments)
                         .unwrap_or_else(|e| {
                             eprintln!(
@@ -753,7 +894,6 @@ impl<'a> ToolUseLoop<'a> {
                     let msg = self.apply_privacy_to_message(msg);
 
                     // Cache store AFTER privacy filtering — cache only holds filtered data.
-                    // We extract the filtered content from the message we're about to push.
                     if result.success {
                         if let ChatMessage::Tool { ref content, .. } = msg {
                             self.cache_store(
@@ -1041,7 +1181,7 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: None,
                 prompt: None,
                 session_type: None,
-                workspace: self.workspace_str(),
+                workspace: self.workspace_str().to_string(),
             };
             let hook_result = hooks.fire(HookEvent::PreToolUse, &input);
             if hook_result.blocked {
@@ -1239,7 +1379,7 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: Some(result.output.clone()),
                 prompt: None,
                 session_type: None,
-                workspace: self.workspace_str(),
+                workspace: self.workspace_str().to_string(),
             };
             Self::fire_hook_logged(hooks, HookEvent::PostToolUse, &input);
         }
@@ -1266,6 +1406,12 @@ impl<'a> ToolUseLoop<'a> {
             },
         });
 
+        // Persist large outputs to disk so the model can re-read the full content.
+        let file_hint = result
+            .output
+            .as_str()
+            .and_then(|s| self.persist_large_output(&llm_call.name, s));
+
         // Convert result to ChatMessage::Tool and append, scanning for security issues
         let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
             &llm_call.id,
@@ -1273,6 +1419,21 @@ impl<'a> ToolUseLoop<'a> {
             &result,
             Some(&self.output_scanner),
         );
+        // Append file persistence hint to the truncated message content.
+        let msg = if let Some(hint) = file_hint {
+            match msg {
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                } => ChatMessage::Tool {
+                    tool_call_id,
+                    content: format!("{content}{hint}"),
+                },
+                other => other,
+            }
+        } else {
+            msg
+        };
         let msg = self.apply_privacy_to_message(msg);
 
         // ── Cache store (after privacy filtering) ──
@@ -1490,7 +1651,7 @@ impl<'a> ToolUseLoop<'a> {
                     tool_result: None,
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self.workspace_str(),
+                    workspace: self.workspace_str().to_string(),
                 };
                 Self::fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
             }
@@ -1512,7 +1673,7 @@ impl<'a> ToolUseLoop<'a> {
                         .map(|r| serde_json::Value::String(r.clone())),
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self.workspace_str(),
+                    workspace: self.workspace_str().to_string(),
                 };
                 Self::fire_hook_logged(hooks, HookEvent::SubagentStop, &input);
             }
@@ -1877,7 +2038,7 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: Some(serde_json::Value::String(summary.clone())),
                 prompt: None,
                 session_type: None,
-                workspace: self.workspace_str(),
+                workspace: self.workspace_str().to_string(),
             };
             Self::fire_hook_logged(hooks, HookEvent::PreCompact, &input);
         }
@@ -1933,7 +2094,24 @@ impl<'a> ToolUseLoop<'a> {
             return false;
         }
 
+        let compacted_count = middle_count;
         self.messages = new_messages;
+
+        // Inject synthetic continuation to prevent model confusion after compaction.
+        // Only add when significant compaction occurred (5+ messages removed) and
+        // the last message is not already a User message.
+        if compacted_count >= 5 {
+            let last_is_user = self
+                .messages
+                .last()
+                .is_some_and(|m| matches!(m, ChatMessage::User { .. }));
+            if !last_is_user {
+                self.messages.push(ChatMessage::User {
+                    content: "Continue with your next steps if any remain, or summarize what was accomplished.".to_string(),
+                });
+            }
+        }
+
         true
     }
 
@@ -2061,8 +2239,8 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Get the workspace path as a string for hook inputs (pre-computed in `new()`).
-    fn workspace_str(&self) -> String {
-        self.workspace_path_str.clone()
+    fn workspace_str(&self) -> &str {
+        &self.workspace_path_str
     }
 
     /// Emit a stream chunk to the callback.
@@ -3240,8 +3418,11 @@ mod tests {
 
         let result = loop_.run("what's in this image?").unwrap();
         assert_eq!(result.response, "I see the image.");
-        // The images are included in the config, which is used in build_request
-        assert!(!loop_.config.images.is_empty());
+        // Images are cleared after the first turn to avoid re-sending them every turn
+        assert!(
+            loop_.config.images.is_empty(),
+            "images should be cleared after first turn"
+        );
     }
 
     #[test]

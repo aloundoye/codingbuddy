@@ -322,7 +322,11 @@ impl ContextManager {
         }
 
         // Sort by score descending
-        suggestions.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        suggestions.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Take top N
         suggestions.truncate(limit);
@@ -385,15 +389,17 @@ impl ContextManager {
         let lines: Vec<&str> = context.lines().collect();
         let total_lines = lines.len();
 
-        if total_lines <= max_tokens / 10 {
-            // Rough estimate: 10 lines per token
+        // Estimate: ~15 tokens per line of code (standard approximation).
+        let estimated_tokens = total_lines * 15;
+        if estimated_tokens <= max_tokens {
             return context.to_string();
         }
 
-        // Keep beginning and end, with some middle context
-        let keep_start = (max_tokens / 30).min(total_lines / 4);
-        let keep_end = (max_tokens / 30).min(total_lines / 4);
-        let keep_middle = max_tokens / 30;
+        // Budget: how many lines we can keep within max_tokens.
+        let line_budget = max_tokens / 15;
+        let keep_start = (line_budget / 3).min(total_lines / 4);
+        let keep_end = (line_budget / 3).min(total_lines / 4);
+        let keep_middle = line_budget / 3;
 
         let mut compressed = Vec::new();
 
