@@ -137,6 +137,15 @@ impl SkillManager {
                     .get("disable-model-invocation")
                     .is_some_and(|v| v == "true");
 
+                // Determine scope based on which root directory this skill was found under.
+                let scope = if root == self.install_root {
+                    SkillScope::BuiltIn
+                } else if root.starts_with(&self.workspace) {
+                    SkillScope::Project
+                } else {
+                    SkillScope::User
+                };
+
                 out.push(SkillEntry {
                     id,
                     name,
@@ -144,7 +153,7 @@ impl SkillManager {
                     summary,
                     allowed_tools,
                     disallowed_tools,
-                    scope: SkillScope::BuiltIn,
+                    scope,
                     context,
                     disable_model_invocation,
                 });

@@ -3054,11 +3054,22 @@ impl Store {
             return Ok(0);
         }
 
-        // Delete related rows
-        for id in &ids {
-            conn.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
-            conn.execute("DELETE FROM plans WHERE session_id = ?1", params![id])?;
-            conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![id])?;
+        // Delete related rows in a single transaction for atomicity.
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<()> {
+            for id in &ids {
+                conn.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
+                conn.execute("DELETE FROM plans WHERE session_id = ?1", params![id])?;
+                conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![id])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
         Ok(ids.len() as u64)
     }

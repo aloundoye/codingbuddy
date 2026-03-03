@@ -30,7 +30,11 @@ pub struct StepSnapshot {
     pub after: Vec<FileSnapshot>,
 }
 
-/// Snapshot of a single file's state (content hash + preview).
+/// Maximum file size (in bytes) for storing full content in snapshots.
+/// Files larger than this get preview-only snapshots (revert will require git).
+const SNAPSHOT_FULL_CONTENT_LIMIT: usize = 1024 * 1024; // 1 MB
+
+/// Snapshot of a single file's state (content hash + content for revert).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSnapshot {
     /// Relative path from workspace root.
@@ -39,6 +43,9 @@ pub struct FileSnapshot {
     pub content_hash: String,
     /// First 50 lines of content for quick preview.
     pub preview: String,
+    /// Full file content for revert (None if file too large or binary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_content: Option<String>,
     /// Whether the file exists at this point.
     pub exists: bool,
 }
@@ -58,10 +65,16 @@ impl FileSnapshot {
                 hasher.update(content.as_bytes());
                 let hash = format!("{:x}", hasher.finalize());
                 let preview: String = content.lines().take(50).collect::<Vec<_>>().join("\n");
+                let full_content = if content.len() <= SNAPSHOT_FULL_CONTENT_LIMIT {
+                    Some(content)
+                } else {
+                    None
+                };
                 Self {
                     path: file_path.to_string(),
                     content_hash: hash,
                     preview,
+                    full_content,
                     exists: true,
                 }
             }
@@ -69,6 +82,7 @@ impl FileSnapshot {
                 path: file_path.to_string(),
                 content_hash: String::new(),
                 preview: String::new(),
+                full_content: None,
                 exists: false,
             },
         }
@@ -894,11 +908,16 @@ impl MemoryManager {
                     fs::remove_file(&abs_path)?;
                     restored.push(format!("deleted {}", file_snap.path));
                 }
+            } else if let Some(ref content) = file_snap.full_content {
+                // Full content available — write it back.
+                if let Some(parent) = abs_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&abs_path, content)?;
+                restored.push(format!("restored {}", file_snap.path));
             } else {
-                // We only have a preview (first 50 lines), not the full content.
-                // For a real revert, use the checkpoint system (git shadow commit).
-                // This is a best-effort revert for recently created files.
-                restored.push(format!("needs full revert: {}", file_snap.path));
+                // File too large for inline snapshot — needs git-based revert.
+                restored.push(format!("needs git revert (>1MB): {}", file_snap.path));
             }
         }
 

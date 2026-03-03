@@ -883,10 +883,34 @@ fn allow_pattern_matches(pattern: &str, cmd_tokens: &[&str]) -> bool {
 }
 
 fn split_pipeline_segments(cmd: &str) -> Result<Vec<&str>, PolicyError> {
-    let segments = cmd.split('|').map(str::trim).collect::<Vec<_>>();
-    if segments.iter().any(|segment| segment.is_empty()) {
+    // Split on `|` only when not inside single or double quotes.
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = cmd.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => {
+                let seg = cmd[start..i].trim();
+                if seg.is_empty() {
+                    return Err(PolicyError::CommandInjection);
+                }
+                segments.push(seg);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    // Final segment
+    let seg = cmd[start..].trim();
+    if seg.is_empty() {
         return Err(PolicyError::CommandInjection);
     }
+    segments.push(seg);
     Ok(segments)
 }
 

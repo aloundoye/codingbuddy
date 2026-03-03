@@ -602,7 +602,7 @@ impl ApiClient {
                         let mut reasoning_out = String::new();
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
-                        let completed_tool_calls: Vec<LlmToolCall> = Vec::new();
+                        let mut completed_tool_calls: Vec<LlmToolCall> = Vec::new();
                         // Suppress text display once structured tool_calls
                         // deltas arrive — the text fragments between tool calls
                         // are noise that confuses the TUI display.
@@ -675,6 +675,24 @@ impl ApiClient {
                                 {
                                     has_structured_tool_calls = true;
                                     merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
+                                }
+                            }
+                            // Some providers send non-streamed `message` instead of `delta`.
+                            if let Some(message) = choice.get("message") {
+                                if let Some(content) =
+                                    message.get("content").and_then(|v| v.as_str())
+                                {
+                                    content_out.push_str(content);
+                                    cb(StreamChunk::ContentDelta(content.to_string()));
+                                }
+                                if let Some(reasoning) =
+                                    message.get("reasoning_content").and_then(|v| v.as_str())
+                                {
+                                    reasoning_out.push_str(reasoning);
+                                    cb(StreamChunk::ReasoningDelta(reasoning.to_string()));
+                                }
+                                if let Some(tool_calls) = message.get("tool_calls") {
+                                    completed_tool_calls.extend(parse_tool_calls_array(tool_calls));
                                 }
                             }
                         }

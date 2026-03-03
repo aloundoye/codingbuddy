@@ -884,7 +884,21 @@ fn discover_server_tools(server: &McpServer) -> Result<Vec<McpTool>> {
                 .as_deref()
                 .ok_or_else(|| anyhow!("http transport requires url"))?;
             let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-            let value: serde_json::Value = client.get(url).send()?.error_for_status()?.json()?;
+            // MCP uses JSON-RPC: POST with tools/list method.
+            let rpc_body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            });
+            let value: serde_json::Value = client
+                .post(url)
+                .json(&rpc_body)
+                .send()?
+                .error_for_status()?
+                .json()?;
+            // JSON-RPC wraps the result in a "result" field.
+            let value = value.get("result").cloned().unwrap_or(value);
             let tools = value
                 .get("tools")
                 .and_then(|v| v.as_array())
@@ -1066,40 +1080,50 @@ impl McpConnectionPool {
         // Evict idle connections
         pool.retain(|_, conn| conn.last_used.elapsed() < self.idle_timeout);
 
-        // Try reusing existing connection
-        if let Some(conn) = pool.get_mut(&key) {
+        // Try reusing existing connection — take it out of the pool so we can
+        // release the lock before performing I/O.
+        let existing = if let Some(mut conn) = pool.remove(&key) {
             // Health check: try_wait returns Some if process exited
             if conn.child.try_wait().ok().flatten().is_some() {
-                pool.remove(&key);
+                let _ = conn.child.kill();
+                let _ = conn.child.wait();
+                None
             } else {
-                let request_id = conn.next_request_id;
                 conn.next_request_id += 1;
                 conn.last_used = Instant::now();
-
-                if let Err(e) =
-                    write_mcp_request(&mut conn.stdin, request_id, method, params.clone())
-                {
-                    // Connection broken — remove and fall through to create new one
-                    let mut removed = pool.remove(&key).unwrap();
-                    let _ = removed.child.kill();
-                    let _ = removed.child.wait();
-                    let _ = e; // Connection broken — will create new one
-                } else {
-                    let _ = conn.stdin.flush();
-                    let response = wait_for_mcp_response(&conn.rx, request_id, timeout);
-                    return match response {
-                        Some(value) => Ok(value),
-                        None => Err(anyhow!(
-                            "MCP pooled request timed out: method={method} timeout_ms={}",
-                            timeout.as_millis()
-                        )),
-                    };
-                }
+                Some((conn.next_request_id - 1, conn))
             }
+        } else {
+            None
+        };
+
+        if let Some((request_id, mut conn)) = existing {
+            drop(pool); // Release lock before I/O
+
+            if let Err(_e) = write_mcp_request(&mut conn.stdin, request_id, method, params.clone())
+            {
+                // Connection broken — discard and fall through to create new one
+                let _ = conn.child.kill();
+                let _ = conn.child.wait();
+            } else {
+                let _ = conn.stdin.flush();
+                let response = wait_for_mcp_response(&conn.rx, request_id, timeout);
+                // Re-insert connection into pool
+                let mut pool = self.connections.lock().unwrap();
+                pool.insert(key.clone(), conn);
+                return match response {
+                    Some(value) => Ok(value),
+                    None => Err(anyhow!(
+                        "MCP pooled request timed out: method={method} timeout_ms={}",
+                        timeout.as_millis()
+                    )),
+                };
+            }
+        } else {
+            drop(pool); // Release lock before creating new connection
         }
 
-        // Create new connection
-        drop(pool); // Release lock during process spawn
+        // Create new connection (lock already released above)
         let conn = self.create_connection(server)?;
         let mut pool = self.connections.lock().unwrap();
 
