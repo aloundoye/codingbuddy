@@ -897,6 +897,7 @@ dependencies = [
  "anyhow",
  "codingbuddy-agent",
  "codingbuddy-core",
+ "codingbuddy-llm",
  "reqwest 0.13.2",
  "serde_json",
  "tempfile",

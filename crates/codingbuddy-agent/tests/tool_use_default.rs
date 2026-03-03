@@ -1,6 +1,6 @@
 //! Integration tests proving the tool-use loop is the default Code path.
 //!
-//! Uses `ScriptedToolLlm` to simulate tool-call responses from the LLM,
+//! Uses `ScriptedLlm` to simulate tool-call responses from the LLM,
 //! and verifies that the AgentEngine correctly routes through the tool-use loop.
 
 use anyhow::{Result, anyhow};
@@ -9,61 +9,11 @@ use codingbuddy_core::{
     ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, TokenUsage,
 };
 use codingbuddy_llm::LlmClient;
+use codingbuddy_testkit::ScriptedLlm;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-
-// ── Scripted LLM that returns tool calls ──
-
-struct ScriptedToolLlm {
-    responses: Mutex<VecDeque<LlmResponse>>,
-}
-
-impl ScriptedToolLlm {
-    fn new(responses: Vec<LlmResponse>) -> Self {
-        Self {
-            responses: Mutex::new(VecDeque::from(responses)),
-        }
-    }
-}
-
-impl LlmClient for ScriptedToolLlm {
-    fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
-        Err(anyhow!("complete() not used in tool_use_default tests"))
-    }
-    fn complete_streaming(&self, _req: &LlmRequest, _cb: StreamCallback) -> Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_streaming() not used in tool_use_default tests"
-        ))
-    }
-    fn complete_chat(&self, _req: &ChatRequest) -> Result<LlmResponse> {
-        self.responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| anyhow!("scripted tool llm exhausted"))
-    }
-    fn complete_chat_streaming(
-        &self,
-        req: &ChatRequest,
-        _cb: StreamCallback,
-    ) -> Result<LlmResponse> {
-        self.complete_chat(req)
-    }
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
-        Err(anyhow!("complete_fim() not used in tool_use_default tests"))
-    }
-    fn complete_fim_streaming(
-        &self,
-        _req: &codingbuddy_core::FimRequest,
-        _cb: StreamCallback,
-    ) -> Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_fim_streaming() not used in tool_use_default tests"
-        ))
-    }
-}
 
 // ── Response builders ──
 
@@ -121,7 +71,7 @@ fn init_workspace(path: &Path) -> Result<()> {
 }
 
 fn build_engine(path: &Path, responses: Vec<LlmResponse>) -> Result<AgentEngine> {
-    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(ScriptedToolLlm::new(responses));
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(ScriptedLlm::new(responses));
     AgentEngine::new_with_llm(path, llm)
 }
 

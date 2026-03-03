@@ -2319,6 +2319,7 @@ mod tests {
     struct MockToolHost {
         results: Mutex<VecDeque<ToolResult>>,
         auto_approve: bool,
+        execute_count: std::sync::atomic::AtomicUsize,
     }
 
     impl MockToolHost {
@@ -2326,7 +2327,13 @@ mod tests {
             Self {
                 results: Mutex::new(VecDeque::from(results)),
                 auto_approve,
+                execute_count: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn executed_count(&self) -> usize {
+            self.execute_count
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -2339,6 +2346,8 @@ mod tests {
             }
         }
         fn execute(&self, _approved: ApprovedToolCall) -> ToolResult {
+            self.execute_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.results
                 .lock()
                 .unwrap()
@@ -5094,5 +5103,75 @@ mod tests {
         }
         // If compacted is true, the code-based fallback produced a sufficient summary.
         // Either outcome is valid — the key test is that empty summaries are caught.
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn hook_denial_blocks_tool_execution() {
+        use codingbuddy_hooks::{HookDefinition, HookHandler, HookRuntime, HooksConfig};
+
+        // Create a HookRuntime with a PreToolUse hook that exits with code 2 (block)
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            HookEvent::PreToolUse.as_str().to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: "exit 2".to_string(),
+                    timeout: 5,
+                }],
+                once: false,
+                disabled: false,
+            }],
+        );
+        let hooks_config = HooksConfig { events };
+        let hooks = HookRuntime::new(dir.path(), hooks_config);
+
+        let llm = ScriptedLlm::new(vec![
+            // LLM tries to call fs_read
+            make_tool_response(vec![LlmToolCall {
+                id: "c1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: serde_json::json!({"path": "test.txt"}).to_string(),
+            }]),
+            // After denial, LLM responds with text
+            make_text_response("OK, I won't use that tool."),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig::default();
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host.clone(),
+            config,
+            "You are helpful.".to_string(),
+            default_tools(),
+        );
+        loop_.set_hooks(hooks);
+
+        let result = loop_.run("Read test.txt").unwrap();
+
+        // The tool should NOT have been executed (host should have 0 calls)
+        assert_eq!(
+            tool_host.executed_count(),
+            0,
+            "tool should not be executed when hook blocks it"
+        );
+
+        // The LLM should have received a denial message and responded
+        assert_eq!(result.response, "OK, I won't use that tool.");
+
+        // Check that the denial message was added to the conversation
+        let has_denial = loop_.messages.iter().any(|m| {
+            if let ChatMessage::Tool { content, .. } = m {
+                content.contains("blocked by pre-tool-use hook")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_denial,
+            "denial message should be in conversation history"
+        );
     }
 }
