@@ -207,6 +207,70 @@ pub(crate) fn render_plan_payload(payload: &Value) -> String {
     lines.join("\n")
 }
 
+pub(crate) fn render_plan_notice_lines(payload: &Value) -> Vec<String> {
+    let plan_state = payload
+        .get("plan_state")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let version = payload.get("version").and_then(Value::as_u64).unwrap_or(0);
+    let goal = payload
+        .get("goal_preview")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let steps = payload
+        .get("steps")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let verification = payload
+        .get("verification")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let label = match plan_state {
+        "draft" => "draft ready",
+        "awaiting_approval" => "awaiting approval",
+        "approved" => "approved",
+        "paused" => "paused",
+        "failed" => "failed",
+        other => other,
+    };
+
+    let mut lines = vec![format!("[plan] {label} v{version}: {goal}")];
+    if !steps.is_empty() {
+        let preview = steps
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(idx, step)| {
+                let title = step
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("untitled");
+                format!("{}. {}", idx + 1, truncate_inline(title, 48))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let extra = steps.len().saturating_sub(3);
+        let suffix = if extra > 0 {
+            format!(" | +{} more", extra)
+        } else {
+            String::new()
+        };
+        lines.push(format!("[plan] steps: {preview}{suffix}"));
+    }
+    if let Some(first_verify) = verification.first().and_then(Value::as_str) {
+        lines.push(format!(
+            "[plan] verify: {}",
+            truncate_inline(first_verify, 100)
+        ));
+    }
+    if plan_state == "awaiting_approval" {
+        lines.push("[plan] next: /plan show | /plan approve | /plan reject <feedback>".to_string());
+    }
+    lines
+}
+
 fn transition_session_state(cwd: &Path, session: &Session, to: SessionState) -> Result<()> {
     if !is_valid_session_state_transition(&session.status, &to) {
         return Err(anyhow!(
@@ -478,5 +542,22 @@ mod tests {
         assert_eq!(updated.status, SessionState::Planning);
         assert!(response.text.contains("drafting"));
         Ok(())
+    }
+
+    #[test]
+    fn render_plan_notice_lines_summarizes_review_state() {
+        let root = Path::new("/tmp");
+        let plan = sample_plan("Fix login");
+        let session = sample_session(root, SessionState::AwaitingApproval, Some(plan.plan_id));
+        let payload = plan_payload(&session, &plan);
+        let lines = render_plan_notice_lines(&payload);
+        assert!(!lines.is_empty());
+        assert!(lines[0].contains("awaiting approval"));
+        assert!(lines.iter().any(|line| line.contains("steps:")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/plan approve") && line.contains("/plan reject"))
+        );
     }
 }

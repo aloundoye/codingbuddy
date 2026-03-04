@@ -54,7 +54,7 @@ use crate::commands::git::{
 };
 use crate::commands::mcp::run_mcp;
 use crate::commands::memory::{run_export, run_memory};
-use crate::commands::plan::{current_plan_payload, handle_plan_slash};
+use crate::commands::plan::{current_plan_payload, handle_plan_slash, render_plan_notice_lines};
 use crate::commands::search::run_search;
 use crate::commands::skills::run_skills;
 use crate::commands::status::{current_ui_status, run_context, run_usage};
@@ -1013,6 +1013,43 @@ fn background_job_notice(
     Ok(Some(SessionLifecycleNotice { line, is_error }))
 }
 
+fn plan_notices(store: &Store, session_id: Uuid) -> Result<Vec<SessionLifecycleNotice>> {
+    let Some(session) = store.load_session(session_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(payload) = current_plan_payload(store, Some(&session))? else {
+        return Ok(Vec::new());
+    };
+    Ok(render_plan_notice_lines(&payload)
+        .into_iter()
+        .map(|line| SessionLifecycleNotice {
+            line,
+            is_error: false,
+        })
+        .collect())
+}
+
+fn plan_state_transition_notice(
+    from: &codingbuddy_core::SessionState,
+    to: &codingbuddy_core::SessionState,
+) -> Option<SessionLifecycleNotice> {
+    let line = match (from, to) {
+        (
+            codingbuddy_core::SessionState::AwaitingApproval,
+            codingbuddy_core::SessionState::ExecutingStep,
+        ) => "[plan] approved; workflow moved to execute".to_string(),
+        (
+            codingbuddy_core::SessionState::AwaitingApproval,
+            codingbuddy_core::SessionState::Planning,
+        ) => "[plan] returned to drafting for revision".to_string(),
+        _ => return None,
+    };
+    Some(SessionLifecycleNotice {
+        line,
+        is_error: false,
+    })
+}
+
 fn poll_session_lifecycle_notices(
     cwd: &Path,
     session_override: Option<Uuid>,
@@ -1021,14 +1058,23 @@ fn poll_session_lifecycle_notices(
     let Some(session_id) = active_session_id_for_notices(cwd, session_override)? else {
         return Ok(Vec::new());
     };
+    let store = Store::new(cwd)?;
     let baseline = if let Some(seq) = watermarks.get(&session_id).copied() {
         seq
     } else {
         let latest = latest_session_event_seq(cwd, session_id)?;
         watermarks.insert(session_id, latest);
+        if let Some(session) = store.load_session(session_id)?
+            && matches!(
+                session.status,
+                codingbuddy_core::SessionState::AwaitingApproval
+            )
+            && session.active_plan_id.is_some()
+        {
+            return plan_notices(&store, session_id);
+        }
         return Ok(Vec::new());
     };
-    let store = Store::new(cwd)?;
     let mut next_seq = baseline;
     let mut notices = Vec::new();
     for event in read_session_events(cwd, session_id)? {
@@ -1036,16 +1082,26 @@ fn poll_session_lifecycle_notices(
             continue;
         }
         next_seq = next_seq.max(event.seq_no);
-        let notice = match event.kind {
+        let event_notices = match event.kind {
             EventKind::TaskUpdated { task_id, status } => {
                 background_task_notice(&store, &task_id, &status)?
+                    .into_iter()
+                    .collect::<Vec<_>>()
             }
             EventKind::BackgroundJobStopped { job_id, reason } => {
                 background_job_notice(&store, job_id, &reason)?
+                    .into_iter()
+                    .collect::<Vec<_>>()
             }
-            _ => None,
+            EventKind::PlanCreated { .. } | EventKind::PlanRevised { .. } => {
+                plan_notices(&store, session_id)?
+            }
+            EventKind::SessionStateChanged { from, to } => plan_state_transition_notice(&from, &to)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         };
-        if let Some(notice) = notice {
+        for notice in event_notices {
             notices.push(notice);
         }
     }
@@ -4775,7 +4831,7 @@ pub(crate) fn run_resume_specific(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codingbuddy_core::{EventEnvelope, Session, SessionBudgets, SessionState};
+    use codingbuddy_core::{EventEnvelope, Plan, PlanStep, Session, SessionBudgets, SessionState};
     use codingbuddy_store::{BackgroundJobRecord, SubagentRunRecord, TaskQueueRecord};
     use std::fs;
     use tempfile::tempdir;
@@ -4968,6 +5024,132 @@ mod tests {
         assert!(notices[0].line.contains("stopped"));
         assert!(notices[0].line.contains("shell"));
         assert!(!notices[0].is_error);
+        Ok(())
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_reports_plan_review_summary() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let plan_id = Uuid::now_v7();
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::AwaitingApproval,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: Some(plan_id),
+        };
+        store.save_session(&session)?;
+        let plan = Plan {
+            plan_id,
+            version: 2,
+            goal: "Fix the login race".to_string(),
+            assumptions: vec![],
+            steps: vec![
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Inspect login handler".to_string(),
+                    intent: "Read the current flow".to_string(),
+                    tools: vec![],
+                    files: vec!["src/login.rs".to_string()],
+                    done: false,
+                },
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Patch state transition".to_string(),
+                    intent: "Remove the race".to_string(),
+                    tools: vec![],
+                    files: vec!["src/state.rs".to_string()],
+                    done: false,
+                },
+            ],
+            verification: vec!["cargo test -p codingbuddy-cli".to_string()],
+            risk_notes: vec![],
+        };
+        store.save_plan(session.session_id, &plan)?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::PlanRevised { plan: plan.clone() },
+        })?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::ExitPlanMode {
+                session_id: session.session_id,
+            },
+        })?;
+
+        let mut watermarks = HashMap::from([(session.session_id, 0_u64)]);
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.line.contains("awaiting approval"))
+        );
+        assert!(notices.iter().any(|notice| notice.line.contains("steps:")));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.line.contains("/plan approve"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_surfaces_pending_plan_on_first_attach() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let plan_id = Uuid::now_v7();
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::AwaitingApproval,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: Some(plan_id),
+        };
+        store.save_session(&session)?;
+        store.save_plan(
+            session.session_id,
+            &Plan {
+                plan_id,
+                version: 1,
+                goal: "Audit approval UX".to_string(),
+                assumptions: vec![],
+                steps: vec![PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Review transcript notices".to_string(),
+                    intent: "Surface the plan".to_string(),
+                    tools: vec![],
+                    files: vec!["src/chat.rs".to_string()],
+                    done: false,
+                }],
+                verification: vec![],
+                risk_notes: vec![],
+            },
+        )?;
+
+        let mut watermarks = HashMap::new();
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert!(!notices.is_empty());
+        assert!(notices[0].line.contains("[plan]"));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.line.contains("awaiting approval"))
+        );
         Ok(())
     }
 

@@ -3742,7 +3742,10 @@ where
                     info_line = format!("subagent failed: {name}");
                 }
                 TuiStreamEvent::SystemNotice { line, error } => {
-                    if line.starts_with("[background]") || line.starts_with("[task]") {
+                    if line.starts_with("[background]")
+                        || line.starts_with("[task]")
+                        || line.starts_with("[plan]")
+                    {
                         shell.push_mission_control(line.clone());
                     }
                     if error {
