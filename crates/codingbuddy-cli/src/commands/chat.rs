@@ -1121,6 +1121,7 @@ pub(crate) fn run_chat(
     let mut last_watch_digest: Option<u64> = None;
     let mut pending_images: Vec<codingbuddy_core::ImageContent> = vec![];
     let mut selected_session_id = initial_session_id;
+    let mut lifecycle_notice_watermarks = HashMap::<Uuid, u64>::new();
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
@@ -1140,6 +1141,13 @@ pub(crate) fn run_chat(
     }
     loop {
         if !json_mode {
+            for notice in poll_session_lifecycle_notices(
+                cwd,
+                selected_session_id,
+                &mut lifecycle_notice_watermarks,
+            )? {
+                println!("{}", notice.line);
+            }
             print!("> ");
             stdout().flush()?;
         }
@@ -2547,6 +2555,13 @@ pub(crate) fn run_chat(
             if !suggestions.is_empty() {
                 println!("\x1b[2m  suggestions: {}\x1b[0m", suggestions.join(" | "));
             }
+            for notice in poll_session_lifecycle_notices(
+                cwd,
+                selected_session_id,
+                &mut lifecycle_notice_watermarks,
+            )? {
+                println!("{}", notice.line);
+            }
         }
 
         // Watch auto-execute: if digest changed after agent turn, auto-dispatch
@@ -2667,6 +2682,39 @@ pub(crate) fn run_chat_tui(
     let active_mode_for_closure = Arc::clone(&active_chat_mode);
     let watch_digest_for_closure = Arc::clone(&last_watch_digest);
     let active_session_for_closure = Arc::clone(&active_session_id);
+
+    {
+        let tx_notices = tx.clone();
+        let cwd_for_notices = cwd.to_path_buf();
+        let active_session_for_notices = Arc::clone(&active_session_id);
+        thread::spawn(move || {
+            let mut watermarks = HashMap::<Uuid, u64>::new();
+            loop {
+                let session_override = active_session_for_notices
+                    .lock()
+                    .map(|guard| *guard)
+                    .unwrap_or(None);
+                if let Ok(notices) = poll_session_lifecycle_notices(
+                    &cwd_for_notices,
+                    session_override,
+                    &mut watermarks,
+                ) {
+                    for notice in notices {
+                        if tx_notices
+                            .send(TuiStreamEvent::SystemNotice {
+                                line: notice.line,
+                                error: notice.is_error,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(400));
+            }
+        });
+    }
 
     // Build ML completion callback for ghost text (if local_ml + autocomplete enabled).
     // Model loading runs in a background thread to avoid blocking TUI startup.
@@ -4660,6 +4708,8 @@ pub(crate) fn run_resume_specific(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codingbuddy_core::{EventEnvelope, Session, SessionBudgets, SessionState};
+    use codingbuddy_store::{BackgroundJobRecord, SubagentRunRecord, TaskQueueRecord};
     use std::fs;
     use tempfile::tempdir;
 
@@ -4730,6 +4780,128 @@ mod tests {
         assert!(rendered.contains("1. CodingBuddy docs"));
         assert!(rendered.contains("## Extract (https://example.com/docs)"));
         assert!(rendered.contains("CodingBuddy is terminal-native."));
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_reports_background_task_completion() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session)?;
+        let task_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        let job_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        store.insert_task(&TaskQueueRecord {
+            task_id,
+            session_id: session.session_id,
+            title: "Background audit".to_string(),
+            description: None,
+            priority: 1,
+            status: "completed".to_string(),
+            outcome: Some("done".to_string()),
+            artifact_path: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_subagent_run(&SubagentRunRecord {
+            run_id,
+            session_id: Some(session.session_id),
+            task_id: Some(task_id),
+            child_session_id: None,
+            background_job_id: Some(job_id),
+            name: "explore".to_string(),
+            goal: "inspect".to_string(),
+            status: "completed".to_string(),
+            output: Some("done".to_string()),
+            error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_background_job(&BackgroundJobRecord {
+            job_id,
+            kind: "subagent".to_string(),
+            reference: format!("subagent:{run_id}"),
+            status: "completed".to_string(),
+            metadata_json: json!({"reason":"completed"}).to_string(),
+            started_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::TaskUpdated {
+                task_id: task_id.to_string(),
+                status: "completed".to_string(),
+            },
+        })?;
+
+        let mut watermarks = HashMap::from([(session.session_id, 0_u64)]);
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].line.contains("Background audit"));
+        assert!(notices[0].line.contains("done"));
+        assert!(!notices[0].is_error);
+        Ok(())
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_reports_background_job_stop() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session)?;
+        let job_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        store.upsert_background_job(&BackgroundJobRecord {
+            job_id,
+            kind: "shell".to_string(),
+            reference: "shell:abc123".to_string(),
+            status: "stopped".to_string(),
+            metadata_json: json!({"reason":"manual_stop"}).to_string(),
+            started_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::BackgroundJobStopped {
+                job_id,
+                reason: "manual_stop".to_string(),
+            },
+        })?;
+
+        let mut watermarks = HashMap::from([(session.session_id, 0_u64)]);
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].line.contains("stopped"));
+        assert!(notices[0].line.contains("shell"));
+        assert!(!notices[0].is_error);
+        Ok(())
     }
 
     #[test]
