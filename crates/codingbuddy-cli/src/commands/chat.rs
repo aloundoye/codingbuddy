@@ -1028,7 +1028,7 @@ pub(crate) fn run_chat(
         println!("deepseek chat (type 'exit' to quit)");
         println!(
             "model: {} thinking=auto approvals: bash={} edits={} tools={}",
-            cfg.llm.base_model,
+            cfg.llm.active_base_model(),
             cfg.policy.approve_bash,
             cfg.policy.approve_edits,
             if allow_tools {
@@ -1252,15 +1252,22 @@ pub(crate) fn run_chat(
                     if json_mode {
                         print_json(&json!({
                             "force_max_think": force_max_think,
-                            "model": cfg.llm.base_model,
+                            "model": if force_max_think {
+                                cfg.llm.active_reasoner_model()
+                            } else {
+                                cfg.llm.active_base_model()
+                            },
                             "thinking_enabled": force_max_think,
                         }))?;
                     } else if force_max_think {
-                        println!("model mode: thinking-enabled ({})", cfg.llm.base_model);
+                        println!(
+                            "model mode: thinking-enabled ({})",
+                            cfg.llm.active_reasoner_model()
+                        );
                     } else {
                         println!(
                             "model mode: auto ({} thinking=on-demand)",
-                            cfg.llm.base_model
+                            cfg.llm.active_base_model()
                         );
                     }
                 }
@@ -2377,7 +2384,7 @@ pub(crate) fn run_chat(
 
         let images_for_turn = std::mem::take(&mut pending_images);
         if !json_mode && !json_events {
-            crate::md_render::print_role_header("assistant", &cfg.llm.base_model);
+            crate::md_render::print_role_header("assistant", &cfg.llm.active_base_model());
         }
         let output = engine.chat_with_options(
             prompt,
@@ -2786,12 +2793,12 @@ pub(crate) fn run_chat_tui(
                     if force_max_think.load(Ordering::Relaxed) {
                         format!(
                             "model mode: thinking-enabled ({})",
-                            cfg.llm.base_model
+                            cfg.llm.active_reasoner_model()
                         )
                     } else {
                         format!(
                             "model mode: auto ({} thinking=on-demand)",
-                            cfg.llm.base_model
+                            cfg.llm.active_base_model()
                         )
                     }
                 }
@@ -4367,7 +4374,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
             print_json(&json!({
                 "output": output,
                 "session_id": session_id,
-                "model": AppConfig::load(cwd).unwrap_or_default().llm.base_model,
+                "model": AppConfig::load(cwd)
+                    .unwrap_or_default()
+                    .llm
+                    .active_base_model(),
             }))?;
         }
         "stream-json" => {
@@ -4382,7 +4392,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     "type": "result",
                     "output": output,
                     "session_id": session_id,
-                    "model": AppConfig::load(cwd).unwrap_or_default().llm.base_model,
+                    "model": AppConfig::load(cwd)
+                        .unwrap_or_default()
+                        .llm
+                        .active_base_model(),
                 }))?
             );
         }

@@ -234,8 +234,10 @@ impl AgentEngine {
     }
 
     pub fn validate_api_key(&self) -> Result<()> {
+        let provider = self.cfg.llm.active_provider();
+        let model = self.cfg.llm.active_base_model();
         let test_request = ChatRequest {
-            model: self.cfg.llm.base_model.clone(),
+            model: model.clone(),
             messages: vec![ChatMessage::User {
                 content: "hi".to_string(),
             }],
@@ -263,7 +265,8 @@ impl AgentEngine {
                     || err_str.contains("authentication")
                 {
                     Err(anyhow!(
-                        "Invalid or missing API key.\n\nSet your API key using one of:\n• export DEEPSEEK_API_KEY=your-key-here\n• Add \"api_key\" to ~/.codingbuddy/settings.json under the \"llm\" section\n\nGet an API key at: https://platform.deepseek.com/api_keys"
+                        "Invalid or missing API key.\n\nSet your API key using one of:\n• export {}=your-key-here\n• Add \"api_key\" to ~/.codingbuddy/settings.json under the \"llm\" section",
+                        provider.api_key_env
                     ))
                 } else {
                     self.observer.warn_log(&format!(
@@ -579,13 +582,17 @@ impl AgentEngine {
         // Select agent profile based on mode and prompt content
         let profile = agent_profiles::select_profile(options.mode, prompt, complexity);
 
-        let mut system_prompt = prompts::build_tool_use_system_prompt_with_complexity(
+        let active_base_model = self.cfg.llm.active_base_model();
+        let active_reasoner_model = self.cfg.llm.active_reasoner_model();
+
+        let mut system_prompt = prompts::build_model_aware_system_prompt(
             project_memory.as_deref(),
             options.system_prompt_override.as_deref(),
             options.system_prompt_append.as_deref(),
             Some(&ws_context),
             complexity,
             repo_map_summary.as_deref(),
+            &active_base_model,
         );
 
         // Append profile-specific system prompt addendum
@@ -630,7 +637,7 @@ impl AgentEngine {
         };
 
         let config = tool_loop::ToolLoopConfig {
-            model: self.cfg.llm.base_model.clone(), // Always deepseek-chat
+            model: active_base_model,
             max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
             temperature: None, // Incompatible with thinking mode
             context_window_tokens: self.cfg.llm.context_window_tokens,
@@ -639,7 +646,7 @@ impl AgentEngine {
                 .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns) as usize,
             read_only,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(think_budget)),
-            extended_thinking_model: self.cfg.llm.max_think_model.clone(),
+            extended_thinking_model: active_reasoner_model,
             complexity,
             subagent_worker: self.build_subagent_worker(),
             skill_runner: self.build_skill_runner(),

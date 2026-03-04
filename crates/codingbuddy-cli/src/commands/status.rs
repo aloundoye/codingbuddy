@@ -62,9 +62,9 @@ pub(crate) fn current_ui_status(
 
     Ok(UiStatus {
         model: if force_max_think {
-            cfg.llm.max_think_model.clone()
+            cfg.llm.active_reasoner_model()
         } else {
-            cfg.llm.base_model.clone()
+            cfg.llm.active_base_model()
         },
         pending_approvals,
         estimated_cost_usd,
@@ -158,8 +158,8 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "active_plan_id": session.active_plan_id,
             "model": {
                 "profile": cfg.llm.profile,
-                "base": cfg.llm.base_model,
-                "max_think": cfg.llm.base_model,
+                "base": cfg.llm.active_base_model(),
+                "max_think": cfg.llm.active_reasoner_model(),
                 "thinking_mode": "auto",
             },
             "context_usage_percent": context_usage_pct,
@@ -188,8 +188,8 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "state": "none",
             "model": {
                 "profile": cfg.llm.profile,
-                "base": cfg.llm.base_model,
-                "max_think": cfg.llm.base_model,
+                "base": cfg.llm.active_base_model(),
+                "max_think": cfg.llm.active_reasoner_model(),
                 "thinking_mode": "auto",
             },
             "context_usage_percent": 0.0,
