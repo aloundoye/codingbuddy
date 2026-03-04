@@ -768,4 +768,70 @@ mod tests {
         assert_eq!(payload["output_text"].as_str(), Some("task finished"));
         Ok(())
     }
+
+    #[test]
+    fn handle_tasks_slash_resume_switches_to_child_session() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let session = codingbuddy_core::Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: codingbuddy_core::SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session)?;
+        let child_session = store.fork_session(session.session_id)?;
+        let now = Utc::now().to_rfc3339();
+        let task_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        store.insert_task(&TaskQueueRecord {
+            task_id,
+            session_id: session.session_id,
+            title: "Resume subagent".to_string(),
+            description: Some("switch into child session".to_string()),
+            priority: 1,
+            status: "completed".to_string(),
+            outcome: Some("ready".to_string()),
+            artifact_path: Some(format!("session://{}", child_session.session_id)),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_subagent_run(&SubagentRunRecord {
+            run_id,
+            session_id: Some(session.session_id),
+            task_id: Some(task_id),
+            child_session_id: Some(child_session.session_id),
+            background_job_id: None,
+            name: "resume".to_string(),
+            goal: "switch sessions".to_string(),
+            status: "completed".to_string(),
+            output: Some("ready".to_string()),
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        })?;
+
+        let response = handle_tasks_slash(
+            temp.path(),
+            &["resume".to_string(), task_id.to_string()],
+            Some(session.session_id),
+        )?;
+
+        let child_session_id = child_session.session_id.to_string();
+        assert_eq!(response.session_switch, Some(child_session.session_id));
+        assert_eq!(
+            response.payload["session_id"].as_str(),
+            Some(child_session_id.as_str())
+        );
+        assert!(
+            response.text.contains(&child_session_id),
+            "resume text should reference the child session"
+        );
+        Ok(())
+    }
 }

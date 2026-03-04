@@ -278,6 +278,62 @@ impl<'a> ToolUseLoop<'a> {
             .unwrap_or_default()
     }
 
+    fn persist_phase_state_best_effort(&self, new_phase: codingbuddy_core::TaskPhase) {
+        let Some(session_id) = self.config.session_id else {
+            return;
+        };
+        if self.config.workspace.is_none() {
+            return;
+        }
+
+        let Ok(store) = self.workspace_store() else {
+            return;
+        };
+        let Ok(Some(mut session)) = store.load_session(session_id) else {
+            return;
+        };
+
+        let target_status = match new_phase {
+            codingbuddy_core::TaskPhase::Explore => return,
+            codingbuddy_core::TaskPhase::Plan => SessionState::Planning,
+            codingbuddy_core::TaskPhase::Execute => SessionState::ExecutingStep,
+            codingbuddy_core::TaskPhase::Verify => SessionState::Verifying,
+        };
+
+        if new_phase == codingbuddy_core::TaskPhase::Plan && session.active_plan_id.is_none() {
+            let plan_id = Uuid::now_v7();
+            let plan = Plan {
+                plan_id,
+                version: 1,
+                goal: self.latest_user_prompt(),
+                assumptions: Vec::new(),
+                steps: Vec::new(),
+                verification: Vec::new(),
+                risk_notes: Vec::new(),
+            };
+            if store.save_plan(session.session_id, &plan).is_ok() {
+                session.active_plan_id = Some(plan_id);
+                self.emit_event_if_present(EventKind::PlanCreated { plan });
+            }
+        }
+
+        if session.status == target_status {
+            if session.active_plan_id.is_some() {
+                let _ = store.save_session(&session);
+            }
+            return;
+        }
+
+        let previous = session.status.clone();
+        session.status = target_status.clone();
+        if store.save_session(&session).is_ok() {
+            self.emit_event_if_present(EventKind::SessionStateChanged {
+                from: previous,
+                to: target_status,
+            });
+        }
+    }
+
     fn emit_event_if_present(&self, kind: EventKind) {
         if let Some(ref cb) = self.event_cb {
             cb(kind);
@@ -908,6 +964,27 @@ impl<'a> ToolUseLoop<'a> {
                     tool_calls: vec![],
                 });
 
+                if let Some(current_phase) = self.phase {
+                    let should_allow_text_transition =
+                        current_phase != codingbuddy_core::TaskPhase::Plan;
+                    let text_has_plan_keywords =
+                        should_allow_text_transition && phases::text_has_plan_keywords(&text);
+                    if should_allow_text_transition
+                        && let Some(new_phase) = phases::check_phase_transition(
+                            current_phase,
+                            self.phase_read_only_calls,
+                            true,
+                            text_has_plan_keywords,
+                            false,
+                            self.phase_edit_calls,
+                        )
+                    {
+                        self.apply_phase_transition(new_phase);
+                        strip_prior_reasoning_content(&mut self.messages);
+                        continue;
+                    }
+                }
+
                 self.emit(StreamChunk::Done { reason: None });
                 return Ok(ToolLoopResult {
                     response: text,
@@ -1332,29 +1409,7 @@ impl<'a> ToolUseLoop<'a> {
                     used_write,
                     self.phase_edit_calls,
                 ) {
-                    self.emit(StreamChunk::PhaseTransition {
-                        from: current_phase.as_str().to_string(),
-                        to: new_phase.as_str().to_string(),
-                    });
-                    // Inject transition guidance
-                    match new_phase {
-                        codingbuddy_core::TaskPhase::Plan => {
-                            self.messages.push(ChatMessage::System {
-                                content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
-                            });
-                        }
-                        codingbuddy_core::TaskPhase::Verify => {
-                            self.messages.push(ChatMessage::System {
-                                content: phases::VERIFY_TRANSITION_MESSAGE.to_string(),
-                            });
-                        }
-                        _ => {}
-                    }
-                    self.phase = Some(new_phase);
-                    self.phase_read_only_calls = 0;
-                    if new_phase == codingbuddy_core::TaskPhase::Execute {
-                        self.phase_edit_calls = 0;
-                    }
+                    self.apply_phase_transition(new_phase);
                 }
             }
 
@@ -2473,6 +2528,41 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
+    fn apply_phase_transition(&mut self, new_phase: codingbuddy_core::TaskPhase) {
+        if self.phase == Some(new_phase) {
+            self.phase_read_only_calls = 0;
+            self.phase_edit_calls = 0;
+            return;
+        }
+
+        self.persist_phase_state_best_effort(new_phase);
+
+        if let Some(current_phase) = self.phase {
+            self.emit(StreamChunk::PhaseTransition {
+                from: current_phase.as_str().to_string(),
+                to: new_phase.as_str().to_string(),
+            });
+        }
+
+        match new_phase {
+            codingbuddy_core::TaskPhase::Plan => {
+                self.messages.push(ChatMessage::System {
+                    content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
+                });
+            }
+            codingbuddy_core::TaskPhase::Verify => {
+                self.messages.push(ChatMessage::System {
+                    content: phases::VERIFY_TRANSITION_MESSAGE.to_string(),
+                });
+            }
+            _ => {}
+        }
+
+        self.phase = Some(new_phase);
+        self.phase_read_only_calls = 0;
+        self.phase_edit_calls = 0;
+    }
+
     fn handle_enter_plan_mode(&mut self) -> Result<String> {
         let store = self.workspace_store()?;
         let mut session = self.current_session(&store)?;
@@ -2492,17 +2582,12 @@ impl<'a> ToolUseLoop<'a> {
         session.active_plan_id = Some(plan_id);
         store.save_session(&session)?;
         store.save_plan(session.session_id, &plan)?;
-        self.phase = Some(codingbuddy_core::TaskPhase::Plan);
-        self.phase_read_only_calls = 0;
-        self.phase_edit_calls = 0;
+        self.apply_phase_transition(codingbuddy_core::TaskPhase::Plan);
 
         self.emit_event_if_present(EventKind::EnterPlanMode {
             session_id: session.session_id,
         });
         self.emit_event_if_present(EventKind::PlanCreated { plan });
-        self.messages.push(ChatMessage::System {
-            content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
-        });
 
         Ok("Plan mode entered. Explore and write the implementation plan before executing changes."
             .to_string())

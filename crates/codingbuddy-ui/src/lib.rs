@@ -21,6 +21,7 @@ use syntect::parsing::SyntaxSet;
 mod keybindings;
 mod panels;
 mod statusline;
+mod stream_runtime;
 mod theme;
 
 #[cfg(test)]
@@ -31,6 +32,9 @@ use panels::{load_artifact_lines, render_mission_control_panel};
 use statusline::render_statusline_spans;
 use statusline::review_badge;
 pub use statusline::{UiStatus, render_statusline};
+use stream_runtime::{
+    StreamEventResult, StreamRuntimeState, filter_stream_event, handle_stream_event,
+};
 pub use theme::TuiTheme;
 
 /// Lazy-initialized syntect highlighting assets.
@@ -1031,7 +1035,7 @@ fn compute_inline_heights(total_height: u16, desired_input_rows: usize) -> (u16,
     (stream_height, input_height)
 }
 
-fn truncate_inline(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_inline(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
@@ -3123,208 +3127,26 @@ where
 
         // Drain streaming events from background agent thread.
         while let Ok(ev) = stream_rx.try_recv() {
-            if cancelled {
-                match ev {
-                    TuiStreamEvent::Done(_) | TuiStreamEvent::Error(_) => {
-                        cancelled = false;
-                    }
-                    TuiStreamEvent::ApprovalNeeded { response_tx, .. } => {
-                        let _ = response_tx.send(false);
-                    }
-                    _ => {}
-                }
+            let Some(ev) = filter_stream_event(ev, &mut cancelled) else {
                 continue;
-            }
-            match ev {
-                TuiStreamEvent::ContentDelta(text) => {
-                    // Transition out of thinking state when content arrives.
-                    if shell.is_thinking {
-                        shell.is_thinking = false;
-                        shell.thinking_buffer.clear();
-                    }
-                    // Buffer streaming text — complete lines will be flushed
-                    // to scrollback on next loop iteration, partial line shown
-                    // in the viewport.
-                    streaming_buffer.push_str(&text);
-                    shell.append_streaming(&text);
-                }
-                TuiStreamEvent::ReasoningDelta(text) => {
-                    if shell.thinking_visibility == "raw" {
-                        if !shell.is_thinking {
-                            shell.is_thinking = true;
-                            shell.thinking_buffer.clear();
-                        }
-                        shell.thinking_buffer.push_str(&text);
-                    } else {
-                        shell.is_thinking = true;
-                        if shell.thinking_buffer.is_empty() {
-                            let label = active_phase
-                                .as_ref()
-                                .map(|(_, phase)| phase.as_str())
-                                .unwrap_or("reasoning");
-                            shell.thinking_buffer = format!("{label}: analyzing...");
-                        }
-                    }
-                }
-                TuiStreamEvent::ToolActive(name) => {
-                    shell.is_thinking = false;
-                    shell.active_tool = Some(name);
-                }
-                TuiStreamEvent::ToolCallStart {
-                    tool_name,
-                    args_summary,
-                } => {
-                    shell.is_thinking = false;
-                    shell.push_tool_call(&tool_name, &args_summary);
-                    shell.active_tool = Some(tool_name);
-                }
-                TuiStreamEvent::ToolCallEnd {
-                    tool_name,
-                    duration_ms,
-                    summary,
-                    success,
-                } => {
-                    let marker = if success { "✓" } else { "✗" };
-                    shell.push_tool_result(&format!("{marker} {tool_name}"), duration_ms, &summary);
-                    shell.active_tool = None;
-                }
-                TuiStreamEvent::ModeTransition { from, to, reason } => {
-                    shell.agent_mode = to.clone();
-                    let label = format!("mode transition {from} -> {to} ({reason})");
-                    shell.push_system(label);
-                    info_line = format!("mode: {from} -> {to}");
-                }
-                TuiStreamEvent::SubagentSpawned { run_id, name, goal } => {
-                    let goal_compact = truncate_inline(&goal.replace('\n', " "), 120);
-                    shell.push_mission_control(format!(
-                        "spawned {name} ({run_id}) goal={goal_compact}"
-                    ));
-                    shell.push_system(format!("[subagent] started {name}: {goal_compact}"));
-                    info_line = format!("subagent started: {name}");
-                }
-                TuiStreamEvent::SubagentCompleted {
-                    run_id,
-                    name,
-                    summary,
-                } => {
-                    let summary_compact = truncate_inline(&summary.replace('\n', " "), 120);
-                    shell.push_mission_control(format!(
-                        "completed {name} ({run_id}) summary={summary_compact}"
-                    ));
-                    shell.push_system(format!("[subagent] completed {name}: {summary_compact}"));
-                    info_line = format!("subagent completed: {name}");
-                }
-                TuiStreamEvent::SubagentFailed {
-                    run_id,
-                    name,
-                    error,
-                } => {
-                    let error_compact = truncate_inline(&error.replace('\n', " "), 120);
-                    shell.push_mission_control(format!(
-                        "failed {name} ({run_id}) error={error_compact}"
-                    ));
-                    shell.push_error(format!("[subagent] failed {name}: {error_compact}"));
-                    info_line = format!("subagent failed: {name}");
-                }
-                TuiStreamEvent::SystemNotice { line, error } => {
-                    if line.starts_with("[background]")
-                        || line.starts_with("[task]")
-                        || line.starts_with("[plan]")
-                    {
-                        shell.push_mission_control(line.clone());
-                    }
-                    if error {
-                        shell.push_error(line.clone());
-                    } else {
-                        shell.push_system(line.clone());
-                    }
-                    info_line = truncate_inline(&line, 96);
-                }
-                TuiStreamEvent::WatchTriggered { comment_count, .. } => {
-                    shell.push_system(format!(
-                        "[watch: {comment_count} comment(s) detected, auto-triggering]"
-                    ));
-                    info_line = format!("watch: {comment_count} hints");
-                }
-                TuiStreamEvent::ImageDisplay { data, label } => {
-                    // Render inline image if terminal supports it
-                    if !display_image_inline(&data) {
-                        shell.push_system(format!("[image: {label} ({} bytes)]", data.len()));
-                    } else {
-                        shell.push_system(format!("[image: {label}]"));
-                    }
-                }
-                TuiStreamEvent::ClearStreamingText => {
-                    // The response contained tool calls — clear the noise text
-                    // fragments that were streamed before/between them.
-                    streaming_buffer.clear();
-                    shell.clear_streaming_text();
-                }
-                TuiStreamEvent::DiffApplied {
-                    path,
-                    hunks,
-                    added,
-                    removed,
-                } => {
-                    shell.push_system(format!(
-                        "  \u{2502} {} \u{2014} {} hunk(s), +{} -{}",
-                        path, hunks, added, removed
-                    ));
-                }
-                TuiStreamEvent::UsageSummary {
-                    input_tokens,
-                    output_tokens,
-                    cache_hit_tokens,
-                    cost_usd,
-                } => {
-                    let cache_info = if cache_hit_tokens > 0 {
-                        format!(" (cache hit: {})", cache_hit_tokens)
-                    } else {
-                        String::new()
-                    };
-                    shell.push_system(format!(
-                        "\u{2500}\u{2500} tokens: {}in / {}out{} \u{2502} cost: ${:.4}",
-                        input_tokens, output_tokens, cache_info, cost_usd
-                    ));
-                }
-                TuiStreamEvent::RoleHeader { role, model } => {
-                    shell.push_system(format!(
-                        "\u{2501}\u{2501} {} ({}) \u{2501}\u{2501}",
-                        role, model
-                    ));
-                }
-                TuiStreamEvent::ApprovalNeeded {
-                    tool_name,
-                    args_summary,
-                    response_tx,
-                } => {
-                    let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
-                    info_line = format!(
-                        "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
-                    );
-                    shell.push_system(format!(
-                        "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
-                    ));
-                    // Terminal bell helps when the approval prompt appears off-focus.
-                    use std::io::Write as _;
-                    let _ = write!(io::stdout(), "\x07");
-                    let _ = io::stdout().flush();
-                    pending_approval = Some((tool_name, args_summary, response_tx));
-                }
-                TuiStreamEvent::Error(msg) => {
-                    streaming_buffer.clear();
-                    streaming_in_code_block = false;
-                    streaming_in_diff_block = false;
-                    streaming_code_block_lang.clear();
-                    active_phase = None;
-                    shell.is_thinking = false;
-                    shell.thinking_buffer.clear();
-                    shell.push_error(&msg);
-                    info_line = format!("error: {msg}");
-                    is_processing = false;
-                    shell.active_tool = None;
-                }
-                TuiStreamEvent::Done(output) => {
+            };
+            let result = {
+                let mut state = StreamRuntimeState {
+                    shell: &mut shell,
+                    streaming_buffer: &mut streaming_buffer,
+                    active_phase: &mut active_phase,
+                    pending_approval: &mut pending_approval,
+                    info_line: &mut info_line,
+                    is_processing: &mut is_processing,
+                    streaming_in_code_block: &mut streaming_in_code_block,
+                    streaming_in_diff_block: &mut streaming_in_diff_block,
+                    streaming_code_block_lang: &mut streaming_code_block_lang,
+                };
+                handle_stream_event(ev, &mut state)
+            };
+            match result {
+                StreamEventResult::Continue => {}
+                StreamEventResult::Done(output) => {
                     // Flush thinking buffer to transcript as a collapsed summary.
                     if !shell.thinking_buffer.is_empty() {
                         let thought = std::mem::take(&mut shell.thinking_buffer);
