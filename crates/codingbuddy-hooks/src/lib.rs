@@ -759,6 +759,7 @@ fn build_command(path: &Path) -> Command {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    #[cfg(not(target_os = "windows"))]
     use std::fs;
 
     #[test]
