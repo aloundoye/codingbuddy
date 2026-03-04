@@ -162,7 +162,7 @@ pub enum SlashCommand {
     Mcp(Vec<String>),
     Rewind(Vec<String>),
     Export(Vec<String>),
-    Plan,
+    Plan(Vec<String>),
     Status,
     Effort(Option<String>),
     Skills(Vec<String>),
@@ -248,7 +248,7 @@ impl SlashCommand {
             "mcp" => Self::Mcp(args),
             "rewind" => Self::Rewind(args),
             "export" => Self::Export(args),
-            "plan" => Self::Plan,
+            "plan" => Self::Plan(args),
             "status" => Self::Status,
             "effort" => Self::Effort(args.first().cloned()),
             "skills" => Self::Skills(args),
@@ -2668,7 +2668,7 @@ const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("mcp", "Manage MCP servers"),
     ("rewind", "Rewind to a checkpoint"),
     ("export", "Export conversation"),
-    ("plan", "Enter plan mode"),
+    ("plan", "Plan mode or review"),
     ("status", "Show session status"),
     ("effort", "Set thinking effort level"),
     ("skills", "List available skills"),
@@ -6580,7 +6580,10 @@ mod tests {
         assert_eq!(SlashCommand::parse("/Help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse("/CONTEXT"), Some(SlashCommand::Context));
         assert_eq!(SlashCommand::parse("/EXIT"), Some(SlashCommand::Exit));
-        assert_eq!(SlashCommand::parse("/Plan"), Some(SlashCommand::Plan));
+        assert_eq!(
+            SlashCommand::parse("/Plan"),
+            Some(SlashCommand::Plan(vec![]))
+        );
     }
 
     #[test]

@@ -9,21 +9,9 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::UsageArgs;
+use crate::commands::plan::{current_plan_payload, plan_state_label, workflow_phase_label};
 use crate::output::*;
 use crate::util::*;
-
-fn workflow_phase_label(state: &SessionState) -> &'static str {
-    match state {
-        SessionState::Idle => "idle",
-        SessionState::Planning => "plan",
-        SessionState::ExecutingStep => "execute",
-        SessionState::AwaitingApproval => "approval",
-        SessionState::Verifying => "verify",
-        SessionState::Completed => "completed",
-        SessionState::Paused => "paused",
-        SessionState::Failed => "failed",
-    }
-}
 
 pub(crate) fn current_ui_status(
     cwd: &Path,
@@ -101,22 +89,7 @@ pub(crate) fn current_ui_status(
             .as_ref()
             .map(|record| workflow_phase_label(&record.status).to_string())
             .unwrap_or_default(),
-        plan_state: session
-            .as_ref()
-            .and_then(|record| {
-                record.active_plan_id.map(|_| {
-                    if matches!(
-                        record.status,
-                        SessionState::Planning | SessionState::AwaitingApproval
-                    ) {
-                        "active"
-                    } else {
-                        "available"
-                    }
-                })
-            })
-            .unwrap_or("none")
-            .to_string(),
+        plan_state: plan_state_label(session.as_ref()).to_string(),
         context_used_tokens: estimated_context_tokens,
         context_max_tokens: cfg.llm.context_window_tokens,
         session_turns: projection.transcript.len(),
@@ -189,6 +162,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         let max_tokens = session.budgets.max_think_tokens.max(1) as f64;
         let context_usage_pct =
             (((usage.input_tokens + usage.output_tokens) as f64 / max_tokens) * 100.0).min(100.0);
+        let active_plan = current_plan_payload(&store, Some(&session))?;
         let pending_approvals = projection
             .tool_invocations
             .len()
@@ -198,16 +172,9 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "session_id": session.session_id,
             "state": session.status,
             "workflow_phase": workflow_phase_label(&session.status),
-            "plan_state": if session.active_plan_id.is_some() {
-                if matches!(session.status, SessionState::Planning | SessionState::AwaitingApproval) {
-                    "active"
-                } else {
-                    "available"
-                }
-            } else {
-                "none"
-            },
+            "plan_state": plan_state_label(Some(&session)),
             "active_plan_id": session.active_plan_id,
+            "plan": active_plan.unwrap_or(serde_json::Value::Null),
             "model": {
                 "profile": cfg.llm.profile,
                 "base": cfg.llm.active_base_model(),
@@ -240,6 +207,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "state": "none",
             "workflow_phase": "idle",
             "plan_state": "none",
+            "plan": null,
             "model": {
                 "profile": cfg.llm.profile,
                 "base": cfg.llm.active_base_model(),
@@ -299,6 +267,19 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 .as_u64()
                 .unwrap_or(0),
         );
+        if let Some(plan) = payload.get("plan").filter(|value| !value.is_null()) {
+            println!(
+                "plan id={} state={} version={} steps={} goal={}",
+                plan["plan_id"].as_str().unwrap_or_default(),
+                payload["plan_state"].as_str().unwrap_or("none"),
+                plan["version"].as_u64().unwrap_or(0),
+                plan["steps_count"].as_u64().unwrap_or(0),
+                plan["goal_preview"].as_str().unwrap_or_default(),
+            );
+            if payload["plan_state"].as_str() == Some("awaiting_approval") {
+                println!("next: /plan show | /plan approve | /plan reject <feedback>");
+            }
+        }
         if !payload["autopilot"].is_null() {
             println!(
                 "autopilot run={} status={} completed={} failed={}",

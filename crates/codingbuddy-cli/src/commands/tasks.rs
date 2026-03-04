@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_core::SessionState;
 use codingbuddy_store::{BackgroundJobRecord, Store, SubagentRunRecord};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -7,6 +6,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::TasksCmd;
+use crate::commands::plan::{current_plan_payload, plan_state_label, workflow_phase_label};
 use crate::output::*;
 
 pub(crate) struct TasksSlashResponse {
@@ -25,19 +25,6 @@ fn scoped_session_id(store: &Store, session_override: Option<Uuid>) -> Result<Op
     Ok(store
         .load_latest_session()?
         .map(|session| session.session_id))
-}
-
-fn workflow_phase_label(state: &SessionState) -> &'static str {
-    match state {
-        SessionState::Idle => "idle",
-        SessionState::Planning => "plan",
-        SessionState::ExecutingStep => "execute",
-        SessionState::AwaitingApproval => "approval",
-        SessionState::Verifying => "verify",
-        SessionState::Completed => "completed",
-        SessionState::Paused => "paused",
-        SessionState::Failed => "failed",
-    }
 }
 
 fn session_id_from_artifact_path(path: Option<&str>) -> Option<Uuid> {
@@ -163,23 +150,11 @@ pub(crate) fn mission_control_payload(
     let workflow_phase = session
         .as_ref()
         .map(|record| workflow_phase_label(&record.status));
-    let plan_state = session.as_ref().map(|record| {
-        if record.active_plan_id.is_some() {
-            if matches!(
-                record.status,
-                SessionState::Planning | SessionState::AwaitingApproval
-            ) {
-                "active"
-            } else {
-                "available"
-            }
-        } else {
-            "none"
-        }
-    });
+    let plan_state = session.as_ref().map(|_| plan_state_label(session.as_ref()));
     let active_plan_id = session
         .as_ref()
         .and_then(|record| record.active_plan_id.map(|id| id.to_string()));
+    let active_plan = current_plan_payload(&store, session.as_ref())?;
 
     Ok(json!({
         "schema": "deepseek.chat.mission_control.v1",
@@ -187,6 +162,7 @@ pub(crate) fn mission_control_payload(
         "workflow_phase": workflow_phase,
         "plan_state": plan_state,
         "active_plan_id": active_plan_id,
+        "plan": active_plan.unwrap_or(Value::Null),
         "tasks": tasks,
         "subagents": subagents,
         "background_jobs": background_jobs,
@@ -230,6 +206,7 @@ pub(crate) fn render_mission_control_payload(payload: &Value) -> String {
         .get("plan_state")
         .and_then(Value::as_str)
         .unwrap_or("none");
+    let plan = payload.get("plan").filter(|value| !value.is_null());
     let session_id = payload
         .get("session_id")
         .and_then(Value::as_str)
@@ -255,6 +232,20 @@ pub(crate) fn render_mission_control_payload(payload: &Value) -> String {
         summary["running_background_jobs"].as_u64().unwrap_or(0),
         summary["stopped_background_jobs"].as_u64().unwrap_or(0),
     ));
+    if let Some(plan) = plan {
+        lines.push(format!(
+            "- Plan: state={} version={} steps={} goal={}",
+            plan_state,
+            plan["version"].as_u64().unwrap_or(0),
+            plan["steps_count"].as_u64().unwrap_or(0),
+            plan["goal_preview"].as_str().unwrap_or_default(),
+        ));
+        if plan_state == "awaiting_approval" {
+            lines.push(
+                "- Plan next: /plan show | /plan approve | /plan reject <feedback>".to_string(),
+            );
+        }
+    }
     if tasks.is_empty() {
         lines.push("- Tasks: none".to_string());
     } else {
@@ -702,6 +693,7 @@ pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Resul
 mod tests {
     use super::*;
     use chrono::Utc;
+    use codingbuddy_core::SessionState;
     use codingbuddy_store::{BackgroundJobRecord, SubagentRunRecord, TaskQueueRecord};
     use tempfile::tempdir;
 

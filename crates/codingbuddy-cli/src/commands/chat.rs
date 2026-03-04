@@ -54,6 +54,7 @@ use crate::commands::git::{
 };
 use crate::commands::mcp::run_mcp;
 use crate::commands::memory::{run_export, run_memory};
+use crate::commands::plan::{current_plan_payload, handle_plan_slash};
 use crate::commands::search::run_search;
 use crate::commands::skills::run_skills;
 use crate::commands::status::{current_ui_status, run_context, run_usage};
@@ -1567,14 +1568,45 @@ pub(crate) fn run_chat(
                         json_mode,
                     )?;
                 }
-                SlashCommand::Plan => {
-                    force_max_think = true;
-                    if json_mode {
-                        print_json(&json!({"plan_mode": true, "thinking_enabled": true}))?;
+                SlashCommand::Plan(args) => {
+                    if args.is_empty() {
+                        let store = Store::new(cwd)?;
+                        let session = if let Some(session_id) = selected_session_id {
+                            store.load_session(session_id)?
+                        } else {
+                            store.load_latest_session()?
+                        };
+                        if current_plan_payload(&store, session.as_ref())?.is_some() {
+                            let response =
+                                handle_plan_slash(cwd, &["show".to_string()], selected_session_id)?;
+                            if let Some(session_id) = response.session_switch {
+                                selected_session_id = Some(session_id);
+                            }
+                            if json_mode {
+                                print_json(&response.payload)?;
+                            } else {
+                                println!("{}", response.text);
+                            }
+                        } else {
+                            force_max_think = true;
+                            if json_mode {
+                                print_json(&json!({"plan_mode": true, "thinking_enabled": true}))?;
+                            } else {
+                                println!(
+                                    "plan mode active; prompts will prefer structured planning with thinking enabled. Use /plan show|approve|reject <feedback> for the persisted review flow."
+                                );
+                            }
+                        }
                     } else {
-                        println!(
-                            "plan mode active; prompts will prefer structured planning with thinking enabled."
-                        );
+                        let response = handle_plan_slash(cwd, &args, selected_session_id)?;
+                        if let Some(session_id) = response.session_switch {
+                            selected_session_id = Some(session_id);
+                        }
+                        if json_mode {
+                            print_json(&response.payload)?;
+                        } else {
+                            println!("{}", response.text);
+                        }
                     }
                 }
                 SlashCommand::Add(args) => {
@@ -3052,9 +3084,44 @@ pub(crate) fn run_chat_tui(
                     )?;
                     format!("exported transcript {}", record.output_path)
                 }
-                SlashCommand::Plan => {
-                    force_max_think.store(true, Ordering::Relaxed);
-                    "plan mode enabled (thinking enabled)".to_string()
+                SlashCommand::Plan(args) => {
+                    if args.is_empty() {
+                        let store = Store::new(cwd)?;
+                        let session_override = active_session_for_closure
+                            .lock()
+                            .map_err(|_| anyhow!("failed to access active session state"))?
+                            .to_owned();
+                        let session = if let Some(session_id) = session_override {
+                            store.load_session(session_id)?
+                        } else {
+                            store.load_latest_session()?
+                        };
+                        if current_plan_payload(&store, session.as_ref())?.is_some() {
+                            let response =
+                                handle_plan_slash(cwd, &["show".to_string()], session_override)?;
+                            if let Some(session_id) = response.session_switch
+                                && let Ok(mut guard) = active_session_for_closure.lock()
+                            {
+                                *guard = Some(session_id);
+                            }
+                            response.text
+                        } else {
+                            force_max_think.store(true, Ordering::Relaxed);
+                            "plan mode enabled (thinking enabled). Use /plan show|approve|reject <feedback> for the persisted review flow.".to_string()
+                        }
+                    } else {
+                        let session_override = active_session_for_closure
+                            .lock()
+                            .map_err(|_| anyhow!("failed to access active session state"))?
+                            .to_owned();
+                        let response = handle_plan_slash(cwd, &args, session_override)?;
+                        if let Some(session_id) = response.session_switch
+                            && let Ok(mut guard) = active_session_for_closure.lock()
+                        {
+                            *guard = Some(session_id);
+                        }
+                        response.text
+                    }
                 }
                 SlashCommand::Add(args) => {
                     let mut guard = additional_dirs_for_closure
