@@ -1828,6 +1828,7 @@ impl<'a> ToolUseLoop<'a> {
             "task_get" => self.handle_task_get(&args)?,
             "task_list" => self.handle_task_list()?,
             "task_output" => self.handle_task_output(&args)?,
+            "task_stop" => self.handle_task_stop(&args)?,
             "spawn_task" => self.handle_spawn_task(&args)?,
             "enter_plan_mode" => self.handle_enter_plan_mode()?,
             "exit_plan_mode" => self.handle_exit_plan_mode(&args)?,
@@ -2019,6 +2020,16 @@ impl<'a> ToolUseLoop<'a> {
             return Err(anyhow!("task_output requires 'task_id' or 'run_id'"));
         };
 
+        let background_job = if let Some(run) = run.as_ref() {
+            if let Some(job_id) = run.background_job_id {
+                store.load_background_job(job_id)?
+            } else {
+                store.load_background_job_by_reference(&format!("subagent:{}", run.run_id))?
+            }
+        } else {
+            None
+        };
+
         let child_session = run
             .as_ref()
             .and_then(|record| record.child_session_id)
@@ -2029,7 +2040,128 @@ impl<'a> ToolUseLoop<'a> {
         Ok(serde_json::json!({
             "task": task,
             "run": run,
+            "background_job": background_job,
             "child_session": child_session,
+        })
+        .to_string())
+    }
+
+    fn handle_task_stop(&self, args: &serde_json::Value) -> Result<String> {
+        let store = self.workspace_store()?;
+        let mut run = if let Some(run_id) = args.get("run_id").and_then(|v| v.as_str()) {
+            let run_id = Uuid::parse_str(run_id)?;
+            store
+                .load_subagent_run(run_id)?
+                .ok_or_else(|| anyhow!("subagent run not found: {run_id}"))?
+        } else if let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) {
+            let task_id = Uuid::parse_str(task_id)?;
+            store
+                .load_subagent_run_for_task(task_id)?
+                .ok_or_else(|| anyhow!("task has no associated subagent run: {task_id}"))?
+        } else {
+            return Err(anyhow!("task_stop requires 'task_id' or 'run_id'"));
+        };
+        let task_id = run
+            .task_id
+            .ok_or_else(|| anyhow!("subagent run is missing task_id"))?;
+        let session_id = run
+            .session_id
+            .or(self.config.session_id)
+            .ok_or_else(|| anyhow!("subagent run is missing session_id"))?;
+
+        let mut background_job = if let Some(job_id) = run.background_job_id {
+            store.load_background_job(job_id)?
+        } else {
+            store.load_background_job_by_reference(&format!("subagent:{}", run.run_id))?
+        }
+        .ok_or_else(|| anyhow!("no background job found for task {task_id}"))?;
+
+        let mut metadata = serde_json::from_str::<serde_json::Value>(&background_job.metadata_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let mut terminated_pid = false;
+        let mut stop_file_written = false;
+
+        if let Some(stop_file) = metadata.get("stop_file").and_then(|value| value.as_str()) {
+            let stop_path = std::path::PathBuf::from(stop_file);
+            if let Some(parent) = stop_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &stop_path,
+                format!("stop requested at {}\n", chrono::Utc::now().to_rfc3339()),
+            );
+            stop_file_written = true;
+        }
+
+        if let Some(pid) = metadata.get("pid").and_then(|value| value.as_u64()) {
+            #[cfg(not(windows))]
+            {
+                let status = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+                terminated_pid = status.as_ref().is_ok_and(|status| status.success());
+            }
+            #[cfg(windows)]
+            {
+                let status = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .status();
+                terminated_pid = status.as_ref().is_ok_and(|status| status.success());
+            }
+        }
+
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("reason".to_string(), serde_json::json!("manual_stop"));
+            object.insert(
+                "terminated_pid".to_string(),
+                serde_json::json!(terminated_pid),
+            );
+            object.insert(
+                "stop_file_written".to_string(),
+                serde_json::json!(stop_file_written),
+            );
+            object.insert(
+                "stopped_at".to_string(),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+
+        background_job.status = "stopped".to_string();
+        background_job.updated_at = chrono::Utc::now().to_rfc3339();
+        background_job.metadata_json = metadata.to_string();
+        store.upsert_background_job(&background_job)?;
+        store.update_task_status(task_id, "cancelled", Some("stopped by user"))?;
+
+        run.status = "stopped".to_string();
+        run.error = Some("stopped by user".to_string());
+        run.updated_at = chrono::Utc::now().to_rfc3339();
+        store.upsert_subagent_run(&run)?;
+
+        let event = |kind| {
+            let seq_no = store.next_seq_no(session_id)?;
+            store.append_event(&codingbuddy_core::EventEnvelope {
+                seq_no,
+                at: chrono::Utc::now(),
+                session_id,
+                kind,
+            })
+        };
+        event(EventKind::BackgroundJobStopped {
+            job_id: background_job.job_id,
+            reason: "manual_stop".to_string(),
+        })?;
+        event(EventKind::TaskUpdated {
+            task_id: task_id.to_string(),
+            status: "cancelled".to_string(),
+        })?;
+
+        Ok(serde_json::json!({
+            "task_id": task_id,
+            "run_id": run.run_id,
+            "background_job_id": background_job.job_id,
+            "status": "cancelled",
+            "terminated_pid": terminated_pid,
+            "stop_file_written": stop_file_written,
         })
         .to_string())
     }
@@ -2147,6 +2279,36 @@ impl<'a> ToolUseLoop<'a> {
             }
             let result = match worker(request) {
                 Ok(result) => {
+                    if run_in_background {
+                        let payload = serde_json::from_str::<serde_json::Value>(&result)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": result }));
+                        let background_job_id = payload
+                            .get("job_id")
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| Uuid::parse_str(value).ok());
+                        store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
+                            run_id,
+                            session_id: Some(parent_session.session_id),
+                            task_id: Some(task_id),
+                            child_session_id: Some(child_session.session_id),
+                            background_job_id,
+                            name: task_name.to_string(),
+                            goal: prompt.to_string(),
+                            status: "running".to_string(),
+                            output: None,
+                            error: None,
+                            created_at: now.clone(),
+                            updated_at: chrono::Utc::now().to_rfc3339(),
+                        })?;
+                        return Ok(serde_json::json!({
+                            "task_id": task_id,
+                            "run_id": run_id,
+                            "child_session_id": child_session.session_id,
+                            "background_job_id": background_job_id,
+                            "status": "running",
+                        })
+                        .to_string());
+                    }
                     store.update_task_status(task_id, "completed", Some(&result))?;
                     store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
                         run_id,

@@ -2392,6 +2392,10 @@ Always set in_progress before starting, completed only when fully done".to_strin
                             "type": "integer",
                             "minimum": 1,
                             "description": "Optional maximum turns for the delegated task"
+                        },
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": "When true, run the delegated task as a detached background job and return immediately with tracking IDs"
                         }
                     },
                     "required": ["description", "prompt", "subagent_type"]
@@ -2403,6 +2407,28 @@ Always set in_progress before starting, completed only when fully done".to_strin
             function: FunctionDefinition {
                 name: "task_output".to_string(),
                 description: "Read the latest persisted output for a delegated task or subagent run. Use this after spawn_task when you need the current status, the child session ID, or the final summary.".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Task UUID returned by task_create or spawn_task"
+                        },
+                        "run_id": {
+                            "type": "string",
+                            "description": "Subagent run UUID returned by spawn_task"
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "task_stop".to_string(),
+                description: "Stop a running delegated background task. Use this when a spawned task is hung, no longer needed, or should be cancelled before completion.".to_string(),
                 strict: None,
                 parameters: json!({
                     "type": "object",
@@ -2828,6 +2854,7 @@ pub const AGENT_LEVEL_TOOLS: &[&str] = &[
     "task_get",
     "task_list",
     "task_output",
+    "task_stop",
     "spawn_task",
     "enter_plan_mode",
     "exit_plan_mode",
@@ -5344,6 +5371,7 @@ mod tests {
             "task_create",
             "task_update",
             "task_output",
+            "task_stop",
             "spawn_task",
         ] {
             assert!(
@@ -5377,6 +5405,7 @@ mod tests {
         assert_eq!(map_tool_name("task_create"), "task_create");
         assert_eq!(map_tool_name("task_update"), "task_update");
         assert_eq!(map_tool_name("task_output"), "task_output");
+        assert_eq!(map_tool_name("task_stop"), "task_stop");
         assert_eq!(map_tool_name("spawn_task"), "spawn_task");
     }
 

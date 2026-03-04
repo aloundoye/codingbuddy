@@ -47,7 +47,8 @@ pub fn tool_tier(api_name: &str) -> ToolTier {
         "index_query" => ToolTier::Contextual,
 
         // Contextual: task management (included when multi-step work detected)
-        "task_create" | "task_update" | "task_get" | "task_list" | "task_output" => {
+        "task_create" | "task_update" | "task_get" | "task_list" | "task_output"
+        | "task_stop" => {
             ToolTier::Contextual
         }
 
@@ -94,6 +95,7 @@ pub fn contextual_tool_names(signals: &ToolContextSignals) -> Vec<&'static str> 
             "task_get",
             "task_list",
             "task_output",
+            "task_stop",
         ]);
     }
     tools

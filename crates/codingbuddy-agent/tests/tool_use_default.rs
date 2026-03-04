@@ -10,7 +10,7 @@ use codingbuddy_core::{
     SessionState, StreamCallback, TokenUsage,
 };
 use codingbuddy_llm::LlmClient;
-use codingbuddy_store::{Store, SubagentRunRecord, TaskQueueRecord};
+use codingbuddy_store::{BackgroundJobRecord, Store, SubagentRunRecord, TaskQueueRecord};
 use codingbuddy_testkit::ScriptedLlm;
 use std::collections::VecDeque;
 use std::fs;
@@ -962,6 +962,56 @@ fn spawn_task_persists_child_session_and_run_metadata() -> Result<()> {
 }
 
 #[test]
+fn spawn_task_background_keeps_task_running() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let job_id = Uuid::now_v7();
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![(
+                "call_1",
+                "spawn_task",
+                &format!(
+                    r#"{{"prompt":"analyze the project","description":"explore project","subagent_type":"explore","run_in_background":true,"max_turns":5,"model":"deepseek-chat"}}"#
+                ),
+            )]),
+            text_response("Delegated task queued."),
+        ],
+    )?;
+
+    let worker: codingbuddy_agent::SubagentWorkerFn = Arc::new(move |_task| {
+        Ok(serde_json::json!({
+            "job_id": job_id,
+            "status": "running",
+        })
+        .to_string())
+    });
+    engine.set_subagent_worker(worker);
+
+    let output = engine.chat_with_options(
+        "Analyze this project in background",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Delegated task queued"));
+    let store = Store::new(temp.path())?;
+    let tasks = store.list_tasks(None)?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].status, "in_progress");
+    let run = store
+        .load_subagent_run_for_task(tasks[0].task_id)?
+        .expect("subagent run");
+    assert_eq!(run.status, "running");
+    assert_eq!(run.background_job_id, Some(job_id));
+    Ok(())
+}
+
+#[test]
 fn task_output_tool_surfaces_persisted_run_payload() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
@@ -1044,6 +1094,95 @@ fn task_output_tool_surfaces_persisted_run_payload() -> Result<()> {
     assert!(tool_message.contains(&run_id.to_string()));
     assert!(tool_message.contains(&child_session.session_id.to_string()));
     assert!(tool_message.contains("Indexed 12 files"));
+    Ok(())
+}
+
+#[test]
+fn task_stop_cancels_background_run() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let store = Store::new(temp.path())?;
+    let session = Session {
+        session_id: Uuid::now_v7(),
+        workspace_root: temp.path().to_string_lossy().to_string(),
+        baseline_commit: None,
+        status: SessionState::Idle,
+        budgets: SessionBudgets {
+            per_turn_seconds: 30,
+            max_think_tokens: 1024,
+        },
+        active_plan_id: None,
+    };
+    store.save_session(&session)?;
+
+    let task_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
+    let job_id = Uuid::now_v7();
+    let now = chrono::Utc::now().to_rfc3339();
+    store.insert_task(&TaskQueueRecord {
+        task_id,
+        session_id: session.session_id,
+        title: "Background task".to_string(),
+        description: None,
+        priority: 1,
+        status: "in_progress".to_string(),
+        outcome: None,
+        artifact_path: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    })?;
+    store.upsert_subagent_run(&SubagentRunRecord {
+        run_id,
+        session_id: Some(session.session_id),
+        task_id: Some(task_id),
+        child_session_id: None,
+        background_job_id: Some(job_id),
+        name: "bg".to_string(),
+        goal: "work".to_string(),
+        status: "running".to_string(),
+        output: None,
+        error: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    })?;
+    store.upsert_background_job(&BackgroundJobRecord {
+        job_id,
+        kind: "subagent".to_string(),
+        reference: format!("subagent:{run_id}"),
+        status: "running".to_string(),
+        metadata_json: serde_json::json!({}).to_string(),
+        started_at: now.clone(),
+        updated_at: now,
+    })?;
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![(
+                "call_1",
+                "task_stop",
+                &format!(r#"{{"task_id":"{task_id}"}}"#),
+            )]),
+            text_response("Stopped the task."),
+        ],
+    )?;
+
+    let output = engine.chat_with_options(
+        "Stop the background task",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Stopped the task"));
+    let task = store.load_task(task_id)?.expect("task");
+    assert_eq!(task.status, "cancelled");
+    let run = store.load_subagent_run(run_id)?.expect("run");
+    assert_eq!(run.status, "stopped");
+    let job = store.load_background_job(job_id)?.expect("job");
+    assert_eq!(job.status, "stopped");
     Ok(())
 }
 
