@@ -1315,7 +1315,7 @@ impl LocalToolHost {
                     cmd
                 ));
             }
-            return self.run_cmd(cmd, timeout_secs);
+            self.run_cmd(cmd, timeout_secs)
         }
         #[cfg(not(target_os = "windows"))]
         Err(anyhow!(
