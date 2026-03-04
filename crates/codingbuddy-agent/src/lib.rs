@@ -711,8 +711,15 @@ impl AgentEngine {
         let config = tool_loop::ToolLoopConfig {
             model: active_base_model.clone(),
             max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
+            provider_kind: self
+                .cfg
+                .llm
+                .active_provider_kind()
+                .unwrap_or(codingbuddy_core::ProviderKind::Deepseek),
             temperature: None, // Incompatible with thinking mode
             context_window_tokens: self.cfg.llm.context_window_tokens,
+            reserved_overhead_tokens: self.cfg.context.reserved_overhead_tokens,
+            response_budget_tokens: self.cfg.context.response_budget_tokens,
             max_turns: self
                 .max_turns
                 .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns) as usize,

@@ -230,7 +230,7 @@ impl ApiClient {
     fn build_payload(&self, req: &LlmRequest) -> Value {
         let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
         let fast_mode = self.cfg.fast_mode;
-        let max_cap = model_max_output_tokens(provider, &req.model, false);
+        let max_cap = max_output_tokens_for_model(provider, &req.model, false);
         if req.max_tokens > max_cap {
             eprintln!(
                 "warning: requested max_tokens ({}) exceeds model limit for {} ({}); capping",
@@ -388,7 +388,8 @@ impl ApiClient {
 
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
-        let max_cap = model_max_output_tokens(capabilities.provider, &req.model, thinking_enabled);
+        let max_cap =
+            max_output_tokens_for_model(capabilities.provider, &req.model, thinking_enabled);
         let mut payload = json!({
             "model": if capabilities.provider == ProviderKind::Deepseek {
                 normalize_codingbuddy_model(&req.model).unwrap_or(&req.model)
@@ -1140,7 +1141,11 @@ impl ApiClient {
 ///
 /// Thinking-aware: `deepseek-chat` with thinking enabled can output up to 32K tokens,
 /// compared to 8K without thinking. `deepseek-reasoner` always outputs up to 64K.
-fn model_max_output_tokens(provider: ProviderKind, model: &str, thinking_enabled: bool) -> u32 {
+pub fn max_output_tokens_for_model(
+    provider: ProviderKind,
+    model: &str,
+    thinking_enabled: bool,
+) -> u32 {
     if provider == ProviderKind::Deepseek && codingbuddy_core::is_reasoner_model(model) {
         codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS // 65536
     } else if provider == ProviderKind::Deepseek && thinking_enabled {
@@ -2911,16 +2916,16 @@ mod tests {
     #[test]
     fn model_max_output_tokens_reasoner() {
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-reasoner", false),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
             codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS
         );
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-reasoner", false),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
             65536
         );
         // Reasoner always returns 64K regardless of thinking flag
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-reasoner", true),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", true),
             65536
         );
     }
@@ -2928,11 +2933,11 @@ mod tests {
     #[test]
     fn model_max_output_tokens_chat() {
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-chat", false),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", false),
             codingbuddy_core::CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS
         );
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-chat", false),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", false),
             8192
         );
     }
@@ -2940,11 +2945,11 @@ mod tests {
     #[test]
     fn max_output_tokens_thinking_chat_32k() {
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-chat", true),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", true),
             codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS
         );
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-chat", true),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", true),
             32768
         );
     }
@@ -2953,11 +2958,11 @@ mod tests {
     fn max_output_tokens_reasoner_64k() {
         // Reasoner is always 64K regardless of thinking param
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-reasoner", false),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
             65536
         );
         assert_eq!(
-            model_max_output_tokens(ProviderKind::Deepseek, "deepseek-reasoner", true),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", true),
             65536
         );
     }

@@ -241,7 +241,7 @@ mod tests {
 
         let (active, discoverable) = shape_tool_surface(active, discoverable, caps);
         assert!(active.len() <= 5, "reserve one slot for tool_search");
-        assert!(discoverable.len() >= 1);
+        assert!(!discoverable.is_empty());
         assert!(active.iter().any(|tool| tool.function.name == "fs_edit"));
     }
 }
