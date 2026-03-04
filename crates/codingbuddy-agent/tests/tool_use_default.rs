@@ -6,14 +6,17 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
-    ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, TokenUsage,
+    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, Session, SessionBudgets,
+    SessionState, StreamCallback, TokenUsage,
 };
 use codingbuddy_llm::LlmClient;
+use codingbuddy_store::{Store, SubagentRunRecord, TaskQueueRecord};
 use codingbuddy_testkit::ScriptedLlm;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 // ── Response builders ──
 
@@ -52,6 +55,12 @@ fn text_response(text: &str) -> LlmResponse {
     }
 }
 
+fn tool_call_response_with_text(text: &str, calls: Vec<(&str, &str, &str)>) -> LlmResponse {
+    let mut response = tool_call_response(calls);
+    response.text = text.to_string();
+    response
+}
+
 // ── Helpers ──
 
 fn init_workspace(path: &Path) -> Result<()> {
@@ -72,6 +81,48 @@ fn init_workspace(path: &Path) -> Result<()> {
 
 fn build_engine(path: &Path, responses: Vec<LlmResponse>) -> Result<AgentEngine> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(ScriptedLlm::new(responses));
+    AgentEngine::new_with_llm(path, llm)
+}
+
+#[derive(Clone)]
+struct SharedScriptedLlm(Arc<ScriptedLlm>);
+
+impl LlmClient for SharedScriptedLlm {
+    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        self.0.complete(req)
+    }
+
+    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
+        self.0.complete_streaming(req, cb)
+    }
+
+    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.0.complete_chat(req)
+    }
+
+    fn complete_chat_streaming(
+        &self,
+        req: &ChatRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_chat_streaming(req, cb)
+    }
+
+    fn complete_fim(&self, req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+        self.0.complete_fim(req)
+    }
+
+    fn complete_fim_streaming(
+        &self,
+        req: &codingbuddy_core::FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_fim_streaming(req, cb)
+    }
+}
+
+fn build_engine_with_shared_llm(path: &Path, llm: Arc<ScriptedLlm>) -> Result<AgentEngine> {
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(SharedScriptedLlm(llm));
     AgentEngine::new_with_llm(path, llm)
 }
 
@@ -851,5 +902,219 @@ fn spawn_task_role_maps_correctly() -> Result<()> {
         *role, "Plan",
         "subagent_type 'plan' should map to SubagentRole::Plan"
     );
+    Ok(())
+}
+
+#[test]
+fn spawn_task_persists_child_session_and_run_metadata() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![(
+                "call_1",
+                "spawn_task",
+                r#"{"prompt":"analyze the project","description":"explore project","subagent_type":"explore"}"#,
+            )]),
+            text_response("Delegated task complete."),
+        ],
+    )?;
+
+    let worker: codingbuddy_agent::SubagentWorkerFn =
+        Arc::new(move |task| Ok(format!("Subagent completed: {}", task.goal)));
+    engine.set_subagent_worker(worker);
+
+    let output = engine.chat_with_options(
+        "Analyze this project",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Delegated task complete"));
+    let store = Store::new(temp.path())?;
+    let tasks = store.list_tasks(None)?;
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.status, "completed");
+    assert!(
+        task.artifact_path
+            .as_deref()
+            .is_some_and(|value| value.starts_with("session://"))
+    );
+
+    let run = store
+        .load_subagent_run_for_task(task.task_id)?
+        .expect("subagent run");
+    assert_eq!(run.session_id, Some(task.session_id));
+    assert_eq!(run.task_id, Some(task.task_id));
+    assert_eq!(run.status, "completed");
+    assert_eq!(
+        run.output.as_deref(),
+        Some("Subagent completed: analyze the project")
+    );
+    let child_session_id = run.child_session_id.expect("child session id");
+    assert!(store.load_session(child_session_id)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn task_output_tool_surfaces_persisted_run_payload() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let store = Store::new(temp.path())?;
+    let parent_session = Session {
+        session_id: Uuid::now_v7(),
+        workspace_root: temp.path().to_string_lossy().to_string(),
+        baseline_commit: None,
+        status: SessionState::Idle,
+        budgets: SessionBudgets {
+            per_turn_seconds: 30,
+            max_think_tokens: 1024,
+        },
+        active_plan_id: None,
+    };
+    store.save_session(&parent_session)?;
+    let child_session = store.fork_session(parent_session.session_id)?;
+    store.save_session(&parent_session)?;
+
+    let task_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
+    let now = chrono::Utc::now().to_rfc3339();
+    store.insert_task(&TaskQueueRecord {
+        task_id,
+        session_id: parent_session.session_id,
+        title: "Explore project".to_string(),
+        description: Some("Inspect parser pipeline".to_string()),
+        priority: 1,
+        status: "completed".to_string(),
+        outcome: Some("Indexed 12 files".to_string()),
+        artifact_path: Some(format!("session://{}", child_session.session_id)),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    })?;
+    store.upsert_subagent_run(&SubagentRunRecord {
+        run_id,
+        session_id: Some(parent_session.session_id),
+        task_id: Some(task_id),
+        child_session_id: Some(child_session.session_id),
+        background_job_id: None,
+        name: "explore project".to_string(),
+        goal: "inspect parser pipeline".to_string(),
+        status: "completed".to_string(),
+        output: Some("Indexed 12 files".to_string()),
+        error: None,
+        created_at: now.clone(),
+        updated_at: now,
+    })?;
+
+    let scripted = Arc::new(ScriptedLlm::new(vec![
+        tool_call_response(vec![(
+            "call_1",
+            "task_output",
+            &format!(r#"{{"task_id":"{task_id}"}}"#),
+        )]),
+        text_response("Read task output."),
+    ]));
+    let engine = build_engine_with_shared_llm(temp.path(), scripted.clone())?;
+
+    let output = engine.chat_with_options(
+        "Read the delegated task output",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Read task output"));
+    let captured = scripted.captured_messages();
+    assert!(captured.len() >= 2, "expected two llm calls");
+    let tool_message = captured[1]
+        .iter()
+        .find_map(|msg| match msg {
+            ChatMessage::Tool { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("tool message");
+    assert!(tool_message.contains(&task_id.to_string()));
+    assert!(tool_message.contains(&run_id.to_string()));
+    assert!(tool_message.contains(&child_session.session_id.to_string()));
+    assert!(tool_message.contains("Indexed 12 files"));
+    Ok(())
+}
+
+#[test]
+fn task_create_persists_to_store() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![(
+                "call_1",
+                "task_create",
+                r#"{"subject":"Audit parser","description":"Inspect parser edge cases","priority":2}"#,
+            )]),
+            text_response("Created the task."),
+        ],
+    )?;
+
+    let output = engine.chat_with_options(
+        "Create a task for parser auditing",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Created"));
+    let store = Store::new(temp.path())?;
+    let tasks = store.list_tasks(None)?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].title, "Audit parser");
+    assert_eq!(tasks[0].description.as_deref(), Some("Inspect parser edge cases"));
+    assert_eq!(tasks[0].priority, 2);
+    Ok(())
+}
+
+#[test]
+fn exit_plan_mode_persists_plan_and_session_state() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![("call_1", "enter_plan_mode", "{}")]),
+            tool_call_response_with_text(
+                "1. Read src/main.rs\n2. Update the parser wiring\n3. Verify with cargo test",
+                vec![("call_2", "exit_plan_mode", "{}")],
+            ),
+            text_response("Plan saved for review."),
+        ],
+    )?;
+
+    let output = engine.chat_with_options(
+        "Plan the parser refactor",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Plan saved"));
+    let store = Store::new(temp.path())?;
+    let session = store.load_latest_session()?.expect("session");
+    assert_eq!(session.status, codingbuddy_core::SessionState::AwaitingApproval);
+    let plan_id = session.active_plan_id.expect("active plan");
+    let plan = store.load_plan(plan_id)?.expect("plan");
+    assert_eq!(plan.version, 2);
+    assert_eq!(plan.goal, "Plan the parser refactor");
+    assert!(!plan.steps.is_empty());
     Ok(())
 }

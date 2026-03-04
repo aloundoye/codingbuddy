@@ -4,6 +4,7 @@ use anyhow::Result;
 use codingbuddy_core::{ChatMessage, EventKind, TokenUsage, UserQuestion};
 use std::path::PathBuf;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Default maximum turns (LLM calls) before stopping the loop.
 pub const DEFAULT_MAX_TURNS: usize = 50;
@@ -84,6 +85,10 @@ pub type RetrieverCallback =
 /// Request to spawn a subagent task.
 #[derive(Debug, Clone)]
 pub struct SubagentRequest {
+    pub run_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub parent_session_id: Option<Uuid>,
+    pub child_session_id: Option<Uuid>,
     pub prompt: String,
     pub task_name: String,
     pub subagent_type: String,
@@ -125,6 +130,10 @@ pub struct ToolLoopConfig {
     pub initial_context: Vec<ChatMessage>,
     /// Active agent profile name for logging (e.g. "build", "explore", "plan").
     pub profile_name: Option<String>,
+    /// Optional persisted phase to resume from the session record.
+    pub initial_phase: Option<codingbuddy_core::TaskPhase>,
+    /// Optional explicit session to append events/history into.
+    pub session_id: Option<Uuid>,
     /// Optional post-edit validator for LSP-like diagnostics (Phase 4).
     pub edit_validator: Option<Arc<codingbuddy_lsp::EditValidator>>,
 }
@@ -151,6 +160,8 @@ impl Default for ToolLoopConfig {
             images: vec![],
             initial_context: vec![],
             profile_name: None,
+            initial_phase: None,
+            session_id: None,
             edit_validator: None,
         }
     }

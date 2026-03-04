@@ -351,6 +351,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
             UNIQUE(tool_name, command_pattern, project_hash)
          );",
     ),
+    (
+        10,
+        "ALTER TABLE task_queue ADD COLUMN description TEXT;",
+    ),
+    (
+        11,
+        "ALTER TABLE subagent_runs ADD COLUMN session_id TEXT;
+         ALTER TABLE subagent_runs ADD COLUMN task_id TEXT;
+         ALTER TABLE subagent_runs ADD COLUMN child_session_id TEXT;
+         ALTER TABLE subagent_runs ADD COLUMN background_job_id TEXT;",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -482,6 +493,10 @@ pub struct McpToolCacheRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentRunRecord {
     pub run_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub child_session_id: Option<Uuid>,
+    pub background_job_id: Option<Uuid>,
     pub name: String,
     pub goal: String,
     pub status: String,
@@ -583,6 +598,7 @@ pub struct TaskQueueRecord {
     pub task_id: Uuid,
     pub session_id: Uuid,
     pub title: String,
+    pub description: Option<String>,
     pub priority: u32,
     pub status: String,
     pub outcome: Option<String>,
@@ -1548,10 +1564,29 @@ impl Store {
     pub fn upsert_subagent_run(&self, record: &SubagentRunRecord) -> Result<()> {
         let conn = self.db()?;
         conn.execute(
-            "INSERT OR REPLACE INTO subagent_runs (run_id, name, goal, status, output, error, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO subagent_runs (
+                run_id, session_id, task_id, child_session_id, background_job_id,
+                name, goal, status, output, error, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(run_id) DO UPDATE SET
+                session_id = COALESCE(excluded.session_id, subagent_runs.session_id),
+                task_id = COALESCE(excluded.task_id, subagent_runs.task_id),
+                child_session_id = COALESCE(excluded.child_session_id, subagent_runs.child_session_id),
+                background_job_id = COALESCE(excluded.background_job_id, subagent_runs.background_job_id),
+                name = excluded.name,
+                goal = excluded.goal,
+                status = excluded.status,
+                output = excluded.output,
+                error = excluded.error,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at",
             params![
                 record.run_id.to_string(),
+                record.session_id.map(|id| id.to_string()),
+                record.task_id.map(|id| id.to_string()),
+                record.child_session_id.map(|id| id.to_string()),
+                record.background_job_id.map(|id| id.to_string()),
                 record.name,
                 record.goal,
                 record.status,
@@ -1562,6 +1597,78 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn load_subagent_run(&self, run_id: Uuid) -> Result<Option<SubagentRunRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, task_id, child_session_id, background_job_id,
+                    name, goal, status, output, error, created_at, updated_at
+             FROM subagent_runs WHERE run_id = ?1",
+        )?;
+        let mut rows = stmt.query([run_id.to_string()])?;
+        if let Some(r) = rows.next()? {
+            return Ok(Some(SubagentRunRecord {
+                run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                session_id: r
+                    .get::<_, Option<String>>(1)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                task_id: r
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                child_session_id: r
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                background_job_id: r
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                name: r.get(5)?,
+                goal: r.get(6)?,
+                status: r.get(7)?,
+                output: r.get(8)?,
+                error: r.get(9)?,
+                created_at: r.get(10)?,
+                updated_at: r.get(11)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn load_subagent_run_for_task(&self, task_id: Uuid) -> Result<Option<SubagentRunRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, task_id, child_session_id, background_job_id,
+                    name, goal, status, output, error, created_at, updated_at
+             FROM subagent_runs WHERE task_id = ?1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([task_id.to_string()])?;
+        if let Some(r) = rows.next()? {
+            return Ok(Some(SubagentRunRecord {
+                run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                session_id: r
+                    .get::<_, Option<String>>(1)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                task_id: r
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                child_session_id: r
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                background_job_id: r
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|value| Uuid::parse_str(&value).ok()),
+                name: r.get(5)?,
+                goal: r.get(6)?,
+                status: r.get(7)?,
+                output: r.get(8)?,
+                error: r.get(9)?,
+                created_at: r.get(10)?,
+                updated_at: r.get(11)?,
+            }));
+        }
+        Ok(None)
     }
 
     pub fn list_subagent_runs(
@@ -1600,20 +1707,33 @@ impl Store {
                 return Ok(Vec::new());
             }
             let mut stmt = conn.prepare(
-                "SELECT run_id, name, goal, status, output, error, created_at, updated_at
+                "SELECT run_id, session_id, task_id, child_session_id, background_job_id,
+                        name, goal, status, output, error, created_at, updated_at
                  FROM subagent_runs
                  ORDER BY updated_at DESC",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(SubagentRunRecord {
                     run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
-                    name: r.get(1)?,
-                    goal: r.get(2)?,
-                    status: r.get(3)?,
-                    output: r.get(4)?,
-                    error: r.get(5)?,
-                    created_at: r.get(6)?,
-                    updated_at: r.get(7)?,
+                    session_id: r
+                        .get::<_, Option<String>>(1)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    task_id: r
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    child_session_id: r
+                        .get::<_, Option<String>>(3)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    background_job_id: r
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    name: r.get(5)?,
+                    goal: r.get(6)?,
+                    status: r.get(7)?,
+                    output: r.get(8)?,
+                    error: r.get(9)?,
+                    created_at: r.get(10)?,
+                    updated_at: r.get(11)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -1630,7 +1750,8 @@ impl Store {
             Ok(out)
         } else {
             let mut stmt = conn.prepare(
-                "SELECT run_id, name, goal, status, output, error, created_at, updated_at
+                "SELECT run_id, session_id, task_id, child_session_id, background_job_id,
+                        name, goal, status, output, error, created_at, updated_at
                  FROM subagent_runs
                  ORDER BY updated_at DESC
                  LIMIT ?1",
@@ -1638,13 +1759,25 @@ impl Store {
             let rows = stmt.query_map(params![capped_limit], |r| {
                 Ok(SubagentRunRecord {
                     run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
-                    name: r.get(1)?,
-                    goal: r.get(2)?,
-                    status: r.get(3)?,
-                    output: r.get(4)?,
-                    error: r.get(5)?,
-                    created_at: r.get(6)?,
-                    updated_at: r.get(7)?,
+                    session_id: r
+                        .get::<_, Option<String>>(1)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    task_id: r
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    child_session_id: r
+                        .get::<_, Option<String>>(3)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    background_job_id: r
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|value| Uuid::parse_str(&value).ok()),
+                    name: r.get(5)?,
+                    goal: r.get(6)?,
+                    status: r.get(7)?,
+                    output: r.get(8)?,
+                    error: r.get(9)?,
+                    created_at: r.get(10)?,
+                    updated_at: r.get(11)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -2139,12 +2272,21 @@ impl Store {
             active_plan_id: None,
         };
         self.save_session(&forked)?;
-        // Record fork events in both sessions
         let seq = self.next_seq_no(from_session_id)?;
         self.append_event(&EventEnvelope {
             seq_no: seq,
             at: Utc::now(),
             session_id: from_session_id,
+            kind: EventKind::SessionForked {
+                from_session_id,
+                to_session_id: new_id,
+            },
+        })?;
+        let child_seq = self.next_seq_no(new_id)?;
+        self.append_event(&EventEnvelope {
+            seq_no: child_seq,
+            at: Utc::now(),
+            session_id: new_id,
             kind: EventKind::SessionForked {
                 from_session_id,
                 to_session_id: new_id,
@@ -2158,12 +2300,13 @@ impl Store {
     pub fn insert_task(&self, record: &TaskQueueRecord) -> Result<()> {
         let conn = self.db()?;
         conn.execute(
-            "INSERT OR REPLACE INTO task_queue (task_id, session_id, title, priority, status, outcome, artifact_path, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO task_queue (task_id, session_id, title, description, priority, status, outcome, artifact_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 record.task_id.to_string(),
                 record.session_id.to_string(),
                 record.title,
+                record.description,
                 record.priority as i64,
                 record.status,
                 record.outcome,
@@ -2172,6 +2315,38 @@ impl Store {
                 record.updated_at,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn load_task(&self, task_id: Uuid) -> Result<Option<TaskQueueRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, session_id, title, description, priority, status, outcome, artifact_path, created_at, updated_at
+             FROM task_queue WHERE task_id = ?1",
+        )?;
+        let mut rows = stmt.query([task_id.to_string()])?;
+        if let Some(r) = rows.next()? {
+            return Ok(Some(TaskQueueRecord {
+                task_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                title: r.get(2)?,
+                description: r.get(3)?,
+                priority: r.get::<_, i64>(4)? as u32,
+                status: r.get(5)?,
+                outcome: r.get(6)?,
+                artifact_path: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn delete_task(&self, task_id: Uuid) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute("DELETE FROM task_queue WHERE task_id = ?1", [task_id.to_string()])?;
         Ok(())
     }
 
@@ -2199,7 +2374,7 @@ impl Store {
         let mut out = Vec::new();
         if let Some(sid) = session_id {
             let mut stmt = conn.prepare(
-                "SELECT task_id, session_id, title, priority, status, outcome, artifact_path, created_at, updated_at
+                "SELECT task_id, session_id, title, description, priority, status, outcome, artifact_path, created_at, updated_at
                  FROM task_queue WHERE session_id = ?1 ORDER BY priority DESC, created_at ASC",
             )?;
             let rows = stmt.query_map([sid.to_string()], |r| {
@@ -2209,12 +2384,13 @@ impl Store {
                     session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
                         .unwrap_or_else(|_| Uuid::nil()),
                     title: r.get(2)?,
-                    priority: r.get::<_, i64>(3)? as u32,
-                    status: r.get(4)?,
-                    outcome: r.get(5)?,
-                    artifact_path: r.get(6)?,
-                    created_at: r.get(7)?,
-                    updated_at: r.get(8)?,
+                    description: r.get(3)?,
+                    priority: r.get::<_, i64>(4)? as u32,
+                    status: r.get(5)?,
+                    outcome: r.get(6)?,
+                    artifact_path: r.get(7)?,
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
                 })
             })?;
             for row in rows {
@@ -2222,7 +2398,7 @@ impl Store {
             }
         } else {
             let mut stmt = conn.prepare(
-                "SELECT task_id, session_id, title, priority, status, outcome, artifact_path, created_at, updated_at
+                "SELECT task_id, session_id, title, description, priority, status, outcome, artifact_path, created_at, updated_at
                  FROM task_queue ORDER BY priority DESC, created_at ASC",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -2232,12 +2408,13 @@ impl Store {
                     session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
                         .unwrap_or_else(|_| Uuid::nil()),
                     title: r.get(2)?,
-                    priority: r.get::<_, i64>(3)? as u32,
-                    status: r.get(4)?,
-                    outcome: r.get(5)?,
-                    artifact_path: r.get(6)?,
-                    created_at: r.get(7)?,
-                    updated_at: r.get(8)?,
+                    description: r.get(3)?,
+                    priority: r.get::<_, i64>(4)? as u32,
+                    status: r.get(5)?,
+                    outcome: r.get(6)?,
+                    artifact_path: r.get(7)?,
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
                 })
             })?;
             for row in rows {
@@ -2245,6 +2422,17 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    pub fn load_plan(&self, plan_id: Uuid) -> Result<Option<Plan>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare("SELECT payload FROM plans WHERE plan_id = ?1")?;
+        let mut rows = stmt.query([plan_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            return Ok(Some(serde_json::from_str(&payload)?));
+        }
+        Ok(None)
     }
 
     // --- Web Search Cache ---
@@ -2503,6 +2691,15 @@ impl Store {
             }
             EventKind::PlanCreated { plan } | EventKind::PlanRevised { plan } => {
                 self.save_plan(event.session_id, plan)?;
+                conn.execute(
+                    "UPDATE sessions SET active_plan_id = ?1, status = ?2, updated_at = ?3 WHERE session_id = ?4",
+                    params![
+                        plan.plan_id.to_string(),
+                        serde_json::to_string(&SessionState::Planning)?,
+                        Utc::now().to_rfc3339(),
+                        event.session_id.to_string(),
+                    ],
+                )?;
             }
             EventKind::ToolApproved { invocation_id } => {
                 conn.execute(
@@ -2731,10 +2928,20 @@ impl Store {
             }
             EventKind::SubagentSpawned { run_id, name, goal } => {
                 conn.execute(
-                    "INSERT OR REPLACE INTO subagent_runs (run_id, name, goal, status, output, error, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'running', NULL, NULL, ?4, ?5)",
+                    "INSERT INTO subagent_runs (
+                        run_id, session_id, task_id, child_session_id, background_job_id,
+                        name, goal, status, output, error, created_at, updated_at
+                     )
+                     VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, 'running', NULL, NULL, ?5, ?6)
+                     ON CONFLICT(run_id) DO UPDATE SET
+                        session_id = COALESCE(subagent_runs.session_id, excluded.session_id),
+                        name = excluded.name,
+                        goal = excluded.goal,
+                        status = excluded.status,
+                        updated_at = excluded.updated_at",
                     params![
                         run_id.to_string(),
+                        event.session_id.to_string(),
                         name,
                         goal,
                         Utc::now().to_rfc3339(),
@@ -2966,6 +3173,35 @@ impl Store {
                 conn.execute(
                     "UPDATE task_queue SET status = 'completed', outcome = ?1, updated_at = ?2 WHERE task_id = ?3",
                     params![outcome, Utc::now().to_rfc3339(), task_id.to_string()],
+                )?;
+            }
+            EventKind::TaskUpdated { task_id, status } => {
+                conn.execute(
+                    "UPDATE task_queue SET status = ?1, updated_at = ?2 WHERE task_id = ?3",
+                    params![status, Utc::now().to_rfc3339(), task_id],
+                )?;
+            }
+            EventKind::TaskDeleted { task_id } => {
+                conn.execute("DELETE FROM task_queue WHERE task_id = ?1", [task_id])?;
+            }
+            EventKind::EnterPlanMode { .. } => {
+                conn.execute(
+                    "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE session_id = ?3",
+                    params![
+                        serde_json::to_string(&SessionState::Planning)?,
+                        Utc::now().to_rfc3339(),
+                        event.session_id.to_string(),
+                    ],
+                )?;
+            }
+            EventKind::ExitPlanMode { .. } => {
+                conn.execute(
+                    "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE session_id = ?3",
+                    params![
+                        serde_json::to_string(&SessionState::AwaitingApproval)?,
+                        Utc::now().to_rfc3339(),
+                        event.session_id.to_string(),
+                    ],
                 )?;
             }
             EventKind::ReviewStarted {

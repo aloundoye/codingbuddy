@@ -56,10 +56,22 @@ pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Resul
             } else {
                 println!("Task:     {}", task.task_id);
                 println!("Title:    {}", task.title);
+                if let Some(description) = &task.description {
+                    println!("Desc:     {description}");
+                }
                 println!("Status:   {}", task.status);
                 println!("Priority: {}", task.priority);
                 if let Some(outcome) = &task.outcome {
                     println!("Outcome:  {outcome}");
+                }
+                if let Some(run) = store.load_subagent_run_for_task(task.task_id)? {
+                    println!("Run:      {} [{}]", run.run_id, run.status);
+                    if let Some(child_session_id) = run.child_session_id {
+                        println!("Session:  {child_session_id}");
+                    }
+                    if let Some(error) = run.error {
+                        println!("Error:    {error}");
+                    }
                 }
                 if let Some(path) = &task.artifact_path {
                     println!("Artifacts: {path}");

@@ -32,8 +32,7 @@ pub fn tool_tier(api_name: &str) -> ToolTier {
         | "multi_edit" => ToolTier::Core,
 
         // Core: agent-level tools always available
-        "user_question" | "spawn_task" | "task_output" | "task_stop" | "kill_shell"
-        | "extended_thinking" | "think_deeply" => ToolTier::Core,
+        "user_question" | "spawn_task" | "extended_thinking" | "think_deeply" => ToolTier::Core,
 
         // Contextual: git tools (included in git repos)
         "git_status" | "git_diff" | "git_show" => ToolTier::Contextual,
@@ -48,7 +47,9 @@ pub fn tool_tier(api_name: &str) -> ToolTier {
         "index_query" => ToolTier::Contextual,
 
         // Contextual: task management (included when multi-step work detected)
-        "task_create" | "task_update" | "task_get" | "task_list" => ToolTier::Contextual,
+        "task_create" | "task_update" | "task_get" | "task_list" | "task_output" => {
+            ToolTier::Contextual
+        }
 
         // Everything else: notebooks, chrome, patches, plan mode, skills
         _ => ToolTier::Extended,
@@ -87,7 +88,13 @@ pub fn contextual_tool_names(signals: &ToolContextSignals) -> Vec<&'static str> 
         tools.push("index_query");
     }
     if signals.prompt_is_complex {
-        tools.extend_from_slice(&["task_create", "task_update", "task_get", "task_list"]);
+        tools.extend_from_slice(&[
+            "task_create",
+            "task_update",
+            "task_get",
+            "task_list",
+            "task_output",
+        ]);
     }
     tools
 }

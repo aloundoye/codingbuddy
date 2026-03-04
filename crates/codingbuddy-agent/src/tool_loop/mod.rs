@@ -31,15 +31,17 @@ pub use types::*;
 
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
-    ApprovedToolCall, ChatMessage, ChatRequest, EventKind, LlmToolCall, StreamCallback,
-    StreamChunk, TokenUsage, ToolCall, ToolChoice, ToolDefinition, ToolHost, UserQuestion,
-    estimate_message_tokens, strip_prior_reasoning_content,
+    ApprovedToolCall, ChatMessage, ChatRequest, EventKind, LlmToolCall, Plan, PlanStep, Session,
+    SessionState, StreamCallback, StreamChunk, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    ToolHost, UserQuestion, estimate_message_tokens, strip_prior_reasoning_content,
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
 use codingbuddy_llm::LlmClient;
+use codingbuddy_store::{Store, TaskQueueRecord};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
+use uuid::Uuid;
 
 use crate::tool_bridge;
 
@@ -179,11 +181,13 @@ impl<'a> ToolUseLoop<'a> {
             .unwrap_or_default();
 
         // Phase loop: only for Complex tasks
-        let initial_phase = if config.complexity == crate::complexity::PromptComplexity::Complex {
-            Some(codingbuddy_core::TaskPhase::Explore)
-        } else {
-            None
-        };
+        let initial_phase = config.initial_phase.or_else(|| {
+            if config.complexity == crate::complexity::PromptComplexity::Complex {
+                Some(codingbuddy_core::TaskPhase::Explore)
+            } else {
+                None
+            }
+        });
 
         Self {
             llm,
@@ -222,6 +226,131 @@ impl<'a> ToolUseLoop<'a> {
         let hash = Sha256::digest(raw.as_bytes());
         let bytes: [u8; 8] = hash[..8].try_into().unwrap();
         (format!("{:016x}", u64::from_be_bytes(bytes)), raw)
+    }
+
+    fn workspace_store(&self) -> Result<Store> {
+        let workspace = self
+            .config
+            .workspace
+            .as_ref()
+            .ok_or_else(|| anyhow!("workspace is not available in this context"))?;
+        Store::new(workspace)
+    }
+
+    fn current_session(&self, store: &Store) -> Result<Session> {
+        if let Some(session_id) = self.config.session_id {
+            return store
+                .load_session(session_id)?
+                .ok_or_else(|| anyhow!("no active session record found for {session_id}"));
+        }
+        store
+            .load_latest_session()?
+            .ok_or_else(|| anyhow!("no active session record found"))
+    }
+
+    fn latest_user_prompt(&self) -> String {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|msg| match msg {
+                ChatMessage::User { content } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn latest_assistant_text(&self) -> String {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|msg| match msg {
+                ChatMessage::Assistant { content, .. } => content.clone(),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn emit_event_if_present(&self, kind: EventKind) {
+        if let Some(ref cb) = self.event_cb {
+            cb(kind);
+        }
+    }
+
+    fn build_plan_from_text(&self, plan_id: Uuid, version: u32, goal: String, text: &str) -> Plan {
+        let mut assumptions = Vec::new();
+        let mut verification = Vec::new();
+        let mut risk_notes = Vec::new();
+        let mut steps = Vec::new();
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("assum") {
+                assumptions.push(trimmed.to_string());
+                continue;
+            }
+            if lower.contains("verify") || lower.contains("test") || lower.contains("check") {
+                verification.push(trimmed.to_string());
+            }
+            if lower.contains("risk") || lower.contains("watch") || lower.contains("careful") {
+                risk_notes.push(trimmed.to_string());
+            }
+
+            let numbered = trimmed
+                .strip_prefix("1. ")
+                .or_else(|| trimmed.strip_prefix("2. "))
+                .or_else(|| trimmed.strip_prefix("3. "))
+                .or_else(|| trimmed.strip_prefix("4. "))
+                .or_else(|| trimmed.strip_prefix("5. "));
+            let bulleted = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "));
+            if let Some(step_text) = numbered.or(bulleted) {
+                let title = step_text.trim().to_string();
+                if !title.is_empty() {
+                    steps.push(PlanStep {
+                        step_id: Uuid::now_v7(),
+                        title: title.clone(),
+                        intent: title,
+                        tools: Vec::new(),
+                        files: Vec::new(),
+                        done: false,
+                    });
+                }
+            }
+        }
+
+        if steps.is_empty() {
+            let fallback = text
+                .lines()
+                .find_map(|line| {
+                    let trimmed = line.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+                .unwrap_or_else(|| "Finalize the approved implementation plan".to_string());
+            steps.push(PlanStep {
+                step_id: Uuid::now_v7(),
+                title: fallback.clone(),
+                intent: fallback,
+                tools: Vec::new(),
+                files: Vec::new(),
+                done: false,
+            });
+        }
+
+        Plan {
+            plan_id,
+            version,
+            goal,
+            assumptions,
+            steps,
+            verification,
+            risk_notes,
+        }
     }
 
     /// Build a bounded cache key by hashing the tool name + args with SHA-256.
@@ -527,7 +656,7 @@ impl<'a> ToolUseLoop<'a> {
                         }
                         resp.text
                     }
-                    Err(_) => String::new(),
+                    Err(e) => format!("(Summary generation failed: {e})"),
                 };
                 if !summary_text.is_empty() {
                     self.emit(StreamChunk::ContentDelta(summary_text.clone()));
@@ -1250,6 +1379,7 @@ impl<'a> ToolUseLoop<'a> {
         // If this tool has failed too many times consecutively, reject it
         // with guidance to try a different approach.
         if let Some(state) = self.circuit_breaker.get(&llm_call.name)
+            && state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD
             && state.cooldown_remaining > 0
         {
             let duration = start.elapsed().as_millis() as u64;
@@ -1693,7 +1823,14 @@ impl<'a> ToolUseLoop<'a> {
                     )
                 }
             }
+            "task_create" => self.handle_task_create(&args)?,
+            "task_update" => self.handle_task_update(&args)?,
+            "task_get" => self.handle_task_get(&args)?,
+            "task_list" => self.handle_task_list()?,
+            "task_output" => self.handle_task_output(&args)?,
             "spawn_task" => self.handle_spawn_task(&args)?,
+            "enter_plan_mode" => self.handle_enter_plan_mode()?,
+            "exit_plan_mode" => self.handle_exit_plan_mode(&args)?,
             "skill" => self.handle_skill(&args)?,
             _ => {
                 // Other agent-level tools (task_*, etc.) — not yet wired
@@ -1767,6 +1904,136 @@ impl<'a> ToolUseLoop<'a> {
         Ok(response.text)
     }
 
+    fn handle_task_create(&self, args: &serde_json::Value) -> Result<String> {
+        let subject = args
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("task_create requires a non-empty 'subject'"))?;
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
+        let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+
+        let store = self.workspace_store()?;
+        let session = self.current_session(&store)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = TaskQueueRecord {
+            task_id: Uuid::now_v7(),
+            session_id: session.session_id,
+            title: subject.to_string(),
+            description,
+            priority,
+            status: "pending".to_string(),
+            outcome: None,
+            artifact_path: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        store.insert_task(&record)?;
+
+        Ok(serde_json::json!({
+            "task_id": record.task_id,
+            "subject": record.title,
+            "description": record.description,
+            "priority": record.priority,
+            "status": record.status,
+        })
+        .to_string())
+    }
+
+    fn handle_task_update(&self, args: &serde_json::Value) -> Result<String> {
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("task_update requires 'task_id'"))?;
+        let task_id = Uuid::parse_str(task_id)?;
+        let status = args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("task_update requires 'status'"))?;
+        let outcome = args.get("outcome").and_then(|v| v.as_str());
+
+        let store = self.workspace_store()?;
+        store.update_task_status(task_id, status, outcome)?;
+        self.emit_event_if_present(EventKind::TaskUpdated {
+            task_id: task_id.to_string(),
+            status: status.to_string(),
+        });
+
+        Ok(serde_json::json!({
+            "task_id": task_id,
+            "status": status,
+            "outcome": outcome,
+        })
+        .to_string())
+    }
+
+    fn handle_task_get(&self, args: &serde_json::Value) -> Result<String> {
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("task_get requires 'task_id'"))?;
+        let task_id = Uuid::parse_str(task_id)?;
+        let store = self.workspace_store()?;
+        let task = store
+            .load_task(task_id)?
+            .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
+        Ok(serde_json::to_string(&task)?)
+    }
+
+    fn handle_task_list(&self) -> Result<String> {
+        let store = self.workspace_store()?;
+        let session = self.current_session(&store)?;
+        let tasks = store.list_tasks(Some(session.session_id))?;
+        Ok(serde_json::json!({ "tasks": tasks }).to_string())
+    }
+
+    fn handle_task_output(&self, args: &serde_json::Value) -> Result<String> {
+        let store = self.workspace_store()?;
+        let task = if let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) {
+            let task_id = Uuid::parse_str(task_id)?;
+            Some(
+                store
+                    .load_task(task_id)?
+                    .ok_or_else(|| anyhow!("task not found: {task_id}"))?,
+            )
+        } else {
+            None
+        };
+
+        let run = if let Some(run_id) = args.get("run_id").and_then(|v| v.as_str()) {
+            let run_id = Uuid::parse_str(run_id)?;
+            Some(
+                store
+                    .load_subagent_run(run_id)?
+                    .ok_or_else(|| anyhow!("subagent run not found: {run_id}"))?,
+            )
+        } else if let Some(task) = task.as_ref() {
+            store.load_subagent_run_for_task(task.task_id)?
+        } else {
+            return Err(anyhow!("task_output requires 'task_id' or 'run_id'"));
+        };
+
+        let child_session = run
+            .as_ref()
+            .and_then(|record| record.child_session_id)
+            .map(|session_id| store.load_session(session_id))
+            .transpose()?
+            .flatten();
+
+        Ok(serde_json::json!({
+            "task": task,
+            "run": run,
+            "child_session": child_session,
+        })
+        .to_string())
+    }
+
     /// Handle the spawn_task tool by delegating to the subagent worker.
     fn handle_spawn_task(&self, args: &serde_json::Value) -> Result<String> {
         let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -1795,7 +2062,67 @@ impl<'a> ToolUseLoop<'a> {
             );
         }
 
+        let store = self.workspace_store()?;
+        let parent_session = self.current_session(&store)?;
+        let child_session = store.fork_session(parent_session.session_id)?;
+        store.save_session(&parent_session)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let role_label = match subagent_type {
+            "explore" => "explore",
+            "plan" => "plan",
+            "bash" => "bash",
+            _ => "general-purpose",
+        };
+
+        store.insert_task(&TaskQueueRecord {
+            task_id,
+            session_id: parent_session.session_id,
+            title: task_name.to_string(),
+            description: Some(format!("[{role_label}] {prompt}")),
+            priority: 1,
+            status: "in_progress".to_string(),
+            outcome: None,
+            artifact_path: Some(format!("session://{}", child_session.session_id)),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
+            run_id,
+            session_id: Some(parent_session.session_id),
+            task_id: Some(task_id),
+            child_session_id: Some(child_session.session_id),
+            background_job_id: None,
+            name: task_name.to_string(),
+            goal: prompt.to_string(),
+            status: "running".to_string(),
+            output: None,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        self.emit_event_if_present(EventKind::TaskUpdated {
+            task_id: task_id.to_string(),
+            status: "in_progress".to_string(),
+        });
+
+        self.emit(StreamChunk::SubagentSpawned {
+            run_id: run_id.to_string(),
+            name: task_name.to_string(),
+            goal: prompt.to_string(),
+        });
+        self.emit_event_if_present(EventKind::SubagentSpawned {
+            run_id,
+            name: task_name.to_string(),
+            goal: prompt.to_string(),
+        });
+
         let request = SubagentRequest {
+            run_id,
+            task_id: Some(task_id),
+            parent_session_id: Some(parent_session.session_id),
+            child_session_id: Some(child_session.session_id),
             prompt: prompt.to_string(),
             task_name: task_name.to_string(),
             subagent_type: subagent_type.to_string(),
@@ -1819,10 +2146,78 @@ impl<'a> ToolUseLoop<'a> {
                 Self::fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
             }
             let result = match worker(request) {
-                Ok(result) => Ok(result),
-                Err(e) => Ok(format!(
-                    "Subagent '{task_name}' failed: {e}. Try a different approach or handle the task directly."
-                )),
+                Ok(result) => {
+                    store.update_task_status(task_id, "completed", Some(&result))?;
+                    store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
+                        run_id,
+                        session_id: Some(parent_session.session_id),
+                        task_id: Some(task_id),
+                        child_session_id: Some(child_session.session_id),
+                        background_job_id: None,
+                        name: task_name.to_string(),
+                        goal: prompt.to_string(),
+                        status: "completed".to_string(),
+                        output: Some(result.clone()),
+                        error: None,
+                        created_at: now.clone(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    })?;
+                    self.emit_event_if_present(EventKind::TaskUpdated {
+                        task_id: task_id.to_string(),
+                        status: "completed".to_string(),
+                    });
+                    self.emit(StreamChunk::SubagentCompleted {
+                        run_id: run_id.to_string(),
+                        name: task_name.to_string(),
+                        summary: result.clone(),
+                    });
+                    self.emit_event_if_present(EventKind::SubagentCompleted {
+                        run_id,
+                        output: result.clone(),
+                    });
+                    Ok(serde_json::json!({
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "child_session_id": child_session.session_id,
+                        "status": "completed",
+                        "output": result,
+                    })
+                    .to_string())
+                }
+                Err(e) => {
+                    store.update_task_status(task_id, "failed", Some(&e.to_string()))?;
+                    store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
+                        run_id,
+                        session_id: Some(parent_session.session_id),
+                        task_id: Some(task_id),
+                        child_session_id: Some(child_session.session_id),
+                        background_job_id: None,
+                        name: task_name.to_string(),
+                        goal: prompt.to_string(),
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(e.to_string()),
+                        created_at: now.clone(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    })?;
+                    self.emit_event_if_present(EventKind::TaskUpdated {
+                        task_id: task_id.to_string(),
+                        status: "failed".to_string(),
+                    });
+                    let message = format!(
+                        "Subagent '{task_name}' failed: {e}. Try a different approach or handle the task directly."
+                    );
+                    self.emit(StreamChunk::SubagentFailed {
+                        run_id: run_id.to_string(),
+                        name: task_name.to_string(),
+                        error: message.clone(),
+                    });
+                    self.emit_event_if_present(EventKind::SubagentFailed {
+                        run_id,
+                        error: e.to_string(),
+                    });
+                    Ok(message)
+                }
             };
             // P5-14: Fire SubagentStop hook
             if let Some(ref hooks) = self.hooks {
@@ -1842,6 +2237,29 @@ impl<'a> ToolUseLoop<'a> {
             }
             result
         } else {
+            store.update_task_status(
+                task_id,
+                "failed",
+                Some("spawn_task is not available in this context"),
+            )?;
+            store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
+                run_id,
+                session_id: Some(parent_session.session_id),
+                task_id: Some(task_id),
+                child_session_id: Some(child_session.session_id),
+                background_job_id: None,
+                name: task_name.to_string(),
+                goal: prompt.to_string(),
+                status: "failed".to_string(),
+                output: None,
+                error: Some("spawn_task is not available in this context".to_string()),
+                created_at: now,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })?;
+            self.emit_event_if_present(EventKind::TaskUpdated {
+                task_id: task_id.to_string(),
+                status: "failed".to_string(),
+            });
             // No worker wired — run inline by providing guidance
             Ok(format!(
                 "spawn_task is not available in this context. Handle the task directly instead.\n\
@@ -1850,6 +2268,73 @@ impl<'a> ToolUseLoop<'a> {
                  Use the available tools to accomplish this yourself."
             ))
         }
+    }
+
+    fn handle_enter_plan_mode(&mut self) -> Result<String> {
+        let store = self.workspace_store()?;
+        let mut session = self.current_session(&store)?;
+        let goal = self.latest_user_prompt();
+        let plan_id = session.active_plan_id.unwrap_or_else(Uuid::now_v7);
+        let plan = Plan {
+            plan_id,
+            version: 1,
+            goal,
+            assumptions: Vec::new(),
+            steps: Vec::new(),
+            verification: Vec::new(),
+            risk_notes: Vec::new(),
+        };
+
+        session.status = SessionState::Planning;
+        session.active_plan_id = Some(plan_id);
+        store.save_session(&session)?;
+        store.save_plan(session.session_id, &plan)?;
+        self.phase = Some(codingbuddy_core::TaskPhase::Plan);
+        self.phase_read_only_calls = 0;
+        self.phase_edit_calls = 0;
+
+        self.emit_event_if_present(EventKind::EnterPlanMode {
+            session_id: session.session_id,
+        });
+        self.emit_event_if_present(EventKind::PlanCreated { plan });
+        self.messages.push(ChatMessage::System {
+            content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
+        });
+
+        Ok("Plan mode entered. Explore and write the implementation plan before executing changes."
+            .to_string())
+    }
+
+    fn handle_exit_plan_mode(&mut self, _args: &serde_json::Value) -> Result<String> {
+        let store = self.workspace_store()?;
+        let mut session = self.current_session(&store)?;
+        let plan_id = session.active_plan_id.unwrap_or_else(Uuid::now_v7);
+        let previous_version = store
+            .load_plan(plan_id)?
+            .map(|plan| plan.version)
+            .unwrap_or(0);
+        let plan_text = self.latest_assistant_text();
+        let goal = if let Some(plan) = store.load_plan(plan_id)? {
+            plan.goal
+        } else {
+            self.latest_user_prompt()
+        };
+        let plan = self.build_plan_from_text(plan_id, previous_version + 1, goal, &plan_text);
+
+        session.status = SessionState::AwaitingApproval;
+        session.active_plan_id = Some(plan_id);
+        store.save_session(&session)?;
+        store.save_plan(session.session_id, &plan)?;
+        self.phase = Some(codingbuddy_core::TaskPhase::Plan);
+        self.phase_read_only_calls = 0;
+        self.phase_edit_calls = 0;
+
+        self.emit_event_if_present(EventKind::PlanRevised { plan });
+        self.emit_event_if_present(EventKind::ExitPlanMode {
+            session_id: session.session_id,
+        });
+
+        Ok("Plan saved. Await user approval before executing code changes.".to_string())
     }
 
     /// Handle the skill tool invocation.
@@ -1899,6 +2384,14 @@ impl<'a> ToolUseLoop<'a> {
         if result.forked {
             if let Some(ref worker) = self.config.subagent_worker {
                 let request = SubagentRequest {
+                    run_id: Uuid::now_v7(),
+                    task_id: None,
+                    parent_session_id: self
+                        .workspace_store()
+                        .ok()
+                        .and_then(|store| self.current_session(&store).ok())
+                        .map(|session| session.session_id),
+                    child_session_id: None,
                     prompt: result.rendered_prompt.clone(),
                     task_name: format!("skill:{skill_name}"),
                     subagent_type: "general-purpose".to_string(),

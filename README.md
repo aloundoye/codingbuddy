@@ -13,7 +13,7 @@ CodingBuddy is a terminal-native coding agent written in Rust. It combines chat,
 - **Per-turn retrieval**: Vector + BM25 code search with RRF fusion — fires every turn, not just the first
 - **Privacy scanning**: 3-layer secret detection (path/content/builtin patterns) with redaction on tool outputs
 - **Ghost text**: Local ML-powered inline completions in the TUI (Tab to accept, Alt+Right for one word)
-- **Multi-provider**: DeepSeek default, any OpenAI-compatible endpoint (GLM-5, Qwen, Ollama, OpenRouter, etc.) via setup wizard or `--model` flag
+- **Provider support**: DeepSeek is fully supported today. OpenAI-compatible and Ollama support are planned as capability-gated providers rather than best-effort aliases.
 - **Model routing**: Automatically routes complex tasks to `deepseek-reasoner`, simple tasks to `deepseek-chat`
 - **Step snapshots**: Per-tool-call file snapshots with content hashing for fine-grained undo
 - **Default deny rules**: Built-in safety rules block dangerous operations (`rm -rf`, `git push --force`, `.env` edits)
@@ -34,7 +34,7 @@ CodingBuddy is a Rust workspace organized into focused crates:
 |-------|------|
 | `codingbuddy-cli` | CLI dispatch, argument parsing, 24 subcommand handlers |
 | `codingbuddy-agent` | Agent engine, tool-use loop, complexity classifier, prompt construction, phase loop, team mode |
-| `codingbuddy-core` | Shared types (`AppConfig`, `ChatRequest`, `StreamChunk`, `TaskPhase`, `EventEnvelope`), config loading, multi-provider config |
+| `codingbuddy-core` | Shared types (`AppConfig`, `ChatRequest`, `StreamChunk`, `TaskPhase`, `EventEnvelope`), config loading, session/task metadata |
 | `codingbuddy-llm` | LLM client (`LlmClient` trait), streaming, prompt cache, cached API key resolution |
 | `codingbuddy-tools` | Tool definitions (enriched descriptions), plugin manager, shell runner, sandbox wrapping |
 | `codingbuddy-policy` | Permission engine (denylist/allowlist), approval gates, output scanner, `ManagedSettings`, default deny rules |
