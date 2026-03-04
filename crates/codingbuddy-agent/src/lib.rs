@@ -1165,8 +1165,9 @@ fn build_retriever_callback(
         ..Default::default()
     };
 
-    // Build hybrid retriever: use UsearchBackend (HNSW) with local-ml, BruteForce without.
-    #[cfg(feature = "local-ml")]
+    // Build hybrid retriever: use UsearchBackend only when explicitly enabled;
+    // otherwise stick to the built-in brute-force backend for portability.
+    #[cfg(feature = "local-ml-usearch")]
     let retriever = match codingbuddy_local_ml::UsearchBackend::new(embeddings.dimension()) {
         Ok(backend) => codingbuddy_local_ml::HybridRetriever::new_with_backend(
             &index_path,
@@ -1184,6 +1185,14 @@ fn build_retriever_callback(
             chunk_config,
         ),
     };
+    #[cfg(all(feature = "local-ml", not(feature = "local-ml-usearch")))]
+    let retriever = codingbuddy_local_ml::HybridRetriever::new(
+        &index_path,
+        embeddings,
+        None,
+        0.7,
+        chunk_config,
+    );
     #[cfg(not(feature = "local-ml"))]
     let retriever = codingbuddy_local_ml::HybridRetriever::new(
         &index_path,

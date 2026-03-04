@@ -9,11 +9,12 @@ license.workspace = true
 default = []
 local-ml = [
     "candle-core", "candle-nn", "candle-transformers",
-    "tokenizers", "hf-hub", "usearch",
+    "tokenizers", "hf-hub",
     "tree-sitter", "tree-sitter-rust", "tree-sitter-python",
     "tree-sitter-javascript", "tree-sitter-typescript",
     "tree-sitter-go", "tree-sitter-java",
 ]
+usearch-backend = ["dep:usearch"]
 
 [dependencies]
 anyhow.workspace = true
