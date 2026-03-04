@@ -749,7 +749,62 @@ fn parse_hook_output(stdout: &str) -> HookOutput {
             return parsed;
         }
     }
+    let fallback = parse_hook_output_loose(trimmed);
+    if fallback.decision.is_some()
+        || fallback.reason.is_some()
+        || fallback.updated_input.is_some()
+        || fallback.permission_decision.is_some()
+        || fallback.additional_context.is_some()
+    {
+        return fallback;
+    }
     HookOutput::default()
+}
+
+fn parse_hook_output_loose(stdout: &str) -> HookOutput {
+    let mut output = HookOutput::default();
+    if let Some(value) = extract_loose_field(stdout, "permissionDecision") {
+        let normalized = value.to_ascii_lowercase();
+        if matches!(normalized.as_str(), "allow" | "deny" | "ask") {
+            output.permission_decision = Some(normalized);
+        }
+    }
+    if let Some(value) = extract_loose_field(stdout, "decision")
+        && value.eq_ignore_ascii_case("block")
+    {
+        output.decision = Some("block".to_string());
+    }
+    if let Some(value) = extract_loose_field(stdout, "reason")
+        && !value.is_empty()
+    {
+        output.reason = Some(value);
+    }
+    output
+}
+
+fn extract_loose_field(input: &str, key: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    let key_lower = key.to_ascii_lowercase();
+    let start = lower.find(&key_lower)?;
+    let bytes = input.as_bytes();
+    let mut i = start + key.len();
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+        i += 1;
+    }
+    if i < bytes.len() && matches!(bytes[i], b':' | b'=') {
+        i += 1;
+    }
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+        i += 1;
+    }
+    let value_start = i;
+    while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b'\n' | b'\r' | b'"' | b'\'') {
+        i += 1;
+    }
+    if value_start >= i {
+        return None;
+    }
+    Some(input[value_start..i].trim().to_string())
 }
 
 fn build_command(path: &Path) -> Command {
@@ -1335,6 +1390,22 @@ mod tests {
 
     // ── P5-11: Permission decision tests ──
 
+    fn permission_allow_command() -> String {
+        if cfg!(target_os = "windows") {
+            r#"echo {"permissionDecision":"allow"}"#.to_string()
+        } else {
+            r#"echo '{"permissionDecision":"allow"}'"#.to_string()
+        }
+    }
+
+    fn permission_deny_command() -> String {
+        if cfg!(target_os = "windows") {
+            r#"echo {"permissionDecision":"deny","decision":"block","reason":"policy_violation"} && exit /b 2"#.to_string()
+        } else {
+            r#"echo '{"permissionDecision":"deny","decision":"block","reason":"policy_violation"}' && exit 2"#.to_string()
+        }
+    }
+
     #[test]
     fn permission_hook_allows() {
         let mut events = std::collections::HashMap::new();
@@ -1343,7 +1414,7 @@ mod tests {
             vec![HookDefinition {
                 matcher: None,
                 hooks: vec![HookHandler::Command {
-                    command: r#"echo '{"permissionDecision":"allow"}'"#.to_string(),
+                    command: permission_allow_command(),
                     timeout: 5,
                 }],
                 once: false,
@@ -1377,7 +1448,7 @@ mod tests {
             vec![HookDefinition {
                 matcher: None,
                 hooks: vec![HookHandler::Command {
-                    command: r#"echo '{"permissionDecision":"deny","decision":"block","reason":"policy violation"}' && exit 2"#.to_string(),
+                    command: permission_deny_command(),
                     timeout: 5,
                 }],
                 once: false,
