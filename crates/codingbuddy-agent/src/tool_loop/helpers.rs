@@ -1,30 +1,13 @@
 //! Small utility functions used across the tool loop.
 
+use codingbuddy_core::ToolName;
+
 /// Check if a tool API name is read-only.
 pub(crate) fn is_read_only_api_name(name: &str) -> bool {
-    matches!(
-        name,
-        "fs_read"
-            | "fs_glob"
-            | "fs_grep"
-            | "fs_list"
-            | "git_status"
-            | "git_diff"
-            | "git_show"
-            | "git_log"
-            | "web_search"
-            | "web_fetch"
-            | "notebook_read"
-            | "index_query"
-            | "extended_thinking"
-            | "think_deeply"
-            | "user_question"
-            | "spawn_task"
-            | "task_output"
-            | "task_list"
-            | "task_get"
-            | "diagnostics_check"
-    )
+    matches!(name, "extended_thinking" | "think_deeply")
+        || ToolName::from_api_name(name)
+            .map(|tool| tool.is_read_only())
+            .unwrap_or(false)
 }
 
 /// Strip fenced code blocks from text so that word counting applies only to prose.

@@ -24,8 +24,8 @@ pub fn has_local_ml_feature() -> bool {
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use codingbuddy_core::{
-    AppConfig, ChatMessage, ChatRequest, EventEnvelope, EventKind, StreamChunk, ToolCall,
-    ToolChoice, UserQuestionHandler,
+    AppConfig, ChatMessage, ChatRequest, EventEnvelope, EventKind, Session, SessionBudgets,
+    SessionState, StreamChunk, TaskPhase, ToolCall, ToolChoice, UserQuestionHandler,
 };
 use codingbuddy_hooks::{HookRuntime, HooksConfig};
 use codingbuddy_llm::{ApiClient, LlmClient};
@@ -34,10 +34,14 @@ use codingbuddy_observe::Observer;
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
 use codingbuddy_subagent::SubagentTask;
-use codingbuddy_tools::{LocalToolHost, tool_definitions};
+use codingbuddy_tools::{
+    LocalToolHost, detect_signals, tiered_tool_definitions, tool_definitions,
+    tool_search_definition,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Handler for spawn_task subagent workers. Retained for API compatibility,
 /// but the core loop does not dispatch subagents in this architecture.
@@ -78,6 +82,8 @@ pub struct ChatOptions {
     pub images: Vec<codingbuddy_core::ImageContent>,
     /// Full context history (transcript) of the active session.
     pub chat_history: Vec<ChatMessage>,
+    /// Optional explicit session target, used for child-session delegation.
+    pub session_id: Option<Uuid>,
 }
 
 pub struct AgentEngine {
@@ -288,26 +294,40 @@ impl AgentEngine {
     }
 
     pub fn set_approval_handler(&self, handler: ApprovalHandler) {
-        if let Ok(mut guard) = self.approval_handler.lock() {
-            *guard = Some(Arc::new(Mutex::new(handler)));
+        match self.approval_handler.lock() {
+            Ok(mut guard) => {
+                *guard = Some(Arc::new(Mutex::new(handler)));
+            }
+            Err(_) => eprintln!("[agent] approval handler mutex poisoned; handler not installed"),
         }
     }
 
     pub fn set_stream_callback(&self, cb: codingbuddy_core::StreamCallback) {
-        if let Ok(mut guard) = self.stream_callback.lock() {
-            *guard = Some(cb);
+        match self.stream_callback.lock() {
+            Ok(mut guard) => {
+                *guard = Some(cb);
+            }
+            Err(_) => eprintln!("[agent] stream callback mutex poisoned; callback not installed"),
         }
     }
 
     pub fn set_user_question_handler(&self, handler: UserQuestionHandler) {
-        if let Ok(mut guard) = self.user_question_handler.lock() {
-            *guard = Some(handler);
+        match self.user_question_handler.lock() {
+            Ok(mut guard) => {
+                *guard = Some(handler);
+            }
+            Err(_) => {
+                eprintln!("[agent] user question handler mutex poisoned; handler not installed")
+            }
         }
     }
 
     pub fn set_subagent_worker(&self, worker: SubagentWorkerFn) {
-        if let Ok(mut guard) = self.subagent_worker.lock() {
-            *guard = Some(worker);
+        match self.subagent_worker.lock() {
+            Ok(mut guard) => {
+                *guard = Some(worker);
+            }
+            Err(_) => eprintln!("[agent] subagent worker mutex poisoned; worker not installed"),
         }
     }
 
@@ -315,11 +335,11 @@ impl AgentEngine {
         self.subagent_worker.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Build a subagent worker closure that delegates spawn_task to a new engine instance.
+    /// Build a subagent worker closure from the installed worker, if any.
     ///
-    /// If the user has provided an explicit subagent worker (via `set_subagent_worker`),
-    /// that takes priority. Otherwise we build a default worker that creates a new
-    /// `AgentEngine` and runs `chat_with_options()` with the subtask prompt.
+    /// The CLI installs a worker that creates child sessions and runs delegated
+    /// tasks in isolated engine scopes. When no worker is installed, spawn_task
+    /// remains unavailable in that context.
     fn build_subagent_worker(&self) -> Option<tool_loop::SubagentWorker> {
         // Check if user provided an explicit worker
         if let Some(worker) = self.subagent_worker() {
@@ -328,14 +348,21 @@ impl AgentEngine {
                 let role = match req.subagent_type.as_str() {
                     "explore" => codingbuddy_subagent::SubagentRole::Explore,
                     "plan" => codingbuddy_subagent::SubagentRole::Plan,
+                    "bash" => codingbuddy_subagent::SubagentRole::Bash,
                     _ => codingbuddy_subagent::SubagentRole::Task,
                 };
                 let task = SubagentTask {
-                    run_id: uuid::Uuid::new_v4(),
+                    run_id: req.run_id,
                     name: req.task_name.clone(),
                     goal: req.prompt.clone(),
                     role,
                     team: String::new(),
+                    task_id: req.task_id,
+                    parent_session_id: req.parent_session_id,
+                    child_session_id: req.child_session_id,
+                    model_override: req.model_override.clone(),
+                    max_turns: req.max_turns,
+                    run_in_background: req.run_in_background,
                     read_only_fallback: false,
                     custom_agent: None,
                 };
@@ -343,6 +370,33 @@ impl AgentEngine {
             }));
         }
         None
+    }
+
+    fn ensure_session_record_for(&self, session_id: Option<Uuid>) -> Result<Session> {
+        if let Some(session_id) = session_id {
+            return self
+                .store
+                .load_session(session_id)?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"));
+        }
+
+        if let Some(existing) = self.store.load_latest_session()? {
+            return Ok(existing);
+        }
+
+        let session = Session {
+            session_id: uuid::Uuid::now_v7(),
+            workspace_root: self.workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: self.cfg.budgets.max_turn_duration_secs,
+                max_think_tokens: self.cfg.budgets.max_reasoner_tokens_per_session as u32,
+            },
+            active_plan_id: None,
+        };
+        self.store.save_session(&session)?;
+        Ok(session)
     }
 
     /// Build a skill runner callback that wraps SkillManager.
@@ -554,6 +608,27 @@ impl AgentEngine {
         let initial_context =
             self.build_bootstrap_context(prompt, options, self.cfg.llm.context_window_tokens);
 
+        let session = self.ensure_session_record_for(options.session_id)?;
+        let initial_phase = match session.status {
+            SessionState::Planning | SessionState::AwaitingApproval => {
+                if prompt_grants_plan_approval(prompt) {
+                    self.append_event_best_effort_for_session(
+                        Some(session.session_id),
+                        EventKind::SessionStateChanged {
+                        from: session.status.clone(),
+                        to: SessionState::ExecutingStep,
+                    },
+                    );
+                    Some(TaskPhase::Execute)
+                } else {
+                    Some(TaskPhase::Plan)
+                }
+            }
+            SessionState::ExecutingStep => Some(TaskPhase::Execute),
+            SessionState::Verifying => Some(TaskPhase::Verify),
+            _ => None,
+        };
+
         let config = tool_loop::ToolLoopConfig {
             model: self.cfg.llm.base_model.clone(), // Always deepseek-chat
             max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
@@ -574,11 +649,18 @@ impl AgentEngine {
             images: options.images.clone(),
             initial_context,
             profile_name: profile.map(|p| p.name.to_string()),
+            initial_phase,
+            session_id: Some(session.session_id),
             edit_validator: None,
         };
 
-        // Build tool list: built-in tools + MCP-discovered tools.
-        let mut tools = tool_definitions();
+        // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.
+        let builtin_tools = tool_definitions();
+        let signals = detect_signals(prompt, &self.workspace);
+        let (mut tools, extended_tools) = tiered_tool_definitions(builtin_tools, &signals);
+        if !extended_tools.is_empty() {
+            tools.push(tool_search_definition());
+        }
         if let Some(ref mcp) = self.mcp
             && let Ok(mcp_tools) = mcp.discover_tools()
         {
@@ -617,31 +699,63 @@ impl AgentEngine {
         );
 
         // Wire stream callback
-        if let Ok(guard) = self.stream_callback.lock()
-            && let Some(ref cb) = *guard
         {
-            loop_.set_stream_callback(cb.clone());
+            let guard = self
+                .stream_callback
+                .lock()
+                .map_err(|_| anyhow!("stream callback mutex poisoned"))?;
+            if let Some(ref cb) = *guard {
+                loop_.set_stream_callback(cb.clone());
+            }
         }
 
         // Wire approval handler (clone Arc — engine stays reusable across run() calls)
-        if let Ok(guard) = self.approval_handler.lock()
-            && let Some(ref handler) = *guard
         {
-            let handler = handler.clone();
-            loop_.set_approval_callback(Arc::new(move |call| {
-                let mut h = handler
-                    .lock()
-                    .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
-                h(call)
-            }));
+            let guard = self
+                .approval_handler
+                .lock()
+                .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
+            if let Some(ref handler) = *guard {
+                let handler = handler.clone();
+                loop_.set_approval_callback(Arc::new(move |call| {
+                    let mut h = handler
+                        .lock()
+                        .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
+                    h(call)
+                }));
+            }
         }
 
         // Wire user question handler (clone Arc — already Arc<dyn Fn>)
-        if let Ok(guard) = self.user_question_handler.lock()
-            && let Some(ref handler) = *guard
         {
-            loop_.set_user_question_callback(handler.clone());
+            let guard = self
+                .user_question_handler
+                .lock()
+                .map_err(|_| anyhow!("user question handler mutex poisoned"))?;
+            if let Some(ref handler) = *guard {
+                loop_.set_user_question_callback(handler.clone());
+            }
         }
+
+        loop_.set_event_callback(Arc::new({
+            let workspace = self.workspace.clone();
+            let session_id = session.session_id;
+            move |kind| {
+                let Ok(store) = Store::new(&workspace) else {
+                    return;
+                };
+                let Ok(seq_no) = store.next_seq_no(session_id) else {
+                    return;
+                };
+                let event = EventEnvelope {
+                    seq_no,
+                    at: Utc::now(),
+                    session_id,
+                    kind,
+                };
+                let _ = store.append_event(&event);
+            }
+        }));
 
         // Wire hooks — create a new runtime with the same config for the loop
         {
@@ -748,20 +862,24 @@ impl AgentEngine {
 
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
+        let session = self.ensure_session_record_for(options.session_id)?;
+        options.session_id = Some(session.session_id);
 
         // Load chat history from the store if possible
-        if let Ok(Some(session)) = self.store.load_latest_session()
-            && let Ok(projection) = self.store.rebuild_from_events(session.session_id)
+        if let Ok(projection) = self.store.rebuild_from_events(session.session_id)
         {
             options.chat_history = projection.chat_messages;
         }
 
         // Record User Turn
-        self.append_event_best_effort(EventKind::ChatTurn {
+        self.append_event_best_effort_for_session(
+            Some(session.session_id),
+            EventKind::ChatTurn {
             message: ChatMessage::User {
                 content: prompt_enriched.clone(),
             },
-        });
+        },
+        );
 
         let result = if !options.tools {
             // No tools requested → use the analysis path (read-only Q&A)
@@ -774,13 +892,16 @@ impl AgentEngine {
 
         if let Ok(text) = &result {
             // Record Assistant Turn
-            self.append_event_best_effort(EventKind::ChatTurn {
+            self.append_event_best_effort_for_session(
+                Some(session.session_id),
+                EventKind::ChatTurn {
                 message: ChatMessage::Assistant {
                     content: Some(text.clone()),
                     reasoning_content: None,
                     tool_calls: vec![],
                 },
-            });
+            },
+            );
         }
 
         // Fire Stop hooks for post-processing (logging, notifications, etc.)
@@ -790,7 +911,15 @@ impl AgentEngine {
     }
 
     pub(crate) fn append_event_best_effort(&self, kind: EventKind) {
-        let Ok(Some(session)) = self.store.load_latest_session() else {
+        self.append_event_best_effort_for_session(None, kind);
+    }
+
+    pub(crate) fn append_event_best_effort_for_session(
+        &self,
+        session_id: Option<Uuid>,
+        kind: EventKind,
+    ) {
+        let Ok(session) = self.ensure_session_record_for(session_id) else {
             return;
         };
         let Ok(seq_no) = self.store.next_seq_no(session.session_id) else {
@@ -802,7 +931,9 @@ impl AgentEngine {
             session_id: session.session_id,
             kind,
         };
-        let _ = self.store.append_event(&event);
+        if let Err(err) = self.store.append_event(&event) {
+            eprintln!("[agent] failed to persist event: {err}");
+        }
     }
 
     #[allow(dead_code)]
@@ -843,6 +974,21 @@ impl AgentEngine {
             projection.step_status.len()
         ))
     }
+}
+
+fn prompt_grants_plan_approval(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    [
+        "go ahead",
+        "proceed",
+        "execute",
+        "implement",
+        "apply the plan",
+        "start coding",
+        "continue with the plan",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Truncate text to fit a token budget (chars/4 heuristic).

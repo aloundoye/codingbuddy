@@ -445,6 +445,7 @@ impl ToolName {
                 | Self::UserQuestion
                 | Self::TaskGet
                 | Self::TaskList
+                | Self::TaskOutput
         )
     }
 
@@ -524,6 +525,7 @@ impl ToolName {
         Self::ExitPlanMode,
         Self::Skill,
         Self::KillShell,
+        Self::Batch,
     ];
 }
 

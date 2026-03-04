@@ -10,6 +10,7 @@ use uuid::Uuid;
 pub enum SubagentRole {
     Explore,
     Plan,
+    Bash,
     Task,
     Custom(String),
 }
@@ -19,8 +20,9 @@ impl SubagentRole {
         match self {
             Self::Explore => 0,
             Self::Plan => 1,
-            Self::Task => 2,
-            Self::Custom(_) => 3,
+            Self::Bash => 2,
+            Self::Task => 3,
+            Self::Custom(_) => 4,
         }
     }
 }
@@ -32,6 +34,18 @@ pub struct SubagentTask {
     pub goal: String,
     pub role: SubagentRole,
     pub team: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<usize>,
+    #[serde(default)]
+    pub run_in_background: bool,
     /// When true, the subagent should only use read-only operations.
     /// Set automatically on retry when a permission denial is detected.
     #[serde(default)]
@@ -234,10 +248,21 @@ impl BackgroundTaskRegistry {
 
         let tasks_ref = self.tasks.clone();
         thread::spawn(move || {
-            let (status, result, error) = match worker() {
-                Ok(output) => (BackgroundTaskStatus::Completed, Some(output), None),
-                Err(e) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
-            };
+            let (status, result, error) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)) {
+                    Ok(Ok(output)) => (BackgroundTaskStatus::Completed, Some(output), None),
+                    Ok(Err(e)) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
+                    Err(panic) => {
+                        let panic_msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "subagent worker panicked".to_string()
+                        };
+                        (BackgroundTaskStatus::Failed, None, Some(panic_msg))
+                    }
+                };
             let finished_at = chrono::Utc::now();
             if let Ok(mut tasks) = tasks_ref.lock()
                 && let Some(entry) = tasks.get_mut(&id)
@@ -793,6 +818,12 @@ mod tests {
                 goal: "analyze".to_string(),
                 role: SubagentRole::Task,
                 team: "default".to_string(),
+                task_id: None,
+                parent_session_id: None,
+                child_session_id: None,
+                model_override: None,
+                max_turns: None,
+                run_in_background: false,
                 read_only_fallback: false,
                 custom_agent: None,
             })
@@ -826,6 +857,12 @@ mod tests {
             goal: "recover".to_string(),
             role: SubagentRole::Task,
             team: "execution".to_string(),
+            task_id: None,
+            parent_session_id: None,
+            child_session_id: None,
+            model_override: None,
+            max_turns: None,
+            run_in_background: false,
             read_only_fallback: false,
             custom_agent: None,
         };
@@ -858,6 +895,12 @@ mod tests {
                 goal: "x".to_string(),
                 role,
                 team: team.to_string(),
+                task_id: None,
+                parent_session_id: None,
+                child_session_id: None,
+                model_override: None,
+                max_turns: None,
+                run_in_background: false,
                 read_only_fallback: false,
                 custom_agent: None,
             });
@@ -881,6 +924,12 @@ mod tests {
             goal: "fix bug".to_string(),
             role: SubagentRole::Task,
             team: "execution".to_string(),
+            task_id: None,
+            parent_session_id: None,
+            child_session_id: None,
+            model_override: None,
+            max_turns: None,
+            run_in_background: false,
             read_only_fallback: false,
             custom_agent: None,
         };
@@ -945,6 +994,12 @@ mod tests {
                 goal: "do work".to_string(),
                 role: SubagentRole::Task,
                 team: "alpha".to_string(),
+                task_id: None,
+                parent_session_id: None,
+                child_session_id: None,
+                model_override: None,
+                max_turns: None,
+                run_in_background: false,
                 read_only_fallback: false,
                 custom_agent: None,
             })
@@ -1317,6 +1372,12 @@ mod tests {
             goal: "read system file".to_string(),
             role: SubagentRole::Task,
             team: "execution".to_string(),
+            task_id: None,
+            parent_session_id: None,
+            child_session_id: None,
+            model_override: None,
+            max_turns: None,
+            run_in_background: false,
             read_only_fallback: false,
             custom_agent: None,
         };

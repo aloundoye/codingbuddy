@@ -39,30 +39,70 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
     let workspace = cwd.to_path_buf();
     let worker = std::sync::Arc::new(
         move |task: &codingbuddy_subagent::SubagentTask| -> anyhow::Result<String> {
-            let engine = codingbuddy_agent::AgentEngine::new(&workspace)?;
+            let mut engine = codingbuddy_agent::AgentEngine::new(&workspace)?;
+            let (mode, force_max_think, role_prompt) = match &task.role {
+                codingbuddy_subagent::SubagentRole::Explore => (
+                    codingbuddy_agent::ChatMode::Ask,
+                    false,
+                    "You are an exploration subagent. Read, search, and summarize. Do not edit files.",
+                ),
+                codingbuddy_subagent::SubagentRole::Plan => (
+                    codingbuddy_agent::ChatMode::Ask,
+                    true,
+                    "You are a planning subagent. Explore the codebase, identify risks, and produce a concrete implementation plan. Do not edit files.",
+                ),
+                codingbuddy_subagent::SubagentRole::Bash => (
+                    codingbuddy_agent::ChatMode::Code,
+                    false,
+                    "You are a bash-focused subagent. Prefer commands and verification steps, keep file edits minimal, and report command outcomes precisely.",
+                ),
+                codingbuddy_subagent::SubagentRole::Task => (
+                    codingbuddy_agent::ChatMode::Code,
+                    false,
+                    "You are an execution subagent. Use the available tools to complete the delegated task and report what changed and what remains.",
+                ),
+                codingbuddy_subagent::SubagentRole::Custom(_) => (
+                    codingbuddy_agent::ChatMode::Code,
+                    false,
+                    "You are a custom subagent. Follow the delegated objective and use tools deliberately.",
+                ),
+            };
             let mut options = codingbuddy_agent::ChatOptions {
-                tools: false, // Subagents (specialists) do not have direct tool access
-                mode: codingbuddy_agent::ChatMode::Ask, // Ensure no patching is done
+                tools: true,
+                force_max_think,
+                mode,
+                session_id: task.child_session_id,
                 ..Default::default()
             };
 
+            if let Some(max_turns) = task.max_turns {
+                engine.set_max_turns(Some(max_turns as u64));
+            }
+            if let Some(model) = &task.model_override {
+                engine.cfg_mut().llm.base_model = model.clone();
+            }
+
             let system_prompt = match task.name.as_str() {
                 "debugger" => {
-                    "You are the Debugger subagent. Triage failing tests or build data and return a strict JSON object with `{\"analysis\": \"...\", \"suspect_files\": [\"...\"], \"suggested_fix\": \"...\"}`."
+                    "You are the Debugger subagent. Triage failing tests or build output, identify suspect files, and recommend the smallest credible fix."
                 }
                 "refactor-sheriff" => {
-                    "You are the Refactor Sheriff subagent. Analyze the code for refactoring opportunities without changing behavior. Return a strict JSON object with `{\"issues\": [\"...\"], \"recommendation\": \"...\"}`."
+                    "You are the Refactor Sheriff subagent. Identify behavior-preserving refactors, call out risks, and propose the cleanest change sequence."
                 }
                 "security-sentinel" => {
-                    "You are the Security Sentinel subagent. Scan the requested changes or goal for security vulnerabilities or risky commands. Return a strict JSON object with `{\"safe\": boolean, \"risks\": [\"...\"], \"mitigation\": \"...\"}`."
+                    "You are the Security Sentinel subagent. Review the requested goal for vulnerabilities, risky commands, and unsafe assumptions."
                 }
-                _ => {
-                    "You are a specialized subagent. Execute your goal and return a strict JSON object with `{\"findings\": \"...\", \"recommendation\": \"...\"}`."
-                }
+                _ => role_prompt,
             };
 
             options.system_prompt_append = Some(format!(
-                "{system_prompt}\n\nYour Goal:\n{}\n\nRemember: Output ONLY valid JSON matching the exact schema required.",
+                "{system_prompt}\n\nParent Session: {}\nChild Session: {}\nDelegated Goal:\n{}\n\nReturn a concise, structured result with findings, actions taken, and any remaining risks or follow-ups.",
+                task.parent_session_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                task.child_session_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 task.goal
             ));
             engine.chat_with_options(&task.goal, options)
@@ -112,6 +152,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         watch_files: cli.watch_files,
         images: vec![],
         chat_history: vec![],
+        session_id: None,
     }
 }
 

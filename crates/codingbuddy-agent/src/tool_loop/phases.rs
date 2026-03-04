@@ -3,54 +3,29 @@
 //! Implements the Explore→Plan→Execute→Verify workflow with tool filtering
 //! per phase. Simple/Medium tasks bypass phases entirely.
 
-use codingbuddy_core::TaskPhase;
+use codingbuddy_core::{TaskPhase, ToolName};
+use codingbuddy_tools::PLAN_MODE_TOOLS;
 
-/// Read-only tools allowed during the Explore phase.
-const EXPLORE_TOOLS: &[&str] = &[
-    "fs_read",
-    "fs_list",
-    "fs_glob",
-    "fs_grep",
-    "git_status",
-    "git_diff",
-    "git_show",
-    "index_query",
-    "git_log",
-];
+use super::helpers::is_read_only_api_name;
 
-/// Verify phase allows read-only tools plus bash_run for tests.
-const VERIFY_TOOLS: &[&str] = &[
-    "fs_read",
-    "fs_list",
-    "fs_glob",
-    "fs_grep",
-    "git_status",
-    "git_diff",
-    "git_show",
-    "index_query",
-    "git_log",
-    "bash_run",
-];
+fn is_mcp_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp__")
+}
 
 /// Check if a tool is allowed in the given phase.
 /// Returns true if the tool should be included in the request.
-/// Plan and Execute phases allow all tools.
 pub fn is_tool_allowed_in_phase(tool_name: &str, phase: TaskPhase) -> bool {
+    if is_mcp_tool(tool_name) {
+        return true;
+    }
+
     match phase {
-        TaskPhase::Explore => {
-            // MCP tools always pass through
-            if tool_name.starts_with("mcp__") {
-                return true;
-            }
-            EXPLORE_TOOLS.contains(&tool_name)
-        }
+        TaskPhase::Explore => is_read_only_api_name(tool_name),
+        TaskPhase::Plan => PLAN_MODE_TOOLS.contains(&tool_name),
         TaskPhase::Verify => {
-            if tool_name.starts_with("mcp__") {
-                return true;
-            }
-            VERIFY_TOOLS.contains(&tool_name)
+            tool_name == ToolName::BashRun.as_api_name() || is_read_only_api_name(tool_name)
         }
-        TaskPhase::Plan | TaskPhase::Execute => true,
+        TaskPhase::Execute => true,
     }
 }
 

@@ -1707,7 +1707,6 @@ Using dedicated tools provides structured output, better error handling, and cle
 ## Tips\n\
 - Always provide a 'description' so the user understands what the command does\n\
 - Commands time out after 120 seconds by default. Set a higher timeout for long builds.\n\
-- Use run_in_background: true for long-running commands (builds, test suites). Use task_output to check results later.\n\
 - Quote file paths with spaces using double quotes\n\
 - Prefer absolute paths to avoid directory confusion".to_string(),
             strict: None,
@@ -1725,10 +1724,6 @@ Using dedicated tools provides structured output, better error handling, and cle
                         "description": {
                             "type": "string",
                             "description": "Short description of what this command does"
-                        },
-                        "run_in_background": {
-                            "type": "boolean",
-                            "description": "Set to true to run this command in the background. Returns immediately with a shell_id. Use task_output to check results."
                         }
                     },
                     "required": ["command"]
@@ -2371,7 +2366,6 @@ Always set in_progress before starting, completed only when fully done".to_strin
 - 'general-purpose': Full capabilities — for complex multi-step tasks requiring all tools\n\n\
 ## Tips\n\
 - Launch multiple agents concurrently when tasks are independent (use separate calls)\n\
-- Use run_in_background: true for tasks that don't block your current work\n\
 - Provide clear, detailed prompts so the agent can work autonomously".to_string(),
             strict: None,
                 parameters: json!({
@@ -2392,19 +2386,12 @@ Always set in_progress before starting, completed only when fully done".to_strin
                         },
                         "model": {
                             "type": "string",
-                            "description": "Optional model override for this agent"
+                            "description": "Optional model override for this delegated task"
                         },
                         "max_turns": {
                             "type": "integer",
-                            "description": "Maximum number of agentic turns before stopping"
-                        },
-                        "run_in_background": {
-                            "type": "boolean",
-                            "description": "Set to true to run this agent in the background. Returns immediately with a task_id. Use task_output to retrieve the result later."
-                        },
-                        "resume": {
-                            "type": "string",
-                            "description": "Optional agent ID to resume from a previous invocation"
+                            "minimum": 1,
+                            "description": "Optional maximum turns for the delegated task"
                         }
                     },
                     "required": ["description", "prompt", "subagent_type"]
@@ -2415,64 +2402,21 @@ Always set in_progress before starting, completed only when fully done".to_strin
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "task_output".to_string(),
-                description: "Retrieve output from a running or completed background task.\n\n\
-## When to use\n\
-- After spawning a background task with spawn_task(run_in_background=true)\n\
-- To check if a long-running task has finished (use block=false)\n\
-- To get the final result of a completed background task (use block=true)\n\n\
-## Parameters\n\
-- block=true (default): waits for the task to complete before returning\n\
-- block=false: returns immediately with current status, even if still running\n\
-- timeout: max wait time in ms (default 30000). Use longer timeouts for slow tasks\n\n\
-## Tips\n\
-- You will be automatically notified when background tasks complete — no need to poll\n\
-- If a task is still running with block=false, you'll get partial output and status 'running'".to_string(),
-            strict: None,
+                description: "Read the latest persisted output for a delegated task or subagent run. Use this after spawn_task when you need the current status, the child session ID, or the final summary.".to_string(),
+                strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "task_id": {
                             "type": "string",
-                            "description": "The task ID to get output from"
+                            "description": "Task UUID returned by task_create or spawn_task"
                         },
-                        "block": {
-                            "type": "boolean",
-                            "description": "Whether to wait for completion (default true)"
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Max wait time in milliseconds (default 30000)"
-                        }
-                    },
-                    "required": ["task_id"]
-                }),
-            },
-        },
-        ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDefinition {
-                name: "task_stop".to_string(),
-                description: "Stop a running background task by its ID.\n\n\
-## When to use\n\
-- A background task is taking too long and you want to cancel it\n\
-- The task's results are no longer needed (e.g. user changed direction)\n\
-- A task is stuck or producing errors and should be terminated\n\n\
-## When NOT to use\n\
-- To check task status — use task_output with block=false instead\n\
-- For tasks that have already completed — stopping has no effect\n\n\
-## Tips\n\
-- Returns success/failure status indicating whether the task was stopped\n\
-- Stopped tasks cannot be resumed — you would need to spawn a new one".to_string(),
-            strict: None,
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
+                        "run_id": {
                             "type": "string",
-                            "description": "The ID of the background task to stop"
+                            "description": "Subagent run UUID returned by spawn_task"
                         }
                     },
-                    "required": ["task_id"]
+                    "required": []
                 }),
             },
         },
@@ -2593,25 +2537,6 @@ For each task: id, subject, status, owner, blockedBy list\n\n\
                 }),
             },
         },
-        // ── KillShell tool (terminate background bash) ───────────────────
-        ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDefinition {
-                name: "kill_shell".to_string(),
-                description: "Stop a running background shell process by its shell ID. Use this to terminate a bash command that was started with run_in_background: true.".to_string(),
-            strict: None,
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "shell_id": {
-                            "type": "string",
-                            "description": "The ID of the background shell to stop"
-                        }
-                    },
-                    "required": ["shell_id"]
-                }),
-            },
-        },
         // ── extended_thinking: R1 consultation for complex subproblems ──
         ToolDefinition {
             tool_type: "function".to_string(),
@@ -2650,8 +2575,10 @@ For each task: id, subject, status, owner, blockedBy list\n\n\
     ]
 }
 
-/// Tools allowed in plan mode (read-only operations only).
-/// Built from `ToolName::is_read_only()`.
+/// Tools allowed in plan mode.
+///
+/// Plan mode blocks file edits and shell execution, but still allows planning
+/// metadata tools such as task creation and plan completion.
 pub const PLAN_MODE_TOOLS: &[&str] = &[
     "fs_read",
     "fs_list",
@@ -2671,6 +2598,7 @@ pub const PLAN_MODE_TOOLS: &[&str] = &[
     "task_update",
     "task_get",
     "task_list",
+    "task_output",
     "spawn_task",
     "exit_plan_mode",
 ];
@@ -2899,13 +2827,11 @@ pub const AGENT_LEVEL_TOOLS: &[&str] = &[
     "task_update",
     "task_get",
     "task_list",
-    "spawn_task",
     "task_output",
-    "task_stop",
+    "spawn_task",
     "enter_plan_mode",
     "exit_plan_mode",
     "skill",
-    "kill_shell",
     "extended_thinking",
 ];
 
@@ -5413,7 +5339,13 @@ mod tests {
             );
         }
         // Agent-level tools
-        for expected in ["user_question", "task_create", "task_update", "spawn_task"] {
+        for expected in [
+            "user_question",
+            "task_create",
+            "task_update",
+            "task_output",
+            "spawn_task",
+        ] {
             assert!(
                 names.contains(&expected),
                 "missing agent tool definition: {expected}"
@@ -5444,6 +5376,7 @@ mod tests {
         assert_eq!(map_tool_name("user_question"), "user_question");
         assert_eq!(map_tool_name("task_create"), "task_create");
         assert_eq!(map_tool_name("task_update"), "task_update");
+        assert_eq!(map_tool_name("task_output"), "task_output");
         assert_eq!(map_tool_name("spawn_task"), "spawn_task");
     }
 
@@ -5530,7 +5463,8 @@ mod tests {
     #[test]
     fn agent_level_tools_excluded_from_plan_mode() {
         for tool_name in AGENT_LEVEL_TOOLS {
-            // Agent-level tools that ARE in plan mode are: user_question, task_*, spawn_task, exit_plan_mode
+            // Agent-level tools that ARE in plan mode are: user_question, task_*, task_output,
+            // spawn_task, exit_plan_mode
             // The write-oriented agent-level tools should not be in plan mode:
             // enter_plan_mode makes no sense inside plan mode, kill_shell is mutating, skill is execution
             let expected_in_plan = matches!(
@@ -5540,6 +5474,7 @@ mod tests {
                     | "task_update"
                     | "task_get"
                     | "task_list"
+                    | "task_output"
                     | "spawn_task"
                     | "exit_plan_mode"
             );
