@@ -1408,6 +1408,7 @@ mod tests {
 
     #[test]
     fn permission_hook_allows() {
+        let temp = tempfile::tempdir().expect("tempdir");
         let mut events = std::collections::HashMap::new();
         events.insert(
             "PermissionRequest".to_string(),
@@ -1421,7 +1422,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(temp.path(), HooksConfig { events });
         let input = HookInput {
             event: "PermissionRequest".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1429,7 +1430,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: temp.path().to_string_lossy().to_string(),
         };
 
         let result = rt.fire(HookEvent::PermissionRequest, &input);
@@ -1442,6 +1443,7 @@ mod tests {
 
     #[test]
     fn permission_hook_denies() {
+        let temp = tempfile::tempdir().expect("tempdir");
         let mut events = std::collections::HashMap::new();
         events.insert(
             "PermissionRequest".to_string(),
@@ -1455,7 +1457,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(temp.path(), HooksConfig { events });
         let input = HookInput {
             event: "PermissionRequest".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1463,7 +1465,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: temp.path().to_string_lossy().to_string(),
         };
 
         let result = rt.fire(HookEvent::PermissionRequest, &input);
