@@ -657,6 +657,39 @@ fn load_config_if_exists(path: &Path) -> Result<McpConfig> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
+fn resolve_env_var(var_name: &str) -> Option<String> {
+    let name = var_name.trim();
+    if let Ok(value) = std::env::var(name)
+        && !value.is_empty()
+    {
+        return Some(value);
+    }
+
+    // Cross-platform HOME fallback: many configs use ${HOME} even on Windows.
+    if name.eq_ignore_ascii_case("HOME") {
+        if let Ok(profile) = std::env::var("USERPROFILE")
+            && !profile.is_empty()
+        {
+            return Some(profile);
+        }
+        let drive = std::env::var("HOMEDRIVE").unwrap_or_default();
+        let path = std::env::var("HOMEPATH").unwrap_or_default();
+        if !drive.is_empty() && !path.is_empty() {
+            return Some(format!("{drive}{path}"));
+        }
+    }
+
+    // Inverse fallback can help configs that use USERPROFILE on non-Windows hosts.
+    if name.eq_ignore_ascii_case("USERPROFILE")
+        && let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return Some(home);
+    }
+
+    None
+}
+
 /// Expand environment variables (`${VAR}` and `${VAR:-default}`) in a string.
 pub fn expand_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
@@ -672,9 +705,9 @@ pub fn expand_env_vars(input: &str) -> String {
                 var_expr.push(c);
             }
             if let Some((var_name, default)) = var_expr.split_once(":-") {
-                result.push_str(&std::env::var(var_name).unwrap_or_else(|_| default.to_string()));
+                result.push_str(&resolve_env_var(var_name).unwrap_or_else(|| default.to_string()));
             } else {
-                result.push_str(&std::env::var(&var_expr).unwrap_or_default());
+                result.push_str(&resolve_env_var(&var_expr).unwrap_or_default());
             }
         } else {
             result.push(ch);
