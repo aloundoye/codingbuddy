@@ -1,5 +1,6 @@
 mod fuzzy_edit;
 mod plugins;
+mod sandbox;
 mod shell;
 pub mod tool_tiers;
 pub mod validation;
@@ -47,6 +48,9 @@ use fuzzy_edit::{
     fuzzy_block_anchor, fuzzy_context_aware, fuzzy_escape_normalized, fuzzy_indentation_flexible,
     fuzzy_line_trimmed, fuzzy_trimmed_boundary, fuzzy_whitespace_normalized,
 };
+use sandbox::sandbox_wrap_command;
+#[cfg(test)]
+use sandbox::{build_bwrap_command, build_seatbelt_profile, seatbelt_wrap};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;
@@ -3889,125 +3893,6 @@ fn parse_ruff_json(output: &str) -> Vec<serde_json::Value> {
         }));
     }
     diagnostics
-}
-
-#[allow(dead_code)]
-fn build_seatbelt_profile(workspace: &Path, config: &codingbuddy_core::SandboxConfig) -> String {
-    let workspace_str = workspace.to_string_lossy();
-    let mut profile = String::from("(version 1)\n(deny default)\n");
-    profile.push_str("(allow process*)\n");
-    profile.push_str("(allow file-read* (subpath \"/usr\") (subpath \"/lib\") (subpath \"/bin\") (subpath \"/System\"))\n");
-    profile.push_str(&format!(
-        "(allow file-read* file-write* (subpath \"{}\"))\n",
-        workspace_str
-    ));
-    // Allow /tmp access
-    profile
-        .push_str("(allow file-read* file-write* (subpath \"/tmp\") (subpath \"/private/tmp\"))\n");
-    // Network access
-    if config.network.block_all {
-        profile.push_str("(deny network*)\n");
-        // Even when blocking network, allow local binding if configured
-        if config.network.allow_local_binding {
-            profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
-        }
-        if config.network.allow_unix_sockets {
-            profile.push_str("(allow network* (local unix-socket))\n");
-        }
-    } else {
-        profile.push_str("(allow network*)\n");
-    }
-    profile
-}
-
-/// Wrap a command with macOS Seatbelt sandbox.
-#[allow(dead_code)]
-fn seatbelt_wrap(cmd: &str, profile: &str) -> String {
-    // Escape single quotes in profile
-    let escaped_profile = profile.replace('\'', "'\\''");
-    format!("sandbox-exec -p '{}' -- {}", escaped_profile, cmd)
-}
-
-/// Build a Linux bubblewrap (bwrap) sandboxed command.
-#[allow(dead_code)]
-fn build_bwrap_command(
-    workspace: &Path,
-    cmd: &str,
-    config: &codingbuddy_core::SandboxConfig,
-) -> String {
-    let workspace_str = workspace.to_string_lossy();
-    let mut parts = vec![
-        "bwrap".to_string(),
-        "--die-with-parent".to_string(),
-        "--new-session".to_string(),
-    ];
-    // Read-only system paths
-    for sys_path in &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
-        parts.push("--ro-bind".to_string());
-        parts.push(sys_path.to_string());
-        parts.push(sys_path.to_string());
-    }
-    // Read-write workspace
-    parts.push("--bind".to_string());
-    parts.push(workspace_str.to_string());
-    parts.push(workspace_str.to_string());
-    // Tmp
-    parts.push("--tmpfs".to_string());
-    parts.push("/tmp".to_string());
-    // Network
-    if config.network.block_all {
-        if config.network.allow_local_binding || config.network.allow_unix_sockets {
-            // When local binding or unix sockets are allowed, we can't fully unshare
-            // network. Instead we rely on application-level filtering.
-            // bwrap doesn't support fine-grained socket filtering natively.
-        } else {
-            parts.push("--unshare-net".to_string());
-        }
-    }
-    // Proc and dev
-    parts.push("--proc".to_string());
-    parts.push("/proc".to_string());
-    parts.push("--dev".to_string());
-    parts.push("/dev".to_string());
-    parts.push("--".to_string());
-    parts.push(cmd.to_string());
-    parts.join(" ")
-}
-
-/// Wrap a command with the appropriate OS-level sandbox if enabled.
-#[allow(clippy::needless_return)]
-fn sandbox_wrap_command(
-    workspace: &Path,
-    cmd: &str,
-    config: &codingbuddy_core::SandboxConfig,
-) -> String {
-    if !config.enabled {
-        return cmd.to_string();
-    }
-    // Skip sandbox wrapping if already inside a container
-    if detect_container_environment().is_some() {
-        return cmd.to_string();
-    }
-    // Check if command is excluded
-    for excluded in &config.excluded_commands {
-        if cmd.starts_with(excluded) || cmd.contains(excluded) {
-            return cmd.to_string();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let profile = build_seatbelt_profile(workspace, config);
-        return seatbelt_wrap(cmd, &profile);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return build_bwrap_command(workspace, cmd, config);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = workspace;
-        cmd.to_string()
-    }
 }
 
 impl LocalToolHost {
