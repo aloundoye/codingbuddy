@@ -190,7 +190,7 @@ fn load_autocomplete_backend(
             &model_path.join("tokenizer.json"),
             &device,
         )?;
-        return Ok(Arc::new(backend));
+        Ok(Arc::new(backend))
     }
 
     #[cfg(not(feature = "local-ml"))]

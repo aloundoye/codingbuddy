@@ -3891,6 +3891,7 @@ fn parse_ruff_json(output: &str) -> Vec<serde_json::Value> {
     diagnostics
 }
 
+#[allow(dead_code)]
 fn build_seatbelt_profile(workspace: &Path, config: &codingbuddy_core::SandboxConfig) -> String {
     let workspace_str = workspace.to_string_lossy();
     let mut profile = String::from("(version 1)\n(deny default)\n");
