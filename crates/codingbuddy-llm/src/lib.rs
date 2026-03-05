@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
-    CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse,
-    LlmToolCall, ProviderKind, StreamCallback, StreamChunk, normalize_codingbuddy_model,
+    CancellationToken, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
+    ProviderKind, StreamCallback, StreamChunk, normalize_codingbuddy_model,
     normalize_codingbuddy_profile,
 };
 use reqwest::StatusCode;
@@ -14,6 +14,8 @@ use std::error::Error as StdError;
 use std::io::BufRead;
 use std::thread;
 use std::time::Duration;
+
+mod provider_transform;
 
 /// Base delay for network/transport error retries (1s, 2s, 4s exponential backoff).
 const NETWORK_RETRY_BASE_MS: u64 = 1000;
@@ -327,64 +329,7 @@ impl ApiClient {
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
         let thinking_enabled = requested_thinking && capabilities.supports_thinking_config;
-
-        let mut messages: Vec<Value> = req
-            .messages
-            .iter()
-            .map(|m| match m {
-                ChatMessage::System { content } => json!({"role": "system", "content": content}),
-                ChatMessage::User { content } => json!({"role": "user", "content": content}),
-                ChatMessage::Assistant {
-                    content,
-                    reasoning_content,
-                    tool_calls,
-                } => {
-                    let mut msg = json!({"role": "assistant"});
-                    if let Some(c) = content {
-                        msg["content"] = json!(c);
-                    }
-                    if let Some(rc) = reasoning_content {
-                        msg["reasoning_content"] = json!(rc);
-                    }
-                    if !tool_calls.is_empty() {
-                        let tc: Vec<Value> = tool_calls
-                            .iter()
-                            .map(|tc| {
-                                json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": tc.arguments
-                                    }
-                                })
-                            })
-                            .collect();
-                        msg["tool_calls"] = json!(tc);
-                    }
-                    msg
-                }
-                ChatMessage::Tool {
-                    tool_call_id,
-                    content,
-                } => json!({"role": "tool", "tool_call_id": tool_call_id, "content": content}),
-            })
-            .collect();
-
-        // If images are provided, convert the last User message to multipart content
-        if !req.images.is_empty()
-            && let Some(last_user) = messages.iter_mut().rev().find(|m| m["role"] == "user")
-        {
-            let text = last_user["content"].as_str().unwrap_or("").to_string();
-            let mut parts = vec![json!({"type": "text", "text": text})];
-            for img in &req.images {
-                parts.push(json!({
-                    "type": "image_url",
-                    "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
-                }));
-            }
-            last_user["content"] = json!(parts);
-        }
+        let messages = provider_transform::preflight_chat_messages(req, &capabilities)?;
 
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
@@ -466,6 +411,12 @@ impl ApiClient {
 
     fn complete_chat_inner(&self, req: &ChatRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let payload = self.build_chat_payload(req)?;
+        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                self.cfg.provider
+            )
+        })?;
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -485,7 +436,11 @@ impl ApiClient {
                     let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
-                        return parse_non_streaming_payload(&body);
+                        let response = parse_non_streaming_payload(&body)?;
+                        return Ok(provider_transform::postprocess_chat_response(
+                            response,
+                            &capabilities,
+                        ));
                     }
                     last_err = Some(format_api_error(
                         status,
@@ -701,6 +656,12 @@ impl ApiClient {
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
         let mut payload = self.build_chat_payload(req)?;
+        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                self.cfg.provider
+            )
+        })?;
         payload["stream"] = json!(true);
         payload["stream_options"] = json!({"include_usage": true});
 
@@ -860,13 +821,17 @@ impl ApiClient {
                             String::new()
                         };
 
-                        return Ok(LlmResponse {
+                        let response = LlmResponse {
                             text,
                             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
-                        });
+                        };
+                        return Ok(provider_transform::postprocess_chat_response(
+                            response,
+                            &capabilities,
+                        ));
                     }
 
                     let body = resp.text().unwrap_or_default();
@@ -1751,6 +1716,7 @@ fn parse_tool_calls_array(value: &Value) -> Vec<LlmToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codingbuddy_core::ChatMessage;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
