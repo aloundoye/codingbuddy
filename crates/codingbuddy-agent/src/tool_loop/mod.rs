@@ -163,6 +163,9 @@ pub struct ToolUseLoop<'a> {
     workspace_path_str: String,
     /// Whether `cleanup_old_tool_outputs` has run this session (at most once).
     tool_output_cleanup_done: bool,
+    /// When true, complex-task execution has progressed but the checklist has not
+    /// been refreshed via `todo_read`/`todo_write` yet.
+    pending_todo_sync: bool,
     /// Current execution phase (None for Simple/Medium tasks).
     phase: Option<codingbuddy_core::TaskPhase>,
     /// Count of read-only tool calls since entering current phase.
@@ -233,6 +236,7 @@ impl<'a> ToolUseLoop<'a> {
             pinned_directives: Vec::new(),
             workspace_path_str,
             tool_output_cleanup_done: false,
+            pending_todo_sync: false,
             phase: initial_phase,
             phase_read_only_calls: 0,
             phase_edit_calls: 0,
@@ -294,6 +298,127 @@ impl<'a> ToolUseLoop<'a> {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    fn continuation_anchor_message(&self) -> Option<String> {
+        if self.config.complexity != crate::complexity::PromptComplexity::Complex {
+            return None;
+        }
+
+        let store = self.workspace_store().ok()?;
+        let session = self.current_session(&store).ok()?;
+        let mut lines = Vec::new();
+
+        lines.push(format!("- session_id: {}", session.session_id));
+        if let Some(phase) = self.phase {
+            lines.push(format!("- workflow_phase: {}", phase.as_str()));
+        }
+
+        if let Some(plan_id) = session.active_plan_id
+            && let Ok(Some(plan)) = store.load_plan(plan_id)
+        {
+            let done_steps = plan.steps.iter().filter(|step| step.done).count();
+            let total_steps = plan.steps.len();
+            lines.push(format!("- plan_progress: {done_steps}/{total_steps}"));
+            if let Some(step) = plan.steps.iter().find(|step| !step.done) {
+                lines.push(format!(
+                    "- current_step: {}",
+                    truncate_line(&step.title, 120)
+                ));
+            }
+        }
+
+        if let Ok(todos) = store.list_session_todos(session.session_id) {
+            let in_progress = todos
+                .iter()
+                .filter(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+                .count();
+            let completed = todos
+                .iter()
+                .filter(|todo| todo.status.eq_ignore_ascii_case("completed"))
+                .count();
+            lines.push(format!(
+                "- todos: total={} completed={} in_progress={}",
+                todos.len(),
+                completed,
+                in_progress
+            ));
+            if let Some(current) = todos
+                .iter()
+                .find(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+                .or_else(|| {
+                    todos
+                        .iter()
+                        .find(|todo| todo.status.eq_ignore_ascii_case("pending"))
+                })
+            {
+                lines.push(format!(
+                    "- current_todo: {} [{}]",
+                    truncate_line(&current.content, 120),
+                    current.status
+                ));
+            }
+        }
+
+        if lines.len() <= 1 {
+            return None;
+        }
+
+        Some(format!(
+            "CONTINUATION_CONTEXT (stay aligned with current work state):\n{}",
+            lines.join("\n")
+        ))
+    }
+
+    fn should_track_checklist_discipline(&self) -> bool {
+        self.config.complexity == crate::complexity::PromptComplexity::Complex
+    }
+
+    fn maybe_inject_complex_checklist_nudge(&mut self, batch_calls: &[LlmToolCall]) {
+        if !self.should_track_checklist_discipline() || batch_calls.is_empty() {
+            return;
+        }
+
+        let touched_todo = batch_calls
+            .iter()
+            .any(|call| matches!(call.name.as_str(), "todo_read" | "todo_write"));
+        if touched_todo {
+            self.pending_todo_sync = false;
+            return;
+        }
+
+        let progressed_work = batch_calls.iter().any(|call| {
+            tool_bridge::is_write_tool(&call.name)
+                || matches!(
+                    call.name.as_str(),
+                    "spawn_task" | "task_create" | "task_update" | "task_stop"
+                )
+        });
+        if !progressed_work || self.pending_todo_sync {
+            return;
+        }
+
+        let mut reminder = "Checklist discipline (complex workflow): refresh session todos now with todo_read/todo_write before continuing. Keep exactly one in_progress item.".to_string();
+        if let Ok(store) = self.workspace_store()
+            && let Ok(session) = self.current_session(&store)
+            && let Ok(todos) = store.list_session_todos(session.session_id)
+        {
+            let in_progress = todos
+                .iter()
+                .filter(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+                .count();
+            if todos.is_empty() {
+                reminder = "Checklist discipline (complex workflow): initialize session todos now via todo_write before more edits or delegation.".to_string();
+            } else if in_progress != 1 {
+                reminder = format!(
+                    "Checklist discipline (complex workflow): expected exactly one in_progress todo, found {in_progress}. Normalize with todo_write before proceeding."
+                );
+            }
+        }
+
+        self.messages
+            .push(ChatMessage::System { content: reminder });
+        self.pending_todo_sync = true;
     }
 
     fn next_request_route(&self) -> (String, Option<codingbuddy_core::ThinkingConfig>, u32) {
@@ -849,10 +974,14 @@ impl<'a> ToolUseLoop<'a> {
     ) -> Result<ToolLoopResult> {
         if is_continuation {
             strip_prior_reasoning_content(&mut self.messages);
+            if let Some(anchor) = self.continuation_anchor_message() {
+                self.messages.push(ChatMessage::System { content: anchor });
+            }
         }
 
         // Reset per-question state so previous errors don't leak across turns
         self.recovery_injected = false;
+        self.pending_todo_sync = false;
 
         self.messages.push(ChatMessage::User {
             content: user_message.to_string(),
@@ -1466,6 +1595,8 @@ impl<'a> ToolUseLoop<'a> {
                 }
                 tool_calls_made.extend(records);
             }
+
+            self.maybe_inject_complex_checklist_nudge(&response.tool_calls);
 
             // Update escalation signals based on batch outcome
             if batch_had_success {
@@ -2514,7 +2645,7 @@ mod tests {
         LlmResponse, Plan, PlanStep, Session, SessionBudgets, SessionState, TaskPhase, ToolCall,
         ToolProposal, ToolResult,
     };
-    use codingbuddy_store::{Store, TaskQueueRecord};
+    use codingbuddy_store::{SessionTodoRecord, Store, TaskQueueRecord};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -2871,6 +3002,71 @@ mod tests {
     }
 
     #[test]
+    fn tool_search_caps_promotions_for_weak_models() {
+        let llm = ScriptedLlm::new(vec![]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig {
+            model: "deepseek-chat".to_string(),
+            ..Default::default()
+        };
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: codingbuddy_core::FunctionDefinition {
+                name: "fs_read".to_string(),
+                description: "read".to_string(),
+                strict: None,
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }];
+        let mut loop_ = ToolUseLoop::new(&llm, tool_host, config, "system".to_string(), tools);
+        loop_.set_discoverable_tools(vec![
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "enter_plan_mode".to_string(),
+                    description: "plan mode".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "exit_plan_mode".to_string(),
+                    description: "leave plan mode".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "web_search".to_string(),
+                    description: "web search mode".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            },
+        ]);
+
+        let baseline = loop_.tools.len();
+        let output = super::agent_tools::handle_tool_search(
+            &mut loop_,
+            &serde_json::json!({"query":"mode"}),
+        );
+        let promoted = loop_.tools.len().saturating_sub(baseline);
+
+        assert!(
+            promoted <= 1,
+            "single-keyword weak-model search should be capped"
+        );
+        assert!(
+            output.contains("weak-model guardrail"),
+            "result should explain capped promotion behavior"
+        );
+    }
+
+    #[test]
     fn tool_chain_multiple_turns() {
         let llm = ScriptedLlm::new(vec![
             // Turn 1: grep
@@ -3084,6 +3280,151 @@ mod tests {
         assert_eq!(r2.response, "Second answer");
         // Messages should contain: system, user1, assistant1, user2, assistant2
         assert_eq!(r2.messages.len(), 5);
+    }
+
+    #[test]
+    fn complex_continuation_injects_anchor_context() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-tool-loop-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Store::new(&workspace).expect("store");
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+
+        let llm = ScriptedLlm::new(vec![
+            make_text_response("First answer"),
+            make_text_response("Second answer"),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig {
+            complexity: crate::complexity::PromptComplexity::Complex,
+            workspace: Some(workspace),
+            session_id: Some(session.session_id),
+            initial_phase: Some(TaskPhase::Verify),
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(&llm, tool_host, config, "system".to_string(), vec![]);
+
+        let _ = loop_.run("first question").expect("first run");
+        let second = loop_.continue_with("follow up").expect("second run");
+
+        let has_anchor = second.messages.iter().any(|msg| {
+            matches!(
+                msg,
+                ChatMessage::System { content } if content.contains("CONTINUATION_CONTEXT")
+            )
+        });
+        assert!(
+            has_anchor,
+            "complex continuation should inject anchor context"
+        );
+    }
+
+    #[test]
+    fn complex_write_without_todo_refresh_injects_checklist_nudge() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-tool-loop-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Store::new(&workspace).expect("store");
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+        store
+            .replace_session_todos(
+                session.session_id,
+                &[SessionTodoRecord {
+                    todo_id: Uuid::now_v7(),
+                    session_id: session.session_id,
+                    content: "Refactor parser".to_string(),
+                    status: "in_progress".to_string(),
+                    position: 0,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                }],
+            )
+            .expect("seed todos");
+
+        let llm = ScriptedLlm::new(vec![
+            make_tool_response(vec![LlmToolCall {
+                id: "edit_1".to_string(),
+                name: "fs_edit".to_string(),
+                arguments: r#"{"path":"src/main.rs","search":"fn main() {}","replace":"fn main() { println!(\"ok\"); }"}"#.to_string(),
+            }]),
+            make_text_response("done"),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(
+            vec![ToolResult {
+                invocation_id: uuid::Uuid::nil(),
+                success: true,
+                output: serde_json::json!("patched"),
+            }],
+            true,
+        ));
+        let tools = vec![
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "fs_edit".to_string(),
+                    description: "edit".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties": {
+                            "path":{"type":"string"},
+                            "search":{"type":"string"},
+                            "replace":{"type":"string"}
+                        },
+                        "required":["path","search","replace"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "todo_write".to_string(),
+                    description: "todo write".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            },
+        ];
+        let config = ToolLoopConfig {
+            complexity: crate::complexity::PromptComplexity::Complex,
+            workspace: Some(workspace),
+            session_id: Some(session.session_id),
+            initial_phase: Some(TaskPhase::Verify),
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(&llm, tool_host, config, "system".to_string(), tools);
+
+        let result = loop_.run("apply the patch").expect("run");
+        let has_nudge = result.messages.iter().any(|msg| {
+            matches!(
+                msg,
+                ChatMessage::System { content }
+                    if content.contains("Checklist discipline (complex workflow)")
+            )
+        });
+        assert!(has_nudge, "missing checklist refresh should inject a nudge");
     }
 
     #[test]
