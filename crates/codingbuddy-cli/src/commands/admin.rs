@@ -243,6 +243,9 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             let keep_warm = payload["local_ml"]["runtime"]["keep_warm_secs"]
                 .as_u64()
                 .unwrap_or(0);
+            let max_queue_depth = payload["local_ml"]["runtime"]["max_queue_depth"]
+                .as_u64()
+                .unwrap_or(0);
             let queue_peak = payload["local_ml"]["runtime"]["metrics"]["max_observed_queue_depth"]
                 .as_u64()
                 .unwrap_or(0);
@@ -253,6 +256,9 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
                 payload["local_ml"]["runtime"]["metrics"]["total_queue_completed"]
                     .as_u64()
                     .unwrap_or(0);
+            let queue_rejected = payload["local_ml"]["runtime"]["metrics"]["total_queue_rejected"]
+                .as_u64()
+                .unwrap_or(0);
             let capacity_evictions =
                 payload["local_ml"]["runtime"]["metrics"]["total_capacity_evictions"]
                     .as_u64()
@@ -260,11 +266,22 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             let idle_evictions = payload["local_ml"]["runtime"]["metrics"]["total_idle_evictions"]
                 .as_u64()
                 .unwrap_or(0);
+            let memory_denied =
+                payload["local_ml"]["runtime"]["metrics"]["total_memory_admission_denied"]
+                    .as_u64()
+                    .unwrap_or(0);
+            let runner_reloads = payload["local_ml"]["runtime"]["metrics"]["total_runner_reloads"]
+                .as_u64()
+                .unwrap_or(0);
+            let runner_load_failures =
+                payload["local_ml"]["runtime"]["metrics"]["total_runner_load_failures"]
+                    .as_u64()
+                    .unwrap_or(0);
             let recent_events = payload["local_ml"]["runtime"]["recent_events"]
                 .as_array()
                 .map_or(0usize, std::vec::Vec::len);
             println!(
-                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=enq:{queue_enqueued}/done:{queue_completed}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions} events={recent_events}"
+                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=max:{max_queue_depth}/enq:{queue_enqueued}/done:{queue_completed}/rejected:{queue_rejected}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions} memory_denied:{memory_denied} reloads:{runner_reloads} load_failures:{runner_load_failures} events={recent_events}"
             );
         }
         if let Some(warnings) = payload["warnings"].as_array()

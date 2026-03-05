@@ -67,6 +67,7 @@ pub struct RuntimeLifecycleEvent {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RuntimeLifecycleMetrics {
     pub total_slot_activations: u64,
     pub total_slot_reuses: u64,
@@ -74,6 +75,10 @@ pub struct RuntimeLifecycleMetrics {
     pub total_idle_evictions: u64,
     pub total_queue_enqueued: u64,
     pub total_queue_completed: u64,
+    pub total_queue_rejected: u64,
+    pub total_memory_admission_denied: u64,
+    pub total_runner_reloads: u64,
+    pub total_runner_load_failures: u64,
     pub max_observed_queue_depth: usize,
 }
 
@@ -355,6 +360,78 @@ impl ModelManager {
             model_id: None,
             at_epoch_secs: now_epoch_secs(),
             detail: None,
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record rejection due to queue/backpressure admission policy.
+    pub fn record_runtime_queue_rejected(
+        &mut self,
+        active_requests: usize,
+        queued_requests: usize,
+        max_concurrent_requests: usize,
+        max_queue_depth: usize,
+    ) {
+        self.runtime_metrics.total_queue_rejected =
+            self.runtime_metrics.total_queue_rejected.saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "request_rejected_queue_full".to_string(),
+            model_id: None,
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!(
+                "active={active_requests},queued={queued_requests},max_concurrent={max_concurrent_requests},max_queue={max_queue_depth}"
+            )),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record memory-based admission denial before loading a model runner.
+    pub fn record_runtime_memory_admission_denied(
+        &mut self,
+        model_id: &str,
+        available_mb: u64,
+        reason: &str,
+    ) {
+        self.runtime_metrics.total_memory_admission_denied = self
+            .runtime_metrics
+            .total_memory_admission_denied
+            .saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_admission_denied_memory".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!(
+                "available_mb={available_mb}; {}",
+                compact_detail(reason)
+            )),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record a runner reload attempt after a generation failure.
+    pub fn record_runtime_runner_reload(&mut self, model_id: &str, reason: &str) {
+        self.runtime_metrics.total_runner_reloads =
+            self.runtime_metrics.total_runner_reloads.saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_reload".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(compact_detail(reason)),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record a terminal runner load/generation failure.
+    pub fn record_runtime_runner_load_failure(&mut self, model_id: &str, reason: &str) {
+        self.runtime_metrics.total_runner_load_failures = self
+            .runtime_metrics
+            .total_runner_load_failures
+            .saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_load_failure".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(compact_detail(reason)),
         });
         self.persist_runtime_state();
     }
@@ -823,6 +900,16 @@ fn has_model_files(dir: &Path) -> bool {
     false
 }
 
+fn compact_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 220;
+    let trimmed = detail.trim();
+    if trimmed.chars().count() <= MAX_DETAIL_CHARS {
+        return trimmed.to_string();
+    }
+    let clipped: String = trimmed.chars().take(MAX_DETAIL_CHARS).collect();
+    format!("{clipped}...")
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1115,6 +1202,10 @@ mod tests {
 
         mgr.record_runtime_queue_enqueued(2);
         mgr.record_runtime_queue_completed();
+        mgr.record_runtime_queue_rejected(1, 1, 1, 1);
+        mgr.record_runtime_memory_admission_denied("model-a", 1024, "requires more memory");
+        mgr.record_runtime_runner_reload("model-a", "first generation failed");
+        mgr.record_runtime_runner_load_failure("model-b", "backend init failed");
         assert!(mgr.mark_runtime_used_at("model-a", 100).is_empty());
         assert!(mgr.mark_runtime_used_at("model-a", 110).is_empty());
         let capacity_evicted = mgr.mark_runtime_used_at("model-b", 120);
@@ -1130,6 +1221,10 @@ mod tests {
         assert_eq!(snapshot.metrics.total_idle_evictions, 1);
         assert_eq!(snapshot.metrics.total_queue_enqueued, 1);
         assert_eq!(snapshot.metrics.total_queue_completed, 1);
+        assert_eq!(snapshot.metrics.total_queue_rejected, 1);
+        assert_eq!(snapshot.metrics.total_memory_admission_denied, 1);
+        assert_eq!(snapshot.metrics.total_runner_reloads, 1);
+        assert_eq!(snapshot.metrics.total_runner_load_failures, 1);
         assert_eq!(snapshot.metrics.max_observed_queue_depth, 2);
         assert!(!snapshot.recent_events.is_empty());
     }
