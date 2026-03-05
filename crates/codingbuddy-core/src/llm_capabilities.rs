@@ -511,6 +511,47 @@ mod tests {
     }
 
     #[test]
+    fn preferred_edit_tool_contracts_match_provider_and_model() {
+        let cases = [
+            (
+                ProviderKind::Deepseek,
+                "deepseek-chat",
+                PreferredEditTool::FsEdit,
+            ),
+            (
+                ProviderKind::OpenAiCompatible,
+                "gpt-4o-mini",
+                PreferredEditTool::PatchDirect,
+            ),
+            (
+                ProviderKind::OpenAiCompatible,
+                "qwen2.5-coder:7b",
+                PreferredEditTool::MultiEdit,
+            ),
+            (
+                ProviderKind::Ollama,
+                "qwen2.5-coder:7b",
+                PreferredEditTool::MultiEdit,
+            ),
+            (
+                ProviderKind::Ollama,
+                "llama3.1:8b",
+                PreferredEditTool::PatchDirect,
+            ),
+        ];
+
+        for (provider, model, expected) in cases {
+            let caps = model_capabilities(provider, model);
+            assert_eq!(
+                caps.preferred_edit_tool, expected,
+                "unexpected preferred edit tool for provider={} model={}",
+                provider.as_key(),
+                model
+            );
+        }
+    }
+
+    #[test]
     fn config_overrides_apply_in_specificity_order() {
         let mut registry = CapabilityRegistryOverrides::default();
         registry.families.insert(
