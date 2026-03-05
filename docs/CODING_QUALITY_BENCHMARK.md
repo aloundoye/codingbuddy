@@ -50,5 +50,8 @@ docs/benchmarks/coding_quality_baseline.json
 Gate rule in the test:
 
 - fail if pass-rate drops by more than `5.0` percentage points vs baseline
+- fail if average completion quality score drops by more than `0.10`
+- fail if average retries increase by more than `0.50`
+- fail if baseline suite/model identity does not match current report
 
 Update baseline only when an intentional quality shift is accepted.

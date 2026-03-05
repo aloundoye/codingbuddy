@@ -6,8 +6,9 @@ use codingbuddy_core::{
 use codingbuddy_llm::LlmClient;
 use codingbuddy_store::Store;
 use codingbuddy_testkit::{
-    CodingBenchmarkCaseResult, CodingBenchmarkReport, ScriptedLlm, evaluate_coding_benchmark_gate,
-    read_coding_benchmark_report, write_coding_benchmark_report,
+    CodingBenchmarkCaseResult, CodingBenchmarkGateThresholds, CodingBenchmarkReport, ScriptedLlm,
+    evaluate_coding_benchmark_gate_with_thresholds, read_coding_benchmark_report,
+    write_coding_benchmark_report,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -321,14 +322,31 @@ fn coding_quality_benchmark_suite() -> Result<()> {
     let baseline_path = root.join("docs/benchmarks/coding_quality_baseline.json");
     if baseline_path.exists() {
         let baseline = read_coding_benchmark_report(&baseline_path)?;
-        let gate = evaluate_coding_benchmark_gate(&report, &baseline, 5.0);
+        let gate = evaluate_coding_benchmark_gate_with_thresholds(
+            &report,
+            &baseline,
+            CodingBenchmarkGateThresholds {
+                max_pass_rate_drop_pct: 5.0,
+                max_quality_score_drop: 0.10,
+                max_avg_retries_increase: 0.50,
+            },
+        );
         assert!(
             gate.passed,
-            "coding benchmark regression: current={:.1}% baseline={:.1}% delta={:.1}% allowed_drop={:.1}%",
+            "coding benchmark regression: compatible={} pass_rate current={:.1}% baseline={:.1}% delta={:.1}% allowed_drop={:.1}% quality current={:.3} baseline={:.3} delta={:.3} allowed_drop={:.3} retries current={:.3} baseline={:.3} delta={:.3} allowed_increase={:.3}",
+            gate.suite_model_compatible,
             gate.current_pass_rate_pct,
             gate.baseline_pass_rate_pct,
             gate.delta_pct,
-            gate.allowed_drop_pct
+            gate.allowed_drop_pct,
+            gate.current_avg_completion_quality_score,
+            gate.baseline_avg_completion_quality_score,
+            gate.quality_delta,
+            gate.max_quality_drop,
+            gate.current_avg_retries,
+            gate.baseline_avg_retries,
+            gate.retries_delta,
+            gate.max_retry_increase
         );
     }
 
