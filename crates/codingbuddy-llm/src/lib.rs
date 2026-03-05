@@ -318,6 +318,7 @@ impl ApiClient {
     }
 
     fn build_chat_payload(&self, req: &ChatRequest) -> Result<Value> {
+        let provider = self.provider_config();
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
                 "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
@@ -390,20 +391,29 @@ impl ApiClient {
         {
             payload["thinking"] = serde_json::to_value(thinking)?;
         }
-        if capabilities.supports_tool_calling && !req.tools.is_empty() {
-            payload["tools"] = serde_json::to_value(&req.tools)?;
-            if capabilities.supports_parallel_tool_calls
-                && matches!(
-                    capabilities.provider,
-                    ProviderKind::OpenAiCompatible | ProviderKind::Ollama
-                )
-            {
-                // OpenAI-compatible payload knob; omit for providers that do not
-                // advertise this field to avoid spurious 400s.
-                payload["parallel_tool_calls"] = json!(true);
-            }
-            if capabilities.supports_tool_choice {
-                payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
+        if capabilities.supports_tool_calling
+            && let Some(prepared_tools) = provider_transform::prepare_chat_tools(
+                req,
+                &capabilities,
+                &provider.base_url,
+                &self.cfg.endpoint,
+            )?
+        {
+            payload["tools"] = json!(prepared_tools.tools);
+            if !prepared_tools.shim_only {
+                if capabilities.supports_parallel_tool_calls
+                    && matches!(
+                        capabilities.provider,
+                        ProviderKind::OpenAiCompatible | ProviderKind::Ollama
+                    )
+                {
+                    // OpenAI-compatible payload knob; omit for providers that do not
+                    // advertise this field to avoid spurious 400s.
+                    payload["parallel_tool_calls"] = json!(true);
+                }
+                if capabilities.supports_tool_choice {
+                    payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
+                }
             }
         }
         provider_transform::apply_chat_payload_compatibility(&mut payload, req, &capabilities);
@@ -2626,6 +2636,116 @@ mod tests {
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
         assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn litellm_proxy_with_tool_history_gets_placeholder_tool_payload() {
+        let mut cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        cfg.endpoint = "https://litellm.internal/v1/chat/completions".to_string();
+        cfg.providers
+            .get_mut("openai-compatible")
+            .expect("provider")
+            .base_url = "https://litellm.internal".to_string();
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![
+                ChatMessage::User {
+                    content: "run tool".to_string(),
+                },
+                ChatMessage::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![codingbuddy_core::LlmToolCall {
+                        id: "call_1".to_string(),
+                        name: "fs_read".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                },
+                ChatMessage::Tool {
+                    tool_call_id: "call_1".to_string(),
+                    content: "ok".to_string(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["tools"][0]["function"]["name"], "_noop");
+        assert!(payload.get("parallel_tool_calls").is_none());
+        assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn gemini_payload_sanitizes_tool_schema_for_gateway_compatibility() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gemini-2.0-flash".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "pick a mode".to_string(),
+            }],
+            tools: vec![codingbuddy_core::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "pick_mode".to_string(),
+                    description: "Pick a mode".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "integer",
+                                "enum": [1, 2]
+                            },
+                            "items": {
+                                "type": "array",
+                                "items": {}
+                            }
+                        },
+                        "required": ["mode", "missing"]
+                    }),
+                },
+            }],
+            tool_choice: codingbuddy_core::ToolChoice::auto(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        let schema = &payload["tools"][0]["function"]["parameters"];
+        assert_eq!(schema["required"], serde_json::json!(["mode"]));
+        assert_eq!(schema["properties"]["mode"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["1", "2"])
+        );
+        assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
     }
 
     #[test]

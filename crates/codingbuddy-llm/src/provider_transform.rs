@@ -1,9 +1,15 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
     ChatMessage, ChatRequest, LlmResponse, ModelCapabilities, ModelFamily, ProviderKind,
+    ToolDefinition,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+
+pub(crate) struct PreparedToolPayload {
+    pub tools: Vec<Value>,
+    pub shim_only: bool,
+}
 
 pub(crate) fn preflight_chat_messages(
     req: &ChatRequest,
@@ -181,6 +187,28 @@ pub(crate) fn postprocess_chat_response(
     response
 }
 
+pub(crate) fn prepare_chat_tools(
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+    provider_base_url: &str,
+    endpoint: &str,
+) -> Result<Option<PreparedToolPayload>> {
+    let mut tools = serialize_tool_definitions(&req.tools)?;
+    sanitize_tool_definitions_for_provider(&mut tools, capabilities);
+
+    let shim_only = tools.is_empty()
+        && requires_placeholder_tool(req, capabilities, provider_base_url, endpoint);
+    if shim_only {
+        tools.push(placeholder_tool_definition());
+    }
+
+    if tools.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PreparedToolPayload { tools, shim_only }))
+    }
+}
+
 pub(crate) fn apply_chat_payload_compatibility(
     payload: &mut Value,
     req: &ChatRequest,
@@ -264,6 +292,183 @@ pub(crate) fn apply_chat_payload_compatibility(
         }
         payload["options"]["num_predict"] = max_tokens;
     }
+}
+
+fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
+    tools
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn sanitize_tool_definitions_for_provider(tools: &mut [Value], capabilities: &ModelCapabilities) {
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && capabilities.family == ModelFamily::Gemini
+    {
+        for tool in tools {
+            if let Some(schema) = tool
+                .get_mut("function")
+                .and_then(Value::as_object_mut)
+                .and_then(|function| function.get_mut("parameters"))
+            {
+                sanitize_gemini_schema(schema);
+            }
+        }
+    }
+}
+
+fn requires_placeholder_tool(
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+    provider_base_url: &str,
+    endpoint: &str,
+) -> bool {
+    if capabilities.provider != ProviderKind::OpenAiCompatible {
+        return false;
+    }
+    let lower_base = provider_base_url.to_ascii_lowercase();
+    let lower_endpoint = endpoint.to_ascii_lowercase();
+    let looks_like_litellm = lower_base.contains("litellm") || lower_endpoint.contains("litellm");
+    if !looks_like_litellm {
+        return false;
+    }
+    history_uses_tool_protocol(req)
+}
+
+fn history_uses_tool_protocol(req: &ChatRequest) -> bool {
+    req.messages.iter().any(|message| match message {
+        ChatMessage::Assistant { tool_calls, .. } => !tool_calls.is_empty(),
+        ChatMessage::Tool { .. } => true,
+        _ => false,
+    })
+}
+
+fn placeholder_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "_noop",
+            "description": "Placeholder tool for proxy compatibility when tool history exists but no active tools are needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn sanitize_gemini_schema(schema: &mut Value) {
+    match schema {
+        Value::Array(items) => {
+            for item in items {
+                sanitize_gemini_schema(item);
+            }
+        }
+        Value::Object(map) => {
+            let keys = map.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                if key == "enum" {
+                    if let Some(enum_values) = map.get_mut(&key).and_then(Value::as_array_mut) {
+                        for value in enum_values {
+                            if !value.is_string() {
+                                let normalized = match value {
+                                    Value::Null => "null".to_string(),
+                                    Value::Bool(b) => b.to_string(),
+                                    Value::Number(n) => n.to_string(),
+                                    Value::String(s) => s.clone(),
+                                    Value::Array(_) | Value::Object(_) => value.to_string(),
+                                };
+                                *value = Value::String(normalized);
+                            }
+                        }
+                        if map
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|ty| ty == "integer" || ty == "number")
+                        {
+                            map.insert("type".to_string(), Value::String("string".to_string()));
+                        }
+                    }
+                    continue;
+                }
+                if let Some(value) = map.get_mut(&key) {
+                    sanitize_gemini_schema(value);
+                }
+            }
+
+            let has_combiner = has_schema_combiner(map);
+            if map.get("type").and_then(Value::as_str) == Some("object") {
+                let property_names = map
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| properties.keys().cloned().collect::<HashSet<String>>());
+                if let (Some(property_names), Some(required)) = (
+                    property_names,
+                    map.get_mut("required").and_then(Value::as_array_mut),
+                ) {
+                    required.retain(|field| {
+                        field
+                            .as_str()
+                            .is_some_and(|name| property_names.contains(name))
+                    });
+                }
+            }
+
+            if map.get("type").and_then(Value::as_str) == Some("array") && !has_combiner {
+                if !map.contains_key("items") || map.get("items").is_some_and(Value::is_null) {
+                    map.insert("items".to_string(), json!({}));
+                }
+                if let Some(items) = map.get_mut("items")
+                    && items.as_object().is_some_and(|obj| !has_schema_intent(obj))
+                {
+                    *items = json!({"type": "string"});
+                }
+            }
+
+            if map.contains_key("type")
+                && map
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| ty != "object")
+                && !has_combiner
+            {
+                map.remove("properties");
+                map.remove("required");
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn has_schema_combiner(map: &serde_json::Map<String, Value>) -> bool {
+    ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .any(|key| map.get(*key).is_some_and(Value::is_array))
+}
+
+fn has_schema_intent(map: &serde_json::Map<String, Value>) -> bool {
+    if has_schema_combiner(map) {
+        return true;
+    }
+    [
+        "type",
+        "properties",
+        "items",
+        "prefixItems",
+        "enum",
+        "const",
+        "$ref",
+        "additionalProperties",
+        "patternProperties",
+        "required",
+        "not",
+        "if",
+        "then",
+        "else",
+    ]
+    .iter()
+    .any(|key| map.contains_key(*key))
 }
 
 fn provider_supports_reasoning_content(provider: ProviderKind) -> bool {
@@ -843,5 +1048,114 @@ mod tests {
 
         apply_chat_payload_compatibility(&mut payload, &req, &caps);
         assert_eq!(payload["options"]["num_predict"], 2048);
+    }
+
+    #[test]
+    fn prepare_chat_tools_adds_placeholder_tool_for_litellm_tool_history() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tools".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "ok".to_string(),
+            },
+        ];
+
+        let prepared = prepare_chat_tools(
+            &req,
+            &caps,
+            "https://litellm.internal",
+            "https://litellm.internal/v1/chat/completions",
+        )
+        .expect("prepared")
+        .expect("placeholder");
+
+        assert!(prepared.shim_only);
+        assert_eq!(prepared.tools.len(), 1);
+        assert_eq!(prepared.tools[0]["function"]["name"], "_noop");
+    }
+
+    #[test]
+    fn prepare_chat_tools_skips_placeholder_without_tool_history() {
+        let (req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+
+        let prepared = prepare_chat_tools(
+            &req,
+            &caps,
+            "https://litellm.internal",
+            "https://litellm.internal/v1/chat/completions",
+        )
+        .expect("prepared");
+
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn prepare_chat_tools_sanitizes_gemini_tool_schema() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gemini-2.0-flash");
+        req.tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: codingbuddy_core::FunctionDefinition {
+                name: "pick_mode".to_string(),
+                description: "Pick a mode".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "integer",
+                            "enum": [1, 2]
+                        },
+                        "items": {
+                            "type": "array",
+                            "items": {}
+                        },
+                        "status": {
+                            "type": "string",
+                            "properties": {
+                                "unused": { "type": "string" }
+                            },
+                            "required": ["unused"]
+                        }
+                    },
+                    "required": ["mode", "missing"]
+                }),
+            },
+        }];
+
+        let prepared = prepare_chat_tools(
+            &req,
+            &caps,
+            "https://api.openai.com",
+            "https://api.openai.com/v1/chat/completions",
+        )
+        .expect("prepared")
+        .expect("tools");
+
+        assert!(!prepared.shim_only);
+        let schema = &prepared.tools[0]["function"]["parameters"];
+        assert_eq!(schema["required"], json!(["mode"]));
+        assert_eq!(schema["properties"]["mode"]["type"], "string");
+        assert_eq!(schema["properties"]["mode"]["enum"], json!(["1", "2"]));
+        assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
+        assert!(
+            schema["properties"]["status"].get("properties").is_none(),
+            "non-object schema members should not retain object-only keys"
+        );
+        assert!(
+            schema["properties"]["status"].get("required").is_none(),
+            "non-object schema members should not retain required"
+        );
     }
 }
