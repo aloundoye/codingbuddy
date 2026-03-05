@@ -14,6 +14,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use crate::commands::operator_diagnostics::{
+    provider_compatibility_diagnostics, runtime_operator_diagnostics,
+};
 use crate::context::*;
 use crate::output::*;
 use crate::util::*;
@@ -212,10 +215,16 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
                 let rules = item["applied_rules"]
                     .as_array()
                     .map_or(0usize, std::vec::Vec::len);
+                let compatibility = item["compatibility"]["summary"]
+                    .as_str()
+                    .unwrap_or_default();
                 println!(
                     "- model={} provider={} family={} thinking={} reasoning={} tool_choice={} images={} rules={}",
                     model, provider, family, thinking, reasoning, tool_choice, images, rules
                 );
+                if !compatibility.is_empty() {
+                    println!("  compatibility={compatibility}");
+                }
             }
         }
         println!(
@@ -303,6 +312,11 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             println!(
                 "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=concurrency:{max_concurrent_requests}/max:{max_queue_depth}/wait_ms:{max_queue_wait_ms}/enq:{queue_enqueued}/done:{queue_completed}/rejected:{queue_rejected}/timeouts:{queue_wait_timeouts}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions}/memory_pressure:{pressure_evictions} memory_denied:{memory_denied} load_waits:{runner_load_waits} reloads:{runner_reloads} load_failures:{runner_load_failures} events={recent_events}"
             );
+            if let Some(summary) = payload["local_ml"]["runtime"]["summary"].as_str()
+                && !summary.is_empty()
+            {
+                println!("local_ml_runtime_summary: {summary}");
+            }
         }
         if let Some(warnings) = payload["warnings"].as_array()
             && !warnings.is_empty()
@@ -394,11 +408,13 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
     for model in capability_models {
         if let Some(resolution) = cfg.llm.capability_resolution_for_model(&model) {
             let caps = resolution.capabilities;
+            let compatibility = provider_compatibility_diagnostics(&cfg, &model);
             capability_profiles.push(json!({
                 "model": model,
                 "provider": caps.provider.as_key(),
                 "family": caps.family.as_key(),
                 "applied_rules": resolution.applied_rules,
+                "compatibility": compatibility,
                 "constraints": {
                     "modality": {
                         "image_input": caps.supports_image_input,
@@ -428,7 +444,15 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
     let runtime_snapshot =
         codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
             .runtime_snapshot();
-    let local_ml_runtime = serde_json::to_value(runtime_snapshot).unwrap_or_else(|_| json!({}));
+    let runtime_diagnostics = runtime_operator_diagnostics(&runtime_snapshot);
+    let mut local_ml_runtime = serde_json::to_value(runtime_snapshot).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = local_ml_runtime.as_object_mut() {
+        obj.insert("summary".to_string(), json!(runtime_diagnostics.summary));
+        obj.insert(
+            "highlights".to_string(),
+            json!(runtime_diagnostics.highlights),
+        );
+    }
 
     let payload = json!({
         "os": std::env::consts::OS,
@@ -1061,6 +1085,8 @@ mod tests {
         assert!(local_ml["runtime"]["metrics"].is_object());
         assert!(local_ml["runtime"]["recent_events"].is_array());
         assert!(local_ml["runtime"]["warm_models"].is_array());
+        assert!(local_ml["runtime"]["summary"].is_string());
+        assert!(local_ml["runtime"]["highlights"].is_array());
         assert!(
             local_ml["runtime"]["scheduler"].is_object(),
             "doctor payload must include runtime scheduler policy snapshot"
@@ -1105,6 +1131,14 @@ mod tests {
         assert!(
             selected["constraints"]["tool_protocol"]["max_safe_tool_count"].is_number(),
             "tool protocol constraints should expose max_safe_tool_count"
+        );
+        assert!(
+            selected["compatibility"]["summary"].is_string(),
+            "capability profiles should expose operator-facing compatibility summary"
+        );
+        assert!(
+            selected["compatibility"]["active_transforms"].is_array(),
+            "capability profiles should expose active compatibility transforms"
         );
     }
 }

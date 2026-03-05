@@ -909,13 +909,31 @@ fn operator_summary_line(status: &UiStatus) -> String {
     } else {
         truncate_inline(&status.capability_summary, 48)
     };
+    let provider_diagnostics = if status.provider_diagnostics_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            " compat={}",
+            truncate_inline(&status.provider_diagnostics_summary, 40)
+        )
+    };
+    let runtime_diagnostics = if status.runtime_diagnostics_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            " runtime={}",
+            truncate_inline(&status.runtime_diagnostics_summary, 40)
+        )
+    };
     format!(
-        "phase={phase} step={step} todo={todo} subagents={}/{} bg={} {} caps={} compaction/replay={}/{}",
+        "phase={phase} step={step} todo={todo} subagents={}/{} bg={} {} caps={}{}{} compaction/replay={}/{}",
         status.running_subagents,
         status.failed_subagents,
         status.running_background_jobs.max(status.background_jobs),
         blockers,
         capabilities,
+        provider_diagnostics,
+        runtime_diagnostics,
         status.compaction_count,
         status.replay_count
     )
@@ -1831,6 +1849,18 @@ impl ChatShell {
         self.push_system(format!("Pending approvals: {}", status.pending_approvals));
         self.push_system(format!("Active tasks: {}", status.active_tasks));
         self.push_system(format!("Background jobs: {}", status.background_jobs));
+        if !status.provider_diagnostics_summary.is_empty() {
+            self.push_system(format!(
+                "Provider compatibility: {}",
+                status.provider_diagnostics_summary
+            ));
+        }
+        if !status.runtime_diagnostics_summary.is_empty() {
+            self.push_system(format!(
+                "Runtime diagnostics: {}",
+                status.runtime_diagnostics_summary
+            ));
+        }
         self.push_system(format!(
             "Autopilot: {}",
             if status.autopilot_running {
