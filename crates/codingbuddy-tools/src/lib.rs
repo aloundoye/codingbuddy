@@ -1,5 +1,7 @@
+mod command_guard;
 mod fuzzy_edit;
 mod plugins;
+mod sandbox;
 mod shell;
 pub mod tool_tiers;
 pub mod validation;
@@ -25,6 +27,7 @@ use codingbuddy_index::IndexService;
 use codingbuddy_memory::MemoryManager;
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
+pub(crate) use command_guard::detect_container_environment;
 use ignore::WalkBuilder;
 pub use plugins::{
     CatalogPlugin, PluginCommandPrompt, PluginInfo, PluginManager, PluginVerifyResult,
@@ -47,6 +50,9 @@ use fuzzy_edit::{
     fuzzy_block_anchor, fuzzy_context_aware, fuzzy_escape_normalized, fuzzy_indentation_flexible,
     fuzzy_line_trimmed, fuzzy_trimmed_boundary, fuzzy_whitespace_normalized,
 };
+use sandbox::sandbox_wrap_command;
+#[cfg(test)]
+use sandbox::{build_bwrap_command, build_seatbelt_profile, seatbelt_wrap};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;
@@ -1275,7 +1281,8 @@ impl LocalToolHost {
     }
 
     fn run_bash_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
-        if is_isolated_sandbox_mode(&self.sandbox_mode) && detect_container_environment().is_none()
+        if command_guard::is_isolated_sandbox_mode(&self.sandbox_mode)
+            && detect_container_environment().is_none()
         {
             return self.run_cmd_in_isolated_sandbox(cmd, timeout_secs);
         }
@@ -1296,30 +1303,30 @@ impl LocalToolHost {
         let workspace =
             std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
         if let Some(template) = self.sandbox_wrapper.as_deref() {
-            let wrapped = render_wrapper_template(template, &workspace, cmd)?;
+            let wrapped = command_guard::render_wrapper_template(template, &workspace, cmd)?;
             return self.run_cmd(&wrapped, timeout_secs);
         }
         if let Ok(template) = std::env::var("CODINGBUDDY_SANDBOX_WRAPPER")
             && !template.trim().is_empty()
         {
-            let wrapped = render_wrapper_template(template.trim(), &workspace, cmd)?;
+            let wrapped = command_guard::render_wrapper_template(template.trim(), &workspace, cmd)?;
             return self.run_cmd(&wrapped, timeout_secs);
         }
-        if let Some(wrapped) = auto_isolated_wrapper_command(&workspace, cmd) {
+        if let Some(wrapped) = command_guard::auto_isolated_wrapper_command(&workspace, cmd) {
             return self.run_cmd(&wrapped, timeout_secs);
         }
         #[cfg(target_os = "windows")]
         {
             // Windows doesn't have a built-in wrapper path today. Fall back to direct
             // execution with strict logical isolation checks.
-            if command_references_outside_workspace(cmd, &workspace) {
+            if command_guard::command_references_outside_workspace(cmd, &workspace) {
                 return Err(anyhow!(
                     "sandbox_mode={} blocked path outside workspace: {}",
                     self.sandbox_mode,
                     cmd
                 ));
             }
-            if command_has_network_egress_intent(cmd) {
+            if command_guard::command_has_network_egress_intent(cmd) {
                 return Err(anyhow!(
                     "sandbox_mode={} blocked network command: {}",
                     self.sandbox_mode,
@@ -1384,13 +1391,13 @@ impl LocalToolHost {
     fn enforce_sandbox_mode(&self, cmd: &str) -> Result<()> {
         match self.sandbox_mode.as_str() {
             "read-only" | "readonly" => {
-                if command_has_mutating_intent(cmd) {
+                if command_guard::command_has_mutating_intent(cmd) {
                     return Err(anyhow!(
                         "sandbox_mode=read-only blocked mutating command: {}",
                         cmd
                     ));
                 }
-                if command_has_network_egress_intent(cmd) {
+                if command_guard::command_has_network_egress_intent(cmd) {
                     return Err(anyhow!(
                         "sandbox_mode=read-only blocked network command: {}",
                         cmd
@@ -1398,13 +1405,13 @@ impl LocalToolHost {
                 }
             }
             "workspace-write" | "workspace_write" => {
-                if command_references_outside_workspace(cmd, &self.workspace) {
+                if command_guard::command_references_outside_workspace(cmd, &self.workspace) {
                     return Err(anyhow!(
                         "sandbox_mode=workspace-write blocked path outside workspace: {}",
                         cmd
                     ));
                 }
-                if command_has_network_egress_intent(cmd) {
+                if command_guard::command_has_network_egress_intent(cmd) {
                     return Err(anyhow!(
                         "sandbox_mode=workspace-write blocked network command: {}",
                         cmd
@@ -2984,335 +2991,6 @@ fn normalize_rel_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn is_isolated_sandbox_mode(mode: &str) -> bool {
-    matches!(mode, "isolated" | "container" | "os-sandbox" | "os_sandbox")
-}
-
-/// Detect if we're already running inside a container environment.
-///
-/// When running inside Docker/Podman/LXC, adding seatbelt/bwrap sandboxing
-/// is redundant, may fail, and adds overhead. This function checks several
-/// indicators and returns the container type if detected.
-pub fn detect_container_environment() -> Option<&'static str> {
-    // Explicit env var override
-    if std::env::var("CODINGBUDDY_CONTAINER_MODE").is_ok() {
-        return Some("explicit");
-    }
-    // Docker
-    if Path::new("/.dockerenv").exists() {
-        return Some("docker");
-    }
-    // Podman
-    if Path::new("/run/.containerenv").exists() {
-        return Some("podman");
-    }
-    // Check cgroup for container runtime indicators
-    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
-        let lower = cgroup.to_ascii_lowercase();
-        if lower.contains("docker") || lower.contains("containerd") || lower.contains("lxc") {
-            return Some("cgroup");
-        }
-    }
-    None
-}
-
-fn render_wrapper_template(template: &str, workspace: &Path, cmd: &str) -> Result<String> {
-    if !template.contains("{cmd}") {
-        return Err(anyhow!(
-            "sandbox wrapper template must include {{cmd}} placeholder"
-        ));
-    }
-    let workspace_q = platform_shell_quote(workspace.to_string_lossy().as_ref());
-    let cmd_q = platform_shell_quote(cmd);
-    Ok(template
-        .replace("{workspace}", &workspace_q)
-        .replace("{cmd}", &cmd_q))
-}
-
-fn auto_isolated_wrapper_command(workspace: &Path, cmd: &str) -> Option<String> {
-    let workspace_q = shell_quote(workspace.to_string_lossy().as_ref());
-    let cmd_q = shell_quote(cmd);
-
-    if cfg!(target_os = "linux") {
-        if command_in_path("bwrap") {
-            return Some(format!(
-                "bwrap --die-with-parent --new-session --unshare-all --proc /proc --dev /dev --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --ro-bind /etc /etc --tmpfs /tmp --bind {workspace_q} {workspace_q} --chdir {workspace_q} /bin/sh -lc {cmd_q}"
-            ));
-        }
-        if command_in_path("firejail") {
-            return Some(format!(
-                "firejail --quiet --net=none --private={workspace_q} sh -lc {cmd_q}"
-            ));
-        }
-    }
-    if cfg!(target_os = "macos") && command_in_path("sandbox-exec") {
-        let workspace_profile = workspace
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        let profile = format!(
-            "(version 1) \
-             (deny default) \
-             (allow process*) \
-             (allow file-read* (subpath \"/usr\")) \
-             (allow file-read* (subpath \"/bin\")) \
-             (allow file-read* (subpath \"/System\")) \
-             (allow file-read* (subpath \"/Library\")) \
-             (allow file-read* (subpath \"/private/tmp\")) \
-             (allow file-write* (subpath \"/private/tmp\")) \
-             (allow file-read* file-write* (subpath \"{workspace_profile}\"))"
-        );
-        return Some(format!(
-            "sandbox-exec -p {} /bin/sh -lc {}",
-            shell_quote(&profile),
-            cmd_q
-        ));
-    }
-    None
-}
-
-fn command_in_path(command: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let separators = if cfg!(target_os = "windows") {
-        vec![".exe", ".cmd", ".bat", ""]
-    } else {
-        vec![""]
-    };
-    std::env::split_paths(&paths).any(|dir| {
-        separators
-            .iter()
-            .map(|suffix| dir.join(format!("{command}{suffix}")))
-            .any(|candidate| candidate.exists() && candidate.is_file())
-    })
-}
-
-fn shell_quote(value: &str) -> String {
-    let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
-}
-
-#[cfg(target_os = "windows")]
-fn platform_shell_quote(value: &str) -> String {
-    windows_shell_quote(value)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn platform_shell_quote(value: &str) -> String {
-    shell_quote(value)
-}
-
-#[cfg(target_os = "windows")]
-fn windows_shell_quote(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len() + 2);
-    for ch in value.chars() {
-        match ch {
-            // Keep arguments stable when the wrapper is executed via cmd /C.
-            '"' => escaped.push_str("\\\""),
-            '%' => escaped.push_str("%%"),
-            '^' | '&' | '|' | '<' | '>' => {
-                escaped.push('^');
-                escaped.push(ch);
-            }
-            _ => escaped.push(ch),
-        }
-    }
-    format!("\"{escaped}\"")
-}
-
-fn shell_tokens(cmd: &str) -> Vec<String> {
-    cmd.split_whitespace()
-        .map(|token| {
-            token
-                .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | '(' | ')' | '[' | ']'))
-                .to_ascii_lowercase()
-        })
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn command_has_mutating_intent(cmd: &str) -> bool {
-    let tokens = shell_tokens(cmd);
-    if tokens.is_empty() {
-        return false;
-    }
-    let mut lowered = cmd.to_ascii_lowercase();
-    lowered.retain(|ch| ch != '\n' && ch != '\r');
-    if lowered.contains(">>")
-        || lowered.contains(" >")
-        || lowered.contains("1>")
-        || lowered.contains("2>")
-    {
-        return true;
-    }
-
-    let command = tokens[0].as_str();
-    if matches!(
-        command,
-        "rm" | "rmdir"
-            | "del"
-            | "rd"
-            | "mv"
-            | "cp"
-            | "mkdir"
-            | "touch"
-            | "chmod"
-            | "chown"
-            | "chgrp"
-            | "truncate"
-            | "dd"
-            | "mkfs"
-            | "format"
-            | "patch"
-            | "tee"
-    ) {
-        return true;
-    }
-
-    if command == "git"
-        && tokens.get(1).is_some_and(|sub| {
-            matches!(
-                sub.as_str(),
-                "add"
-                    | "commit"
-                    | "push"
-                    | "merge"
-                    | "rebase"
-                    | "reset"
-                    | "checkout"
-                    | "restore"
-                    | "clean"
-                    | "cherry-pick"
-            )
-        })
-    {
-        return true;
-    }
-    if command == "cargo"
-        && tokens.get(1).is_some_and(|sub| {
-            matches!(
-                sub.as_str(),
-                "add" | "remove" | "update" | "install" | "publish" | "fix"
-            )
-        })
-    {
-        return true;
-    }
-    if matches!(command, "npm" | "pnpm" | "yarn")
-        && tokens
-            .get(1)
-            .is_some_and(|sub| matches!(sub.as_str(), "install" | "update" | "uninstall" | "add"))
-    {
-        return true;
-    }
-    if matches!(command, "pip" | "pip3")
-        && tokens
-            .get(1)
-            .is_some_and(|sub| matches!(sub.as_str(), "install" | "uninstall"))
-    {
-        return true;
-    }
-    if command == "sed" && tokens.iter().any(|token| token == "-i") {
-        return true;
-    }
-    if command == "perl" && tokens.iter().any(|token| token.starts_with("-i")) {
-        return true;
-    }
-
-    false
-}
-
-fn command_has_network_egress_intent(cmd: &str) -> bool {
-    let tokens = shell_tokens(cmd);
-    if tokens.is_empty() {
-        return false;
-    }
-    let command = tokens[0].as_str();
-    if matches!(
-        command,
-        "curl"
-            | "wget"
-            | "scp"
-            | "sftp"
-            | "ssh"
-            | "nc"
-            | "ncat"
-            | "telnet"
-            | "ftp"
-            | "rsync"
-            | "http"
-    ) {
-        return true;
-    }
-    if command == "git"
-        && tokens.get(1).is_some_and(|sub| {
-            matches!(
-                sub.as_str(),
-                "push" | "fetch" | "pull" | "clone" | "ls-remote"
-            )
-        })
-    {
-        return true;
-    }
-    false
-}
-
-fn token_to_absolute_path(token: &str) -> Option<PathBuf> {
-    let token = token.trim();
-    if token.is_empty() || token.starts_with('-') {
-        return None;
-    }
-    if token.starts_with("~/") {
-        let home = std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok())?;
-        return Some(PathBuf::from(home).join(token.trim_start_matches("~/")));
-    }
-    let candidate = PathBuf::from(token);
-    if candidate.is_absolute() {
-        return Some(candidate);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if token.starts_with("~\\") {
-            let home = std::env::var("USERPROFILE")
-                .ok()
-                .or_else(|| std::env::var("HOME").ok())?;
-            return Some(PathBuf::from(home).join(token.trim_start_matches("~\\")));
-        }
-    }
-    None
-}
-
-fn command_references_outside_workspace(cmd: &str, workspace: &Path) -> bool {
-    let workspace_root =
-        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    for raw in cmd.split_whitespace() {
-        let token =
-            raw.trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | '(' | ')' | '[' | ']'));
-        if token.is_empty() || token.starts_with('-') {
-            continue;
-        }
-        if token == ".."
-            || token.starts_with("../")
-            || token.contains("/../")
-            || token.ends_with("/..")
-            || token.starts_with("..\\")
-            || token.contains("\\..\\")
-            || token.ends_with("\\..")
-        {
-            return true;
-        }
-        if let Some(path) = token_to_absolute_path(token)
-            && !path.starts_with(&workspace_root)
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn is_binary(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
@@ -3889,124 +3567,6 @@ fn parse_ruff_json(output: &str) -> Vec<serde_json::Value> {
         }));
     }
     diagnostics
-}
-
-fn build_seatbelt_profile(workspace: &Path, config: &codingbuddy_core::SandboxConfig) -> String {
-    let workspace_str = workspace.to_string_lossy();
-    let mut profile = String::from("(version 1)\n(deny default)\n");
-    profile.push_str("(allow process*)\n");
-    profile.push_str("(allow file-read* (subpath \"/usr\") (subpath \"/lib\") (subpath \"/bin\") (subpath \"/System\"))\n");
-    profile.push_str(&format!(
-        "(allow file-read* file-write* (subpath \"{}\"))\n",
-        workspace_str
-    ));
-    // Allow /tmp access
-    profile
-        .push_str("(allow file-read* file-write* (subpath \"/tmp\") (subpath \"/private/tmp\"))\n");
-    // Network access
-    if config.network.block_all {
-        profile.push_str("(deny network*)\n");
-        // Even when blocking network, allow local binding if configured
-        if config.network.allow_local_binding {
-            profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
-        }
-        if config.network.allow_unix_sockets {
-            profile.push_str("(allow network* (local unix-socket))\n");
-        }
-    } else {
-        profile.push_str("(allow network*)\n");
-    }
-    profile
-}
-
-/// Wrap a command with macOS Seatbelt sandbox.
-#[allow(dead_code)]
-fn seatbelt_wrap(cmd: &str, profile: &str) -> String {
-    // Escape single quotes in profile
-    let escaped_profile = profile.replace('\'', "'\\''");
-    format!("sandbox-exec -p '{}' -- {}", escaped_profile, cmd)
-}
-
-/// Build a Linux bubblewrap (bwrap) sandboxed command.
-#[allow(dead_code)]
-fn build_bwrap_command(
-    workspace: &Path,
-    cmd: &str,
-    config: &codingbuddy_core::SandboxConfig,
-) -> String {
-    let workspace_str = workspace.to_string_lossy();
-    let mut parts = vec![
-        "bwrap".to_string(),
-        "--die-with-parent".to_string(),
-        "--new-session".to_string(),
-    ];
-    // Read-only system paths
-    for sys_path in &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
-        parts.push("--ro-bind".to_string());
-        parts.push(sys_path.to_string());
-        parts.push(sys_path.to_string());
-    }
-    // Read-write workspace
-    parts.push("--bind".to_string());
-    parts.push(workspace_str.to_string());
-    parts.push(workspace_str.to_string());
-    // Tmp
-    parts.push("--tmpfs".to_string());
-    parts.push("/tmp".to_string());
-    // Network
-    if config.network.block_all {
-        if config.network.allow_local_binding || config.network.allow_unix_sockets {
-            // When local binding or unix sockets are allowed, we can't fully unshare
-            // network. Instead we rely on application-level filtering.
-            // bwrap doesn't support fine-grained socket filtering natively.
-        } else {
-            parts.push("--unshare-net".to_string());
-        }
-    }
-    // Proc and dev
-    parts.push("--proc".to_string());
-    parts.push("/proc".to_string());
-    parts.push("--dev".to_string());
-    parts.push("/dev".to_string());
-    parts.push("--".to_string());
-    parts.push(cmd.to_string());
-    parts.join(" ")
-}
-
-/// Wrap a command with the appropriate OS-level sandbox if enabled.
-#[allow(clippy::needless_return)]
-fn sandbox_wrap_command(
-    workspace: &Path,
-    cmd: &str,
-    config: &codingbuddy_core::SandboxConfig,
-) -> String {
-    if !config.enabled {
-        return cmd.to_string();
-    }
-    // Skip sandbox wrapping if already inside a container
-    if detect_container_environment().is_some() {
-        return cmd.to_string();
-    }
-    // Check if command is excluded
-    for excluded in &config.excluded_commands {
-        if cmd.starts_with(excluded) || cmd.contains(excluded) {
-            return cmd.to_string();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let profile = build_seatbelt_profile(workspace, config);
-        return seatbelt_wrap(cmd, &profile);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return build_bwrap_command(workspace, cmd, config);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = workspace;
-        cmd.to_string()
-    }
 }
 
 impl LocalToolHost {

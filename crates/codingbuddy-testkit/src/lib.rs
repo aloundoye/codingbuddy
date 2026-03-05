@@ -4,10 +4,11 @@ use codingbuddy_core::{
     ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, TokenUsage,
 };
 use codingbuddy_llm::LlmClient;
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -280,6 +281,251 @@ pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
             ..Default::default()
         },
     )
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkCaseResult {
+    pub case_id: String,
+    pub category: String,
+    pub passed: bool,
+    pub tool_invocations: usize,
+    pub retries: usize,
+    pub completion_quality_score: f32,
+    pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CodingBenchmarkSummary {
+    pub total_cases: usize,
+    pub passed_cases: usize,
+    pub pass_rate_pct: f32,
+    pub avg_tool_invocations: f32,
+    pub avg_retries: f32,
+    pub avg_completion_quality_score: f32,
+    pub avg_duration_ms: f32,
+    pub category_pass_rate_pct: BTreeMap<String, f32>,
+    pub category_avg_quality_score: BTreeMap<String, f32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkReport {
+    pub suite: String,
+    pub model: String,
+    pub generated_at_epoch_secs: u64,
+    pub cases: Vec<CodingBenchmarkCaseResult>,
+    pub summary: CodingBenchmarkSummary,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkGateResult {
+    pub passed: bool,
+    pub suite_model_compatible: bool,
+    pub current_pass_rate_pct: f32,
+    pub baseline_pass_rate_pct: f32,
+    pub allowed_drop_pct: f32,
+    pub delta_pct: f32,
+    pub current_avg_completion_quality_score: f32,
+    pub baseline_avg_completion_quality_score: f32,
+    pub max_quality_drop: f32,
+    pub quality_delta: f32,
+    pub current_avg_retries: f32,
+    pub baseline_avg_retries: f32,
+    pub max_retry_increase: f32,
+    pub retries_delta: f32,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkGateThresholds {
+    pub max_pass_rate_drop_pct: f32,
+    pub max_quality_score_drop: f32,
+    pub max_avg_retries_increase: f32,
+}
+
+impl Default for CodingBenchmarkGateThresholds {
+    fn default() -> Self {
+        Self {
+            max_pass_rate_drop_pct: 5.0,
+            max_quality_score_drop: 0.10,
+            max_avg_retries_increase: 0.50,
+        }
+    }
+}
+
+impl CodingBenchmarkReport {
+    pub fn from_case_results(
+        suite: &str,
+        model: &str,
+        cases: Vec<CodingBenchmarkCaseResult>,
+    ) -> Self {
+        let total_cases = cases.len();
+        let passed_cases = cases.iter().filter(|case| case.passed).count();
+        let pass_rate_pct = if total_cases == 0 {
+            0.0
+        } else {
+            passed_cases as f32 * 100.0 / total_cases as f32
+        };
+        let avg_tool_invocations = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.tool_invocations as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_retries = if total_cases == 0 {
+            0.0
+        } else {
+            cases.iter().map(|case| case.retries as f32).sum::<f32>() / total_cases as f32
+        };
+        let avg_completion_quality_score = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.completion_quality_score)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_duration_ms = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.duration_ms as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let mut category_stats: BTreeMap<String, (usize, usize, f32)> = BTreeMap::new();
+        for case in &cases {
+            let entry = category_stats
+                .entry(case.category.clone())
+                .or_insert((0usize, 0usize, 0.0f32));
+            entry.0 = entry.0.saturating_add(1);
+            if case.passed {
+                entry.1 = entry.1.saturating_add(1);
+            }
+            entry.2 += case.completion_quality_score;
+        }
+        let mut category_pass_rate_pct: BTreeMap<String, f32> = BTreeMap::new();
+        let mut category_avg_quality_score: BTreeMap<String, f32> = BTreeMap::new();
+        for (category, (count, passed, quality_sum)) in category_stats {
+            let count_f = count as f32;
+            let pass_rate = if count == 0 {
+                0.0
+            } else {
+                passed as f32 * 100.0 / count_f
+            };
+            let avg_quality = if count == 0 {
+                0.0
+            } else {
+                quality_sum / count_f
+            };
+            category_pass_rate_pct.insert(category.clone(), pass_rate);
+            category_avg_quality_score.insert(category, avg_quality);
+        }
+        Self {
+            suite: suite.to_string(),
+            model: model.to_string(),
+            generated_at_epoch_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+            cases,
+            summary: CodingBenchmarkSummary {
+                total_cases,
+                passed_cases,
+                pass_rate_pct,
+                avg_tool_invocations,
+                avg_retries,
+                avg_completion_quality_score,
+                avg_duration_ms,
+                category_pass_rate_pct,
+                category_avg_quality_score,
+            },
+        }
+    }
+}
+
+pub fn write_coding_benchmark_report(
+    output_root: &Path,
+    report: &CodingBenchmarkReport,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(output_root)?;
+    let suite = sanitize_slug(&report.suite);
+    let model = sanitize_slug(&report.model);
+    let filename = format!("{suite}.{model}.latest.json");
+    let path = output_root.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(report)?)?;
+    Ok(path)
+}
+
+pub fn read_coding_benchmark_report(path: &Path) -> Result<CodingBenchmarkReport> {
+    let raw = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+pub fn evaluate_coding_benchmark_gate(
+    current: &CodingBenchmarkReport,
+    baseline: &CodingBenchmarkReport,
+    allowed_drop_pct: f32,
+) -> CodingBenchmarkGateResult {
+    evaluate_coding_benchmark_gate_with_thresholds(
+        current,
+        baseline,
+        CodingBenchmarkGateThresholds {
+            max_pass_rate_drop_pct: allowed_drop_pct,
+            max_quality_score_drop: f32::INFINITY,
+            max_avg_retries_increase: f32::INFINITY,
+        },
+    )
+}
+
+pub fn evaluate_coding_benchmark_gate_with_thresholds(
+    current: &CodingBenchmarkReport,
+    baseline: &CodingBenchmarkReport,
+    thresholds: CodingBenchmarkGateThresholds,
+) -> CodingBenchmarkGateResult {
+    let suite_model_compatible = current.suite == baseline.suite && current.model == baseline.model;
+    let delta = current.summary.pass_rate_pct - baseline.summary.pass_rate_pct;
+    let quality_delta = current.summary.avg_completion_quality_score
+        - baseline.summary.avg_completion_quality_score;
+    let retries_delta = current.summary.avg_retries - baseline.summary.avg_retries;
+    let passed = suite_model_compatible
+        && delta >= -thresholds.max_pass_rate_drop_pct
+        && quality_delta >= -thresholds.max_quality_score_drop
+        && retries_delta <= thresholds.max_avg_retries_increase;
+    CodingBenchmarkGateResult {
+        passed,
+        suite_model_compatible,
+        current_pass_rate_pct: current.summary.pass_rate_pct,
+        baseline_pass_rate_pct: baseline.summary.pass_rate_pct,
+        allowed_drop_pct: thresholds.max_pass_rate_drop_pct,
+        delta_pct: delta,
+        current_avg_completion_quality_score: current.summary.avg_completion_quality_score,
+        baseline_avg_completion_quality_score: baseline.summary.avg_completion_quality_score,
+        max_quality_drop: thresholds.max_quality_score_drop,
+        quality_delta,
+        current_avg_retries: current.summary.avg_retries,
+        baseline_avg_retries: baseline.summary.avg_retries,
+        max_retry_increase: thresholds.max_avg_retries_increase,
+        retries_delta,
+    }
+}
+
+fn sanitize_slug(input: &str) -> String {
+    let mut slug = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
 }
 
 // ── HTTP mock internals ─────────────────────────────────────────────────
@@ -630,5 +876,112 @@ mod tests {
             let contents = fs::read_to_string(&events_path).expect("read events");
             assert!(!contents.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn benchmark_report_serialization_and_gate() {
+        let report = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "scripted-tool-loop",
+            vec![
+                CodingBenchmarkCaseResult {
+                    case_id: "edit-single-file".to_string(),
+                    category: "edit".to_string(),
+                    passed: true,
+                    tool_invocations: 2,
+                    retries: 0,
+                    completion_quality_score: 1.0,
+                    duration_ms: 12,
+                    note: None,
+                },
+                CodingBenchmarkCaseResult {
+                    case_id: "debug-bugfix".to_string(),
+                    category: "debug".to_string(),
+                    passed: false,
+                    tool_invocations: 1,
+                    retries: 1,
+                    completion_quality_score: 0.4,
+                    duration_ms: 9,
+                    note: Some("missing expected patch".to_string()),
+                },
+            ],
+        );
+        assert_eq!(report.summary.total_cases, 2);
+        assert_eq!(report.summary.passed_cases, 1);
+        assert!((report.summary.pass_rate_pct - 50.0).abs() < f32::EPSILON);
+        assert!(report.summary.avg_duration_ms > 0.0);
+        assert!(report.summary.category_pass_rate_pct.contains_key("edit"));
+        assert!(
+            report
+                .summary
+                .category_avg_quality_score
+                .contains_key("debug")
+        );
+
+        let baseline = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "scripted-tool-loop",
+            vec![CodingBenchmarkCaseResult {
+                case_id: "baseline".to_string(),
+                category: "edit".to_string(),
+                passed: true,
+                tool_invocations: 1,
+                retries: 0,
+                completion_quality_score: 1.0,
+                duration_ms: 1,
+                note: None,
+            }],
+        );
+        let gate = evaluate_coding_benchmark_gate_with_thresholds(
+            &report,
+            &baseline,
+            CodingBenchmarkGateThresholds {
+                max_pass_rate_drop_pct: 60.0,
+                max_quality_score_drop: 1.0,
+                max_avg_retries_increase: 2.0,
+            },
+        );
+        assert!(gate.passed, "large allowed drop should pass");
+        assert!(gate.suite_model_compatible);
+        assert!(gate.quality_delta <= 0.0);
+    }
+
+    #[test]
+    fn benchmark_gate_fails_for_suite_model_mismatch() {
+        let current = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "scripted-tool-loop",
+            vec![CodingBenchmarkCaseResult {
+                case_id: "c1".to_string(),
+                category: "edit".to_string(),
+                passed: true,
+                tool_invocations: 1,
+                retries: 0,
+                completion_quality_score: 1.0,
+                duration_ms: 1,
+                note: None,
+            }],
+        );
+        let baseline = CodingBenchmarkReport::from_case_results(
+            "coding-quality-extended",
+            "scripted-tool-loop",
+            vec![CodingBenchmarkCaseResult {
+                case_id: "b1".to_string(),
+                category: "edit".to_string(),
+                passed: true,
+                tool_invocations: 1,
+                retries: 0,
+                completion_quality_score: 1.0,
+                duration_ms: 1,
+                note: None,
+            }],
+        );
+        let gate = evaluate_coding_benchmark_gate_with_thresholds(
+            &current,
+            &baseline,
+            CodingBenchmarkGateThresholds::default(),
+        );
+        assert!(!gate.passed);
+        assert!(!gate.suite_model_compatible);
     }
 }

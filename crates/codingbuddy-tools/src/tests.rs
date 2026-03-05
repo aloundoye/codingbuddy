@@ -504,9 +504,13 @@ fn isolated_sandbox_uses_configured_wrapper_template() {
         },
     });
     assert!(result.success);
+    if super::detect_container_environment().is_some() {
+        assert_eq!(runner.captured(), vec!["cat note.txt".to_string()]);
+        return;
+    }
     let normalized_workspace =
         std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
-    let expected = render_wrapper_template(
+    let expected = super::command_guard::render_wrapper_template(
         "sandboxctl --workspace {workspace} --cmd {cmd}",
         &normalized_workspace,
         "cat note.txt",
@@ -603,6 +607,11 @@ fn isolated_sandbox_requires_cmd_placeholder_in_wrapper_template() {
             requires_approval: false,
         },
     });
+    if super::detect_container_environment().is_some() {
+        assert!(result.success);
+        assert_eq!(runner.captured(), vec!["cat note.txt".to_string()]);
+        return;
+    }
     assert!(!result.success);
     assert!(
         result.output["error"]

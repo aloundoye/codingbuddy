@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_core::{ChatMessage, ChatRequest, LlmResponse, ModelCapabilities};
+use codingbuddy_core::{
+    ChatMessage, ChatRequest, LlmResponse, ModelCapabilities, ModelFamily, ProviderKind,
+};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -51,6 +53,7 @@ pub(crate) fn preflight_chat_messages(
 
                 if let Some(rc) = reasoning_content
                     && (!capabilities.strict_empty_content_filtering || !rc.trim().is_empty())
+                    && provider_supports_reasoning_content(capabilities.provider)
                 {
                     msg["reasoning_content"] = json!(rc);
                     has_visible_content = true;
@@ -64,10 +67,10 @@ pub(crate) fn preflight_chat_messages(
                         tool_call_seq = tool_call_seq.saturating_add(1);
                         continue;
                     }
-                    let normalized_id = normalize_tool_call_id(
+                    let normalized_id = normalize_tool_call_id_for_provider(
                         &tool_call.id,
                         tool_call_seq,
-                        capabilities.normalize_tool_call_ids,
+                        capabilities,
                     );
                     tool_call_seq = tool_call_seq.saturating_add(1);
 
@@ -89,6 +92,11 @@ pub(crate) fn preflight_chat_messages(
                 if !normalized_tool_calls.is_empty() {
                     msg["tool_calls"] = json!(normalized_tool_calls);
                     has_visible_content = true;
+                    if capabilities.strict_empty_content_filtering && msg.get("content").is_none() {
+                        // Some strict OpenAI-compatible gateways require explicit
+                        // assistant content=null when tool_calls are present.
+                        msg["content"] = Value::Null;
+                    }
                 }
 
                 if !capabilities.strict_empty_content_filtering || has_visible_content {
@@ -103,10 +111,10 @@ pub(crate) fn preflight_chat_messages(
                     .get(tool_call_id)
                     .cloned()
                     .unwrap_or_else(|| {
-                        normalize_tool_call_id(
+                        normalize_tool_call_id_for_provider(
                             tool_call_id,
                             tool_call_seq,
-                            capabilities.normalize_tool_call_ids,
+                            capabilities,
                         )
                     });
                 if !tool_call_id_map.contains_key(tool_call_id) {
@@ -139,6 +147,7 @@ pub(crate) fn preflight_chat_messages(
             capabilities.strict_empty_content_filtering,
         );
     }
+    repair_message_sequence_for_provider(&mut messages, capabilities);
 
     Ok(messages)
 }
@@ -170,6 +179,111 @@ pub(crate) fn postprocess_chat_response(
     }
 
     response
+}
+
+pub(crate) fn apply_chat_payload_compatibility(
+    payload: &mut Value,
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+) {
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && prefers_max_completion_tokens(&req.model)
+        && let Some(max_tokens) = payload.get("max_tokens").cloned()
+    {
+        payload["max_completion_tokens"] = max_tokens;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("max_tokens");
+        }
+    }
+
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.thinking_type == "enabled")
+    {
+        let effort = thinking_budget_to_reasoning_effort(
+            req.thinking.as_ref().and_then(|t| t.budget_tokens),
+        );
+        payload["reasoning_effort"] = json!(effort);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("thinking");
+        }
+    }
+
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && capabilities.family == ModelFamily::Gemini
+        && payload.get("max_output_tokens").is_none()
+        && let Some(max_tokens) = payload.get("max_tokens").cloned()
+    {
+        // Gemini-compatible OpenAI gateways often accept max_output_tokens.
+        payload["max_output_tokens"] = max_tokens;
+    }
+
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && payload.get("reasoning_effort").is_some()
+        && prefers_max_completion_tokens(&req.model)
+        && let Some(obj) = payload.as_object_mut()
+    {
+        // Strict OpenAI-compatible reasoning gateways commonly reject sampling
+        // controls when reasoning_effort is active.
+        for key in [
+            "temperature",
+            "top_p",
+            "presence_penalty",
+            "frequency_penalty",
+            "logprobs",
+            "top_logprobs",
+        ] {
+            obj.remove(key);
+        }
+    }
+
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && capabilities.family == ModelFamily::Gemini
+        && payload.get("tool_choice").and_then(Value::as_str) == Some("required")
+    {
+        // Gemini gateways are inconsistent with required tool_choice.
+        payload["tool_choice"] = json!("auto");
+    }
+
+    if capabilities.provider == ProviderKind::Ollama
+        && payload.get("tool_choice").and_then(Value::as_str) == Some("required")
+    {
+        // Ollama accepts tool_choice but "required" is inconsistently supported
+        // across model families and fronting gateways.
+        payload["tool_choice"] = json!("auto");
+    }
+
+    if capabilities.provider == ProviderKind::Ollama
+        && let Some(max_tokens) = payload.get("max_tokens").cloned()
+    {
+        // Ollama native/runtime adapters typically use options.num_predict.
+        if !payload.get("options").is_some_and(Value::is_object) {
+            payload["options"] = json!({});
+        }
+        payload["options"]["num_predict"] = max_tokens;
+    }
+}
+
+fn provider_supports_reasoning_content(provider: ProviderKind) -> bool {
+    provider == ProviderKind::Deepseek
+}
+
+fn prefers_max_completion_tokens(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.contains("reasoning")
+}
+
+fn thinking_budget_to_reasoning_effort(budget_tokens: Option<u32>) -> &'static str {
+    match budget_tokens.unwrap_or(4096) {
+        0..=2048 => "low",
+        2049..=8192 => "medium",
+        _ => "high",
+    }
 }
 
 fn attach_images_to_last_user_message(
@@ -228,6 +342,17 @@ fn extract_user_text(content: Option<&Value>) -> String {
     }
 }
 
+fn normalize_tool_call_id_for_provider(
+    raw: &str,
+    fallback_idx: usize,
+    capabilities: &ModelCapabilities,
+) -> String {
+    if requires_mistral_tool_id_compat(capabilities) {
+        return normalize_tool_call_id_mistral(raw, fallback_idx);
+    }
+    normalize_tool_call_id(raw, fallback_idx, capabilities.normalize_tool_call_ids)
+}
+
 fn normalize_tool_call_id(raw: &str, fallback_idx: usize, normalize: bool) -> String {
     let trimmed = raw.trim();
     if !normalize {
@@ -260,6 +385,55 @@ fn normalize_tool_call_id(raw: &str, fallback_idx: usize, normalize: bool) -> St
     }
 
     normalized
+}
+
+fn normalize_tool_call_id_mistral(raw: &str, fallback_idx: usize) -> String {
+    let mut normalized = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if normalized.is_empty() {
+        normalized = format!("t{:08}", fallback_idx % 100_000_000);
+    }
+    if normalized.len() > 9 {
+        normalized.truncate(9);
+    }
+    while normalized.len() < 9 {
+        normalized.push('0');
+    }
+    normalized
+}
+
+fn requires_mistral_tool_id_compat(capabilities: &ModelCapabilities) -> bool {
+    matches!(
+        capabilities.provider,
+        ProviderKind::OpenAiCompatible | ProviderKind::Ollama
+    ) && capabilities.family == ModelFamily::Mistral
+}
+
+fn repair_message_sequence_for_provider(
+    messages: &mut Vec<Value>,
+    capabilities: &ModelCapabilities,
+) {
+    if !requires_mistral_tool_id_compat(capabilities) {
+        return;
+    }
+    let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
+    for idx in 0..messages.len() {
+        repaired.push(messages[idx].clone());
+        let current_role = messages[idx].get("role").and_then(Value::as_str);
+        let next_role = messages
+            .get(idx + 1)
+            .and_then(|next| next.get("role"))
+            .and_then(Value::as_str);
+        if current_role == Some("tool") && next_role == Some("user") {
+            repaired.push(json!({
+                "role": "assistant",
+                "content": "Done.",
+            }));
+        }
+    }
+    *messages = repaired;
 }
 
 #[cfg(test)]
@@ -451,5 +625,223 @@ mod tests {
         let messages = preflight_chat_messages(&req, &caps).expect("messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn openai_compatible_drops_reasoning_content_from_assistant_messages() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "hello".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("answer".to_string()),
+                reasoning_content: Some("hidden reasoning".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "answer");
+        assert!(
+            messages[1].get("reasoning_content").is_none(),
+            "non-deepseek providers should not receive reasoning_content field"
+        );
+    }
+
+    #[test]
+    fn strict_provider_sets_null_content_for_tool_calls() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tool".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        assert_eq!(messages[1]["content"], Value::Null);
+        assert!(messages[1].get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn payload_compat_remaps_max_tokens_for_openai_reasoning_models() {
+        let (req, caps) = req_for(ProviderKind::OpenAiCompatible, "o3-mini");
+        let mut payload = json!({
+            "model": "o3-mini",
+            "messages": [],
+            "max_tokens": 2048
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["max_completion_tokens"], 2048);
+        assert!(payload.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn payload_compat_maps_thinking_to_reasoning_effort_for_openai_compat() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.thinking = Some(codingbuddy_core::ThinkingConfig::enabled(16_384));
+        let mut payload = json!({
+            "model": "gpt-4o-mini",
+            "messages": [],
+            "max_tokens": 1024
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn payload_compat_downgrades_required_tool_choice_for_ollama() {
+        let (req, caps) = req_for(ProviderKind::Ollama, "qwen2.5-coder:7b");
+        let mut payload = json!({
+            "model": "qwen2.5-coder:7b",
+            "messages": [],
+            "tool_choice": "required"
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn mistral_repair_inserts_assistant_between_tool_and_user() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "mistral-large");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tool".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "bad id".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "bad id".to_string(),
+                content: "ok".to_string(),
+            },
+            ChatMessage::User {
+                content: "continue".to_string(),
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"], "Done.");
+        assert_eq!(messages[4]["role"], "user");
+    }
+
+    #[test]
+    fn mistral_tool_ids_are_strictly_normalized() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "mistral-large");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tools".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "bad-id!?".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "bad-id!?".to_string(),
+                content: "ok".to_string(),
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        let call_id = messages[1]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(call_id.len(), 9);
+        assert!(call_id.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert_eq!(messages[2]["tool_call_id"], call_id);
+    }
+
+    #[test]
+    fn payload_compat_adds_gemini_max_output_tokens_alias() {
+        let (req, caps) = req_for(ProviderKind::OpenAiCompatible, "gemini-2.0-flash");
+        let mut payload = json!({
+            "model": "gemini-2.0-flash",
+            "messages": [],
+            "max_tokens": 1024
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["max_output_tokens"], 1024);
+        assert_eq!(payload["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn payload_compat_strips_sampling_fields_for_reasoning_effort_models() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "o3-mini");
+        req.thinking = Some(codingbuddy_core::ThinkingConfig::enabled(16_384));
+        let mut payload = json!({
+            "model": "o3-mini",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "presence_penalty": 0.2,
+            "frequency_penalty": 0.3,
+            "logprobs": true,
+            "top_logprobs": 3
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["reasoning_effort"], "high");
+        assert!(payload.get("temperature").is_none());
+        assert!(payload.get("top_p").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("logprobs").is_none());
+        assert!(payload.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn payload_compat_downgrades_required_tool_choice_for_gemini_gateways() {
+        let (req, caps) = req_for(ProviderKind::OpenAiCompatible, "gemini-2.0-flash");
+        let mut payload = json!({
+            "model": "gemini-2.0-flash",
+            "messages": [],
+            "tool_choice": "required"
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn payload_compat_maps_ollama_max_tokens_to_num_predict_option() {
+        let (req, caps) = req_for(ProviderKind::Ollama, "qwen2.5-coder:7b");
+        let mut payload = json!({
+            "model": "qwen2.5-coder:7b",
+            "messages": [],
+            "max_tokens": 2048
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["options"]["num_predict"], 2048);
     }
 }

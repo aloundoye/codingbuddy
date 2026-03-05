@@ -67,6 +67,7 @@ pub struct RuntimeLifecycleEvent {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RuntimeLifecycleMetrics {
     pub total_slot_activations: u64,
     pub total_slot_reuses: u64,
@@ -74,7 +75,31 @@ pub struct RuntimeLifecycleMetrics {
     pub total_idle_evictions: u64,
     pub total_queue_enqueued: u64,
     pub total_queue_completed: u64,
+    pub total_queue_rejected: u64,
+    pub total_queue_wait_timeouts: u64,
+    pub total_memory_admission_denied: u64,
+    pub total_memory_pressure_evictions: u64,
+    pub total_runner_reloads: u64,
+    pub total_runner_load_failures: u64,
     pub max_observed_queue_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeSchedulerPolicySnapshot {
+    pub max_concurrent_requests: usize,
+    pub max_queue_depth: usize,
+    pub max_queue_wait_ms: u64,
+}
+
+impl Default for RuntimeSchedulerPolicySnapshot {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 1,
+            max_queue_depth: 4,
+            max_queue_wait_ms: 45_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +107,8 @@ pub struct RuntimeLifecycleSnapshot {
     pub max_loaded_models: usize,
     pub keep_warm_secs: u64,
     pub aggressive_eviction: bool,
+    #[serde(default)]
+    pub scheduler: RuntimeSchedulerPolicySnapshot,
     pub warm_models: Vec<String>,
     pub metrics: RuntimeLifecycleMetrics,
     pub recent_events: Vec<RuntimeLifecycleEvent>,
@@ -93,6 +120,8 @@ struct RuntimeStateFile {
     runtime_slots: BTreeMap<String, RuntimeSlotState>,
     #[serde(default)]
     metrics: RuntimeLifecycleMetrics,
+    #[serde(default)]
+    scheduler_policy: RuntimeSchedulerPolicySnapshot,
     #[serde(default)]
     recent_events: Vec<RuntimeLifecycleEvent>,
 }
@@ -114,6 +143,7 @@ pub struct ModelManager {
     cache_dir: PathBuf,
     statuses: BTreeMap<String, ModelStatus>,
     runtime_policy: LocalModelRuntimePolicy,
+    runtime_scheduler_policy: RuntimeSchedulerPolicySnapshot,
     runtime_slots: BTreeMap<String, RuntimeSlotState>,
     runtime_metrics: RuntimeLifecycleMetrics,
     runtime_events: Vec<RuntimeLifecycleEvent>,
@@ -131,10 +161,26 @@ impl ModelManager {
         runtime_policy: LocalModelRuntimePolicy,
     ) -> Self {
         let persisted = load_runtime_state_file(&cache_dir).unwrap_or_default();
+        let mut runtime_scheduler_policy = persisted.scheduler_policy;
+        if runtime_scheduler_policy.max_concurrent_requests == 0 {
+            runtime_scheduler_policy.max_concurrent_requests =
+                runtime_policy.max_loaded_models.max(1);
+        }
+        if runtime_scheduler_policy.max_queue_depth == 0 {
+            runtime_scheduler_policy.max_queue_depth = runtime_scheduler_policy
+                .max_concurrent_requests
+                .saturating_mul(4)
+                .max(1);
+        }
+        if runtime_scheduler_policy.max_queue_wait_ms == 0 {
+            runtime_scheduler_policy.max_queue_wait_ms =
+                RuntimeSchedulerPolicySnapshot::default().max_queue_wait_ms;
+        }
         Self {
             cache_dir,
             statuses: BTreeMap::new(),
             runtime_policy,
+            runtime_scheduler_policy,
             runtime_slots: persisted.runtime_slots,
             runtime_metrics: persisted.metrics,
             runtime_events: persisted.recent_events,
@@ -323,10 +369,41 @@ impl ModelManager {
             max_loaded_models: self.runtime_policy.max_loaded_models,
             keep_warm_secs: self.runtime_policy.keep_warm_secs,
             aggressive_eviction: self.runtime_policy.aggressive_eviction,
+            scheduler: self.runtime_scheduler_policy.clone(),
             warm_models: self.warm_runtime_models(),
             metrics: self.runtime_metrics.clone(),
             recent_events: self.runtime_events.clone(),
         }
+    }
+
+    /// Persist scheduler queue/backpressure policy for runtime diagnostics.
+    pub fn record_runtime_scheduler_policy(
+        &mut self,
+        max_concurrent_requests: usize,
+        max_queue_depth: usize,
+        max_queue_wait_ms: u64,
+    ) {
+        let normalized = RuntimeSchedulerPolicySnapshot {
+            max_concurrent_requests: max_concurrent_requests.max(1),
+            max_queue_depth: max_queue_depth.max(1),
+            max_queue_wait_ms: max_queue_wait_ms.max(1),
+        };
+        if self.runtime_scheduler_policy == normalized {
+            return;
+        }
+        self.runtime_scheduler_policy = normalized.clone();
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "scheduler_policy_updated".to_string(),
+            model_id: None,
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!(
+                "max_concurrent={},max_queue={},max_wait_ms={}",
+                normalized.max_concurrent_requests,
+                normalized.max_queue_depth,
+                normalized.max_queue_wait_ms
+            )),
+        });
+        self.persist_runtime_state();
     }
 
     /// Record queue depth when a scheduler enqueues a request.
@@ -355,6 +432,133 @@ impl ModelManager {
             model_id: None,
             at_epoch_secs: now_epoch_secs(),
             detail: None,
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record rejection due to queue/backpressure admission policy.
+    pub fn record_runtime_queue_rejected(
+        &mut self,
+        active_requests: usize,
+        queued_requests: usize,
+        max_concurrent_requests: usize,
+        max_queue_depth: usize,
+    ) {
+        self.runtime_metrics.total_queue_rejected =
+            self.runtime_metrics.total_queue_rejected.saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "request_rejected_queue_full".to_string(),
+            model_id: None,
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!(
+                "active={active_requests},queued={queued_requests},max_concurrent={max_concurrent_requests},max_queue={max_queue_depth}"
+            )),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record timeout while waiting in queue admission backpressure.
+    pub fn record_runtime_queue_wait_timeout(
+        &mut self,
+        waited_ms: u64,
+        active_requests: usize,
+        queued_requests: usize,
+        max_concurrent_requests: usize,
+        max_queue_depth: usize,
+    ) {
+        self.runtime_metrics.total_queue_wait_timeouts = self
+            .runtime_metrics
+            .total_queue_wait_timeouts
+            .saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "request_timed_out_queue_wait".to_string(),
+            model_id: None,
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!(
+                "waited_ms={waited_ms},active={active_requests},queued={queued_requests},max_concurrent={max_concurrent_requests},max_queue={max_queue_depth}"
+            )),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record memory-based admission denial before loading a model runner.
+    pub fn record_runtime_memory_admission_denied(
+        &mut self,
+        model_id: &str,
+        available_mb: u64,
+        reason: &str,
+    ) {
+        self.runtime_metrics.total_memory_admission_denied = self
+            .runtime_metrics
+            .total_memory_admission_denied
+            .saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_admission_denied_memory".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!(
+                "available_mb={available_mb}; {}",
+                compact_detail(reason)
+            )),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Evict one runner slot as pressure relief before retrying admission checks.
+    pub fn evict_one_runtime_model_for_memory_pressure(
+        &mut self,
+        target_model_id: &str,
+        available_mb: u64,
+        attempt: usize,
+    ) -> Option<String> {
+        let victim = self
+            .runtime_slots
+            .iter()
+            .filter(|(candidate, _)| candidate.as_str() != target_model_id)
+            .min_by_key(|(_, slot)| (slot.last_used_epoch_secs, slot.loaded_at_epoch_secs))
+            .map(|(candidate, _)| candidate.clone())
+            .or_else(|| self.runtime_slots.keys().next().cloned())?;
+        self.runtime_slots.remove(&victim);
+        self.runtime_metrics.total_memory_pressure_evictions = self
+            .runtime_metrics
+            .total_memory_pressure_evictions
+            .saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_evicted_memory_pressure".to_string(),
+            model_id: Some(victim.clone()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!(
+                "target={target_model_id},attempt={attempt},available_mb={available_mb}"
+            )),
+        });
+        self.persist_runtime_state();
+        Some(victim)
+    }
+
+    /// Record a runner reload attempt after a generation failure.
+    pub fn record_runtime_runner_reload(&mut self, model_id: &str, reason: &str) {
+        self.runtime_metrics.total_runner_reloads =
+            self.runtime_metrics.total_runner_reloads.saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_reload".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(compact_detail(reason)),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record a terminal runner load/generation failure.
+    pub fn record_runtime_runner_load_failure(&mut self, model_id: &str, reason: &str) {
+        self.runtime_metrics.total_runner_load_failures = self
+            .runtime_metrics
+            .total_runner_load_failures
+            .saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_load_failure".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(compact_detail(reason)),
         });
         self.persist_runtime_state();
     }
@@ -772,6 +976,7 @@ impl ModelManager {
         let state = RuntimeStateFile {
             runtime_slots: self.runtime_slots.clone(),
             metrics: self.runtime_metrics.clone(),
+            scheduler_policy: self.runtime_scheduler_policy.clone(),
             recent_events: self.runtime_events.clone(),
         };
         let path = self.runtime_state_path();
@@ -821,6 +1026,16 @@ fn has_model_files(dir: &Path) -> bool {
         }
     }
     false
+}
+
+fn compact_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 220;
+    let trimmed = detail.trim();
+    if trimmed.chars().count() <= MAX_DETAIL_CHARS {
+        return trimmed.to_string();
+    }
+    let clipped: String = trimmed.chars().take(MAX_DETAIL_CHARS).collect();
+    format!("{clipped}...")
 }
 
 fn now_epoch_secs() -> u64 {
@@ -1115,6 +1330,10 @@ mod tests {
 
         mgr.record_runtime_queue_enqueued(2);
         mgr.record_runtime_queue_completed();
+        mgr.record_runtime_queue_rejected(1, 1, 1, 1);
+        mgr.record_runtime_memory_admission_denied("model-a", 1024, "requires more memory");
+        mgr.record_runtime_runner_reload("model-a", "first generation failed");
+        mgr.record_runtime_runner_load_failure("model-b", "backend init failed");
         assert!(mgr.mark_runtime_used_at("model-a", 100).is_empty());
         assert!(mgr.mark_runtime_used_at("model-a", 110).is_empty());
         let capacity_evicted = mgr.mark_runtime_used_at("model-b", 120);
@@ -1130,6 +1349,10 @@ mod tests {
         assert_eq!(snapshot.metrics.total_idle_evictions, 1);
         assert_eq!(snapshot.metrics.total_queue_enqueued, 1);
         assert_eq!(snapshot.metrics.total_queue_completed, 1);
+        assert_eq!(snapshot.metrics.total_queue_rejected, 1);
+        assert_eq!(snapshot.metrics.total_memory_admission_denied, 1);
+        assert_eq!(snapshot.metrics.total_runner_reloads, 1);
+        assert_eq!(snapshot.metrics.total_runner_load_failures, 1);
         assert_eq!(snapshot.metrics.max_observed_queue_depth, 2);
         assert!(!snapshot.recent_events.is_empty());
     }

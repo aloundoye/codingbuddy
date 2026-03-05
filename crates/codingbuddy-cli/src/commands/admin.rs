@@ -243,6 +243,17 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             let keep_warm = payload["local_ml"]["runtime"]["keep_warm_secs"]
                 .as_u64()
                 .unwrap_or(0);
+            let max_concurrent_requests =
+                payload["local_ml"]["runtime"]["scheduler"]["max_concurrent_requests"]
+                    .as_u64()
+                    .unwrap_or(0);
+            let max_queue_depth = payload["local_ml"]["runtime"]["scheduler"]["max_queue_depth"]
+                .as_u64()
+                .unwrap_or(0);
+            let max_queue_wait_ms =
+                payload["local_ml"]["runtime"]["scheduler"]["max_queue_wait_ms"]
+                    .as_u64()
+                    .unwrap_or(0);
             let queue_peak = payload["local_ml"]["runtime"]["metrics"]["max_observed_queue_depth"]
                 .as_u64()
                 .unwrap_or(0);
@@ -253,6 +264,13 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
                 payload["local_ml"]["runtime"]["metrics"]["total_queue_completed"]
                     .as_u64()
                     .unwrap_or(0);
+            let queue_rejected = payload["local_ml"]["runtime"]["metrics"]["total_queue_rejected"]
+                .as_u64()
+                .unwrap_or(0);
+            let queue_wait_timeouts =
+                payload["local_ml"]["runtime"]["metrics"]["total_queue_wait_timeouts"]
+                    .as_u64()
+                    .unwrap_or(0);
             let capacity_evictions =
                 payload["local_ml"]["runtime"]["metrics"]["total_capacity_evictions"]
                     .as_u64()
@@ -260,11 +278,26 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             let idle_evictions = payload["local_ml"]["runtime"]["metrics"]["total_idle_evictions"]
                 .as_u64()
                 .unwrap_or(0);
+            let pressure_evictions =
+                payload["local_ml"]["runtime"]["metrics"]["total_memory_pressure_evictions"]
+                    .as_u64()
+                    .unwrap_or(0);
+            let memory_denied =
+                payload["local_ml"]["runtime"]["metrics"]["total_memory_admission_denied"]
+                    .as_u64()
+                    .unwrap_or(0);
+            let runner_reloads = payload["local_ml"]["runtime"]["metrics"]["total_runner_reloads"]
+                .as_u64()
+                .unwrap_or(0);
+            let runner_load_failures =
+                payload["local_ml"]["runtime"]["metrics"]["total_runner_load_failures"]
+                    .as_u64()
+                    .unwrap_or(0);
             let recent_events = payload["local_ml"]["runtime"]["recent_events"]
                 .as_array()
                 .map_or(0usize, std::vec::Vec::len);
             println!(
-                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=enq:{queue_enqueued}/done:{queue_completed}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions} events={recent_events}"
+                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=concurrency:{max_concurrent_requests}/max:{max_queue_depth}/wait_ms:{max_queue_wait_ms}/enq:{queue_enqueued}/done:{queue_completed}/rejected:{queue_rejected}/timeouts:{queue_wait_timeouts}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions}/memory_pressure:{pressure_evictions} memory_denied:{memory_denied} reloads:{runner_reloads} load_failures:{runner_load_failures} events={recent_events}"
             );
         }
         if let Some(warnings) = payload["warnings"].as_array()
@@ -1024,6 +1057,13 @@ mod tests {
         assert!(local_ml["runtime"]["metrics"].is_object());
         assert!(local_ml["runtime"]["recent_events"].is_array());
         assert!(local_ml["runtime"]["warm_models"].is_array());
+        assert!(
+            local_ml["runtime"]["scheduler"].is_object(),
+            "doctor payload must include runtime scheduler policy snapshot"
+        );
+        assert!(local_ml["runtime"]["scheduler"]["max_concurrent_requests"].is_number());
+        assert!(local_ml["runtime"]["scheduler"]["max_queue_depth"].is_number());
+        assert!(local_ml["runtime"]["scheduler"]["max_queue_wait_ms"].is_number());
     }
 
     #[test]
