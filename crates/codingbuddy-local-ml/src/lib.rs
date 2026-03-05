@@ -17,7 +17,7 @@ pub use completion::{
 pub use embeddings::{EmbeddingsBackend, MockEmbeddings};
 pub use model_manager::{
     ModelInfo, ModelManager, ModelManifest, ModelStatus, RuntimeLifecycleEvent,
-    RuntimeLifecycleMetrics, RuntimeLifecycleSnapshot,
+    RuntimeLifecycleMetrics, RuntimeLifecycleSnapshot, RuntimeSchedulerPolicySnapshot,
 };
 pub use privacy::{PrivacyConfig, PrivacyPolicy, PrivacyResult, PrivacyRouter, SensitiveMatch};
 pub use reranker::{MockReranker, RerankerBackend};

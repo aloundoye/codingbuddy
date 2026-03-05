@@ -6,6 +6,7 @@ use crate::model_registry;
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Factory trait for loading local generation backends on demand.
 pub trait BackendFactory: Send + Sync {
@@ -27,6 +28,7 @@ struct RequestGateState {
     queued_requests: usize,
     max_concurrent_requests: usize,
     max_queue_depth: usize,
+    max_queue_wait_ms: u64,
 }
 
 /// Observability snapshot for the local runtime scheduler.
@@ -36,6 +38,7 @@ pub struct LocalRuntimeSchedulerSnapshot {
     pub queued_requests: usize,
     pub max_concurrent_requests: usize,
     pub max_queue_depth: usize,
+    pub max_queue_wait_ms: u64,
     pub loaded_runners: Vec<String>,
     pub lifecycle: RuntimeLifecycleSnapshot,
 }
@@ -117,22 +120,50 @@ impl LocalRunnerLifecycleManager {
         max_concurrent_requests: usize,
         max_queue_depth: usize,
     ) -> Self {
-        Self::with_limits_queue_and_memory_probe(
+        Self::with_limits_queue_and_wait(
             model_manager,
             loader,
             max_concurrent_requests,
             max_queue_depth,
-            Arc::new(hardware::available_memory_mb),
+            45_000,
         )
     }
 
-    fn with_limits_queue_and_memory_probe(
+    /// Build a lifecycle manager with explicit queue wait timeout.
+    pub fn with_limits_queue_and_wait(
         model_manager: ModelManager,
         loader: Arc<dyn BackendFactory>,
         max_concurrent_requests: usize,
         max_queue_depth: usize,
+        max_queue_wait_ms: u64,
+    ) -> Self {
+        Self::with_limits_queue_wait_and_memory_probe(
+            model_manager,
+            loader,
+            max_concurrent_requests,
+            max_queue_depth,
+            max_queue_wait_ms,
+            Arc::new(hardware::available_memory_mb),
+        )
+    }
+
+    fn with_limits_queue_wait_and_memory_probe(
+        model_manager: ModelManager,
+        loader: Arc<dyn BackendFactory>,
+        max_concurrent_requests: usize,
+        max_queue_depth: usize,
+        max_queue_wait_ms: u64,
         memory_probe: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
+        let max_concurrent_requests = max_concurrent_requests.max(1);
+        let max_queue_depth = max_queue_depth.max(1);
+        let max_queue_wait_ms = max_queue_wait_ms.max(1);
+        let mut model_manager = model_manager;
+        model_manager.record_runtime_scheduler_policy(
+            max_concurrent_requests,
+            max_queue_depth,
+            max_queue_wait_ms,
+        );
         Self {
             shared: Arc::new(SharedState {
                 model_manager: Mutex::new(model_manager),
@@ -140,8 +171,9 @@ impl LocalRunnerLifecycleManager {
                 gate: Mutex::new(RequestGateState {
                     active_requests: 0,
                     queued_requests: 0,
-                    max_concurrent_requests: max_concurrent_requests.max(1),
-                    max_queue_depth: max_queue_depth.max(1),
+                    max_concurrent_requests,
+                    max_queue_depth,
+                    max_queue_wait_ms,
                 }),
                 gate_cv: Condvar::new(),
                 loader,
@@ -234,6 +266,7 @@ impl LocalRunnerLifecycleManager {
             queued_requests: gate.queued_requests,
             max_concurrent_requests: gate.max_concurrent_requests,
             max_queue_depth: gate.max_queue_depth,
+            max_queue_wait_ms: gate.max_queue_wait_ms,
             loaded_runners,
             lifecycle,
         }
@@ -276,12 +309,42 @@ impl LocalRunnerLifecycleManager {
         }
 
         let mut gate = self.shared.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let wait_started = Instant::now();
+        let max_wait = Duration::from_millis(gate.max_queue_wait_ms.max(1));
         while gate.active_requests >= gate.max_concurrent_requests {
-            gate = self
+            let elapsed = wait_started.elapsed();
+            if elapsed >= max_wait {
+                gate.queued_requests = gate.queued_requests.saturating_sub(1);
+                let active = gate.active_requests;
+                let queued = gate.queued_requests;
+                let max_concurrent = gate.max_concurrent_requests;
+                let max_queue = gate.max_queue_depth;
+                self.shared.gate_cv.notify_one();
+                drop(gate);
+                let mut mgr = self
+                    .shared
+                    .model_manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                mgr.record_runtime_queue_wait_timeout(
+                    elapsed.as_millis() as u64,
+                    active,
+                    queued,
+                    max_concurrent,
+                    max_queue,
+                );
+                anyhow::bail!(
+                    "local runtime queue wait timed out after {} ms (active={active}, queued={queued}, max_concurrent={max_concurrent}, max_queue_depth={max_queue})",
+                    elapsed.as_millis()
+                );
+            }
+            let remaining = max_wait.saturating_sub(elapsed);
+            let (next_gate, _) = self
                 .shared
                 .gate_cv
-                .wait(gate)
+                .wait_timeout(gate, remaining)
                 .unwrap_or_else(|e| e.into_inner());
+            gate = next_gate;
         }
         gate.queued_requests = gate.queued_requests.saturating_sub(1);
         gate.active_requests = gate.active_requests.saturating_add(1);
@@ -309,15 +372,39 @@ impl LocalRunnerLifecycleManager {
             return Ok(existing);
         }
 
-        let available_mb = (self.shared.memory_probe)();
-        if let Err(reason) = model_registry::check_model_fits(model_id, available_mb) {
-            let mut mgr = self
-                .shared
-                .model_manager
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            mgr.record_runtime_memory_admission_denied(model_id, available_mb, &reason);
-            anyhow::bail!("runtime admission denied for model '{model_id}': {reason}");
+        let mut available_mb = (self.shared.memory_probe)();
+        let mut eviction_attempt = 0usize;
+        loop {
+            match model_registry::check_model_fits(model_id, available_mb) {
+                Ok(()) => break,
+                Err(reason) => {
+                    let victim = {
+                        let mut mgr = self
+                            .shared
+                            .model_manager
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        eviction_attempt = eviction_attempt.saturating_add(1);
+                        mgr.evict_one_runtime_model_for_memory_pressure(
+                            model_id,
+                            available_mb,
+                            eviction_attempt,
+                        )
+                    };
+                    if let Some(evicted_model_id) = victim {
+                        self.remove_runners(&[evicted_model_id]);
+                        available_mb = (self.shared.memory_probe)();
+                        continue;
+                    }
+                    let mut mgr = self
+                        .shared
+                        .model_manager
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    mgr.record_runtime_memory_admission_denied(model_id, available_mb, &reason);
+                    anyhow::bail!("runtime admission denied for model '{model_id}': {reason}");
+                }
+            }
         }
 
         let loaded = match self.shared.loader.load_backend(model_id) {
@@ -395,8 +482,8 @@ mod tests {
     use super::*;
     use crate::completion::MockGenerator;
     use crate::hardware::LocalModelRuntimePolicy;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
-    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     struct SleepGenerator {
@@ -421,6 +508,34 @@ mod tests {
 
         fn model_id(&self) -> &str {
             &self.model_id
+        }
+    }
+
+    struct CancelSignalGenerator {
+        model_id: String,
+        on_cancel: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl CancelSignalGenerator {
+        fn new(model_id: String, on_cancel: Arc<dyn Fn() + Send + Sync>) -> Self {
+            Self {
+                model_id,
+                on_cancel,
+            }
+        }
+    }
+
+    impl LocalGenBackend for CancelSignalGenerator {
+        fn generate(&self, _prompt: &str, _opts: &GenOpts) -> Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+
+        fn cancel(&self) {
+            (self.on_cancel)();
         }
     }
 
@@ -579,11 +694,12 @@ mod tests {
                 as Arc<dyn LocalGenBackend>)
         });
 
-        let scheduler = LocalRunnerLifecycleManager::with_limits_queue_and_memory_probe(
+        let scheduler = LocalRunnerLifecycleManager::with_limits_queue_wait_and_memory_probe(
             manager,
             loader,
             1,
             2,
+            45_000,
             Arc::new(|| 1024),
         );
         let err = scheduler
@@ -596,6 +712,110 @@ mod tests {
 
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.lifecycle.metrics.total_memory_admission_denied, 1);
+    }
+
+    #[test]
+    fn scheduler_queue_wait_timeout_is_tracked() {
+        let dir = TempDir::new().unwrap();
+        let manager = ModelManager::with_runtime_policy(
+            dir.path().to_path_buf(),
+            LocalModelRuntimePolicy {
+                max_loaded_models: 1,
+                keep_warm_secs: 300,
+                aggressive_eviction: false,
+            },
+        );
+
+        let loader: Arc<dyn BackendFactory> = Arc::new(|model_id: &str| {
+            Ok(Arc::new(SleepGenerator::new(
+                model_id.to_string(),
+                Duration::from_millis(250),
+            )) as Arc<dyn LocalGenBackend>)
+        });
+
+        let scheduler =
+            LocalRunnerLifecycleManager::with_limits_queue_and_wait(manager, loader, 1, 2, 40);
+        let opts = GenOpts::default();
+
+        let s1 = scheduler.clone();
+        let opts1 = opts.clone();
+        let h1 = thread::spawn(move || s1.generate("model-a", "prompt-a", &opts1));
+        thread::sleep(Duration::from_millis(15));
+
+        let err = scheduler
+            .generate("model-a", "prompt-b", &opts)
+            .expect_err("queued request should time out");
+        assert!(
+            err.to_string().contains("queue wait timed out"),
+            "unexpected timeout error: {err}"
+        );
+        assert!(h1.join().unwrap().is_ok());
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.lifecycle.metrics.total_queue_wait_timeouts, 1);
+        assert_eq!(snapshot.max_queue_wait_ms, 40);
+    }
+
+    #[test]
+    fn scheduler_memory_pressure_evicts_and_retries_admission() {
+        let dir = TempDir::new().unwrap();
+        let manager = ModelManager::with_runtime_policy(
+            dir.path().to_path_buf(),
+            LocalModelRuntimePolicy {
+                max_loaded_models: 2,
+                keep_warm_secs: 300,
+                aggressive_eviction: false,
+            },
+        );
+        let available_mb = Arc::new(AtomicU64::new(1024));
+        let available_mb_on_cancel = Arc::clone(&available_mb);
+        let loader: Arc<dyn BackendFactory> = Arc::new(move |model_id: &str| {
+            if model_id == "model-a" {
+                let on_cancel: Arc<dyn Fn() + Send + Sync> = Arc::new({
+                    let available_mb = Arc::clone(&available_mb_on_cancel);
+                    move || {
+                        available_mb.store(20_000, Ordering::SeqCst);
+                    }
+                });
+                Ok(
+                    Arc::new(CancelSignalGenerator::new(model_id.to_string(), on_cancel))
+                        as Arc<dyn LocalGenBackend>,
+                )
+            } else {
+                Ok(Arc::new(MockGenerator::new(format!("loaded:{model_id}")))
+                    as Arc<dyn LocalGenBackend>)
+            }
+        });
+
+        let scheduler = LocalRunnerLifecycleManager::with_limits_queue_wait_and_memory_probe(
+            manager,
+            loader,
+            1,
+            2,
+            45_000,
+            Arc::new({
+                let available_mb = Arc::clone(&available_mb);
+                move || available_mb.load(Ordering::SeqCst)
+            }),
+        );
+        scheduler.prewarm("model-a").unwrap();
+        let out = scheduler
+            .generate("qwen2.5-coder-7b", "prompt", &GenOpts::default())
+            .expect("memory pressure relief should allow admission");
+        assert_eq!(out, "loaded:qwen2.5-coder-7b");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(
+            snapshot.lifecycle.metrics.total_memory_pressure_evictions,
+            1
+        );
+        assert_eq!(snapshot.lifecycle.metrics.total_memory_admission_denied, 0);
+        assert!(
+            snapshot
+                .loaded_runners
+                .iter()
+                .any(|model| model == "qwen2.5-coder-7b")
+        );
     }
 
     #[test]
