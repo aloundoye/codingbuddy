@@ -536,9 +536,13 @@ impl PolicyEngine {
 
     pub fn check_path(&self, path: &str) -> Result<(), PolicyError> {
         let candidate = Path::new(path);
+        // Treat rooted paths as absolute-like on all platforms.
+        // On Windows, "/foo" is rooted (current drive) but `is_absolute()` is false.
+        // We still need to constrain it to the workspace root.
+        let absolute_like = candidate.is_absolute() || candidate.has_root();
 
         // Block absolute paths unless workspace root is set and path is under it.
-        if candidate.is_absolute() {
+        if absolute_like {
             if let Some(ref root) = self.workspace_root {
                 if !candidate.starts_with(root) {
                     return Err(PolicyError::PathTraversal);
@@ -559,7 +563,7 @@ impl PolicyEngine {
         // Canonicalize if path exists — resolves symlinks and verifies it stays
         // under the workspace root (prevents symlink-based escapes).
         if let Some(ref root) = self.workspace_root {
-            let resolved = if candidate.is_absolute() {
+            let resolved = if absolute_like {
                 std::fs::canonicalize(candidate).ok()
             } else {
                 std::fs::canonicalize(root.join(candidate)).ok()
@@ -2344,6 +2348,18 @@ mod tests {
         assert!(
             result.is_err(),
             "absolute path outside workspace root should be blocked"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rooted_windows_path_blocked_outside_workspace_root() {
+        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        engine.set_workspace_root(std::path::PathBuf::from(r"C:\workspace\project"));
+        let result = engine.check_path(r"\Windows\System32\drivers\etc\hosts");
+        assert!(
+            result.is_err(),
+            "rooted Windows path outside workspace root should be blocked"
         );
     }
 

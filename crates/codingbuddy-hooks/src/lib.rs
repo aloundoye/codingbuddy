@@ -733,6 +733,22 @@ fn parse_hook_output(stdout: &str) -> HookOutput {
     if let Ok(parsed) = serde_json::from_str::<HookOutput>(trimmed) {
         return parsed;
     }
+    // Windows shell commands sometimes emit JSON with escaped quotes.
+    // Example: {\"permissionDecision\":\"allow\"}
+    if trimmed.contains("\\\"") {
+        let unescaped = trimmed.replace("\\\"", "\"");
+        if let Ok(parsed) = serde_json::from_str::<HookOutput>(&unescaped) {
+            return parsed;
+        }
+        if let (Some(start), Some(end)) = (unescaped.find('{'), unescaped.rfind('}'))
+            && start <= end
+        {
+            let candidate = &unescaped[start..=end];
+            if let Ok(parsed) = serde_json::from_str::<HookOutput>(candidate) {
+                return parsed;
+            }
+        }
+    }
     if let Some(unquoted) = trimmed
         .strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))
@@ -785,20 +801,54 @@ fn parse_hook_output_loose(stdout: &str) -> HookOutput {
 fn extract_loose_field(input: &str, key: &str) -> Option<String> {
     let lower = input.to_ascii_lowercase();
     let key_lower = key.to_ascii_lowercase();
-    let start = lower.find(&key_lower)?;
+    let start = lower.match_indices(&key_lower).find_map(|(idx, _)| {
+        let before_ok = if idx == 0 {
+            true
+        } else {
+            let b = lower.as_bytes()[idx - 1];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        let end = idx + key_lower.len();
+        let after_ok = if end >= lower.len() {
+            true
+        } else {
+            let b = lower.as_bytes()[end];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        if before_ok && after_ok {
+            Some(idx)
+        } else {
+            None
+        }
+    })?;
     let bytes = input.as_bytes();
     let mut i = start + key.len();
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+    while i < bytes.len()
+        && matches!(
+            bytes[i],
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'\\'
+        )
+    {
         i += 1;
     }
     if i < bytes.len() && matches!(bytes[i], b':' | b'=') {
         i += 1;
     }
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+    while i < bytes.len()
+        && matches!(
+            bytes[i],
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'\\'
+        )
+    {
         i += 1;
     }
     let value_start = i;
-    while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b'\n' | b'\r' | b'"' | b'\'') {
+    while i < bytes.len()
+        && !matches!(
+            bytes[i],
+            b',' | b'}' | b'\n' | b'\r' | b'"' | b'\'' | b'\\' | b' ' | b'\t'
+        )
+    {
         i += 1;
     }
     if value_start >= i {
@@ -879,6 +929,10 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     use std::fs;
 
+    fn test_workspace() -> std::path::PathBuf {
+        std::env::temp_dir()
+    }
+
     #[test]
     fn hook_event_roundtrip() {
         for event in [
@@ -929,7 +983,8 @@ mod tests {
 
     #[test]
     fn empty_config_returns_default_result() {
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig::default());
+        let workspace = test_workspace();
+        let rt = HookRuntime::new(&workspace, HooksConfig::default());
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -937,7 +992,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PreToolUse, &input);
         assert!(!result.blocked);
@@ -946,6 +1001,7 @@ mod tests {
 
     #[test]
     fn matcher_filters_by_tool_name() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -959,7 +1015,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
 
         // Should NOT match — tool name doesn't match matcher.
         let input_no_match = HookInput {
@@ -969,7 +1025,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PreToolUse, &input_no_match);
         assert!(result.runs.is_empty());
@@ -982,7 +1038,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PreToolUse, &input_match);
         assert_eq!(result.runs.len(), 1);
@@ -991,6 +1047,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn command_hook_exit_2_blocks() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1004,7 +1061,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1012,7 +1069,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PreToolUse, &input);
         assert!(result.blocked);
@@ -1021,6 +1078,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn command_hook_exit_0_allows() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1034,7 +1092,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1042,7 +1100,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PreToolUse, &input);
         assert!(!result.blocked);
@@ -1098,6 +1156,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn user_prompt_submit_hook_blocks_prompt() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "UserPromptSubmit".to_string(),
@@ -1112,7 +1171,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "UserPromptSubmit".to_string(),
             tool_name: None,
@@ -1120,7 +1179,7 @@ mod tests {
             tool_result: None,
             prompt: Some("test prompt".to_string()),
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::UserPromptSubmit, &input);
         assert!(result.blocked, "UserPromptSubmit with exit 2 should block");
@@ -1137,6 +1196,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn pre_tool_use_hook_modifies_input() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1150,7 +1210,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("fs_read".to_string()),
@@ -1158,7 +1218,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PreToolUse, &input);
         assert!(!result.blocked);
@@ -1173,6 +1233,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn hook_additional_context_is_collected() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1187,7 +1248,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1195,7 +1256,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PreToolUse, &input);
         assert!(
@@ -1210,6 +1271,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn post_tool_use_fires_but_cannot_block() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "PostToolUse".to_string(),
@@ -1224,7 +1286,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PostToolUse".to_string(),
             tool_name: Some("fs_read".to_string()),
@@ -1232,7 +1294,7 @@ mod tests {
             tool_result: Some(serde_json::json!({"output": "file data"})),
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let result = rt.fire(HookEvent::PostToolUse, &input);
         // PostToolUse does not support blocking (supports_blocking() returns false)
@@ -1283,6 +1345,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn hook_timeout_does_not_hang() {
+        let workspace = test_workspace();
         let mut events = HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1296,7 +1359,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1304,7 +1367,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
         let start = std::time::Instant::now();
         let result = rt.fire(HookEvent::PreToolUse, &input);
@@ -1325,6 +1388,7 @@ mod tests {
 
     #[test]
     fn hook_once_fires_only_once() {
+        let workspace = test_workspace();
         let mut events = std::collections::HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1338,7 +1402,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("fs_read".to_string()),
@@ -1346,7 +1410,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
 
         // First fire — should execute
@@ -1360,6 +1424,7 @@ mod tests {
 
     #[test]
     fn hook_disabled_skipped() {
+        let workspace = test_workspace();
         let mut events = std::collections::HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1373,7 +1438,7 @@ mod tests {
                 disabled: true,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("fs_read".to_string()),
@@ -1381,7 +1446,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
 
         let result = rt.fire(HookEvent::PreToolUse, &input);
@@ -1391,18 +1456,16 @@ mod tests {
     // ── P5-11: Permission decision tests ──
 
     fn permission_allow_command() -> String {
-        if cfg!(target_os = "windows") {
-            r#"echo {"permissionDecision":"allow"}"#.to_string()
-        } else {
-            r#"echo '{"permissionDecision":"allow"}'"#.to_string()
-        }
+        "echo permissionDecision=allow".to_string()
     }
 
     fn permission_deny_command() -> String {
         if cfg!(target_os = "windows") {
-            r#"echo {"permissionDecision":"deny","decision":"block","reason":"policy_violation"} && exit /b 2"#.to_string()
+            "echo permissionDecision=deny&&echo decision=block&&echo reason=policy_violation&&exit /b 2"
+                .to_string()
         } else {
-            r#"echo '{"permissionDecision":"deny","decision":"block","reason":"policy_violation"}' && exit 2"#.to_string()
+            "echo permissionDecision=deny && echo decision=block && echo reason=policy_violation && exit 2"
+                .to_string()
         }
     }
 
@@ -1479,10 +1542,26 @@ mod tests {
         assert_eq!(output.permission_decision.as_deref(), Some("allow"));
     }
 
+    #[test]
+    fn parse_hook_output_accepts_escaped_json() {
+        let output =
+            parse_hook_output(r#"{\"permissionDecision\":\"deny\",\"decision\":\"block\"}"#);
+        assert_eq!(output.permission_decision.as_deref(), Some("deny"));
+        assert_eq!(output.decision.as_deref(), Some("block"));
+    }
+
+    #[test]
+    fn parse_hook_output_accepts_windows_loose_tokens() {
+        let output = parse_hook_output(r#"{permissionDecision:allow,decision:block}"#);
+        assert_eq!(output.permission_decision.as_deref(), Some("allow"));
+        assert_eq!(output.decision.as_deref(), Some("block"));
+    }
+
     // ── P5-09: Agent handler test ──
 
     #[test]
     fn agent_handler_spawns_subagent() {
+        let workspace = test_workspace();
         let mut events = std::collections::HashMap::new();
         events.insert(
             "PreToolUse".to_string(),
@@ -1497,7 +1576,7 @@ mod tests {
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(&workspace, HooksConfig { events });
         let input = HookInput {
             event: "PreToolUse".to_string(),
             tool_name: Some("fs_write".to_string()),
@@ -1505,7 +1584,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
         };
 
         let result = rt.fire(HookEvent::PreToolUse, &input);
