@@ -31,6 +31,7 @@ pub use plugins::{
 use serde_json::json;
 use sha2::Digest;
 pub use shell::{PlatformShellRunner, ShellRunResult, ShellRunner};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1159,6 +1160,7 @@ impl LocalToolHost {
                     "source": source,
                 }))
             }
+            name if name.starts_with("plugin__") => self.run_plugin_tool(name, &call.args),
             name if name.starts_with("mcp__") => {
                 let rest = &name[5..]; // skip "mcp__"
                 let (server_id, tool_name) = rest
@@ -1322,6 +1324,52 @@ impl LocalToolHost {
             "sandbox_mode={} requires an OS-level wrapper (set policy.sandbox_wrapper or CODINGBUDDY_SANDBOX_WRAPPER) or install bwrap/firejail/sandbox-exec",
             self.sandbox_mode
         ))
+    }
+
+    fn run_plugin_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let manager = self
+            .plugins
+            .as_ref()
+            .ok_or_else(|| anyhow!("plugin runtime unavailable"))?;
+        let (plugin_id, command_name) = self.resolve_plugin_command(tool_name)?;
+
+        let input = args.get("arguments").or_else(|| args.get("input"));
+        let input = match input {
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            Some(value) if !value.is_null() => Some(serde_json::to_string(value)?),
+            _ => None,
+        };
+
+        let rendered =
+            manager.render_command_prompt(&plugin_id, &command_name, input.as_deref())?;
+        Ok(json!({
+            "plugin_id": rendered.plugin_id,
+            "command_name": rendered.command_name,
+            "source_path": rendered.source_path,
+            "prompt": rendered.prompt,
+        }))
+    }
+
+    fn resolve_plugin_command(&self, tool_name: &str) -> Result<(String, String)> {
+        let manager = self
+            .plugins
+            .as_ref()
+            .ok_or_else(|| anyhow!("plugin runtime unavailable"))?;
+        let plugins = manager.list()?;
+        for plugin in plugins.into_iter().filter(|p| p.enabled) {
+            for cmd_path in &plugin.commands {
+                let command_name = plugin_command_lookup_name(&plugin.root, cmd_path);
+                let candidate = plugin_tool_api_name(&plugin.manifest.id, &command_name);
+                if candidate == tool_name {
+                    return Ok((plugin.manifest.id.clone(), command_name));
+                }
+            }
+        }
+        Err(anyhow!("unknown plugin tool: {tool_name}"))
     }
 
     fn enforce_sandbox_mode(&self, cmd: &str) -> Result<()> {
@@ -2891,32 +2939,36 @@ pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
         Err(_) => return vec![],
     };
     let mut defs = Vec::new();
+    let mut seen = HashSet::new();
     for plugin in plugins {
         if !plugin.enabled {
             continue;
         }
         for cmd_path in &plugin.commands {
-            let cmd_name = cmd_path
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
-            let api_name = format!(
-                "plugin__{}__{}",
-                plugin.manifest.id.replace('-', "_"),
-                cmd_name.replace('-', "_")
-            );
+            let command_name = plugin_command_lookup_name(&plugin.root, cmd_path);
+            let api_name = plugin_tool_api_name(&plugin.manifest.id, &command_name);
+            if !seen.insert(api_name.clone()) {
+                continue;
+            }
             defs.push(ToolDefinition {
                 tool_type: "function".to_string(),
                 function: FunctionDefinition {
                     name: api_name,
-                    description: format!("[Plugin: {}] {} command", plugin.manifest.name, cmd_name),
+                    description: format!(
+                        "[Plugin: {}] {} command",
+                        plugin.manifest.name, command_name
+                    ),
                     strict: None,
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {
                             "arguments": {
                                 "type": "string",
-                                "description": "Arguments to pass to the plugin command"
+                                "description": "Optional input passed to the plugin command template"
+                            },
+                            "input": {
+                                "type": "string",
+                                "description": "Alias for arguments (kept for compatibility)"
                             }
                         },
                         "required": []
@@ -2926,6 +2978,38 @@ pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
         }
     }
     defs
+}
+
+fn plugin_tool_api_name(plugin_id: &str, command_name: &str) -> String {
+    format!(
+        "plugin__{}__{}",
+        sanitize_plugin_tool_segment(plugin_id),
+        sanitize_plugin_tool_segment(command_name)
+    )
+}
+
+fn sanitize_plugin_tool_segment(segment: &str) -> String {
+    segment
+        .replace(['\\', '/'], "_")
+        .replace('-', "_")
+        .trim_matches('_')
+        .to_string()
+}
+
+fn plugin_command_lookup_name(plugin_root: &Path, command_path: &Path) -> String {
+    let commands_root = plugin_root.join("commands");
+    if let Ok(rel) = command_path.strip_prefix(&commands_root) {
+        let rel_no_ext = rel.with_extension("");
+        let rel_name = rel_no_ext.to_string_lossy().replace('\\', "/");
+        if !rel_name.trim().is_empty() {
+            return rel_name;
+        }
+    }
+    command_path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Tools that are handled by AgentEngine directly, not by LocalToolHost.
@@ -4703,6 +4787,80 @@ mod tests {
 
         let hook_out = fs::read_to_string(workspace.join("hook.out")).expect("hook output");
         assert!(hook_out.contains("pretooluse|fs.list"));
+    }
+
+    #[test]
+    fn plugin_tool_definitions_include_installed_commands() {
+        let workspace = std::env::temp_dir().join(format!(
+            "codingbuddy-tools-plugin-defs-test-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let plugin_src = workspace.join("plugin-src");
+        fs::create_dir_all(plugin_src.join(".codingbuddy-plugin")).expect("plugin dir");
+        fs::create_dir_all(plugin_src.join("commands/security")).expect("commands dir");
+        fs::write(
+            plugin_src.join(".codingbuddy-plugin/plugin.json"),
+            r#"{"id":"phase-c-plugin","name":"Phase C Plugin","version":"0.1.0"}"#,
+        )
+        .expect("manifest");
+        fs::write(plugin_src.join("commands/security/review.md"), "# review").expect("command");
+
+        let manager = PluginManager::new(&workspace).expect("plugin manager");
+        manager.install(&plugin_src).expect("install plugin");
+
+        let defs = plugin_tool_definitions(&workspace);
+        assert!(
+            defs.iter()
+                .any(|def| def.function.name == "plugin__phase_c_plugin__security_review"),
+            "expected nested plugin command in generated tool definitions"
+        );
+    }
+
+    #[test]
+    fn plugin_tool_renders_prompt() {
+        let workspace = std::env::temp_dir().join(format!(
+            "codingbuddy-tools-plugin-runtime-test-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let plugin_src = workspace.join("plugin-src");
+        fs::create_dir_all(plugin_src.join(".codingbuddy-plugin")).expect("plugin dir");
+        fs::create_dir_all(plugin_src.join("commands")).expect("commands dir");
+        fs::write(
+            plugin_src.join(".codingbuddy-plugin/plugin.json"),
+            r#"{"id":"phase-c-plugin","name":"Phase C Plugin","version":"0.1.0"}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            plugin_src.join("commands/review.md"),
+            "Plugin {{plugin_id}} / {{command_name}}\nInput={{input}}",
+        )
+        .expect("command");
+
+        let manager = PluginManager::new(&workspace).expect("plugin manager");
+        manager.install(&plugin_src).expect("install plugin");
+
+        let host = LocalToolHost::new(&workspace, PolicyEngine::default()).expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "plugin__phase_c_plugin__review".to_string(),
+                args: json!({"arguments":"focus auth module"}),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success, "plugin tool execution should succeed");
+        assert_eq!(result.output["plugin_id"], "phase-c-plugin");
+        assert_eq!(result.output["command_name"], "review");
+        assert!(
+            result.output["prompt"]
+                .as_str()
+                .is_some_and(|p| p.contains("focus auth module")),
+            "rendered prompt should include provided input"
+        );
     }
 
     #[test]

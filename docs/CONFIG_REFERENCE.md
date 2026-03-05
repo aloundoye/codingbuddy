@@ -85,6 +85,10 @@ Controls for automatic workspace context injection:
 
 ## `plugins` — Plugin System
 
+Enabled plugin commands are exposed to the agent runtime as callable tools named
+`plugin__<plugin_id>__<command>`. Invoking one returns the rendered command prompt
+template so it can be used in the active session.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable plugin discovery and execution |
