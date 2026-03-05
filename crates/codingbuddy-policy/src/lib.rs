@@ -2351,6 +2351,18 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rooted_windows_path_blocked_outside_workspace_root() {
+        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        engine.set_workspace_root(std::path::PathBuf::from(r"C:\workspace\project"));
+        let result = engine.check_path(r"\Windows\System32\drivers\etc\hosts");
+        assert!(
+            result.is_err(),
+            "rooted Windows path outside workspace root should be blocked"
+        );
+    }
+
     #[test]
     fn symlink_escape_blocked() {
         // Create a temp dir and a symlink pointing outside it

@@ -2363,13 +2363,9 @@ mod tests {
 
     #[test]
     fn expand_env_vars_basic() {
-        // Existing env var
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/tmp".to_string());
+        let home = resolve_env_var("HOME").unwrap_or_default();
         let result = expand_env_vars("path=${HOME}/file");
-        assert!(result.contains(&home));
-        assert!(result.ends_with("/file"));
+        assert_eq!(result, format!("path={home}/file"));
     }
 
     #[test]
@@ -2941,10 +2937,9 @@ data: {"other":"ignored"}
 
     #[test]
     fn env_vars_expanded() {
-        // Verify expand_env_vars works with existing HOME var
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/tmp".to_string());
+        // HOME may be absent in some CI setups; resolve with the same helper used
+        // by expansion logic so this stays deterministic cross-platform.
+        let home = resolve_env_var("HOME").unwrap_or_default();
 
         // Expansion works on real env vars
         let expanded = expand_env_vars("Bearer ${HOME}");
@@ -2954,7 +2949,7 @@ data: {"other":"ignored"}
         let expanded2 = expand_env_vars("${NONEXISTENT_ENV_VAR_XYZ:-fallback_val}");
         assert_eq!(expanded2, "fallback_val");
 
-        // Expansion in server config (using HOME which is always set)
+        // Expansion in server config
         let mut server = McpServer {
             id: "svc".to_string(),
             name: "Service".to_string(),
