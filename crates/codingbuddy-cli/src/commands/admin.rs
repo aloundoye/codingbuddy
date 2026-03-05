@@ -8,6 +8,7 @@ use codingbuddy_policy::{PolicyEngine, TeamPolicyLocks, team_policy_locks};
 use codingbuddy_store::Store;
 use codingbuddy_tools::PluginManager;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -185,6 +186,38 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
                 .as_bool()
                 .unwrap_or(false),
         );
+        if let Some(kind) = payload["llm"]["active_provider_kind"].as_str() {
+            println!("llm provider kind: {kind}");
+        }
+        if let Some(models) = payload["llm"]["capability_profiles"].as_array()
+            && !models.is_empty()
+        {
+            println!("capabilities:");
+            for item in models {
+                let model = item["model"].as_str().unwrap_or_default();
+                let provider = item["provider"].as_str().unwrap_or_default();
+                let family = item["family"].as_str().unwrap_or_default();
+                let thinking = item["constraints"]["reasoning"]["thinking_config"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let reasoning = item["constraints"]["reasoning"]["reasoning_mode"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let tool_choice = item["constraints"]["tool_protocol"]["tool_choice"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let images = item["constraints"]["modality"]["image_input"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let rules = item["applied_rules"]
+                    .as_array()
+                    .map_or(0usize, std::vec::Vec::len);
+                println!(
+                    "- model={} provider={} family={} thinking={} reasoning={} tool_choice={} images={} rules={}",
+                    model, provider, family, thinking, reasoning, tool_choice, images, rules
+                );
+            }
+        }
         println!(
             "plugins: enabled={} installed={}",
             payload["plugins"]["enabled"].as_u64().unwrap_or(0),
@@ -215,11 +248,12 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
     Ok(())
 }
 
-pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_json::Value> {
+pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json::Value> {
     let cfg = AppConfig::ensure(cwd)?;
     let plugin_manager = PluginManager::new(cwd)?;
     let plugins = plugin_manager.list().unwrap_or_default();
     let provider = cfg.llm.active_provider();
+    let active_provider_kind = cfg.llm.active_provider_kind();
 
     let runtime = runtime_dir(cwd);
     fs::create_dir_all(&runtime)?;
@@ -261,6 +295,64 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
     if checks["cargo"].as_bool() != Some(true) {
         warnings.push("cargo not found in PATH".to_string());
     }
+    if active_provider_kind.is_none() {
+        warnings.push(format!(
+            "unsupported llm.provider='{}' (capability resolution unavailable)",
+            cfg.llm.provider
+        ));
+    }
+
+    let mut capability_models = Vec::new();
+    if let Some(model) = &args.model {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            capability_models.push(trimmed.to_string());
+        }
+    }
+    capability_models.push(cfg.llm.active_base_model());
+    let reasoner_model = cfg.llm.active_reasoner_model();
+    if reasoner_model != cfg.llm.active_base_model() {
+        capability_models.push(reasoner_model);
+    }
+
+    // Preserve first-seen order while removing duplicates.
+    let mut seen = BTreeSet::new();
+    capability_models.retain(|model| seen.insert(model.to_ascii_lowercase()));
+
+    let mut capability_profiles = Vec::new();
+    for model in capability_models {
+        if let Some(resolution) = cfg.llm.capability_resolution_for_model(&model) {
+            let caps = resolution.capabilities;
+            capability_profiles.push(json!({
+                "model": model,
+                "provider": caps.provider.as_key(),
+                "family": caps.family.as_key(),
+                "applied_rules": resolution.applied_rules,
+                "constraints": {
+                    "modality": {
+                        "image_input": caps.supports_image_input,
+                    },
+                    "tool_protocol": {
+                        "tool_calling": caps.supports_tool_calling,
+                        "tool_choice": caps.supports_tool_choice,
+                        "parallel_tool_calls": caps.supports_parallel_tool_calls,
+                        "streaming_tool_deltas": caps.supports_streaming_tool_deltas,
+                        "normalize_tool_call_ids": caps.normalize_tool_call_ids,
+                        "strict_empty_content_filtering": caps.strict_empty_content_filtering,
+                        "max_safe_tool_count": caps.max_safe_tool_count,
+                        "preferred_edit_tool": preferred_edit_tool_key(caps.preferred_edit_tool),
+                    },
+                    "reasoning": {
+                        "reasoning_mode": caps.supports_reasoning_mode,
+                        "thinking_config": caps.supports_thinking_config,
+                    },
+                    "fim": {
+                        "supported": caps.supports_fim,
+                    },
+                }
+            }));
+        }
+    }
 
     let payload = json!({
         "os": std::env::consts::OS,
@@ -290,6 +382,8 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
             "api_key_configured": api_key_configured,
             "base_model": cfg.llm.active_base_model(),
             "max_think_model": cfg.llm.active_reasoner_model(),
+            "active_provider_kind": active_provider_kind.map(codingbuddy_core::ProviderKind::as_key),
+            "capability_profiles": capability_profiles,
         },
         "plugins": {
             "installed": plugins.len(),
@@ -305,6 +399,14 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
     });
 
     Ok(payload)
+}
+
+fn preferred_edit_tool_key(tool: codingbuddy_core::PreferredEditTool) -> &'static str {
+    match tool {
+        codingbuddy_core::PreferredEditTool::FsEdit => "fs-edit",
+        codingbuddy_core::PreferredEditTool::MultiEdit => "multi-edit",
+        codingbuddy_core::PreferredEditTool::PatchDirect => "patch-direct",
+    }
 }
 
 pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()> {
@@ -869,11 +971,49 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("settings.json"), "{}").unwrap();
 
-        let payload = doctor_payload(cwd, &DoctorArgs {}).unwrap();
+        let payload = doctor_payload(cwd, &DoctorArgs { model: None }).unwrap();
         let local_ml = &payload["local_ml"];
         assert!(local_ml.is_object(), "doctor payload must include local_ml");
         assert!(local_ml.get("enabled").is_some());
         assert!(local_ml.get("privacy_enabled").is_some());
         assert!(local_ml.get("autocomplete_enabled").is_some());
+    }
+
+    #[test]
+    fn doctor_includes_capability_profiles_with_rules() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let dir = cwd.join(".codingbuddy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), "{}").unwrap();
+
+        let payload = doctor_payload(
+            cwd,
+            &DoctorArgs {
+                model: Some("qwen2.5-coder:7b".to_string()),
+            },
+        )
+        .unwrap();
+        let profiles = payload["llm"]["capability_profiles"]
+            .as_array()
+            .expect("capability profiles");
+        assert!(
+            !profiles.is_empty(),
+            "expected at least one capability profile"
+        );
+        let selected = profiles
+            .iter()
+            .find(|entry| entry["model"] == "qwen2.5-coder:7b")
+            .expect("requested model profile");
+        assert!(
+            selected["applied_rules"]
+                .as_array()
+                .is_some_and(|rules| !rules.is_empty()),
+            "applied rules should be auditable"
+        );
+        assert!(
+            selected["constraints"]["tool_protocol"]["max_safe_tool_count"].is_number(),
+            "tool protocol constraints should expose max_safe_tool_count"
+        );
     }
 }
