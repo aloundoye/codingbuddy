@@ -35,37 +35,37 @@ A complete guide to using CodingBuddy — from first install to advanced feature
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aloutndoye/deepseek-cli/main/scripts/install.sh | bash -s -- --version latest
+curl -fsSL https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.sh | bash -s -- --version latest
 ```
 
 Windows (PowerShell):
 
 ```powershell
-$script = Join-Path $env:TEMP "deepseek-install.ps1"
-Invoke-WebRequest https://raw.githubusercontent.com/aloutndoye/deepseek-cli/main/scripts/install.ps1 -OutFile $script
+$script = Join-Path $env:TEMP "codingbuddy-install.ps1"
+Invoke-WebRequest https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.ps1 -OutFile $script
 & $script -Version latest
 ```
 
 ### Build from source
 
 ```bash
-git clone https://github.com/aloutndoye/deepseek-cli.git
-cd deepseek-cli
-cargo build --release --bin deepseek
-# Binary at ./target/release/deepseek
+git clone https://github.com/aloundoye/codingbuddy.git
+cd codingbuddy
+cargo build --release --bin codingbuddy
+# Binary at ./target/release/codingbuddy
 ```
 
 For local ML support (optional, adds ~10MB + model downloads):
 
 ```bash
-cargo build --release --bin deepseek --features local-ml
+cargo build --release --bin codingbuddy --features local-ml
 ```
 
 ### Verify installation
 
 ```bash
-deepseek --version
-deepseek --help
+codingbuddy --version
+codingbuddy --help
 ```
 
 ---
@@ -81,7 +81,7 @@ export DEEPSEEK_API_KEY="sk-..."
 Or persist it per-project:
 
 ```bash
-mkdir -p .deepseek
+mkdir -p .codingbuddy
 echo '{"llm": {"api_key": "sk-..."}}' > .codingbuddy/settings.local.json
 ```
 
@@ -98,9 +98,9 @@ This opens the interactive TUI. Type your request and press Enter.
 ### One-shot commands
 
 ```bash
-deepseek ask "What does this project do?"
-deepseek ask "Find all TODO comments in the codebase"
-deepseek plan "Refactor the authentication module"
+codingbuddy ask "What does this project do?"
+codingbuddy ask "Find all TODO comments in the codebase"
+codingbuddy plan "Refactor the authentication module"
 ```
 
 ### First conversation tips
@@ -118,7 +118,7 @@ deepseek plan "Refactor the authentication module"
 | Mode | Command | What it does | Agent Profile |
 |------|---------|-------------|---------------|
 | **Code** (default) | `codingbuddy chat` | Full agent with all tools — reads, writes, runs commands | None (full tool set) or Plan (if planning keywords detected) |
-| **Ask** | `deepseek ask "..."` | Read-only — answers questions using code search, never modifies files | Explore (read-only tools only) |
+| **Ask** | `codingbuddy ask "..."` | Read-only — answers questions using code search, never modifies files | Explore (read-only tools only) |
 | **Context** | `/context` in chat | Read-only with focus on project structure and dependencies | Explore (read-only tools only) |
 
 Switch modes mid-conversation with slash commands: `/code`, `/ask`, `/context`.
@@ -380,8 +380,8 @@ CodingBuddy ships with built-in safety rules that are always active (prepended b
 | `curl * \| sh` | Ask | Remote code execution risk |
 
 ```bash
-deepseek --permission-mode auto chat
-deepseek permissions set --approve-bash auto --approve-edits ask
+codingbuddy --permission-mode auto chat
+codingbuddy permissions set --approve-bash auto --approve-edits ask
 ```
 
 ### Command Allowlist
@@ -411,8 +411,8 @@ Files matching these patterns are never read or written:
 ### Inspect Policy
 
 ```bash
-deepseek permissions show          # Show current policy
-deepseek permissions dry-run bash_run  # Test what would happen
+codingbuddy permissions show          # Show current policy
+codingbuddy permissions dry-run bash_run  # Test what would happen
 ```
 
 ### Team-Managed Policies
@@ -567,9 +567,9 @@ You are a security-focused code reviewer. Analyze the codebase for:
 ### Managing Subagents
 
 ```bash
-deepseek agents list               # List available agents
-deepseek agents show <name>        # Show agent definition
-deepseek agents create <name>      # Create a new agent definition
+codingbuddy agents list               # List available agents
+codingbuddy agents show <name>        # Show agent definition
+codingbuddy agents create <name>      # Create a new agent definition
 ```
 
 ---
@@ -635,9 +635,9 @@ This gives you:
 ### Privacy Commands
 
 ```bash
-deepseek privacy scan              # Find sensitive files in your project
-deepseek privacy policy            # Show current privacy rules
-deepseek privacy redact-preview    # Preview what would be redacted
+codingbuddy privacy scan              # Find sensitive files in your project
+codingbuddy privacy policy            # Show current privacy rules
+codingbuddy privacy redact-preview    # Preview what would be redacted
 ```
 
 ### Full ML (with models)
@@ -651,10 +651,10 @@ Build with `--features local-ml` to enable Candle-powered backends. Models (~300
 Every conversation is automatically persisted.
 
 ```bash
-deepseek run                       # Resume last session
-deepseek run <session-id>          # Resume specific session
-deepseek status                    # Show current session status
-deepseek usage                     # Show token usage and cost
+codingbuddy run                       # Resume last session
+codingbuddy run <session-id>          # Resume specific session
+codingbuddy status                    # Show current session status
+codingbuddy usage                     # Show token usage and cost
 ```
 
 ### Checkpoints & Rewind
@@ -666,8 +666,8 @@ deepseek usage                     # Show token usage and cost
 ### Replay
 
 ```bash
-deepseek replay list               # List recorded sessions
-deepseek replay run --session-id <id>  # Replay a session deterministically
+codingbuddy replay list               # List recorded sessions
+codingbuddy replay run --session-id <id>  # Replay a session deterministically
 ```
 
 ---
@@ -677,11 +677,11 @@ deepseek replay run --session-id <id>  # Replay a session deterministically
 CodingBuddy can build a local code index for fast search across your project.
 
 ```bash
-deepseek index build               # Build the index
-deepseek index update              # Update with recent changes
-deepseek index status              # Show index stats
-deepseek index watch               # Auto-rebuild on file changes
-deepseek index query "search term" # Search the index directly
+codingbuddy index build               # Build the index
+codingbuddy index update              # Update with recent changes
+codingbuddy index status              # Show index stats
+codingbuddy index watch               # Auto-rebuild on file changes
+codingbuddy index query "search term" # Search the index directly
 ```
 
 The index uses Tantivy (full-text search) and optionally the hybrid vector index (when local ML is enabled).
@@ -693,8 +693,8 @@ The index uses Tantivy (full-text search) and optionally the hybrid vector index
 Run the agent in an unattended loop with a time budget:
 
 ```bash
-deepseek autopilot "Fix all failing tests" --hours 2
-deepseek autopilot status --follow    # Watch progress
+codingbuddy autopilot "Fix all failing tests" --hours 2
+codingbuddy autopilot status --follow    # Watch progress
 ```
 
 Autopilot will:
@@ -720,11 +720,11 @@ Configuration:
 ## Code Review
 
 ```bash
-deepseek review --staged            # Review staged changes
-deepseek review --diff              # Review working tree changes
-deepseek review --pr 123            # Review a pull request
-deepseek review --pr 123 --publish  # Post findings as PR comments
-deepseek review --focus security    # Focus on specific concern
+codingbuddy review --staged            # Review staged changes
+codingbuddy review --diff              # Review working tree changes
+codingbuddy review --pr 123            # Review a pull request
+codingbuddy review --pr 123 --publish  # Post findings as PR comments
+codingbuddy review --focus security    # Focus on specific concern
 ```
 
 Review output follows a structured findings schema with severity levels. Use `--max-comments 20` to limit PR comment volume.
@@ -743,9 +743,9 @@ Configuration merges in this order (later wins):
 ### View & Edit
 
 ```bash
-deepseek config show               # Show merged config (API keys redacted)
-deepseek config edit               # Open config in editor
-deepseek --setting-sources          # Show which files contributed each setting
+codingbuddy config show               # Show merged config (API keys redacted)
+codingbuddy config edit               # Open config in editor
+codingbuddy --setting-sources          # Show which files contributed each setting
 ```
 
 ### Common Settings
@@ -820,7 +820,7 @@ Lower the max turns:
 Switch to `ask` permission mode to approve each action:
 
 ```bash
-deepseek --permission-mode ask chat
+codingbuddy --permission-mode ask chat
 ```
 
 Or block specific paths:
@@ -858,6 +858,6 @@ See `docs/LOCAL_ML_GUIDE.md` for detailed troubleshooting.
 
 Quick fixes:
 - Ghost text empty → need `--features local-ml` build for real completions
-- Retrieval irrelevant → `deepseek index --hybrid clean` to rebuild
+- Retrieval irrelevant → `codingbuddy index --hybrid clean` to rebuild
 - Privacy false positives → adjust `local_ml.privacy.path_globs` in config
 - Model download fails → check `~/.cache/deepseek/` permissions, falls back to mocks automatically

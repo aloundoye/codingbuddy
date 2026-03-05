@@ -7,7 +7,7 @@ CodingBuddy merges configuration from these sources (later entries win):
 3. Project config: `.codingbuddy/settings.json`
 4. Project-local overrides: `.codingbuddy/settings.local.json`
 
-Run `deepseek config show` to view the merged configuration. API keys are redacted in output.
+Run `codingbuddy config show` to view the merged configuration. API keys are redacted in output.
 
 ---
 
