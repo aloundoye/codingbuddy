@@ -27,11 +27,12 @@ use codingbuddy_store::Store;
 use ignore::WalkBuilder;
 pub use plugins::{
     CatalogPlugin, PluginCommandPrompt, PluginInfo, PluginManager, PluginVerifyResult,
+    plugin_tool_definitions,
 };
+use plugins::{plugin_command_lookup_name, plugin_tool_api_name};
 use serde_json::json;
 use sha2::Digest;
 pub use shell::{PlatformShellRunner, ShellRunResult, ShellRunner};
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2925,91 +2926,6 @@ pub fn validate_tool_args_schema(
             errors.join("; ")
         ))
     }
-}
-
-/// Generate ToolDefinitions from installed plugins.
-/// Each plugin command becomes a callable tool with `plugin__<id>__<command>` naming.
-pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
-    let manager = match PluginManager::new(workspace) {
-        Ok(m) => m,
-        Err(_) => return vec![],
-    };
-    let plugins = match manager.list() {
-        Ok(p) => p,
-        Err(_) => return vec![],
-    };
-    let mut defs = Vec::new();
-    let mut seen = HashSet::new();
-    for plugin in plugins {
-        if !plugin.enabled {
-            continue;
-        }
-        for cmd_path in &plugin.commands {
-            let command_name = plugin_command_lookup_name(&plugin.root, cmd_path);
-            let api_name = plugin_tool_api_name(&plugin.manifest.id, &command_name);
-            if !seen.insert(api_name.clone()) {
-                continue;
-            }
-            defs.push(ToolDefinition {
-                tool_type: "function".to_string(),
-                function: FunctionDefinition {
-                    name: api_name,
-                    description: format!(
-                        "[Plugin: {}] {} command",
-                        plugin.manifest.name, command_name
-                    ),
-                    strict: None,
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "arguments": {
-                                "type": "string",
-                                "description": "Optional input passed to the plugin command template"
-                            },
-                            "input": {
-                                "type": "string",
-                                "description": "Alias for arguments (kept for compatibility)"
-                            }
-                        },
-                        "required": []
-                    }),
-                },
-            });
-        }
-    }
-    defs
-}
-
-fn plugin_tool_api_name(plugin_id: &str, command_name: &str) -> String {
-    format!(
-        "plugin__{}__{}",
-        sanitize_plugin_tool_segment(plugin_id),
-        sanitize_plugin_tool_segment(command_name)
-    )
-}
-
-fn sanitize_plugin_tool_segment(segment: &str) -> String {
-    segment
-        .replace(['\\', '/'], "_")
-        .replace('-', "_")
-        .trim_matches('_')
-        .to_string()
-}
-
-fn plugin_command_lookup_name(plugin_root: &Path, command_path: &Path) -> String {
-    let commands_root = plugin_root.join("commands");
-    if let Ok(rel) = command_path.strip_prefix(&commands_root) {
-        let rel_no_ext = rel.with_extension("");
-        let rel_name = rel_no_ext.to_string_lossy().replace('\\', "/");
-        if !rel_name.trim().is_empty() {
-            return rel_name;
-        }
-    }
-    command_path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string()
 }
 
 /// Tools that are handled by AgentEngine directly, not by LocalToolHost.
