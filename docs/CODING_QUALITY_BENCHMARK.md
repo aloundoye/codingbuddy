@@ -18,8 +18,12 @@ Each case records:
 - pass/fail
 - tool invocation count
 - retry count (invocations above expected minimum)
+- denied tool attempts
+- compaction count
 - completion quality score (`1.0`, `0.5`, `0.0`)
 - execution duration
+- input/output/cache token usage
+- estimated cost
 
 ## Run
 
@@ -97,6 +101,10 @@ The comparison summary reports:
 - pass-rate delta
 - average quality delta
 - average retry delta
+- average denied-tool delta
+- average compaction delta
 - average duration delta
+- average input/output token delta
+- average cost delta
 - improved case count
 - regressed case count

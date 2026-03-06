@@ -3490,12 +3490,16 @@ pub struct RebuildProjection {
     pub applied_patches: Vec<Uuid>,
     pub tool_invocations: Vec<Uuid>,
     pub approved_invocations: Vec<Uuid>,
+    pub denied_invocations: Vec<Uuid>,
     pub state: Option<SessionState>,
     pub plugin_events: Vec<String>,
     pub usage_input_tokens: u64,
     pub usage_cache_hit_tokens: u64,
     pub usage_cache_miss_tokens: u64,
     pub usage_output_tokens: u64,
+    pub cost_input_tokens: u64,
+    pub cost_output_tokens: u64,
+    pub estimated_cost_usd: f64,
     pub compaction_events: usize,
     pub autopilot_runs: Vec<Uuid>,
     pub permission_mode: Option<String>,
@@ -3541,6 +3545,7 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
         }
         EventKind::ToolProposed { proposal } => proj.tool_invocations.push(proposal.invocation_id),
         EventKind::ToolApproved { invocation_id } => proj.approved_invocations.push(*invocation_id),
+        EventKind::ToolDenied { invocation_id, .. } => proj.denied_invocations.push(*invocation_id),
         EventKind::SessionStateChanged { to, .. } => proj.state = Some(to.clone()),
         EventKind::PluginInstalled { plugin_id, .. }
         | EventKind::PluginRemoved { plugin_id }
@@ -3561,6 +3566,15 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
                 .usage_cache_miss_tokens
                 .saturating_add(*cache_miss_tokens);
             proj.usage_output_tokens = proj.usage_output_tokens.saturating_add(*output_tokens);
+        }
+        EventKind::CostUpdated {
+            input_tokens,
+            output_tokens,
+            estimated_cost_usd,
+        } => {
+            proj.cost_input_tokens = proj.cost_input_tokens.saturating_add(*input_tokens);
+            proj.cost_output_tokens = proj.cost_output_tokens.saturating_add(*output_tokens);
+            proj.estimated_cost_usd += *estimated_cost_usd;
         }
         EventKind::ContextCompacted { .. } => {
             proj.compaction_events = proj.compaction_events.saturating_add(1)

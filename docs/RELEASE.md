@@ -29,7 +29,7 @@ Not automated in this repo today:
 - Homebrew publishing
 - Winget publishing
 - dedicated live API smoke workflow
-- dedicated benchmark/security/release-readiness workflows
+- dedicated release-readiness/security workflow split
 
 ## Release steps
 1. Ensure `ci.yml` is green on `main`.

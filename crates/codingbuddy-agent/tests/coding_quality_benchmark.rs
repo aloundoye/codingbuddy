@@ -154,6 +154,8 @@ fn run_case(spec: BenchmarkCaseSpec) -> Result<CodingBenchmarkCaseResult> {
         .ok_or_else(|| anyhow!("expected benchmark session to exist"))?
         .session_id;
     let projection = store.rebuild_from_events(session_id)?;
+    let usage = store.usage_summary(Some(session_id), None)?;
+    let estimated_cost_usd = store.total_session_cost(session_id)?;
     let tool_invocations = projection.tool_invocations.len();
     let retries = tool_invocations.saturating_sub(spec.min_tool_invocations);
 
@@ -197,8 +199,15 @@ fn run_case(spec: BenchmarkCaseSpec) -> Result<CodingBenchmarkCaseResult> {
         passed,
         tool_invocations,
         retries,
+        tool_denials: projection.denied_invocations.len(),
+        compaction_events: projection.compaction_events,
         completion_quality_score,
         duration_ms,
+        input_tokens: usage.input_tokens,
+        cache_hit_tokens: usage.cache_hit_tokens,
+        cache_miss_tokens: usage.cache_miss_tokens,
+        output_tokens: usage.output_tokens,
+        estimated_cost_usd,
         note: if notes.is_empty() {
             None
         } else {

@@ -283,15 +283,23 @@ pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
     )
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CodingBenchmarkCaseResult {
     pub case_id: String,
     pub category: String,
     pub passed: bool,
     pub tool_invocations: usize,
     pub retries: usize,
+    pub tool_denials: usize,
+    pub compaction_events: usize,
     pub completion_quality_score: f32,
     pub duration_ms: u128,
+    pub input_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub output_tokens: u64,
+    pub estimated_cost_usd: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -304,8 +312,15 @@ pub struct CodingBenchmarkSummary {
     pub pass_rate_pct: f32,
     pub avg_tool_invocations: f32,
     pub avg_retries: f32,
+    pub avg_tool_denials: f32,
+    pub avg_compaction_events: f32,
     pub avg_completion_quality_score: f32,
     pub avg_duration_ms: f32,
+    pub avg_input_tokens: f32,
+    pub avg_cache_hit_tokens: f32,
+    pub avg_cache_miss_tokens: f32,
+    pub avg_output_tokens: f32,
+    pub avg_estimated_cost_usd: f64,
     pub category_pass_rate_pct: BTreeMap<String, f32>,
     pub category_avg_quality_score: BTreeMap<String, f32>,
 }
@@ -369,7 +384,12 @@ pub struct CodingBenchmarkComparisonSummary {
     pub pass_rate_delta_pct: f32,
     pub avg_completion_quality_delta: f32,
     pub avg_retries_delta: f32,
+    pub avg_tool_denials_delta: f32,
+    pub avg_compaction_events_delta: f32,
     pub avg_duration_delta_ms: f32,
+    pub avg_input_tokens_delta: f32,
+    pub avg_output_tokens_delta: f32,
+    pub avg_estimated_cost_delta_usd: f64,
     pub category_pass_rate_delta_pct: BTreeMap<String, f32>,
     pub category_avg_quality_delta: BTreeMap<String, f32>,
 }
@@ -428,6 +448,24 @@ impl CodingBenchmarkReport {
         } else {
             cases.iter().map(|case| case.retries as f32).sum::<f32>() / total_cases as f32
         };
+        let avg_tool_denials = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.tool_denials as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_compaction_events = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.compaction_events as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
         let avg_completion_quality_score = if total_cases == 0 {
             0.0
         } else {
@@ -445,6 +483,51 @@ impl CodingBenchmarkReport {
                 .map(|case| case.duration_ms as f32)
                 .sum::<f32>()
                 / total_cases as f32
+        };
+        let avg_input_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.input_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_cache_hit_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.cache_hit_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_cache_miss_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.cache_miss_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_output_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.output_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_estimated_cost_usd = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.estimated_cost_usd)
+                .sum::<f64>()
+                / total_cases as f64
         };
         let mut category_stats: BTreeMap<String, (usize, usize, f32)> = BTreeMap::new();
         for case in &cases {
@@ -488,8 +571,15 @@ impl CodingBenchmarkReport {
                 pass_rate_pct,
                 avg_tool_invocations,
                 avg_retries,
+                avg_tool_denials,
+                avg_compaction_events,
                 avg_completion_quality_score,
                 avg_duration_ms,
+                avg_input_tokens,
+                avg_cache_hit_tokens,
+                avg_cache_miss_tokens,
+                avg_output_tokens,
+                avg_estimated_cost_usd,
                 category_pass_rate_pct,
                 category_avg_quality_score,
             },
@@ -622,8 +712,18 @@ pub fn compare_coding_benchmark_reports(
             avg_completion_quality_delta: current.summary.avg_completion_quality_score
                 - reference.summary.avg_completion_quality_score,
             avg_retries_delta: current.summary.avg_retries - reference.summary.avg_retries,
+            avg_tool_denials_delta: current.summary.avg_tool_denials
+                - reference.summary.avg_tool_denials,
+            avg_compaction_events_delta: current.summary.avg_compaction_events
+                - reference.summary.avg_compaction_events,
             avg_duration_delta_ms: current.summary.avg_duration_ms
                 - reference.summary.avg_duration_ms,
+            avg_input_tokens_delta: current.summary.avg_input_tokens
+                - reference.summary.avg_input_tokens,
+            avg_output_tokens_delta: current.summary.avg_output_tokens
+                - reference.summary.avg_output_tokens,
+            avg_estimated_cost_delta_usd: current.summary.avg_estimated_cost_usd
+                - reference.summary.avg_estimated_cost_usd,
             category_pass_rate_delta_pct,
             category_avg_quality_delta,
         },
@@ -1066,8 +1166,15 @@ mod tests {
                     passed: true,
                     tool_invocations: 2,
                     retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
                     completion_quality_score: 1.0,
                     duration_ms: 12,
+                    input_tokens: 120,
+                    cache_hit_tokens: 20,
+                    cache_miss_tokens: 100,
+                    output_tokens: 32,
+                    estimated_cost_usd: 0.0012,
                     note: None,
                 },
                 CodingBenchmarkCaseResult {
@@ -1076,8 +1183,15 @@ mod tests {
                     passed: false,
                     tool_invocations: 1,
                     retries: 1,
+                    tool_denials: 1,
+                    compaction_events: 1,
                     completion_quality_score: 0.4,
                     duration_ms: 9,
+                    input_tokens: 180,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 180,
+                    output_tokens: 48,
+                    estimated_cost_usd: 0.0021,
                     note: Some("missing expected patch".to_string()),
                 },
             ],
@@ -1086,6 +1200,8 @@ mod tests {
         assert_eq!(report.summary.passed_cases, 1);
         assert!((report.summary.pass_rate_pct - 50.0).abs() < f32::EPSILON);
         assert!(report.summary.avg_duration_ms > 0.0);
+        assert!(report.summary.avg_input_tokens > 0.0);
+        assert!(report.summary.avg_estimated_cost_usd > 0.0);
         assert!(report.summary.category_pass_rate_pct.contains_key("edit"));
         assert!(
             report
@@ -1103,8 +1219,15 @@ mod tests {
                 passed: true,
                 tool_invocations: 1,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 64,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 64,
+                output_tokens: 12,
+                estimated_cost_usd: 0.0004,
                 note: None,
             }],
         );
@@ -1133,8 +1256,15 @@ mod tests {
                 passed: true,
                 tool_invocations: 1,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 10,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 10,
+                output_tokens: 5,
+                estimated_cost_usd: 0.0001,
                 note: None,
             }],
         );
@@ -1147,8 +1277,15 @@ mod tests {
                 passed: true,
                 tool_invocations: 1,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 10,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 10,
+                output_tokens: 5,
+                estimated_cost_usd: 0.0001,
                 note: None,
             }],
         );
@@ -1173,8 +1310,15 @@ mod tests {
                     passed: true,
                     tool_invocations: 2,
                     retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
                     completion_quality_score: 1.0,
                     duration_ms: 18,
+                    input_tokens: 200,
+                    cache_hit_tokens: 40,
+                    cache_miss_tokens: 160,
+                    output_tokens: 48,
+                    estimated_cost_usd: 0.0015,
                     note: None,
                 },
                 CodingBenchmarkCaseResult {
@@ -1183,8 +1327,15 @@ mod tests {
                     passed: false,
                     tool_invocations: 3,
                     retries: 1,
+                    tool_denials: 1,
+                    compaction_events: 1,
                     completion_quality_score: 0.5,
                     duration_ms: 27,
+                    input_tokens: 320,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 320,
+                    output_tokens: 80,
+                    estimated_cost_usd: 0.0035,
                     note: Some("missed edge case".to_string()),
                 },
             ],
@@ -1199,8 +1350,15 @@ mod tests {
                     passed: false,
                     tool_invocations: 1,
                     retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
                     completion_quality_score: 0.4,
                     duration_ms: 12,
+                    input_tokens: 140,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 140,
+                    output_tokens: 36,
+                    estimated_cost_usd: 0.0010,
                     note: Some("patch incomplete".to_string()),
                 },
                 CodingBenchmarkCaseResult {
@@ -1209,8 +1367,15 @@ mod tests {
                     passed: true,
                     tool_invocations: 2,
                     retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
                     completion_quality_score: 1.0,
                     duration_ms: 20,
+                    input_tokens: 260,
+                    cache_hit_tokens: 50,
+                    cache_miss_tokens: 210,
+                    output_tokens: 64,
+                    estimated_cost_usd: 0.0027,
                     note: None,
                 },
             ],
@@ -1229,6 +1394,8 @@ mod tests {
             comparison.summary.avg_completion_quality_delta > 0.0,
             "current quality should be higher than reference aggregate"
         );
+        assert!(comparison.summary.avg_estimated_cost_delta_usd > 0.0);
+        assert!(comparison.summary.avg_input_tokens_delta > 0.0);
         assert_eq!(
             comparison.summary.category_pass_rate_delta_pct.get("edit"),
             Some(&100.0)
@@ -1262,8 +1429,15 @@ mod tests {
                 passed: true,
                 tool_invocations: 1,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 10,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 10,
+                output_tokens: 5,
+                estimated_cost_usd: 0.0001,
                 note: None,
             }],
         );
@@ -1276,8 +1450,15 @@ mod tests {
                 passed: true,
                 tool_invocations: 2,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 12,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 12,
+                output_tokens: 7,
+                estimated_cost_usd: 0.0002,
                 note: None,
             }],
         );
