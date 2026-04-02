@@ -417,7 +417,18 @@ pub(crate) fn fuzzy_context_aware(content: &str, search: &str) -> Option<FuzzyMa
     })
 }
 
-pub(crate) fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<usize> {
+/// Result of a single edit: replacements made and optional fuzzy strategy used.
+#[derive(Debug)]
+pub(crate) struct EditResult {
+    pub(crate) replacements: usize,
+    /// Non-None when a fuzzy fallback strategy was used instead of exact match.
+    pub(crate) fuzzy_strategy: Option<&'static str>,
+}
+
+pub(crate) fn apply_single_edit(
+    content: &mut String,
+    edit: &serde_json::Value,
+) -> Result<EditResult> {
     if let (Some(search), Some(replace)) = (
         edit.get("search").and_then(|v| v.as_str()),
         edit.get("replace").and_then(|v| v.as_str()),
@@ -426,24 +437,34 @@ pub(crate) fn apply_single_edit(content: &mut String, edit: &serde_json::Value) 
         if replace_all {
             let count = content.matches(search).count();
             if count == 0 {
-                // Fuzzy fallback for replace_all — try to find at least one match
                 if let Some(fm) = fuzzy_match_search(content, search) {
                     content.replace_range(fm.start..fm.end, replace);
-                    return Ok(1);
+                    return Ok(EditResult {
+                        replacements: 1,
+                        fuzzy_strategy: Some(fm.strategy),
+                    });
                 }
                 return Err(anyhow!("search pattern not found: {search}"));
             }
             *content = content.replace(search, replace);
-            return Ok(count);
+            return Ok(EditResult {
+                replacements: count,
+                fuzzy_strategy: None,
+            });
         }
         if let Some(pos) = content.find(search) {
             content.replace_range(pos..pos + search.len(), replace);
-            return Ok(1);
+            return Ok(EditResult {
+                replacements: 1,
+                fuzzy_strategy: None,
+            });
         }
-        // Fuzzy fallback chain for single replacement
         if let Some(fm) = fuzzy_match_search(content, search) {
             content.replace_range(fm.start..fm.end, replace);
-            return Ok(1);
+            return Ok(EditResult {
+                replacements: 1,
+                fuzzy_strategy: Some(fm.strategy),
+            });
         }
         return Err(anyhow!("search pattern not found: {search}"));
     }
@@ -478,7 +499,10 @@ pub(crate) fn apply_single_edit(content: &mut String, edit: &serde_json::Value) 
         if had_trailing_newline {
             content.push('\n');
         }
-        return Ok(1);
+        return Ok(EditResult {
+            replacements: 1,
+            fuzzy_strategy: None,
+        });
     }
 
     Err(anyhow!(

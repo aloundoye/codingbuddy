@@ -142,6 +142,42 @@ impl Default for CostTracker {
 }
 
 impl CostTracker {
+    /// Set pricing based on model name. Falls back to DeepSeek Chat pricing for unknown models.
+    pub fn set_pricing_for_model(&mut self, model: &str) {
+        let lower = model.to_ascii_lowercase();
+        let (input, output, cache) = match lower.as_str() {
+            // DeepSeek
+            m if m.contains("deepseek-chat") || m.contains("deepseek-v3") => (0.27, 1.10, 0.1),
+            m if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") => (0.55, 2.19, 0.1),
+            // OpenAI
+            m if m.contains("gpt-4o-mini") => (0.15, 0.60, 0.5),
+            m if m.contains("gpt-4o") => (2.50, 10.00, 0.5),
+            m if m.contains("gpt-4.1") => (2.00, 8.00, 0.5),
+            m if m.contains("o3-mini") => (1.10, 4.40, 0.5),
+            m if m.contains("o3") || m.contains("o4-mini") => (1.10, 4.40, 0.5),
+            // Anthropic
+            m if m.contains("claude-3-5-sonnet") || m.contains("claude-sonnet-4") => {
+                (3.00, 15.00, 0.1)
+            }
+            m if m.contains("claude-3-5-haiku") || m.contains("claude-haiku-4") => {
+                (0.80, 4.00, 0.1)
+            }
+            m if m.contains("claude-opus-4") => (15.00, 75.00, 0.1),
+            // Google
+            m if m.contains("gemini-2.5-pro") => (1.25, 10.00, 0.5),
+            m if m.contains("gemini-2.5-flash") => (0.15, 0.60, 0.5),
+            // Qwen
+            m if m.contains("qwen") => (0.14, 0.28, 0.1),
+            // Groq (hosted)
+            m if m.contains("llama") || m.contains("mixtral") => (0.05, 0.08, 0.0),
+            // Default: DeepSeek Chat
+            _ => (0.27, 1.10, 0.1),
+        };
+        self.cost_per_million_input = input;
+        self.cost_per_million_output = output;
+        self.cache_discount = cache;
+    }
+
     /// Record token usage from an API response.
     pub fn record(&mut self, usage: &TokenUsage) {
         self.total_input_tokens += usage.prompt_tokens;

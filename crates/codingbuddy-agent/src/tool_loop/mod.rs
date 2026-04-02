@@ -202,6 +202,7 @@ impl<'a> ToolUseLoop<'a> {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
+        let model_for_pricing = config.model.clone();
 
         // Phase loop: only for Complex tasks
         let initial_phase = config.initial_phase.or_else(|| {
@@ -231,7 +232,11 @@ impl<'a> ToolUseLoop<'a> {
             output_scanner: codingbuddy_policy::output_scanner::OutputScanner::new(),
             tool_cache: HashMap::new(),
             circuit_breaker: HashMap::new(),
-            cost_tracker: CostTracker::default(),
+            cost_tracker: {
+                let mut ct = CostTracker::default();
+                ct.set_pricing_for_model(&model_for_pricing);
+                ct
+            },
             doom_loop_tracker: DoomLoopTracker::default(),
             pinned_directives: Vec::new(),
             workspace_path_str,

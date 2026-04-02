@@ -351,13 +351,22 @@ impl LocalToolHost {
                 let before = fs::read_to_string(&full)?;
                 let mut after = before.clone();
                 let mut replacements = 0usize;
+                let mut fuzzy_strategies: Vec<&str> = Vec::new();
 
                 if let Some(edits) = call.args.get("edits").and_then(|v| v.as_array()) {
                     for edit in edits {
-                        replacements += apply_single_edit(&mut after, edit)?;
+                        let result = apply_single_edit(&mut after, edit)?;
+                        replacements += result.replacements;
+                        if let Some(s) = result.fuzzy_strategy {
+                            fuzzy_strategies.push(s);
+                        }
                     }
                 } else {
-                    replacements += apply_single_edit(&mut after, &call.args)?;
+                    let result = apply_single_edit(&mut after, &call.args)?;
+                    replacements += result.replacements;
+                    if let Some(s) = result.fuzzy_strategy {
+                        fuzzy_strategies.push(s);
+                    }
                 }
 
                 if after == before {
@@ -410,6 +419,9 @@ impl LocalToolHost {
                     "after_sha256": after_sha,
                     "checkpoint_id": checkpoint.map(|id| id.to_string())
                 });
+                if !fuzzy_strategies.is_empty() {
+                    result["fuzzy_strategies"] = json!(fuzzy_strategies);
+                }
                 if let Some(lint) = lint_output {
                     result["lint"] = lint;
                 }
@@ -906,7 +918,7 @@ impl LocalToolHost {
                     if let Some(edits) = file_entry.get("edits").and_then(|v| v.as_array()) {
                         for edit in edits {
                             match apply_single_edit(&mut after, edit) {
-                                Ok(count) => file_replacements += count,
+                                Ok(r) => file_replacements += r.replacements,
                                 Err(e) => {
                                     all_succeeded = false;
                                     results.push(json!({
