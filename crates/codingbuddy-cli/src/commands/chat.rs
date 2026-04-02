@@ -166,6 +166,23 @@ pub(crate) fn run_chat(
         if watch_files_enabled {
             println!("watch mode: enabled (scans TODO(ai)/FIXME(ai)/AI: hints each turn)");
         }
+
+        // Check for incomplete sessions from previous crashes
+        if initial_session_id.is_none()
+            && let Ok(store) = codingbuddy_store::Store::new(cwd)
+            && let Ok(Some(last)) = store.load_latest_session()
+            && let Ok(proj) = store.rebuild_from_events(last.session_id)
+            && !proj.chat_messages.is_empty()
+            && proj
+                .chat_messages
+                .last()
+                .is_some_and(|m| matches!(m, codingbuddy_core::ChatMessage::User { .. }))
+        {
+            println!(
+                "Found incomplete session ({} turns). Use /resume to continue.",
+                proj.transcript.len()
+            );
+        }
     }
     loop {
         if !json_mode {

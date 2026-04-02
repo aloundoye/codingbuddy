@@ -354,7 +354,8 @@ fn styled_statusline_spans_include_mode_badge() {
     assert!(text.contains("EXECUTE"));
     assert!(text.contains("PLAN:AVAILABLE"));
     assert!(text.contains("AUTOPILOT"));
-    assert!(text.contains("100K/128K"));
+    // Token budget bar: 100K/128K ≈ 78%
+    assert!(text.contains("78%"));
 
     // Test with extra context
     let spans_with_ctx = render_statusline_spans(
