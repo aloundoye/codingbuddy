@@ -1,8 +1,6 @@
 use anyhow::{Result, anyhow};
-use base64::Engine;
 use chrono::Utc;
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
-use codingbuddy_chrome::{ChromeSession, ScreenshotFormat};
 use codingbuddy_context::ContextManager;
 use codingbuddy_core::{
     AppConfig, ApprovedToolCall, EventKind, StreamChunk, ToolCall, ToolHost, runtime_dir,
@@ -1303,14 +1301,6 @@ pub(crate) fn run_chat(
                         print_json(&payload)?;
                     } else {
                         println!("{}", render_comment_todos_payload(&payload));
-                    }
-                }
-                SlashCommand::Chrome(args) => {
-                    let payload = chrome_payload(cwd, &args)?;
-                    if json_mode {
-                        print_json(&payload)?;
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&payload)?);
                     }
                 }
                 SlashCommand::Unknown { name, args } => {

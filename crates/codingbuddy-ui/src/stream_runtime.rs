@@ -212,6 +212,12 @@ pub(crate) fn handle_stream_event(
                 "\u{2500}\u{2500} tokens: {}in / {}out{} \u{2502} cost: ${:.4}",
                 input_tokens, output_tokens, cache_info, cost_usd
             ));
+            // Update info line with running cost for status bar visibility
+            *state.info_line = format!(
+                "${:.4} | {}K tok",
+                cost_usd,
+                (input_tokens + output_tokens) / 1000
+            );
             StreamEventResult::Continue
         }
         TuiStreamEvent::RoleHeader { role, model } => {
@@ -227,6 +233,11 @@ pub(crate) fn handle_stream_event(
             response_tx,
         } => {
             let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
+            // Show diff preview for file edit/write operations
+            let diff_preview = build_approval_diff_preview(&tool_name, &args_summary);
+            if let Some(diff) = &diff_preview {
+                state.shell.push_system(diff.clone());
+            }
             *state.info_line = format!(
                 "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
             );
@@ -254,6 +265,51 @@ pub(crate) fn handle_stream_event(
             StreamEventResult::Continue
         }
         TuiStreamEvent::Done(output) => StreamEventResult::Done(output),
+    }
+}
+
+/// Build a diff preview for edit/write approval prompts so users can see
+/// exactly what will change before approving.
+fn build_approval_diff_preview(tool_name: &str, args_json: &str) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(args_json).ok()?;
+
+    match tool_name {
+        "fs.edit" | "fs_edit" => {
+            let file = args.get("file_path").and_then(|v| v.as_str())?;
+            let old = args.get("old_string").and_then(|v| v.as_str())?;
+            let new = args.get("new_string").and_then(|v| v.as_str())?;
+            let mut diff = format!("--- {file}\n+++ {file}\n");
+            for line in old.lines() {
+                diff.push_str(&format!("- {line}\n"));
+            }
+            for line in new.lines() {
+                diff.push_str(&format!("+ {line}\n"));
+            }
+            Some(diff)
+        }
+        "fs.write" | "fs_write" => {
+            let file = args.get("file_path").and_then(|v| v.as_str())?;
+            let content = args.get("content").and_then(|v| v.as_str())?;
+            let mut total_lines = 0usize;
+            let mut preview_lines = Vec::new();
+            for line in content.lines() {
+                total_lines += 1;
+                if preview_lines.len() < 20 {
+                    preview_lines.push(line);
+                }
+            }
+            let suffix = if total_lines > 20 {
+                format!("\n... ({} more lines)", total_lines - 20)
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "Write to {file}:\n{}{}",
+                preview_lines.join("\n"),
+                suffix
+            ))
+        }
+        _ => None,
     }
 }
 

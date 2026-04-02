@@ -202,6 +202,7 @@ impl<'a> ToolUseLoop<'a> {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
+        let model_for_pricing = config.model.clone();
 
         // Phase loop: only for Complex tasks
         let initial_phase = config.initial_phase.or_else(|| {
@@ -231,7 +232,11 @@ impl<'a> ToolUseLoop<'a> {
             output_scanner: codingbuddy_policy::output_scanner::OutputScanner::new(),
             tool_cache: HashMap::new(),
             circuit_breaker: HashMap::new(),
-            cost_tracker: CostTracker::default(),
+            cost_tracker: {
+                let mut ct = CostTracker::default();
+                ct.set_pricing_for_model(&model_for_pricing);
+                ct
+            },
             doom_loop_tracker: DoomLoopTracker::default(),
             pinned_directives: Vec::new(),
             workspace_path_str,
@@ -1117,6 +1122,15 @@ impl<'a> ToolUseLoop<'a> {
                         });
                     }
                 }
+            }
+
+            // Per-turn retrieval: re-inject context every 3 tool-use turns
+            // using the latest assistant message as the query signal.
+            if turns > 0
+                && turns.is_multiple_of(3)
+                && let Some(query) = self.latest_retrieval_query()
+            {
+                self.inject_retrieval_context(&query);
             }
 
             // Build and send the LLM request
@@ -2567,6 +2581,11 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         if !context_parts.is_empty() {
+            // Remove stale retrieval messages to avoid unbounded context growth.
+            self.messages.retain(|m| {
+                !matches!(m, ChatMessage::System { content } if content.starts_with("RETRIEVAL_CONTEXT"))
+            });
+
             let context_msg = format!(
                 "RETRIEVAL_CONTEXT (relevant code from workspace index):\n{}",
                 context_parts.join("\n")
@@ -2583,6 +2602,24 @@ impl<'a> ToolUseLoop<'a> {
                 });
             }
         }
+    }
+
+    fn latest_retrieval_query(&self) -> Option<String> {
+        let user = self.latest_user_prompt();
+        if !user.is_empty() {
+            return Some(user);
+        }
+        // Fallback: last assistant text, truncated to 200 chars
+        self.messages.iter().rev().find_map(|msg| match msg {
+            ChatMessage::Assistant {
+                content: Some(text),
+                ..
+            } if !text.is_empty() => {
+                let end = text.floor_char_boundary(200.min(text.len()));
+                Some(text[..end].to_string())
+            }
+            _ => None,
+        })
     }
 
     /// Apply privacy router to tool output, redacting sensitive content if configured.

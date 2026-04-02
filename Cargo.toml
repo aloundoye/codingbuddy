@@ -9,7 +9,6 @@ members = [
   "crates/codingbuddy-index",
   "crates/codingbuddy-store",
   "crates/codingbuddy-policy",
-  "crates/codingbuddy-observe",
   "crates/codingbuddy-testkit",
   "crates/codingbuddy-ui",
   "crates/codingbuddy-memory",
@@ -18,9 +17,7 @@ members = [
   "crates/codingbuddy-skills",
   "crates/codingbuddy-hooks",
   "crates/codingbuddy-jsonrpc",
-  "crates/codingbuddy-chrome",
   "crates/codingbuddy-context",
-  "crates/codingbuddy-errors",
   "crates/codingbuddy-local-ml",
   "crates/codingbuddy-lsp",
 ]

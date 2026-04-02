@@ -10,7 +10,9 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 // Enhanced context and error handling
-use codingbuddy_errors::ErrorHandler;
+#[allow(dead_code)]
+mod errors;
+use errors::ErrorHandler;
 mod context_enhanced;
 use context_enhanced::errors as enhanced_errors;
 

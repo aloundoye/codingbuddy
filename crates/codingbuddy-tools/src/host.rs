@@ -22,7 +22,6 @@ pub struct LocalToolHost {
     plugins: Option<PluginManager>,
     hooks_enabled: bool,
     visual_verification_enabled: bool,
-    chrome_allow_stub_fallback: bool,
     lint_after_edit: Option<String>,
     diagnostics_after_edit: bool,
     review_mode: bool,
@@ -65,7 +64,6 @@ impl LocalToolHost {
             plugins: PluginManager::new(workspace).ok(),
             hooks_enabled: cfg.plugins.enabled && cfg.plugins.enable_hooks,
             visual_verification_enabled: cfg.experiments.visual_verification,
-            chrome_allow_stub_fallback: cfg.tools.chrome.allow_stub_fallback,
             lint_after_edit,
             diagnostics_after_edit: cfg.tools.diagnostics_after_edit,
             review_mode: false,
@@ -89,23 +87,6 @@ impl LocalToolHost {
 
     pub fn is_review_mode(&self) -> bool {
         self.review_mode
-    }
-
-    fn chrome_port_from_call(call: &ToolCall) -> Result<u16> {
-        let port = call
-            .args
-            .get("port")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(9222);
-        u16::try_from(port).map_err(|_| anyhow!("invalid chrome debug port: {port}"))
-    }
-
-    fn chrome_session_from_call(&self, call: &ToolCall) -> Result<ChromeSession> {
-        let port = Self::chrome_port_from_call(call)?;
-        let mut session = ChromeSession::new(port)?;
-        session.set_allow_stub_fallback(self.chrome_allow_stub_fallback);
-        session.check_connection()?;
-        Ok(session)
     }
 
     fn run_tool(&self, call: &ToolCall) -> Result<serde_json::Value> {
@@ -370,13 +351,22 @@ impl LocalToolHost {
                 let before = fs::read_to_string(&full)?;
                 let mut after = before.clone();
                 let mut replacements = 0usize;
+                let mut fuzzy_strategies: Vec<&str> = Vec::new();
 
                 if let Some(edits) = call.args.get("edits").and_then(|v| v.as_array()) {
                     for edit in edits {
-                        replacements += apply_single_edit(&mut after, edit)?;
+                        let result = apply_single_edit(&mut after, edit)?;
+                        replacements += result.replacements;
+                        if let Some(s) = result.fuzzy_strategy {
+                            fuzzy_strategies.push(s);
+                        }
                     }
                 } else {
-                    replacements += apply_single_edit(&mut after, &call.args)?;
+                    let result = apply_single_edit(&mut after, &call.args)?;
+                    replacements += result.replacements;
+                    if let Some(s) = result.fuzzy_strategy {
+                        fuzzy_strategies.push(s);
+                    }
                 }
 
                 if after == before {
@@ -429,6 +419,9 @@ impl LocalToolHost {
                     "after_sha256": after_sha,
                     "checkpoint_id": checkpoint.map(|id| id.to_string())
                 });
+                if !fuzzy_strategies.is_empty() {
+                    result["fuzzy_strategies"] = json!(fuzzy_strategies);
+                }
                 if let Some(lint) = lint_output {
                     result["lint"] = lint;
                 }
@@ -748,102 +741,6 @@ impl LocalToolHost {
                     }
                 }))
             }
-            "chrome.navigate" => {
-                let url = call
-                    .args
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("url missing"))?;
-                if !url.starts_with("http://")
-                    && !url.starts_with("https://")
-                    && !url.starts_with("about:")
-                {
-                    return Err(anyhow!("url must start with http://, https://, or about:"));
-                }
-                let session = self.chrome_session_from_call(call)?;
-                let result = session.navigate(url)?;
-                Ok(json!({
-                    "url": url,
-                    "cdp": result,
-                    "ok": result.error.is_none()
-                }))
-            }
-            "chrome.click" => {
-                let selector = call
-                    .args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("selector missing"))?;
-                let session = self.chrome_session_from_call(call)?;
-                let result = session.click(selector)?;
-                Ok(json!({
-                    "selector": selector,
-                    "cdp": result,
-                    "ok": result.error.is_none()
-                }))
-            }
-            "chrome.type_text" => {
-                let selector = call
-                    .args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("selector missing"))?;
-                let text = call
-                    .args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("text missing"))?;
-                let session = self.chrome_session_from_call(call)?;
-                let result = session.type_text(selector, text)?;
-                Ok(json!({
-                    "selector": selector,
-                    "text": text,
-                    "cdp": result,
-                    "ok": result.error.is_none()
-                }))
-            }
-            "chrome.screenshot" => {
-                let format = match call
-                    .args
-                    .get("format")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("png")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "png" => ScreenshotFormat::Png,
-                    "jpeg" | "jpg" => ScreenshotFormat::Jpeg,
-                    "webp" => ScreenshotFormat::Webp,
-                    other => return Err(anyhow!("unsupported screenshot format: {other}")),
-                };
-                let session = self.chrome_session_from_call(call)?;
-                let image_base64 = session.screenshot(format)?;
-                Ok(json!({
-                    "format": call.args.get("format").and_then(|v| v.as_str()).unwrap_or("png"),
-                    "base64": image_base64
-                }))
-            }
-            "chrome.read_console" => {
-                let session = self.chrome_session_from_call(call)?;
-                let entries = session.read_console()?;
-                Ok(json!({
-                    "entries": entries,
-                    "count": entries.len()
-                }))
-            }
-            "chrome.evaluate" => {
-                let expression = call
-                    .args
-                    .get("expression")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("expression missing"))?;
-                let session = self.chrome_session_from_call(call)?;
-                let value = session.evaluate(expression)?;
-                Ok(json!({
-                    "expression": expression,
-                    "value": value
-                }))
-            }
             "notebook.read" => {
                 let path = call
                     .args
@@ -1021,7 +918,7 @@ impl LocalToolHost {
                     if let Some(edits) = file_entry.get("edits").and_then(|v| v.as_array()) {
                         for edit in edits {
                             match apply_single_edit(&mut after, edit) {
-                                Ok(count) => file_replacements += count,
+                                Ok(r) => file_replacements += r.replacements,
                                 Err(e) => {
                                     all_succeeded = false;
                                     results.push(json!({
@@ -1386,16 +1283,7 @@ impl ToolHost for LocalToolHost {
             Ok(output) => (true, output),
             Err(err) => {
                 let message = err.to_string();
-                let payload = if call.name.starts_with("chrome.") {
-                    let (kind, hints) = classify_chrome_error(&message);
-                    json!({
-                        "error": message,
-                        "error_kind": kind,
-                        "hints": hints,
-                    })
-                } else {
-                    json!({"error": message})
-                };
+                let payload = json!({"error": message});
                 (false, payload)
             }
         };
@@ -1409,46 +1297,6 @@ impl ToolHost for LocalToolHost {
             success,
             output,
         }
-    }
-}
-
-fn classify_chrome_error(message: &str) -> (&'static str, Vec<&'static str>) {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("connection refused")
-        || lower.contains("endpoint_unreachable")
-        || lower.contains("debugging endpoint is unavailable")
-    {
-        (
-            "endpoint_unreachable",
-            vec![
-                "Start Chrome with --remote-debugging-port=9222",
-                "Verify CODINGBUDDY_CHROME_PORT points to the active debugging port",
-            ],
-        )
-    } else if lower.contains("no_page_targets") || lower.contains("no debuggable page target") {
-        (
-            "no_page_targets",
-            vec![
-                "Open at least one tab in the target Chrome profile",
-                "Run /chrome reconnect to create a recovery tab",
-            ],
-        )
-    } else if lower.contains("timed out") || lower.contains("endpoint_timeout") {
-        (
-            "endpoint_timeout",
-            vec![
-                "Retry /chrome reconnect once the browser is responsive",
-                "Confirm no firewall/proxy is blocking localhost CDP traffic",
-            ],
-        )
-    } else {
-        (
-            "chrome_error",
-            vec![
-                "Run /chrome status for live connection diagnostics",
-                "Run /chrome reconnect to recover stale sessions",
-            ],
-        )
     }
 }
 

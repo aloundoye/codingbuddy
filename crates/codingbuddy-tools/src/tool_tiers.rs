@@ -29,8 +29,6 @@ pub struct ToolContextSignals {
     pub has_notebooks: bool,
     /// Whether the prompt mentions URLs, documentation, or web resources.
     pub prompt_mentions_web: bool,
-    /// Whether the prompt mentions browser, chrome, or UI testing.
-    pub prompt_mentions_chrome: bool,
     /// Approximate number of files in the codebase.
     pub codebase_file_count: usize,
     /// Whether the prompt suggests multi-step work (planning, tasks, etc.).
@@ -88,10 +86,6 @@ pub fn detect_signals(prompt: &str, workspace: &std::path::Path) -> ToolContextS
             || prompt_lower.contains("fetch")
             || prompt_lower.contains("documentation")
             || prompt_lower.contains("web search"),
-        prompt_mentions_chrome: prompt_lower.contains("chrome")
-            || prompt_lower.contains("browser")
-            || prompt_lower.contains("screenshot")
-            || prompt_lower.contains("ui test"),
         codebase_file_count: estimate_file_count(workspace),
         prompt_is_complex: prompt.len() > 300
             || prompt_lower.contains("refactor")
@@ -156,10 +150,9 @@ pub fn tiered_tool_definitions(
             }
             ToolTier::Extended => {
                 // Notebooks included if detected
-                if (signals.has_notebooks
+                if signals.has_notebooks
                     && (def.function.name == "notebook_read"
-                        || def.function.name == "notebook_edit"))
-                    || (signals.prompt_mentions_chrome && def.function.name.starts_with("chrome_"))
+                        || def.function.name == "notebook_edit")
                 {
                     active.push(def);
                 } else {
@@ -180,7 +173,6 @@ pub fn tool_search_definition() -> ToolDefinition {
             name: "tool_search".to_string(),
             description: "Search for additional tools not in your current set. Use when you \
                           need capabilities like: notebooks (notebook_read, notebook_edit), \
-                          browser automation (chrome_navigate, chrome_click, chrome_screenshot), \
                           patch management (patch_stage, patch_apply), skills, or plan mode. \
                           Returns matching tool names and descriptions and makes those matches \
                           available in subsequent turns."
@@ -287,7 +279,6 @@ mod tests {
     #[test]
     fn extended_tools_are_classified() {
         assert_eq!(tool_tier("notebook_read"), ToolTier::Extended);
-        assert_eq!(tool_tier("chrome_navigate"), ToolTier::Extended);
         assert_eq!(tool_tier("patch_stage"), ToolTier::Extended);
         assert_eq!(tool_tier("skill"), ToolTier::Extended);
     }

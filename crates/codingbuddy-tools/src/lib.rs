@@ -16,7 +16,6 @@ pub use validation::{normalize_tool_args, normalize_tool_args_with_workspace, va
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
-use codingbuddy_chrome::{ChromeSession, ScreenshotFormat};
 use codingbuddy_core::{
     AppConfig, ApprovedToolCall, EventEnvelope, EventKind, FunctionDefinition, ToolCall,
     ToolDefinition, ToolHost, ToolProposal, ToolResult,

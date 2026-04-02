@@ -201,6 +201,12 @@ pub enum LlmUnit {
     Executor,
 }
 
+/// Check whether a tool name refers to an MCP-discovered tool (`mcp__server__name` convention).
+#[must_use]
+pub fn is_mcp_tool(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
 /// Type-safe tool name enum covering all built-in tools.
 ///
 /// Maps between underscored API names (`fs_read`) and dotted internal names (`fs.read`).
@@ -228,12 +234,6 @@ pub enum ToolName {
     PatchApply,
     PatchDirect,
     DiagnosticsCheck,
-    ChromeNavigate,
-    ChromeClick,
-    ChromeTypeText,
-    ChromeScreenshot,
-    ChromeReadConsole,
-    ChromeEvaluate,
     ExtendedThinking,
     ToolSearch,
     UserQuestion,
@@ -279,12 +279,6 @@ impl ToolName {
             "patch_apply" => Self::PatchApply,
             "patch_direct" => Self::PatchDirect,
             "diagnostics_check" => Self::DiagnosticsCheck,
-            "chrome_navigate" => Self::ChromeNavigate,
-            "chrome_click" => Self::ChromeClick,
-            "chrome_type_text" => Self::ChromeTypeText,
-            "chrome_screenshot" => Self::ChromeScreenshot,
-            "chrome_read_console" => Self::ChromeReadConsole,
-            "chrome_evaluate" => Self::ChromeEvaluate,
             "extended_thinking" | "think_deeply" => Self::ExtendedThinking,
             "tool_search" => Self::ToolSearch,
             "user_question" => Self::UserQuestion,
@@ -331,12 +325,6 @@ impl ToolName {
             "patch.apply" => Self::PatchApply,
             "patch.direct" => Self::PatchDirect,
             "diagnostics.check" => Self::DiagnosticsCheck,
-            "chrome.navigate" => Self::ChromeNavigate,
-            "chrome.click" => Self::ChromeClick,
-            "chrome.type_text" => Self::ChromeTypeText,
-            "chrome.screenshot" => Self::ChromeScreenshot,
-            "chrome.read_console" => Self::ChromeReadConsole,
-            "chrome.evaluate" => Self::ChromeEvaluate,
             "extended_thinking" | "think_deeply" => Self::ExtendedThinking,
             "tool_search" => Self::ToolSearch,
             "user_question" => Self::UserQuestion,
@@ -382,12 +370,6 @@ impl ToolName {
             Self::PatchApply => "patch.apply",
             Self::PatchDirect => "patch.direct",
             Self::DiagnosticsCheck => "diagnostics.check",
-            Self::ChromeNavigate => "chrome.navigate",
-            Self::ChromeClick => "chrome.click",
-            Self::ChromeTypeText => "chrome.type_text",
-            Self::ChromeScreenshot => "chrome.screenshot",
-            Self::ChromeReadConsole => "chrome.read_console",
-            Self::ChromeEvaluate => "chrome.evaluate",
             Self::ExtendedThinking => "extended_thinking",
             Self::ToolSearch => "tool_search",
             Self::UserQuestion => "user_question",
@@ -432,12 +414,6 @@ impl ToolName {
             Self::PatchApply => "patch_apply",
             Self::PatchDirect => "patch_direct",
             Self::DiagnosticsCheck => "diagnostics_check",
-            Self::ChromeNavigate => "chrome_navigate",
-            Self::ChromeClick => "chrome_click",
-            Self::ChromeTypeText => "chrome_type_text",
-            Self::ChromeScreenshot => "chrome_screenshot",
-            Self::ChromeReadConsole => "chrome_read_console",
-            Self::ChromeEvaluate => "chrome_evaluate",
             Self::ExtendedThinking => "extended_thinking",
             Self::ToolSearch => "tool_search",
             Self::UserQuestion => "user_question",
@@ -498,12 +474,6 @@ impl ToolName {
         Self::PatchApply,
         Self::PatchDirect,
         Self::DiagnosticsCheck,
-        Self::ChromeNavigate,
-        Self::ChromeClick,
-        Self::ChromeTypeText,
-        Self::ChromeScreenshot,
-        Self::ChromeReadConsole,
-        Self::ChromeEvaluate,
         Self::ExtendedThinking,
         Self::ToolSearch,
         Self::UserQuestion,
@@ -3069,7 +3039,6 @@ impl Default for UiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ToolsConfig {
-    pub chrome: ChromeToolsConfig,
     /// Automatically run language-specific diagnostics after file edits.
     /// Feeds compilation errors back to the LLM for self-correction.
     #[serde(default = "default_true")]
@@ -3078,14 +3047,6 @@ pub struct ToolsConfig {
 
 fn default_true() -> bool {
     true
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ChromeToolsConfig {
-    /// Keep deterministic placeholder fallbacks when live Chrome websocket
-    /// is unavailable. Defaults to false (strict-live behavior).
-    pub allow_stub_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
