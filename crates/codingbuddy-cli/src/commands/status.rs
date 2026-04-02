@@ -213,6 +213,7 @@ pub(crate) fn current_ui_status(
         pr_review_status,
         pr_url: None,
         agent_mode: String::new(),
+        active_profile: String::new(),
         mission_control_snapshot,
         current_todo,
         current_step,

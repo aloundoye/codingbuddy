@@ -45,6 +45,8 @@ pub struct UiStatus {
     #[serde(default)]
     pub running_background_jobs: usize,
     #[serde(default)]
+    pub active_profile: String,
+    #[serde(default)]
     pub capability_summary: String,
     #[serde(default)]
     pub provider_diagnostics_summary: String,
@@ -141,8 +143,13 @@ pub fn render_statusline(status: &UiStatus) -> String {
     } else {
         String::new()
     };
+    let profile_part = if !status.active_profile.is_empty() {
+        format!(" profile={}", status.active_profile)
+    } else {
+        String::new()
+    };
     format!(
-        "model={} {} approvals={} jobs={}{}{}{} autopilot={}{}{}{}{}{}{}{}{} cost=${:.4}",
+        "model={} {} approvals={} jobs={}{}{}{} autopilot={}{}{}{}{}{}{}{}{}{} cost=${:.4}",
         status.model,
         mode_indicator,
         status.pending_approvals,
@@ -163,6 +170,7 @@ pub fn render_statusline(status: &UiStatus) -> String {
         caps_part,
         review_part,
         agent_part,
+        profile_part,
         status.estimated_cost_usd,
     )
 }
@@ -348,6 +356,24 @@ pub(crate) fn render_statusline_spans(
         ));
     }
 
+    if !status.active_profile.is_empty() {
+        let profile_color = match status.active_profile.as_str() {
+            "build" => Color::Green,
+            "explore" => Color::Cyan,
+            "plan" => Color::Yellow,
+            "bash" => Color::Magenta,
+            _ => Color::Blue,
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} ", status.active_profile),
+            Style::default()
+                .fg(Color::Black)
+                .bg(profile_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if status.context_max_tokens > 0 {
         let pct =
             (status.context_used_tokens as f64 / status.context_max_tokens as f64 * 100.0) as u64;
@@ -358,13 +384,19 @@ pub(crate) fn render_statusline_spans(
         } else {
             Color::Green
         };
+        // Visual token budget bar: [████░░░░] 42%
+        let bar_width = 8u64;
+        let filled = (pct * bar_width / 100).min(bar_width);
+        let empty = bar_width - filled;
+        let bar = format!(
+            "[{}{}] {}%",
+            "\u{2588}".repeat(filled as usize),
+            "\u{2591}".repeat(empty as usize),
+            pct
+        );
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!(
-                " {}K/{}K ",
-                status.context_used_tokens / 1000,
-                status.context_max_tokens / 1000
-            ),
+            format!(" {bar} "),
             Style::default().fg(ctx_color),
         ));
     }
