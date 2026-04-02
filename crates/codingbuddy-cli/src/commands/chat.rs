@@ -1568,7 +1568,10 @@ pub(crate) fn run_chat(
         if !json_mode && !json_events {
             crate::md_render::print_role_footer();
         }
-        let ui_status = current_ui_status(cwd, &cfg, force_max_think, selected_session_id)?;
+        let mut ui_status = current_ui_status(cwd, &cfg, force_max_think, selected_session_id)?;
+        if let Some(ref p) = active_profile_override {
+            ui_status.active_profile = p.clone();
+        }
         if json_mode {
             let suggestions = generate_prompt_suggestions(&output);
             print_json(
