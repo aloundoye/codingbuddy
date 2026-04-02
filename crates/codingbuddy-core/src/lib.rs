@@ -2397,6 +2397,62 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
         },
     );
     map.insert(
+        "anthropic".to_string(),
+        ProviderConfig {
+            kind: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "claude-sonnet-4-20250514".to_string(),
+                reasoner: Some("claude-sonnet-4-20250514".to_string()),
+            },
+        },
+    );
+    map.insert(
+        "google".to_string(),
+        ProviderConfig {
+            kind: "google".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            api_key_env: "GOOGLE_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "gemini-2.5-flash".to_string(),
+                reasoner: Some("gemini-2.5-pro".to_string()),
+            },
+        },
+    );
+    map.insert(
+        "groq".to_string(),
+        ProviderConfig {
+            kind: "groq".to_string(),
+            base_url: "https://api.groq.com/openai".to_string(),
+            api_key_env: "GROQ_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "llama-3.3-70b-versatile".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "openrouter".to_string(),
+        ProviderConfig {
+            kind: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api".to_string(),
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "anthropic/claude-sonnet-4".to_string(),
+                reasoner: Some("deepseek/deepseek-r1".to_string()),
+            },
+        },
+    );
+    map.insert(
         "ollama".to_string(),
         ProviderConfig {
             kind: "ollama".to_string(),

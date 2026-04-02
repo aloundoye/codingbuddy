@@ -76,6 +76,14 @@ pub(crate) fn provider_compatibility_diagnostics(
             active.push("required->auto-tool_choice".to_string());
             active.push("max_tokens->options.num_predict".to_string());
         }
+        ProviderKind::Anthropic => {
+            active.push("anthropic-cache-control".to_string());
+        }
+        ProviderKind::Google => {
+            active.push("gemini-schema-sanitize".to_string());
+            active.push("max_output_tokens-alias".to_string());
+        }
+        ProviderKind::Groq | ProviderKind::OpenRouter => {}
         ProviderKind::Deepseek => {}
     }
 

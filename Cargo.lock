@@ -905,6 +905,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "strsim",
+ "tree-sitter",
+ "tree-sitter-bash",
  "uuid",
  "wait-timeout",
  "walkdir",
