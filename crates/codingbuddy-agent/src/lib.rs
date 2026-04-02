@@ -93,6 +93,8 @@ pub struct ChatOptions {
     pub chat_history: Vec<ChatMessage>,
     /// Optional explicit session target, used for child-session delegation.
     pub session_id: Option<Uuid>,
+    /// Manual profile override from `/agent <name>`. When set, overrides auto-selection.
+    pub profile_override: Option<String>,
 }
 
 pub struct AgentEngine {
@@ -672,8 +674,12 @@ impl AgentEngine {
             None
         };
 
-        // Select agent profile based on mode and prompt content
-        let profile = agent_profiles::select_profile(options.mode, prompt, complexity);
+        // Select agent profile: manual override takes precedence over auto-selection.
+        let profile = options
+            .profile_override
+            .as_deref()
+            .and_then(agent_profiles::profile_by_name)
+            .or_else(|| agent_profiles::select_profile(options.mode, prompt, complexity));
 
         let active_base_model = self.cfg.llm.active_base_model();
         let active_reasoner_model = self.cfg.llm.active_reasoner_model();

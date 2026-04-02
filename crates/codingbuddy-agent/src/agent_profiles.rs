@@ -73,6 +73,62 @@ pub const PROFILE_GENERAL: AgentProfile = AgentProfile {
     max_turns: None,
 };
 
+/// All named profiles for lookup.
+const ALL_PROFILES: &[&AgentProfile] = &[
+    &PROFILE_BUILD,
+    &PROFILE_EXPLORE,
+    &PROFILE_PLAN,
+    &PROFILE_BASH,
+    &PROFILE_GENERAL,
+];
+
+/// Look up a profile by name (case-insensitive).
+pub fn profile_by_name(name: &str) -> Option<&'static AgentProfile> {
+    ALL_PROFILES
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .copied()
+}
+
+/// All available profile names.
+pub fn available_profile_names() -> &'static [&'static str] {
+    &["build", "explore", "plan", "bash", "general"]
+}
+
+/// Handle the `/agent` slash command. Returns display text and the validated profile name.
+pub fn handle_agent_command(name: Option<&str>) -> (String, Option<String>) {
+    match name {
+        Some(name) => {
+            if let Some(profile) = profile_by_name(name) {
+                (
+                    format!("Switched to agent profile: {}", profile.name),
+                    Some(profile.name.to_string()),
+                )
+            } else {
+                let names = available_profile_names();
+                (
+                    format!(
+                        "Unknown profile '{}'. Available: {}",
+                        name,
+                        names.join(", ")
+                    ),
+                    None,
+                )
+            }
+        }
+        None => {
+            let names = available_profile_names();
+            (
+                format!(
+                    "Available agent profiles: {}\nUsage: /agent <name>",
+                    names.join(", ")
+                ),
+                None,
+            )
+        }
+    }
+}
+
 /// Keywords that indicate the user wants to plan/design without implementing.
 const PLANNING_KEYWORDS: &[&str] = &[
     "plan",
