@@ -191,19 +191,6 @@ impl ToolName {
                 tier: ToolTier::Core,
                 allowed_roles: BUILD_BASH_GENERAL,
             },
-            Self::ChromeNavigate
-            | Self::ChromeClick
-            | Self::ChromeTypeText
-            | Self::ChromeScreenshot
-            | Self::ChromeReadConsole
-            | Self::ChromeEvaluate => ToolMetadata {
-                read_only: false,
-                phase_access: EXECUTE_AND_VERIFY,
-                agent_level: false,
-                review_blocked: false,
-                tier: ToolTier::Extended,
-                allowed_roles: BUILD_GENERAL,
-            },
             Self::TaskCreate | Self::TaskUpdate | Self::TodoWrite | Self::TaskStop => {
                 ToolMetadata {
                     read_only: false,

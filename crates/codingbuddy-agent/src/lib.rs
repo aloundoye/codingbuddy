@@ -31,7 +31,7 @@ use codingbuddy_core::{
 use codingbuddy_hooks::{HookRuntime, HooksConfig};
 use codingbuddy_llm::{ApiClient, LlmClient};
 use codingbuddy_mcp::McpManager;
-use codingbuddy_observe::Observer;
+mod observe;
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
 use codingbuddy_subagent::SubagentTask;
@@ -39,6 +39,7 @@ use codingbuddy_tools::{
     LocalToolHost, detect_signals, plugin_tool_definitions, tiered_tool_definitions,
     tool_definitions, tool_search_definition,
 };
+use observe::Observer;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -777,7 +778,7 @@ impl AgentEngine {
                     tool_type: "function".to_string(),
                     function: codingbuddy_core::FunctionDefinition {
                         name: format!("mcp__{}__{}", mt.server_id, mt.name),
-                        description: mt.description.clone(),
+                        description: truncate_mcp_description(&mt.description),
                         parameters: serde_json::json!({
                             "type": "object",
                             "properties": {
@@ -1106,6 +1107,18 @@ fn prompt_grants_plan_approval(prompt: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+/// Cap MCP tool descriptions to prevent OpenAPI-bloated descriptions from
+/// eating the context window (2048-char cap, inspired by Claude Code).
+const MCP_DESCRIPTION_MAX_CHARS: usize = 2048;
+
+fn truncate_mcp_description(desc: &str) -> String {
+    if desc.len() <= MCP_DESCRIPTION_MAX_CHARS {
+        return desc.to_string();
+    }
+    let safe_end = desc.floor_char_boundary(MCP_DESCRIPTION_MAX_CHARS);
+    format!("{}... [truncated]", &desc[..safe_end])
 }
 
 /// Truncate text to fit a token budget (chars/4 heuristic).

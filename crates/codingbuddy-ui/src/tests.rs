@@ -256,10 +256,6 @@ fn parses_new_slash_commands() {
         SlashCommand::parse("/comment-todos auth"),
         Some(SlashCommand::CommentTodos(vec!["auth".to_string()]))
     );
-    assert_eq!(
-        SlashCommand::parse("/chrome reconnect"),
-        Some(SlashCommand::Chrome(vec!["reconnect".to_string()]))
-    );
     assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit));
     assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Exit));
     assert_eq!(
@@ -955,10 +951,6 @@ fn all_slash_command_variants_parse() {
     assert_eq!(
         SlashCommand::parse("/comment-todos"),
         Some(SlashCommand::CommentTodos(vec![]))
-    );
-    assert_eq!(
-        SlashCommand::parse("/chrome"),
-        Some(SlashCommand::Chrome(vec![]))
     );
     assert_eq!(
         SlashCommand::parse("/rename foo"),
@@ -1841,7 +1833,6 @@ fn slash_catalog_covers_all_canonical_parse_commands() {
         "desktop",
         "todos",
         "comment-todos",
-        "chrome",
         "exit",
         "hooks",
         "rename",

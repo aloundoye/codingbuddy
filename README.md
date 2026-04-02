@@ -51,10 +51,7 @@ CodingBuddy is a Rust workspace organized into focused crates:
 | `codingbuddy-context` | Context enrichment, dependency analysis (petgraph), file relevance scoring |
 | `codingbuddy-skills` | Skill discovery, forked execution, frontmatter parsing |
 | `codingbuddy-subagent` | Background tasks, worktree isolation, custom agent definitions |
-| `codingbuddy-observe` | Structured logging |
 | `codingbuddy-jsonrpc` | JSON-RPC server for IDE integration |
-| `codingbuddy-chrome` | Chrome native host bridge |
-| `codingbuddy-errors` | Error types |
 | `codingbuddy-testkit` | Test utilities |
 
 The default execution mode is the **tool-use loop** (think→act→observe):

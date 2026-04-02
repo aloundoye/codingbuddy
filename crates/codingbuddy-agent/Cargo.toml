@@ -13,7 +13,6 @@ uuid.workspace = true
 ignore.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-llm = { path = "../codingbuddy-llm" }
-codingbuddy-observe = { path = "../codingbuddy-observe" }
 codingbuddy-policy = { path = "../codingbuddy-policy" }
 codingbuddy-store = { path = "../codingbuddy-store" }
 codingbuddy-tools = { path = "../codingbuddy-tools" }

@@ -1,6 +1,6 @@
 //! Enhanced error constructors for CodingBuddy.
 
-use codingbuddy_errors::{EnhancedError, ErrorType};
+use crate::errors::{EnhancedError, ErrorType};
 
 /// Common error constructors using codingbuddy-errors.
 pub mod errors {

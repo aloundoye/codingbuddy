@@ -1119,6 +1119,15 @@ impl<'a> ToolUseLoop<'a> {
                 }
             }
 
+            // Per-turn retrieval: re-inject context every 3 tool-use turns
+            // using the latest assistant message as the query signal.
+            if turns > 0
+                && turns.is_multiple_of(3)
+                && let Some(query) = self.latest_retrieval_query()
+            {
+                self.inject_retrieval_context(&query);
+            }
+
             // Build and send the LLM request
             turns += 1;
             let request = self.build_request();
@@ -2567,6 +2576,11 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         if !context_parts.is_empty() {
+            // Remove stale retrieval messages to avoid unbounded context growth.
+            self.messages.retain(|m| {
+                !matches!(m, ChatMessage::System { content } if content.starts_with("RETRIEVAL_CONTEXT"))
+            });
+
             let context_msg = format!(
                 "RETRIEVAL_CONTEXT (relevant code from workspace index):\n{}",
                 context_parts.join("\n")
@@ -2583,6 +2597,24 @@ impl<'a> ToolUseLoop<'a> {
                 });
             }
         }
+    }
+
+    fn latest_retrieval_query(&self) -> Option<String> {
+        let user = self.latest_user_prompt();
+        if !user.is_empty() {
+            return Some(user);
+        }
+        // Fallback: last assistant text, truncated to 200 chars
+        self.messages.iter().rev().find_map(|msg| match msg {
+            ChatMessage::Assistant {
+                content: Some(text),
+                ..
+            } if !text.is_empty() => {
+                let end = text.floor_char_boundary(200.min(text.len()));
+                Some(text[..end].to_string())
+            }
+            _ => None,
+        })
     }
 
     /// Apply privacy router to tool output, redacting sensitive content if configured.

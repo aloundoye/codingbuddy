@@ -7,28 +7,6 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
-fn chrome_error_payload_classifies_endpoint_unreachable() {
-    let payload = chrome_error_payload(
-        "status",
-        9222,
-        "http://127.0.0.1:9222",
-        &anyhow::anyhow!("Connection refused (os error 61)"),
-    );
-    assert_eq!(payload["error"]["kind"], "endpoint_unreachable");
-}
-
-#[test]
-fn chrome_error_payload_classifies_no_page_targets() {
-    let payload = chrome_error_payload(
-        "status",
-        9222,
-        "http://127.0.0.1:9222",
-        &anyhow::anyhow!("no_page_targets: no debuggable page target available"),
-    );
-    assert_eq!(payload["error"]["kind"], "no_page_targets");
-}
-
-#[test]
 fn render_web_fetch_markdown_contains_metadata_and_extract_block() {
     let output = serde_json::json!({
         "status": 200,

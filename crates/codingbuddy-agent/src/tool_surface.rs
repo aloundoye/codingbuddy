@@ -1,4 +1,6 @@
-use codingbuddy_core::{ModelCapabilities, PreferredEditTool, ToolDefinition, ToolName, ToolTier};
+use codingbuddy_core::{
+    ModelCapabilities, PreferredEditTool, ToolDefinition, ToolName, ToolTier, is_mcp_tool,
+};
 use std::collections::HashSet;
 
 pub(crate) fn shape_tool_surface(
@@ -146,6 +148,7 @@ fn tool_priority(name: &str, capabilities: &ModelCapabilities) -> (u8, u8, Strin
         "exit_plan_mode" => 21,
         "user_question" => 22,
         "extended_thinking" => 23,
+        _ if is_mcp_tool(name) => 30,
         _ => 100,
     };
 
@@ -155,7 +158,7 @@ fn tool_priority(name: &str, capabilities: &ModelCapabilities) -> (u8, u8, Strin
             ToolTier::Contextual => 1,
             ToolTier::Extended => 2,
         })
-        .unwrap_or(3);
+        .unwrap_or(if is_mcp_tool(name) { 1 } else { 3 });
     (primary, tier, name.to_string())
 }
 

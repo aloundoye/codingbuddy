@@ -919,72 +919,6 @@ fn bwrap_preserves_net_when_local_binding_allowed() {
 }
 
 #[test]
-fn chrome_tool_calls_fail_without_live_endpoint_by_default() {
-    let (_workspace, host) = temp_host();
-    let navigate = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "chrome.navigate".to_string(),
-            args: json!({"url":"https://example.com"}),
-            requires_approval: false,
-        },
-    });
-    assert!(!navigate.success);
-    assert!(navigate.output["error"].as_str().is_some());
-    assert!(navigate.output["error_kind"].as_str().is_some());
-    assert!(navigate.output["hints"].is_array());
-}
-
-#[test]
-fn chrome_tool_calls_allow_stub_with_config_opt_in() {
-    let workspace =
-        std::env::temp_dir().join(format!("codingbuddy-tools-chrome-test-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-    let mut cfg = AppConfig::default();
-    cfg.tools.chrome.allow_stub_fallback = true;
-    cfg.save(&workspace).expect("save config");
-    let host = LocalToolHost::new(&workspace, PolicyEngine::default()).expect("tool host");
-
-    let navigate = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "chrome.navigate".to_string(),
-            args: json!({"url":"https://example.com"}),
-            requires_approval: false,
-        },
-    });
-    assert!(navigate.success);
-    assert_eq!(navigate.output["ok"], true);
-    assert_eq!(navigate.output["url"], "https://example.com");
-
-    let evaluate = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "chrome.evaluate".to_string(),
-            args: json!({"expression":"1 + 1"}),
-            requires_approval: false,
-        },
-    });
-    assert!(evaluate.success);
-    assert!(evaluate.output["value"].is_object() || evaluate.output["value"].is_number());
-
-    let screenshot = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "chrome.screenshot".to_string(),
-            args: json!({"format":"png"}),
-            requires_approval: false,
-        },
-    });
-    assert!(screenshot.success);
-    assert!(
-        screenshot.output["base64"]
-            .as_str()
-            .is_some_and(|data| !data.is_empty())
-    );
-}
-
-#[test]
 fn tool_definitions_include_all_tools() {
     let defs = tool_definitions();
     let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
@@ -1016,20 +950,6 @@ fn tool_definitions_include_all_tools() {
         assert!(
             names.contains(&expected),
             "missing tool definition: {expected}"
-        );
-    }
-    // Chrome tools
-    for expected in [
-        "chrome_navigate",
-        "chrome_click",
-        "chrome_type_text",
-        "chrome_screenshot",
-        "chrome_read_console",
-        "chrome_evaluate",
-    ] {
-        assert!(
-            names.contains(&expected),
-            "missing chrome tool definition: {expected}"
         );
     }
     // Agent-level tools
@@ -1066,13 +986,6 @@ fn map_tool_name_covers_all_definitions() {
             "map_tool_name returned empty for {fn_name}"
         );
     }
-    // Verify chrome mappings specifically
-    assert_eq!(map_tool_name("chrome_navigate"), "chrome.navigate");
-    assert_eq!(map_tool_name("chrome_click"), "chrome.click");
-    assert_eq!(map_tool_name("chrome_type_text"), "chrome.type_text");
-    assert_eq!(map_tool_name("chrome_screenshot"), "chrome.screenshot");
-    assert_eq!(map_tool_name("chrome_read_console"), "chrome.read_console");
-    assert_eq!(map_tool_name("chrome_evaluate"), "chrome.evaluate");
     // Agent-level tool mappings
     assert_eq!(map_tool_name("user_question"), "user_question");
     assert_eq!(map_tool_name("task_create"), "task_create");

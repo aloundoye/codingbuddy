@@ -39,8 +39,6 @@ codingbuddy-skills = { path = "../codingbuddy-skills" }
 codingbuddy-subagent = { path = "../codingbuddy-subagent" }
 codingbuddy-jsonrpc = { path = "../codingbuddy-jsonrpc" }
 codingbuddy-context = { path = "../codingbuddy-context" }
-codingbuddy-errors = { path = "../codingbuddy-errors" }
-codingbuddy-chrome = { path = "../codingbuddy-chrome" }
 codingbuddy-local-ml = { path = "../codingbuddy-local-ml" }
 ignore.workspace = true
 

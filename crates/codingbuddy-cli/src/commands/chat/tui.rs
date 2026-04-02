@@ -882,10 +882,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             let payload = comment_todos_payload(cwd, &args)?;
                             render_comment_todos_payload(&payload)
                         }
-                        SlashCommand::Chrome(args) => {
-                            let payload = chrome_payload(cwd, &args)?;
-                            serde_json::to_string_pretty(&payload)?
-                        }
                         SlashCommand::Unknown { name, args } => {
                             let custom_cmds = codingbuddy_skills::load_custom_commands(cwd);
                             if let Some(cmd) = custom_cmds.iter().find(|c| c.name == name) {
@@ -1037,7 +1033,19 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         reason: "model_switch".to_string(),
                     });
                 }
-                StreamChunk::UsageUpdate { .. } => {}
+                StreamChunk::UsageUpdate {
+                    input_tokens,
+                    output_tokens,
+                    cache_hit_tokens,
+                    estimated_cost_usd,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::UsageSummary {
+                        input_tokens,
+                        output_tokens,
+                        cache_hit_tokens,
+                        cost_usd: estimated_cost_usd,
+                    });
+                }
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
                 }
