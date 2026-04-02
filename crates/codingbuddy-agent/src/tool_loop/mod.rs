@@ -100,6 +100,8 @@ Initialize it before edits, keep exactly one in_progress item, and update it aft
 
 /// TTL for cached read-only tool results (in seconds).
 const TOOL_CACHE_TTL_SECS: u64 = 60;
+/// Extended TTL for fs_read — files rarely change between agent turns.
+const TOOL_CACHE_TTL_READ_SECS: u64 = 120;
 
 /// Tools whose results can be cached (all read-only).
 const CACHEABLE_TOOLS: &[&str] = &["fs_read", "fs_glob", "fs_grep", "fs_list", "index_query"];
@@ -773,8 +775,13 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         let key = Self::cache_key(tool_name, args);
+        let ttl = if tool_name == "fs_read" {
+            TOOL_CACHE_TTL_READ_SECS
+        } else {
+            TOOL_CACHE_TTL_SECS
+        };
         if let Some(entry) = self.tool_cache.get(&key)
-            && entry.timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS
+            && entry.timestamp.elapsed().as_secs() < ttl
         {
             return Some(entry.result.clone());
         }

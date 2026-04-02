@@ -145,6 +145,7 @@ pub(crate) fn run_chat(
     let mut additional_dirs = cli.map(|value| value.add_dir.clone()).unwrap_or_default();
     let mut read_only_mode = false;
     let mut active_chat_mode = ChatMode::Code;
+    let mut active_profile_override: Option<String> = None;
     let mut last_watch_digest: Option<u64> = None;
     let mut pending_images: Vec<codingbuddy_core::ImageContent> = vec![];
     let mut selected_session_id = initial_session_id;
@@ -813,6 +814,14 @@ pub(crate) fn run_chat(
                         println!("{}", render_agents_payload(&payload));
                     }
                 }
+                SlashCommand::Agent(name) => {
+                    let (text, profile) =
+                        codingbuddy_agent::agent_profiles::handle_agent_command(name.as_deref());
+                    if let Some(p) = profile {
+                        active_profile_override = Some(p);
+                    }
+                    println!("{text}");
+                }
                 SlashCommand::Tasks(args) => {
                     let response = handle_tasks_slash(cwd, &args, selected_session_id)?;
                     if let Some(session_id) = response.session_switch {
@@ -1330,6 +1339,7 @@ pub(crate) fn run_chat(
                                     detect_urls,
                                     watch_files: watch_files_enabled,
                                     session_id: selected_session_id,
+                                    profile_override: active_profile_override.clone(),
                                     ..Default::default()
                                 },
                             )?;
@@ -1528,6 +1538,7 @@ pub(crate) fn run_chat(
                 watch_files: watch_files_enabled,
                 images: images_for_turn,
                 session_id: selected_session_id,
+                profile_override: active_profile_override.clone(),
                 ..Default::default()
             },
         )?;
@@ -1599,6 +1610,7 @@ pub(crate) fn run_chat(
                             detect_urls,
                             watch_files: true,
                             session_id: selected_session_id,
+                            profile_override: active_profile_override.clone(),
                             ..Default::default()
                         },
                     )?;

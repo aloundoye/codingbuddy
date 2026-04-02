@@ -14,17 +14,17 @@ pub const COMPACTION_TARGET_PCT: f64 = 0.80;
 
 /// Template for LLM-based compaction. The LLM fills this in based on the conversation.
 pub(crate) const COMPACTION_TEMPLATE: &str = "Summarize this conversation into the following sections. \
-Be precise and factual — include file paths, function names, and error messages. \
+Be precise and factual — include file paths, function names, and error messages verbatim. \
 Keep each section to 2-5 bullet points. Output ONLY the filled template:\n\n\
-## Goal\n(What the user asked for)\n\n\
-## Completed\n(What was done successfully — include file paths)\n\n\
-## In Progress\n(What's partially done or pending)\n\n\
-## Key Facts Established\n\
-(Important facts the user stated or that were discovered during the conversation. \
-Include: file paths discussed, decisions made, user preferences stated, corrections given. \
-These facts must be preserved across compaction so the model does not lose context.)\n\n\
-## Key Findings\n(Important discoveries, errors hit, architectural decisions)\n\n\
-## Modified Files\n(List of files created, edited, or deleted)";
+## Goal\n(What the user is trying to accomplish — the high-level objective)\n\n\
+## Key Decisions Made\n\
+(CRITICAL: User preferences, corrections, and explicit instructions that MUST survive compaction. \
+Examples: 'user said don't use mocks', 'user wants single PR', 'user corrected approach X to Y'. \
+These override default behavior in all future turns.)\n\n\
+## Work Completed\n(What was done successfully — include file paths and what changed)\n\n\
+## Current State\n(What's in progress, what's blocked, what the next step should be)\n\n\
+## Key Findings\n(Important discoveries: error patterns, architectural constraints, environment details)\n\n\
+## Modified Files\n(List of files created, edited, or deleted — one per line)";
 
 /// Extract a file path from a tool result (JSON or plain text).
 pub(crate) fn extract_tool_path(content: &str) -> Option<String> {

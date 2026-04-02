@@ -236,6 +236,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         images: vec![],
         chat_history: vec![],
         session_id: None,
+        profile_override: None,
     }
 }
 

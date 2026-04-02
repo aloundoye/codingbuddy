@@ -555,18 +555,22 @@ fn compaction_preserves_key_decisions() {
 }
 
 #[test]
-fn compaction_template_includes_key_facts_section() {
+fn compaction_template_includes_key_decisions_section() {
     assert!(
-        COMPACTION_TEMPLATE.contains("## Key Facts Established"),
-        "template should include Key Facts section for context retention"
+        COMPACTION_TEMPLATE.contains("## Key Decisions Made"),
+        "template should include Key Decisions section for context retention"
     );
     assert!(
-        COMPACTION_TEMPLATE.contains("user preferences"),
+        COMPACTION_TEMPLATE.contains("User preferences"),
         "template should mention preserving user preferences"
     );
     assert!(
-        COMPACTION_TEMPLATE.contains("corrections given"),
+        COMPACTION_TEMPLATE.contains("corrections"),
         "template should mention preserving corrections"
+    );
+    assert!(
+        COMPACTION_TEMPLATE.contains("## Current State"),
+        "template should include Current State section"
     );
 }
 

@@ -882,6 +882,13 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             let payload = comment_todos_payload(cwd, &args)?;
                             render_comment_todos_payload(&payload)
                         }
+                        SlashCommand::Agent(name) => {
+                            let (text, _profile) =
+                                codingbuddy_agent::agent_profiles::handle_agent_command(
+                                    name.as_deref(),
+                                );
+                            text
+                        }
                         SlashCommand::Unknown { name, args } => {
                             let custom_cmds = codingbuddy_skills::load_custom_commands(cwd);
                             if let Some(cmd) = custom_cmds.iter().find(|c| c.name == name) {
