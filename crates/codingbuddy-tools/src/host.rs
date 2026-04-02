@@ -594,6 +594,22 @@ impl LocalToolHost {
                     .or_else(|| call.args.get("command"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("cmd missing — expected 'cmd' parameter"))?;
+
+                // Structural command analysis via tree-sitter-bash AST.
+                let cmd_analysis = crate::bash_ast::analyze_command(cmd);
+                if cmd_analysis.has_dangerous_patterns {
+                    return Err(anyhow!(
+                        "command blocked: dangerous pattern detected ({}). \
+                         Detected commands: [{}]",
+                        if cmd_analysis.has_dangerous_patterns {
+                            "eval, curl|sh, or rm -rf /"
+                        } else {
+                            "unknown"
+                        },
+                        cmd_analysis.commands.join(", ")
+                    ));
+                }
+
                 self.enforce_sandbox_mode(cmd)?;
                 self.policy.check_command(cmd)?;
                 let timeout = call
@@ -601,7 +617,21 @@ impl LocalToolHost {
                     .get("timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-                self.run_bash_cmd(cmd, timeout)
+                let mut result = self.run_bash_cmd(cmd, timeout)?;
+
+                // Annotate result with AST-derived security metadata.
+                if cmd_analysis.has_network_access
+                    || cmd_analysis.has_deletions
+                    || cmd_analysis.has_permission_changes
+                {
+                    result["security_flags"] = json!({
+                        "network_access": cmd_analysis.has_network_access,
+                        "file_deletions": cmd_analysis.has_deletions,
+                        "permission_changes": cmd_analysis.has_permission_changes,
+                        "commands": cmd_analysis.commands,
+                    });
+                }
+                Ok(result)
             }
             "web.fetch" => {
                 let url = call

@@ -1,3 +1,4 @@
+pub mod bash_ast;
 mod command_guard;
 mod fuzzy_edit;
 mod plugins;

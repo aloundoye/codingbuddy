@@ -175,7 +175,12 @@ impl ApiClient {
                     format!("{prefix}/completions")
                 }
             }
-            ProviderKind::OpenAiCompatible | ProviderKind::Ollama => {
+            ProviderKind::OpenAiCompatible
+            | ProviderKind::Anthropic
+            | ProviderKind::Google
+            | ProviderKind::Groq
+            | ProviderKind::OpenRouter
+            | ProviderKind::Ollama => {
                 if is_chat {
                     format!("{prefix}/chat/completions")
                 } else {
@@ -1010,7 +1015,12 @@ impl ApiClient {
                 })?;
                 Ok(normalized.to_string())
             }
-            ProviderKind::OpenAiCompatible | ProviderKind::Ollama => Ok(trimmed.to_string()),
+            ProviderKind::OpenAiCompatible
+            | ProviderKind::Anthropic
+            | ProviderKind::Google
+            | ProviderKind::Groq
+            | ProviderKind::OpenRouter
+            | ProviderKind::Ollama => Ok(trimmed.to_string()),
         }
     }
 
