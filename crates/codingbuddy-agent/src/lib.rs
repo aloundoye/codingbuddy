@@ -22,7 +22,7 @@ pub fn has_local_ml_feature() -> bool {
     cfg!(feature = "local-ml")
 }
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use codingbuddy_core::{
     AppConfig, ChatMessage, ChatRequest, EventEnvelope, EventKind, Session, SessionBudgets,
@@ -119,10 +119,10 @@ impl AgentEngine {
     pub fn new(workspace: &Path) -> Result<Self> {
         let mut prof = codingbuddy_core::profiler::StartupProfiler::new();
 
-        let cfg = AppConfig::ensure(workspace)?;
+        let cfg = AppConfig::ensure(workspace).context("failed to load config")?;
         prof.mark("config_load");
 
-        let llm = Box::new(ApiClient::new(cfg.llm.clone())?);
+        let llm = Box::new(ApiClient::new(cfg.llm.clone()).context("failed to create LLM client")?);
         prof.mark("llm_client");
 
         let result = Self::new_with_components(workspace, cfg, llm);
@@ -147,7 +147,7 @@ impl AgentEngine {
             managed.apply_to_config(&mut cfg);
         }
 
-        let store = Store::new(workspace)?;
+        let store = Store::new(workspace).context("failed to open session store")?;
 
         // Spawn MCP discovery after Store init to avoid SQLite migration races.
         let mcp_workspace = workspace.to_path_buf();

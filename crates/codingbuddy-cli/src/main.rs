@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use codingbuddy_agent::{AgentEngine, ChatMode};
@@ -1324,7 +1324,7 @@ fn run() -> Result<()> {
     prof.mark("cli_parse");
 
     validate_cli_flags(&cli)?;
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir().context("could not determine working directory")?;
 
     // Only migrate if legacy directory exists (skip the check on most runs)
     if cwd.join(".deepseek").exists() {

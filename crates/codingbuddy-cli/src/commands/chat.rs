@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use codingbuddy_agent::context::ContextManager;
 use codingbuddy_agent::skills::SkillManager;
@@ -90,22 +90,25 @@ pub(crate) fn run_chat(
 ) -> Result<()> {
     use std::io::{IsTerminal, Write, stdin, stdout};
 
-    let mut cfg = AppConfig::ensure(cwd)?;
-    // Run first-time setup wizard once (provider, API key, local ML, privacy)
+    let mut cfg = AppConfig::ensure(cwd).context("failed to load workspace config")?;
     if !json_mode {
         match super::setup::maybe_first_time_setup(cwd, &cfg) {
-            Ok(true) => cfg = AppConfig::ensure(cwd)?,
+            Ok(true) => {
+                cfg = AppConfig::ensure(cwd).context("failed to reload config after setup")?
+            }
             Ok(false) => {}
             Err(e) => eprintln!("setup skipped: {e}"),
         }
     }
-    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)?;
-    let mut engine = AgentEngine::new(cwd)?;
+    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)
+        .context("LLM provider not ready — check your API key and provider settings")?;
+    let mut engine = AgentEngine::new(cwd).context("failed to initialize agent engine")?;
     if let Some(cli) = cli {
         apply_cli_flags(&mut engine, cli);
     }
-    // Validate API key works before entering chat loop
-    engine.validate_api_key()?;
+    engine
+        .validate_api_key()
+        .context("API key validation failed — run `codingbuddy init` to configure")?;
     let mut force_max_think = cli
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
