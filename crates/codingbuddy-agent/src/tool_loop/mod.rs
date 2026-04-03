@@ -158,6 +158,8 @@ pub struct ToolUseLoop<'a> {
     cost_tracker: CostTracker,
     /// Doom loop tracker — detects when the model repeats the same tool call.
     doom_loop_tracker: DoomLoopTracker,
+    /// Denial tracker — detects repeated user denials to stop persistent agents.
+    denial_tracker: safety::DenialTracker,
     /// User directives extracted from conversation ("always X", "never Y", etc.).
     /// These survive compaction by being re-injected after the system message.
     pinned_directives: Vec<String>,
@@ -240,6 +242,7 @@ impl<'a> ToolUseLoop<'a> {
                 ct
             },
             doom_loop_tracker: DoomLoopTracker::default(),
+            denial_tracker: safety::DenialTracker::default(),
             pinned_directives: Vec::new(),
             workspace_path_str,
             tool_output_cleanup_done: false,
@@ -1954,11 +1957,18 @@ impl<'a> ToolUseLoop<'a> {
                     success: false,
                     summary: "denied by user".to_string(),
                 });
-                // Feed denial back to LLM
-                self.messages.push(tool_bridge::tool_error_to_message(
-                    &llm_call.id,
-                    "Tool call denied by user. Try a different approach or ask the user for guidance.",
-                ));
+
+                // Track denial for burst detection
+                let threshold_hit = self.denial_tracker.record_denial(&llm_call.name);
+                let denial_msg = if threshold_hit && !self.denial_tracker.guidance_injected {
+                    self.denial_tracker.guidance_injected = true;
+                    safety::DENIAL_GUIDANCE
+                } else {
+                    "Tool call denied by user. Try a different approach or ask the user for guidance."
+                };
+                self.messages
+                    .push(tool_bridge::tool_error_to_message(&llm_call.id, denial_msg));
+
                 records.push(ToolCallRecord {
                     tool_name: llm_call.name.clone(),
                     tool_call_id: llm_call.id.clone(),
@@ -1969,6 +1979,10 @@ impl<'a> ToolUseLoop<'a> {
                     result_preview: None,
                 });
                 return Ok(records);
+            }
+            // Approved after previous denials — reset tracker
+            if self.denial_tracker.denials_pending() {
+                self.denial_tracker.reset();
             }
         }
 

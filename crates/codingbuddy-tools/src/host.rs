@@ -30,7 +30,7 @@ pub struct LocalToolHost {
 
 impl LocalToolHost {
     pub fn new(workspace: &Path, policy: PolicyEngine) -> Result<Self> {
-        Self::with_runner(workspace, policy, Arc::new(PlatformShellRunner))
+        Self::with_runner(workspace, policy, Arc::new(PtyShellRunner))
     }
 
     pub fn with_runner(
