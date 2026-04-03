@@ -2,6 +2,25 @@ use crate::{ChatShell, TuiStreamEvent, display_image_inline, truncate_inline};
 use std::io;
 use std::sync::mpsc;
 
+/// Colors assigned to subagents for visual distinction in the transcript.
+const SUBAGENT_COLORS: &[&str] = &[
+    "\x1b[36m", // cyan
+    "\x1b[33m", // yellow
+    "\x1b[35m", // magenta
+    "\x1b[34m", // blue
+    "\x1b[32m", // green
+    "\x1b[91m", // light red
+    "\x1b[96m", // light cyan
+    "\x1b[93m", // light yellow
+];
+
+fn subagent_color(name: &str) -> &'static str {
+    let hash = name
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    SUBAGENT_COLORS[hash % SUBAGENT_COLORS.len()]
+}
+
 pub(crate) enum StreamEventResult {
     Continue,
     Done(String),
@@ -108,13 +127,15 @@ pub(crate) fn handle_stream_event(
             StreamEventResult::Continue
         }
         TuiStreamEvent::SubagentSpawned { run_id, name, goal } => {
+            let color = subagent_color(&name);
+            let reset = "\x1b[0m";
             let goal_compact = truncate_inline(&goal.replace('\n', " "), 120);
             state
                 .shell
                 .push_mission_control(format!("spawned {name} ({run_id}) goal={goal_compact}"));
             state
                 .shell
-                .push_system(format!("[subagent] started {name}: {goal_compact}"));
+                .push_system(format!("{color}[{name}]{reset} started: {goal_compact}"));
             *state.info_line = format!("subagent started: {name}");
             StreamEventResult::Continue
         }
@@ -127,9 +148,11 @@ pub(crate) fn handle_stream_event(
             state.shell.push_mission_control(format!(
                 "completed {name} ({run_id}) summary={summary_compact}"
             ));
-            state
-                .shell
-                .push_system(format!("[subagent] completed {name}: {summary_compact}"));
+            let color = subagent_color(&name);
+            let reset = "\x1b[0m";
+            state.shell.push_system(format!(
+                "{color}[{name}]{reset} completed: {summary_compact}"
+            ));
             *state.info_line = format!("subagent completed: {name}");
             StreamEventResult::Continue
         }
@@ -142,9 +165,11 @@ pub(crate) fn handle_stream_event(
             state
                 .shell
                 .push_mission_control(format!("failed {name} ({run_id}) error={error_compact}"));
+            let color = subagent_color(&name);
+            let reset = "\x1b[0m";
             state
                 .shell
-                .push_error(format!("[subagent] failed {name}: {error_compact}"));
+                .push_error(format!("{color}[{name}]{reset} failed: {error_compact}"));
             *state.info_line = format!("subagent failed: {name}");
             StreamEventResult::Continue
         }

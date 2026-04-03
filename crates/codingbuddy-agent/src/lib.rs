@@ -794,7 +794,10 @@ impl AgentEngine {
             profile_name: profile.map(|p| p.name.to_string()),
             initial_phase,
             session_id: Some(session.session_id),
-            edit_validator: None,
+            edit_validator: Some(std::sync::Arc::new(codingbuddy_lsp::EditValidator::new(
+                self.workspace.clone(),
+                codingbuddy_lsp::LspConfig::default(),
+            ))),
         };
 
         // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.

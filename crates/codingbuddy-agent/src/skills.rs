@@ -27,6 +27,15 @@ pub struct SkillEntry {
     /// If true, the model cannot invoke this skill via the `skill` tool.
     #[serde(default)]
     pub disable_model_invocation: bool,
+    /// Override the model for this skill (e.g. "deepseek-reasoner", "gpt-4o").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Effort/complexity hint: "low", "medium", "high".
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Guidance for when the model should auto-invoke this skill.
+    #[serde(default)]
+    pub when_to_use: Option<String>,
 }
 
 fn default_context() -> String {
@@ -136,8 +145,14 @@ impl SkillManager {
                 let disable_model_invocation = frontmatter
                     .get("disable-model-invocation")
                     .is_some_and(|v| v == "true");
+                let model = frontmatter.get("model").cloned().filter(|s| !s.is_empty());
+                let effort = frontmatter.get("effort").cloned().filter(|s| !s.is_empty());
+                let when_to_use = frontmatter
+                    .get("when_to_use")
+                    .or_else(|| frontmatter.get("whenToUse"))
+                    .cloned()
+                    .filter(|s| !s.is_empty());
 
-                // Determine scope based on which root directory this skill was found under.
                 let scope = if root == self.install_root {
                     SkillScope::BuiltIn
                 } else if root.starts_with(&self.workspace) {
@@ -156,6 +171,9 @@ impl SkillManager {
                     scope,
                     context,
                     disable_model_invocation,
+                    model,
+                    effort,
+                    when_to_use,
                 });
             }
         }
@@ -589,6 +607,9 @@ mod tests {
                 scope: SkillScope::BuiltIn,
                 context: "normal".to_string(),
                 disable_model_invocation: false,
+                model: None,
+                effort: None,
+                when_to_use: None,
             })
             .collect();
         let result = apply_context_budget(&skills, 100);
@@ -610,6 +631,9 @@ mod tests {
                 scope: SkillScope::BuiltIn,
                 context: "normal".to_string(),
                 disable_model_invocation: false,
+                model: None,
+                effort: None,
+                when_to_use: None,
             })
             .collect();
         let result = apply_context_budget(&skills, 10_000);
@@ -728,6 +752,9 @@ mod tests {
             scope: SkillScope::User,
             context: "normal".to_string(),
             disable_model_invocation: false,
+            model: None,
+            effort: None,
+            when_to_use: None,
         };
 
         let builtin_skill = SkillEntry {
@@ -740,6 +767,9 @@ mod tests {
             scope: SkillScope::BuiltIn,
             context: "normal".to_string(),
             disable_model_invocation: false,
+            model: None,
+            effort: None,
+            when_to_use: None,
         };
 
         let project_skill = SkillEntry {
@@ -752,6 +782,9 @@ mod tests {
             scope: SkillScope::Project,
             context: "fork".to_string(),
             disable_model_invocation: false,
+            model: None,
+            effort: None,
+            when_to_use: None,
         };
 
         // BuiltIn first, User second -- User should still win
