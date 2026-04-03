@@ -106,6 +106,107 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&server)?);
             }
         }
+        McpCmd::Init(args) => {
+            let dir = cwd.join(&args.name);
+            fs::create_dir(&dir).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow!("directory already exists: {}", dir.display())
+                } else {
+                    anyhow!(e)
+                }
+            })?;
+            match args.lang.as_str() {
+                "node" | "javascript" | "js" | "typescript" | "ts" => {
+                    fs::write(
+                        dir.join("package.json"),
+                        serde_json::to_string_pretty(&json!({
+                            "name": args.name,
+                            "version": "0.1.0",
+                            "type": "module",
+                            "dependencies": {
+                                "@modelcontextprotocol/sdk": "^1.0.0"
+                            }
+                        }))?,
+                    )?;
+                    fs::write(
+                        dir.join("index.js"),
+                        format!(
+                            r#"import {{ Server }} from "@modelcontextprotocol/sdk/server/index.js";
+import {{ StdioServerTransport }} from "@modelcontextprotocol/sdk/server/stdio.js";
+
+const server = new Server({{ name: "{name}", version: "0.1.0" }}, {{
+  capabilities: {{ tools: {{}} }}
+}});
+
+server.setRequestHandler("tools/list", async () => ({{
+  tools: [{{
+    name: "hello",
+    description: "Say hello",
+    inputSchema: {{ type: "object", properties: {{ name: {{ type: "string" }} }}, required: ["name"] }}
+  }}]
+}}));
+
+server.setRequestHandler("tools/call", async (request) => ({{
+  content: [{{ type: "text", text: `Hello, ${{request.params.arguments.name}}!` }}]
+}}));
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+"#,
+                            name = args.name
+                        ),
+                    )?;
+                }
+                _ => {
+                    // Python (default)
+                    fs::write(
+                        dir.join("server.py"),
+                        format!(
+                            r#"#!/usr/bin/env python3
+"""MCP server: {name}"""
+import json, sys
+
+def handle_request(req):
+    method = req.get("method", "")
+    if method == "tools/list":
+        return {{"tools": [{{"name": "hello", "description": "Say hello",
+                "inputSchema": {{"type": "object", "properties": {{"name": {{"type": "string"}}}}, "required": ["name"]}}}}]}}
+    if method == "tools/call":
+        name = req.get("params", {{}}).get("arguments", {{}}).get("name", "world")
+        return {{"content": [{{"type": "text", "text": f"Hello, {{name}}!"}}]}}
+    return {{"error": {{"code": -32601, "message": "Method not found"}}}}
+
+if __name__ == "__main__":
+    for line in sys.stdin:
+        req = json.loads(line)
+        resp = handle_request(req)
+        resp["id"] = req.get("id")
+        resp["jsonrpc"] = "2.0"
+        print(json.dumps(resp), flush=True)
+"#,
+                            name = args.name
+                        ),
+                    )?;
+                }
+            }
+            if json_mode {
+                print_json(&json!({ "created": dir.display().to_string(), "name": args.name }))?;
+            } else {
+                println!("Created MCP server scaffold at {}", dir.display());
+                println!(
+                    "Add to config: codingbuddy mcp add {} --transport stdio --command \"{}\"",
+                    args.name,
+                    if args.lang.starts_with("node")
+                        || args.lang.starts_with("js")
+                        || args.lang.starts_with("ts")
+                    {
+                        format!("node {}/index.js", dir.display())
+                    } else {
+                        format!("python3 {}/server.py", dir.display())
+                    }
+                );
+            }
+        }
         McpCmd::Remove(args) => {
             let removed = manager.remove_server(&args.server_id)?;
             if removed {

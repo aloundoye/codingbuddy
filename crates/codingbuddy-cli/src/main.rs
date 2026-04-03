@@ -770,6 +770,17 @@ enum McpCmd {
     List,
     Get(McpGetArgs),
     Remove(McpRemoveArgs),
+    /// Scaffold a new MCP server project
+    Init(McpInitArgs),
+}
+
+#[derive(Args)]
+struct McpInitArgs {
+    /// Name for the new MCP server
+    name: String,
+    /// Language: "python" or "node" (default: python)
+    #[arg(long, default_value = "python")]
+    lang: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]

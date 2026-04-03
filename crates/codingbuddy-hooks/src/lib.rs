@@ -307,9 +307,8 @@ impl HookRuntime {
     /// Fire hooks for an event with the given input context.
     pub fn fire(&self, event: HookEvent, input: &HookInput) -> HookResult {
         let event_key = event.as_str();
-        let defs = match self.config.events.get(event_key) {
-            Some(defs) => defs.clone(),
-            None => return HookResult::default(),
+        let Some(defs) = self.config.events.get(event_key) else {
+            return HookResult::default();
         };
 
         let mut result = HookResult::default();

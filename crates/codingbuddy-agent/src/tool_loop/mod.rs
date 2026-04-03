@@ -1942,11 +1942,31 @@ impl<'a> ToolUseLoop<'a> {
         let proposal = self.tool_host.propose(tool_call);
 
         if !proposal.approved {
-            // Needs user approval
-            let approved = if let Some(ref cb) = self.approval_cb {
+            // Check PermissionRequest hooks — can auto-approve matching patterns
+            let mut hook_approved = false;
+            if let Some(ref hooks) = self.hooks {
+                let perm_input = HookInput {
+                    event: HookEvent::PermissionRequest.as_str().to_string(),
+                    tool_name: Some(llm_call.name.clone()),
+                    tool_input: Some(parsed_args.clone()),
+                    tool_result: None,
+                    prompt: None,
+                    session_type: None,
+                    workspace: self.workspace_str().to_string(),
+                };
+                let result = hooks.fire(HookEvent::PermissionRequest, &perm_input);
+                if let Some(codingbuddy_hooks::PermissionDecision::Allow) =
+                    result.permission_decision
+                {
+                    hook_approved = true;
+                }
+            }
+
+            let approved = if hook_approved {
+                true
+            } else if let Some(ref cb) = self.approval_cb {
                 cb(&proposal.call)?
             } else {
-                // No approval handler — deny by default in non-interactive mode
                 false
             };
 
@@ -2137,6 +2157,13 @@ impl<'a> ToolUseLoop<'a> {
                 workspace: self.workspace_str().to_string(),
             };
             Self::fire_hook_logged(hooks, HookEvent::PostToolUse, &input);
+            if !success {
+                let fail_input = HookInput {
+                    event: HookEvent::PostToolUseFailure.as_str().to_string(),
+                    ..input
+                };
+                Self::fire_hook_logged(hooks, HookEvent::PostToolUseFailure, &fail_input);
+            }
         }
 
         // Log ToolResult event
