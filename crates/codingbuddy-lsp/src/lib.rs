@@ -4,18 +4,23 @@ pub mod parsers;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the post-edit LSP validator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LspConfig {
     /// Global enable/disable toggle.
     pub enabled: bool,
     /// Per-language enable/disable. Keys are language names (e.g., "rust", "typescript").
     /// If a language is absent from the map, it defaults to enabled.
     pub languages: HashMap<String, bool>,
+    /// Timeout in seconds for each language check command.
+    pub timeout_seconds: u64,
 }
 
 impl Default for LspConfig {
@@ -23,6 +28,7 @@ impl Default for LspConfig {
         Self {
             enabled: true,
             languages: HashMap::new(),
+            timeout_seconds: 30,
         }
     }
 }
@@ -67,12 +73,22 @@ pub struct EditValidator {
     pub workspace: PathBuf,
     /// Configuration controlling which languages are validated.
     pub config: LspConfig,
+    /// Cached command availability checks (avoids repeated `which` calls).
+    command_cache: Mutex<HashMap<String, bool>>,
+    /// Timeout for check commands.
+    timeout: Duration,
 }
 
 impl EditValidator {
     /// Create a new `EditValidator`.
     pub fn new(workspace: PathBuf, config: LspConfig) -> Self {
-        Self { workspace, config }
+        let timeout = Duration::from_secs(config.timeout_seconds);
+        Self {
+            workspace,
+            config,
+            command_cache: Mutex::new(HashMap::new()),
+            timeout,
+        }
     }
 
     /// Check a single file for diagnostics based on its extension.
@@ -102,96 +118,116 @@ impl EditValidator {
         formatters::format_diagnostics_for_llm(diagnostics)
     }
 
+    /// Check if a command is available, using a per-session cache.
+    fn is_available(&self, cmd: &str) -> bool {
+        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&available) = cache.get(cmd) {
+            return available;
+        }
+        let available = is_command_available(cmd);
+        cache.insert(cmd.to_string(), available);
+        available
+    }
+
+    /// Run a command with timeout. Returns stdout+stderr or empty on failure/timeout.
+    fn run_with_timeout(&self, mut cmd: Command) -> (String, String) {
+        let mut child = match cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return (String::new(), String::new()),
+        };
+
+        let deadline = std::time::Instant::now() + self.timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return (String::new(), String::new());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => return (String::new(), String::new()),
+            }
+        }
+
+        match child.wait_with_output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                (stdout, stderr)
+            }
+            Err(_) => (String::new(), String::new()),
+        }
+    }
+
     /// Run `cargo check --message-format=json` in the workspace directory.
     fn check_rust(&self) -> Result<Vec<Diagnostic>> {
-        if !is_command_available("cargo") {
+        if !self.is_available("cargo") {
             return Ok(Vec::new());
         }
 
-        let output = Command::new("cargo")
-            .arg("check")
+        let mut cmd = Command::new("cargo");
+        cmd.arg("check")
             .arg("--message-format=json")
-            .current_dir(&self.workspace)
-            .output();
+            .current_dir(&self.workspace);
 
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok(parsers::parse_cargo_check(&stdout))
-            }
-            Err(_) => Ok(Vec::new()),
-        }
+        let (stdout, _) = self.run_with_timeout(cmd);
+        Ok(parsers::parse_cargo_check(&stdout))
     }
 
     /// Run `tsc --noEmit --pretty false` on a TypeScript file.
     fn check_typescript(&self, path: &Path) -> Result<Vec<Diagnostic>> {
-        if !is_command_available("tsc") {
+        if !self.is_available("tsc") {
             return Ok(Vec::new());
         }
 
-        let output = Command::new("tsc")
-            .arg("--noEmit")
+        let mut cmd = Command::new("tsc");
+        cmd.arg("--noEmit")
             .arg("--pretty")
             .arg("false")
             .arg(path)
-            .current_dir(&self.workspace)
-            .output();
+            .current_dir(&self.workspace);
 
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let combined = format!("{stdout}\n{stderr}");
-                Ok(parsers::parse_tsc(&combined))
-            }
-            Err(_) => Ok(Vec::new()),
-        }
+        let (stdout, stderr) = self.run_with_timeout(cmd);
+        let combined = format!("{stdout}\n{stderr}");
+        Ok(parsers::parse_tsc(&combined))
     }
 
     /// Run `python3 -m py_compile <file>` on a Python file.
     fn check_python(&self, path: &Path) -> Result<Vec<Diagnostic>> {
-        if !is_command_available("python3") {
+        if !self.is_available("python3") {
             return Ok(Vec::new());
         }
 
-        let output = Command::new("python3")
-            .arg("-m")
+        let mut cmd = Command::new("python3");
+        cmd.arg("-m")
             .arg("py_compile")
             .arg(path)
-            .current_dir(&self.workspace)
-            .output();
+            .current_dir(&self.workspace);
 
-        match output {
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Ok(parsers::parse_python_compile(&stderr))
-            }
-            Err(_) => Ok(Vec::new()),
-        }
+        let (_, stderr) = self.run_with_timeout(cmd);
+        Ok(parsers::parse_python_compile(&stderr))
     }
 
     /// Run `go vet` on the package containing the edited Go file.
     fn check_go(&self, path: &Path) -> Result<Vec<Diagnostic>> {
-        if !is_command_available("go") {
+        if !self.is_available("go") {
             return Ok(Vec::new());
         }
 
-        // Determine the directory containing the Go file for `go vet`.
         let dir = path.parent().unwrap_or(&self.workspace);
 
-        let output = Command::new("go")
-            .arg("vet")
-            .arg("./...")
-            .current_dir(dir)
-            .output();
+        let mut cmd = Command::new("go");
+        cmd.arg("vet").arg("./...").current_dir(dir);
 
-        match output {
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Ok(parsers::parse_go_vet(&stderr))
-            }
-            Err(_) => Ok(Vec::new()),
-        }
+        let (_, stderr) = self.run_with_timeout(cmd);
+        Ok(parsers::parse_go_vet(&stderr))
     }
 }
 
@@ -363,6 +399,7 @@ SyntaxError: unexpected EOF while parsing"#;
         let config = LspConfig {
             enabled: false,
             languages: HashMap::new(),
+            timeout_seconds: 30,
         };
 
         let validator = EditValidator::new(PathBuf::from("/tmp"), config);
@@ -390,12 +427,22 @@ SyntaxError: unexpected EOF while parsing"#;
 
     #[test]
     fn test_is_command_available_cargo() {
-        // cargo should be available in the test environment
         assert!(is_command_available("cargo"));
     }
 
     #[test]
     fn test_is_command_not_available() {
         assert!(!is_command_available("nonexistent_tool_xyz_12345"));
+    }
+
+    #[test]
+    fn test_command_cache_works() {
+        let validator = EditValidator::new(PathBuf::from("/tmp"), LspConfig::default());
+        // First call caches
+        let first = validator.is_available("cargo");
+        // Second call uses cache
+        let second = validator.is_available("cargo");
+        assert_eq!(first, second);
+        assert!(first);
     }
 }
