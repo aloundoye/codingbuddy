@@ -358,8 +358,7 @@ pub(crate) fn apply_chat_payload_compatibility_with_tracking(
     capabilities: &ModelCapabilities,
     applied: &mut AppliedCompatibility,
 ) {
-    if capabilities.provider == ProviderKind::OpenAiCompatible
-        && prefers_max_completion_tokens(&req.model)
+    if capabilities.prefers_max_completion_tokens
         && let Some(max_tokens) = payload.get("max_tokens").cloned()
     {
         payload["max_completion_tokens"] = max_tokens;
@@ -401,9 +400,8 @@ pub(crate) fn apply_chat_payload_compatibility_with_tracking(
             .push("max_tokens->max_output_tokens".to_string());
     }
 
-    if capabilities.provider == ProviderKind::OpenAiCompatible
+    if capabilities.prefers_max_completion_tokens
         && payload.get("reasoning_effort").is_some()
-        && prefers_max_completion_tokens(&req.model)
         && let Some(obj) = payload.as_object_mut()
     {
         // Strict OpenAI-compatible reasoning gateways commonly reject sampling
@@ -426,29 +424,16 @@ pub(crate) fn apply_chat_payload_compatibility_with_tracking(
         }
     }
 
-    if capabilities.provider == ProviderKind::OpenAiCompatible
-        && capabilities.family == ModelFamily::Gemini
+    if capabilities.downgrades_tool_choice_required
         && payload.get("tool_choice").and_then(Value::as_str) == Some("required")
     {
-        // Gemini gateways are inconsistent with required tool_choice.
         payload["tool_choice"] = json!("auto");
         applied
             .transforms
             .push("required->auto-tool_choice".to_string());
     }
 
-    if capabilities.provider == ProviderKind::Ollama
-        && payload.get("tool_choice").and_then(Value::as_str) == Some("required")
-    {
-        // Ollama accepts tool_choice but "required" is inconsistently supported
-        // across model families and fronting gateways.
-        payload["tool_choice"] = json!("auto");
-        applied
-            .transforms
-            .push("required->auto-tool_choice".to_string());
-    }
-
-    if capabilities.provider == ProviderKind::Ollama
+    if capabilities.uses_options_num_predict
         && let Some(max_tokens) = payload.get("max_tokens").cloned()
     {
         // Ollama native/runtime adapters typically use options.num_predict.
@@ -572,9 +557,7 @@ fn sanitize_tool_definitions_for_provider(
     capabilities: &ModelCapabilities,
 ) -> bool {
     let mut changed = false;
-    if capabilities.provider == ProviderKind::OpenAiCompatible
-        && capabilities.family == ModelFamily::Gemini
-    {
+    if capabilities.requires_schema_sanitization {
         for tool in tools {
             if let Some(schema) = tool
                 .get_mut("function")
@@ -745,14 +728,6 @@ fn has_schema_intent(map: &serde_json::Map<String, Value>) -> bool {
 
 fn provider_supports_reasoning_content(provider: ProviderKind) -> bool {
     provider == ProviderKind::Deepseek
-}
-
-fn prefers_max_completion_tokens(model: &str) -> bool {
-    let lower = model.trim().to_ascii_lowercase();
-    lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("o4")
-        || lower.contains("reasoning")
 }
 
 fn thinking_budget_to_reasoning_effort(budget_tokens: Option<u32>) -> &'static str {

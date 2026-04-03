@@ -84,6 +84,16 @@ pub struct ModelCapabilities {
     pub normalize_tool_call_ids: bool,
     pub max_safe_tool_count: usize,
     pub preferred_edit_tool: PreferredEditTool,
+    /// Whether max_tokens should be renamed to max_completion_tokens (OpenAI reasoning models).
+    pub prefers_max_completion_tokens: bool,
+    /// Whether Gemini-style JSON schema sanitization is needed (enum→string, remove invalid fields).
+    pub requires_schema_sanitization: bool,
+    /// Whether tool_choice="required" should be downgraded to "auto".
+    pub downgrades_tool_choice_required: bool,
+    /// Whether max_tokens should be placed in `options.num_predict` (Ollama).
+    pub uses_options_num_predict: bool,
+    /// Whether Mistral-style message sequence repair is needed (insert assistant between tool→user).
+    pub requires_message_sequence_repair: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -101,6 +111,11 @@ pub struct CapabilityOverride {
     pub normalize_tool_call_ids: Option<bool>,
     pub max_safe_tool_count: Option<usize>,
     pub preferred_edit_tool: Option<PreferredEditTool>,
+    pub prefers_max_completion_tokens: Option<bool>,
+    pub requires_schema_sanitization: Option<bool>,
+    pub downgrades_tool_choice_required: Option<bool>,
+    pub uses_options_num_predict: Option<bool>,
+    pub requires_message_sequence_repair: Option<bool>,
 }
 
 impl CapabilityOverride {
@@ -140,6 +155,21 @@ impl CapabilityOverride {
         }
         if let Some(value) = self.preferred_edit_tool {
             capabilities.preferred_edit_tool = value;
+        }
+        if let Some(value) = self.prefers_max_completion_tokens {
+            capabilities.prefers_max_completion_tokens = value;
+        }
+        if let Some(value) = self.requires_schema_sanitization {
+            capabilities.requires_schema_sanitization = value;
+        }
+        if let Some(value) = self.downgrades_tool_choice_required {
+            capabilities.downgrades_tool_choice_required = value;
+        }
+        if let Some(value) = self.uses_options_num_predict {
+            capabilities.uses_options_num_predict = value;
+        }
+        if let Some(value) = self.requires_message_sequence_repair {
+            capabilities.requires_message_sequence_repair = value;
         }
     }
 }
@@ -283,24 +313,43 @@ fn base_capabilities(
                 normalize_tool_call_ids: false,
                 max_safe_tool_count: if is_reasoner { 18 } else { 24 },
                 preferred_edit_tool: PreferredEditTool::FsEdit,
+                prefers_max_completion_tokens: false,
+                requires_schema_sanitization: false,
+                downgrades_tool_choice_required: false,
+                uses_options_num_predict: false,
+                requires_message_sequence_repair: false,
             }
         }
-        ProviderKind::OpenAiCompatible => ModelCapabilities {
-            provider,
-            family,
-            supports_tool_calling: true,
-            supports_tool_choice: true,
-            supports_parallel_tool_calls: true,
-            supports_reasoning_mode: false,
-            supports_thinking_config: false,
-            supports_streaming_tool_deltas: true,
-            supports_fim: false,
-            supports_image_input: true,
-            strict_empty_content_filtering: true,
-            normalize_tool_call_ids: false,
-            max_safe_tool_count: 18,
-            preferred_edit_tool: PreferredEditTool::PatchDirect,
-        },
+        ProviderKind::OpenAiCompatible => {
+            let is_reasoning = {
+                let l = model.trim().to_ascii_lowercase();
+                l.starts_with("o1")
+                    || l.starts_with("o3")
+                    || l.starts_with("o4")
+                    || l.contains("reasoning")
+            };
+            ModelCapabilities {
+                provider,
+                family,
+                supports_tool_calling: true,
+                supports_tool_choice: true,
+                supports_parallel_tool_calls: true,
+                supports_reasoning_mode: false,
+                supports_thinking_config: false,
+                supports_streaming_tool_deltas: true,
+                supports_fim: false,
+                supports_image_input: true,
+                strict_empty_content_filtering: true,
+                normalize_tool_call_ids: false,
+                max_safe_tool_count: 18,
+                preferred_edit_tool: PreferredEditTool::PatchDirect,
+                prefers_max_completion_tokens: is_reasoning,
+                requires_schema_sanitization: family == ModelFamily::Gemini,
+                downgrades_tool_choice_required: family == ModelFamily::Gemini,
+                uses_options_num_predict: false,
+                requires_message_sequence_repair: family == ModelFamily::Mistral,
+            }
+        }
         ProviderKind::Anthropic => ModelCapabilities {
             provider,
             family,
@@ -316,6 +365,11 @@ fn base_capabilities(
             normalize_tool_call_ids: false,
             max_safe_tool_count: 40,
             preferred_edit_tool: PreferredEditTool::FsEdit,
+            prefers_max_completion_tokens: false,
+            requires_schema_sanitization: false,
+            downgrades_tool_choice_required: false,
+            uses_options_num_predict: false,
+            requires_message_sequence_repair: false,
         },
         ProviderKind::Google => ModelCapabilities {
             provider,
@@ -332,6 +386,11 @@ fn base_capabilities(
             normalize_tool_call_ids: false,
             max_safe_tool_count: 24,
             preferred_edit_tool: PreferredEditTool::FsEdit,
+            prefers_max_completion_tokens: false,
+            requires_schema_sanitization: true,
+            downgrades_tool_choice_required: true,
+            uses_options_num_predict: false,
+            requires_message_sequence_repair: false,
         },
         ProviderKind::Groq => ModelCapabilities {
             provider,
@@ -348,6 +407,11 @@ fn base_capabilities(
             normalize_tool_call_ids: false,
             max_safe_tool_count: 18,
             preferred_edit_tool: PreferredEditTool::FsEdit,
+            prefers_max_completion_tokens: false,
+            requires_schema_sanitization: false,
+            downgrades_tool_choice_required: false,
+            uses_options_num_predict: false,
+            requires_message_sequence_repair: false,
         },
         ProviderKind::OpenRouter => ModelCapabilities {
             provider,
@@ -364,6 +428,11 @@ fn base_capabilities(
             normalize_tool_call_ids: false,
             max_safe_tool_count: 24,
             preferred_edit_tool: PreferredEditTool::FsEdit,
+            prefers_max_completion_tokens: false,
+            requires_schema_sanitization: false,
+            downgrades_tool_choice_required: false,
+            uses_options_num_predict: false,
+            requires_message_sequence_repair: false,
         },
         ProviderKind::Ollama => ModelCapabilities {
             provider,
@@ -380,6 +449,11 @@ fn base_capabilities(
             normalize_tool_call_ids: true,
             max_safe_tool_count: 12,
             preferred_edit_tool: PreferredEditTool::FsEdit,
+            prefers_max_completion_tokens: false,
+            requires_schema_sanitization: false,
+            downgrades_tool_choice_required: true,
+            uses_options_num_predict: true,
+            requires_message_sequence_repair: family == ModelFamily::Mistral,
         },
     }
 }
@@ -445,6 +519,8 @@ fn built_in_family_override(
                 ..CapabilityOverride::default()
             },
         )),
+        // Note: prefers_max_completion_tokens set via detect_model_family
+        // for o1/o3/o4 models, not all OpenAI models.
         _ => None,
     }
 }

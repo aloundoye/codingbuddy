@@ -277,6 +277,11 @@ mod tests {
             normalize_tool_call_ids: true,
             max_safe_tool_count: 6,
             preferred_edit_tool: PreferredEditTool::FsEdit,
+            prefers_max_completion_tokens: false,
+            requires_schema_sanitization: false,
+            downgrades_tool_choice_required: true,
+            uses_options_num_predict: true,
+            requires_message_sequence_repair: false,
         };
 
         let (active, discoverable) = shape_tool_surface(active, discoverable, caps);
