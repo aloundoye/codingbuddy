@@ -226,18 +226,21 @@ pub(crate) fn render_statusline_spans(
         ));
     }
 
+    // Model + provider combined display
+    let model_display = if !status.provider.is_empty()
+        && status.provider != "deepseek"
+        && status.provider != status.model
+    {
+        format!(" {} ({}) ", status.model, status.provider)
+    } else {
+        format!(" {} ", status.model)
+    };
     spans.push(Span::styled(
-        format!(" {} ", status.model),
+        model_display,
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ));
-    if !status.provider.is_empty() && status.provider != status.model {
-        spans.push(Span::styled(
-            format!(" {} ", status.provider),
-            Style::default().fg(Color::Blue),
-        ));
-    }
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         mode_label.to_string(),

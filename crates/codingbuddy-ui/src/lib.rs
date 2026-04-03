@@ -180,7 +180,7 @@ where
     let mut cursor_pos: usize = 0;
     let mut history_cursor: Option<usize> = None;
     let mut saved_input = String::new();
-    let mut info_line = String::from(" Ctrl+C exit | Tab autocomplete | Native scroll & select");
+    let mut info_line = String::from(" Ctrl+C exit | Tab autocomplete | /model to switch models");
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
     let mut cursor_visible;
@@ -761,22 +761,27 @@ where
             match key.code {
                 KeyCode::Up => {
                     mp.up();
-                    mp.selected = mp.selected.min(MODEL_CHOICES.len().saturating_sub(1));
-                    let (name, desc) = MODEL_CHOICES[mp.selected];
-                    info_line = format!("Select model: > {name}  ({desc})");
+                    let lines = mp.display_lines();
+                    info_line = format!(
+                        "Select model ({}): {}",
+                        MODEL_CHOICES.len(),
+                        lines.join(" | ")
+                    );
                     continue;
                 }
                 KeyCode::Down => {
                     mp.down();
-                    mp.selected = mp.selected.min(MODEL_CHOICES.len().saturating_sub(1));
-                    let (name, desc) = MODEL_CHOICES[mp.selected];
-                    info_line = format!("Select model: > {name}  ({desc})");
+                    let lines = mp.display_lines();
+                    info_line = format!(
+                        "Select model ({}): {}",
+                        MODEL_CHOICES.len(),
+                        lines.join(" | ")
+                    );
                     continue;
                 }
                 KeyCode::Enter => {
                     let chosen = mp.confirm();
                     model_picker = None;
-                    // Send the model selection as a /model command
                     let model_cmd = format!("/model {chosen}");
                     on_submit(&model_cmd);
                     info_line = format!("Model: {chosen}");
@@ -787,23 +792,19 @@ where
                     info_line = "model selection cancelled".to_string();
                     continue;
                 }
-                KeyCode::Char('1') => {
-                    model_picker = None;
-                    let chosen = MODEL_CHOICES[0].0;
-                    let model_cmd = format!("/model {chosen}");
-                    on_submit(&model_cmd);
-                    info_line = format!("Model: {chosen}");
+                // Number shortcuts for quick selection (1-9)
+                KeyCode::Char(ch) if ch.is_ascii_digit() && ch != '0' => {
+                    let idx = (ch as usize) - ('1' as usize);
+                    if idx < MODEL_CHOICES.len() {
+                        model_picker = None;
+                        let chosen = MODEL_CHOICES[idx].0;
+                        let model_cmd = format!("/model {chosen}");
+                        on_submit(&model_cmd);
+                        info_line = format!("Model: {chosen}");
+                    }
                     continue;
                 }
-                KeyCode::Char('2') => {
-                    model_picker = None;
-                    let chosen = MODEL_CHOICES[1].0;
-                    let model_cmd = format!("/model {chosen}");
-                    on_submit(&model_cmd);
-                    info_line = format!("Model: {chosen}");
-                    continue;
-                }
-                _ => continue, // ignore other keys while picker is active
+                _ => continue,
             }
         }
 

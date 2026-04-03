@@ -428,15 +428,59 @@ pub fn format_relative_time(timestamp: &str) -> String {
 // ─── Model Picker ───────────────────────────────────────────────────────────
 
 /// Available model choices for the interactive `/model` picker.
+/// Organized by provider — covers current models from each.
 pub(crate) const MODEL_CHOICES: &[(&str, &str)] = &[
-    ("deepseek-chat", "Thinking + tools (default)"),
-    ("deepseek-reasoner", "Deep reasoning + tools"),
+    // ── DeepSeek ──
+    (
+        "deepseek-chat",
+        "DeepSeek V3 — fast, tool-capable (default)",
+    ),
+    ("deepseek-reasoner", "DeepSeek R1 — deep reasoning + tools"),
+    // ── OpenAI ──
+    ("gpt-4.1", "GPT-4.1 — latest, strong coding"),
+    ("gpt-4.1-mini", "GPT-4.1 Mini — fast, affordable"),
+    ("gpt-4.1-nano", "GPT-4.1 Nano — ultra-fast"),
+    ("gpt-4o", "GPT-4o — multimodal all-rounder"),
+    ("gpt-4o-mini", "GPT-4o Mini — cheap, fast"),
+    ("o3", "o3 — strongest reasoning"),
+    ("o3-mini", "o3-mini — fast reasoning"),
+    ("o4-mini", "o4-mini — latest reasoning"),
+    // ── Anthropic ──
+    ("claude-opus-4-20250514", "Claude Opus 4 — most capable"),
+    (
+        "claude-sonnet-4-20250514",
+        "Claude Sonnet 4 — best coding value",
+    ),
+    (
+        "claude-haiku-4-5-20251001",
+        "Claude Haiku 4.5 — fast + cheap",
+    ),
+    // ── Google ──
+    ("gemini-2.5-pro", "Gemini 2.5 Pro — thorough, large context"),
+    ("gemini-2.5-flash", "Gemini 2.5 Flash — fast, cheap"),
+    // ── Groq (hosted) ──
+    ("llama-3.3-70b-versatile", "Llama 3.3 70B — fast via Groq"),
+    ("llama-3.1-8b-instant", "Llama 3.1 8B — ultra-fast via Groq"),
+    // ── Qwen (Ollama / local) ──
+    ("qwen2.5-coder:32b", "Qwen 2.5 Coder 32B — local, strong"),
+    ("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B — local, light"),
+    // ── OpenRouter (any model) ──
+    (
+        "anthropic/claude-sonnet-4",
+        "Claude Sonnet 4 via OpenRouter",
+    ),
+    ("deepseek/deepseek-r1", "DeepSeek R1 via OpenRouter"),
+    ("google/gemini-2.5-pro", "Gemini 2.5 Pro via OpenRouter"),
 ];
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelPickerState {
     pub selected: usize,
+    /// Viewport offset for scrolling through long lists.
+    pub viewport_offset: usize,
 }
+
+const MODEL_PICKER_VISIBLE: usize = 8;
 
 impl ModelPickerState {
     pub fn new() -> Self {
@@ -444,12 +488,31 @@ impl ModelPickerState {
     }
     pub fn up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        if self.selected < self.viewport_offset {
+            self.viewport_offset = self.selected;
+        }
     }
     pub fn down(&mut self) {
         self.selected = (self.selected + 1).min(MODEL_CHOICES.len() - 1);
+        if self.selected >= self.viewport_offset + MODEL_PICKER_VISIBLE {
+            self.viewport_offset = self.selected + 1 - MODEL_PICKER_VISIBLE;
+        }
     }
     pub fn confirm(&self) -> &'static str {
         MODEL_CHOICES[self.selected].0
+    }
+    /// Format visible lines for display in the info area.
+    pub fn display_lines(&self) -> Vec<String> {
+        let end = (self.viewport_offset + MODEL_PICKER_VISIBLE).min(MODEL_CHOICES.len());
+        MODEL_CHOICES[self.viewport_offset..end]
+            .iter()
+            .enumerate()
+            .map(|(i, (name, desc))| {
+                let idx = self.viewport_offset + i;
+                let marker = if idx == self.selected { ">" } else { " " };
+                format!(" {marker} {name}  {desc}")
+            })
+            .collect()
     }
 }
 
