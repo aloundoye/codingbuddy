@@ -203,18 +203,18 @@ pub(crate) fn handle_stream_event(
             cache_hit_tokens,
             cost_usd,
         } => {
-            let cache_info = if cache_hit_tokens > 0 {
-                format!(" (cache hit: {})", cache_hit_tokens)
+            let cache_part = if cache_hit_tokens > 0 {
+                format!(" cache:{cache_hit_tokens}")
             } else {
                 String::new()
             };
+            // Compact per-message cost line (Claude Code style)
             state.shell.push_system(format!(
-                "\u{2500}\u{2500} tokens: {}in / {}out{} \u{2502} cost: ${:.4}",
-                input_tokens, output_tokens, cache_info, cost_usd
+                "\u{2500} ${:.4} \u{2502} {input_tokens}in {output_tokens}out{cache_part}",
+                cost_usd
             ));
-            // Update info line with running cost for status bar visibility
             *state.info_line = format!(
-                "${:.4} | {}K tok",
+                "${:.4} | {}K tok | /model to switch",
                 cost_usd,
                 (input_tokens + output_tokens) / 1000
             );

@@ -1670,17 +1670,23 @@ fn model_picker_navigation() {
     assert_eq!(picker.selected, 1);
     assert_eq!(picker.confirm(), "deepseek-reasoner");
 
-    // Clamp at bottom
-    picker.down();
-    assert_eq!(picker.selected, 1);
+    // Navigate to last item
+    for _ in 0..20 {
+        picker.down();
+    }
+    let last_idx = MODEL_CHOICES.len() - 1;
+    assert_eq!(picker.selected, last_idx, "should clamp at bottom");
 
-    picker.up();
-    assert_eq!(picker.selected, 0);
+    // Back to top
+    for _ in 0..MODEL_CHOICES.len() + 5 {
+        picker.up();
+    }
+    assert_eq!(picker.selected, 0, "should clamp at top");
     assert_eq!(picker.confirm(), "deepseek-chat");
 
-    // Clamp at top
-    picker.up();
-    assert_eq!(picker.selected, 0);
+    // Display lines should be bounded
+    let lines = picker.display_lines();
+    assert!(lines.len() <= 8, "viewport should cap visible items");
 }
 
 // ── P7-09: Vim mode verification ────────────────────────────────────
