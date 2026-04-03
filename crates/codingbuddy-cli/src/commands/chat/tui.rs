@@ -515,6 +515,70 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             )?;
                             format!("Reverted 1 conversation turn. {checkpoint_msg}")
                         }
+                        SlashCommand::Redo => {
+                            "redo not yet implemented — use /rewind to go to a specific checkpoint"
+                                .to_string()
+                        }
+                        SlashCommand::Branch(args) => {
+                            let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+                            match sub {
+                                "create" | "new" => {
+                                    let name = args
+                                        .get(1)
+                                        .cloned()
+                                        .unwrap_or_else(|| "branch".to_string());
+                                    let session_id = active_session_for_closure
+                                        .lock()
+                                        .map(|g| *g)
+                                        .unwrap_or(None);
+                                    if let Some(sid) = session_id {
+                                        match codingbuddy_store::Store::new(cwd)
+                                            .and_then(|s| s.fork_session(sid))
+                                        {
+                                            Ok(forked) => {
+                                                if let Ok(mut guard) =
+                                                    active_session_for_closure.lock()
+                                                {
+                                                    *guard = Some(forked.session_id);
+                                                }
+                                                format!(
+                                                    "Created branch '{}' ({})",
+                                                    name,
+                                                    &forked.session_id.to_string()[..8]
+                                                )
+                                            }
+                                            Err(e) => format!("branch failed: {e}"),
+                                        }
+                                    } else {
+                                        "no active session to branch".to_string()
+                                    }
+                                }
+                                _ => {
+                                    match codingbuddy_store::Store::new(cwd)
+                                        .and_then(|s| s.list_sessions())
+                                    {
+                                        Ok(sessions) => {
+                                            let lines: Vec<String> = sessions
+                                                .iter()
+                                                .take(10)
+                                                .map(|s| {
+                                                    format!(
+                                                        "  {} — {:?}",
+                                                        &s.session_id.to_string()[..8],
+                                                        s.status
+                                                    )
+                                                })
+                                                .collect();
+                                            format!("Branches:\n{}", lines.join("\n"))
+                                        }
+                                        Err(e) => format!("could not list branches: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                        SlashCommand::Draft(_args) => {
+                            "drafts: save/load input buffers not yet implemented".to_string()
+                        }
                         SlashCommand::Status => {
                             let session_override = active_session_for_closure
                                 .lock()
