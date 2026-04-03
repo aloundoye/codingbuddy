@@ -117,23 +117,17 @@ pub struct AgentEngine {
 
 impl AgentEngine {
     pub fn new(workspace: &Path) -> Result<Self> {
-        let profile = std::env::var("CODINGBUDDY_STARTUP_TRACE").is_ok();
-        let t0 = std::time::Instant::now();
+        let mut prof = codingbuddy_core::profiler::StartupProfiler::new();
 
         let cfg = AppConfig::ensure(workspace)?;
-        if profile {
-            eprintln!("[profile] config load: {:?}", t0.elapsed());
-        }
+        prof.mark("config_load");
 
         let llm = Box::new(ApiClient::new(cfg.llm.clone())?);
-        if profile {
-            eprintln!("[profile] llm client: {:?}", t0.elapsed());
-        }
+        prof.mark("llm_client");
 
         let result = Self::new_with_components(workspace, cfg, llm);
-        if profile {
-            eprintln!("[profile] engine init: {:?}", t0.elapsed());
-        }
+        prof.mark("engine_init");
+        prof.finish();
 
         result
     }
