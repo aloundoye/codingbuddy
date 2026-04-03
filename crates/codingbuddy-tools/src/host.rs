@@ -742,7 +742,7 @@ impl LocalToolHost {
                             ttl_seconds: 900, // 15 minutes
                         })
                 {
-                    eprintln!("[deepseek WARN] web_search: failed to cache results: {e}");
+                    eprintln!("[codingbuddy] web_search: failed to cache results: {e}");
                 }
 
                 // Emit event
@@ -757,7 +757,7 @@ impl LocalToolHost {
                         cached: false,
                     },
                 }) {
-                    eprintln!("[deepseek WARN] web_search: failed to emit event: {e}");
+                    eprintln!("[codingbuddy] web_search: failed to emit event: {e}");
                 }
 
                 Ok(json!({
@@ -1410,7 +1410,7 @@ impl LocalToolHost {
             },
         };
         if let Err(e) = self.store.append_event(&event) {
-            eprintln!("[deepseek WARN] hook: failed to emit event: {e}");
+            eprintln!("[codingbuddy] hook: failed to emit event: {e}");
         }
     }
 
@@ -1432,7 +1432,7 @@ impl LocalToolHost {
             },
         };
         if let Err(e) = self.store.append_event(&event) {
-            eprintln!("[deepseek WARN] visual_artifact: failed to emit event: {e}");
+            eprintln!("[codingbuddy] visual_artifact: failed to emit event: {e}");
         }
     }
 

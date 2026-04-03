@@ -19,10 +19,8 @@ codingbuddy-tools = { path = "../codingbuddy-tools" }
 codingbuddy-subagent = { path = "../codingbuddy-subagent" }
 codingbuddy-hooks = { path = "../codingbuddy-hooks" }
 codingbuddy-mcp = { path = "../codingbuddy-mcp" }
-codingbuddy-skills = { path = "../codingbuddy-skills" }
 codingbuddy-diff = { path = "../codingbuddy-diff" }
 codingbuddy-memory = { path = "../codingbuddy-memory" }
-codingbuddy-context = { path = "../codingbuddy-context" }
 codingbuddy-index = { path = "../codingbuddy-index" }
 codingbuddy-local-ml = { path = "../codingbuddy-local-ml" }
 codingbuddy-lsp = { path = "../codingbuddy-lsp" }
@@ -33,6 +31,23 @@ regex.workspace = true
 notify.workspace = true
 sha2.workspace = true
 glob.workspace = true
+walkdir.workspace = true
+petgraph = { workspace = true, features = ["serde-1"] }
+indexmap.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+streaming-iterator = "0.1"
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-haskell.workspace = true
+tree-sitter-swift.workspace = true
+tree-sitter-zig.workspace = true
 
 [features]
 local-ml = ["codingbuddy-local-ml/local-ml"]

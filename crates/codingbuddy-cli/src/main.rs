@@ -1152,7 +1152,9 @@ fn handle_error(error: anyhow::Error, json_mode: bool) -> ! {
             "message": error_message,
             "success": false
         });
-        eprintln!("{}", serde_json::to_string_pretty(&json_error).unwrap());
+        if let Ok(s) = serde_json::to_string_pretty(&json_error) {
+            eprintln!("{}", s);
+        }
     } else {
         // Human-readable output
         eprintln!("{}", error_message);
@@ -1305,7 +1307,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let profile = std::env::var("CODINGBUDDY_STARTUP_TRACE").is_ok();
+    let t0 = std::time::Instant::now();
+
     let mut cli = Cli::parse();
+    if profile {
+        eprintln!("[profile] cli parse: {:?}", t0.elapsed());
+    }
+
     validate_cli_flags(&cli)?;
     let cwd = std::env::current_dir()?;
 

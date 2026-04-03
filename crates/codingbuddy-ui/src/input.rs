@@ -1,5 +1,30 @@
-use super::state::VimMode;
+use super::slash_commands::slash_command_suggestions;
+use super::state::{AutocompleteState, VimMode};
 use super::*;
+
+/// Recompute autocomplete suggestions based on current input, returning the
+/// updated dropdown state and info line. Returns `(None, "")` when there are
+/// no matches.
+pub(crate) fn refresh_autocomplete(
+    input: &str,
+    cursor_pos: usize,
+    trigger_pos: usize,
+    workspace: &Path,
+) -> (Option<AutocompleteState>, String) {
+    let slash_mode = trigger_pos == 0 && input.starts_with('/');
+    let suggestions = if slash_mode {
+        slash_command_suggestions(&input[1..cursor_pos], 8)
+    } else {
+        autocomplete_at_suggestions(&input[trigger_pos + 1..cursor_pos], workspace)
+    };
+    if suggestions.is_empty() {
+        (None, String::new())
+    } else {
+        let ac = AutocompleteState::new(suggestions, trigger_pos);
+        let info = ac.display_lines(6).join("  ");
+        (Some(ac), info)
+    }
+}
 
 pub(crate) fn autocomplete_at_suggestions(prefix: &str, workspace: &Path) -> Vec<String> {
     // Try to glob for matching files

@@ -1,5 +1,5 @@
-use codingbuddy_context::ContextManager;
-use codingbuddy_context::tags::{TagExtractor, tags_to_symbol_hints};
+use crate::context::ContextManager;
+use crate::context::tags::{TagExtractor, tags_to_symbol_hints};
 use codingbuddy_index::IndexService;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

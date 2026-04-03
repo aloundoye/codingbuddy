@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
+use codingbuddy_agent::skills::SkillManager;
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{AppConfig, EventKind};
-use codingbuddy_skills::SkillManager;
 use codingbuddy_store::{SkillRegistryRecord, Store};
 use serde_json::json;
 use std::path::Path;

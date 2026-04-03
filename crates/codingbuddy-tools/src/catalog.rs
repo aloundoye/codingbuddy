@@ -1267,7 +1267,7 @@ pub fn validate_tool_args_schema(
     };
 
     let schema = &tool_def.function.parameters;
-    if schema.is_null() || (schema.is_object() && schema.as_object().unwrap().is_empty()) {
+    if schema.is_null() || schema.as_object().is_some_and(|o| o.is_empty()) {
         return Ok(()); // No schema defined
     }
 

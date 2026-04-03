@@ -35,10 +35,8 @@ codingbuddy-tools = { path = "../codingbuddy-tools" }
 codingbuddy-ui = { path = "../codingbuddy-ui" }
 codingbuddy-memory = { path = "../codingbuddy-memory" }
 codingbuddy-mcp = { path = "../codingbuddy-mcp" }
-codingbuddy-skills = { path = "../codingbuddy-skills" }
 codingbuddy-subagent = { path = "../codingbuddy-subagent" }
 codingbuddy-jsonrpc = { path = "../codingbuddy-jsonrpc" }
-codingbuddy-context = { path = "../codingbuddy-context" }
 codingbuddy-local-ml = { path = "../codingbuddy-local-ml" }
 ignore.workspace = true
 

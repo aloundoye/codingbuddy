@@ -145,7 +145,7 @@ pub(crate) fn has_unverified_file_references(
     // Match file-like references: word chars, dots, slashes, hyphens with a 1-6 char extension.
     // Also match quoted paths like `"src/main.rs"` and backtick paths like `src/main.rs`.
     static FILE_REF_PATTERN: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"[\w./\-]+\.\w{1,6}\b").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"[\w./\-]+\.\w{1,6}\b").expect("valid regex"));
 
     let mentioned_paths: Vec<&str> = FILE_REF_PATTERN
         .find_iter(text)
@@ -201,7 +201,7 @@ pub(crate) fn contains_shell_command_pattern(text: &str) -> bool {
     static SHELL_PATTERNS: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
             r"(?m)(?:^```(?:bash|sh|shell|zsh)?\s*\n\s*(?:cat|head|tail|grep|find|ls|sed|awk)\s+|^\s*\$\s+(?:cat|head|tail|grep|find|ls|sed|awk)\s+)"
-        ).unwrap()
+        ).expect("valid regex")
     });
     SHELL_PATTERNS.is_match(text)
 }
@@ -225,7 +225,7 @@ pub(crate) fn check_response_consistency(
         regex::Regex::new(
             r"(\d+)\s+(crate|file|member|module|package|function|test|error|warning)s?",
         )
-        .unwrap()
+        .expect("valid regex")
     });
 
     // Early return: skip string building if no numeric claims in the response
