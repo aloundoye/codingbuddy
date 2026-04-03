@@ -520,6 +520,7 @@ fn complex_continuation_injects_anchor_context() {
         complexity: codingbuddy_core::complexity::PromptComplexity::Complex,
         workspace: Some(workspace),
         session_id: Some(session.session_id),
+        phase_loop_enabled: true,
         initial_phase: Some(TaskPhase::Verify),
         ..Default::default()
     };
@@ -621,6 +622,7 @@ fn complex_write_without_todo_refresh_injects_checklist_nudge() {
         complexity: codingbuddy_core::complexity::PromptComplexity::Complex,
         workspace: Some(workspace),
         session_id: Some(session.session_id),
+        phase_loop_enabled: true,
         initial_phase: Some(TaskPhase::Verify),
         ..Default::default()
     };

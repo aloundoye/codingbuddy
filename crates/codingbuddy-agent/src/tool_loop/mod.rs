@@ -188,14 +188,18 @@ impl<'a> ToolUseLoop<'a> {
             .unwrap_or_default();
         let model_for_pricing = config.model.clone();
 
-        // Phase loop: only for Complex tasks
-        let initial_phase = config.initial_phase.or_else(|| {
-            if config.complexity == codingbuddy_core::complexity::PromptComplexity::Complex {
-                Some(codingbuddy_core::TaskPhase::Explore)
-            } else {
-                None
-            }
-        });
+        // Phase loop: only when enabled AND for Complex tasks
+        let initial_phase = if config.phase_loop_enabled {
+            config.initial_phase.or_else(|| {
+                if config.complexity == codingbuddy_core::complexity::PromptComplexity::Complex {
+                    Some(codingbuddy_core::TaskPhase::Explore)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
 
         Self {
             llm,
@@ -402,27 +406,16 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     fn next_request_route(&self) -> (String, Option<codingbuddy_core::ThinkingConfig>, u32) {
-        // Model routing: use reasoner for Complex+escalated tasks
-        let use_reasoner = self.config.complexity
-            == codingbuddy_core::complexity::PromptComplexity::Complex
-            && self.escalation.should_escalate();
-
-        if use_reasoner {
-            (
-                self.config.extended_thinking_model.clone(),
-                None, // Reasoner thinks natively
-                codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS,
-            )
-        } else {
-            let thinking = self.config.thinking.as_ref().map(|base| {
-                if self.escalation.should_escalate() {
-                    codingbuddy_core::ThinkingConfig::enabled(self.escalation.budget())
-                } else {
-                    base.clone()
-                }
-            });
-            (self.config.model.clone(), thinking, self.config.max_tokens)
-        }
+        // Always use the user-configured model. No mid-session model switching.
+        // Thinking budget escalates based on evidence (compile errors, test failures).
+        let thinking = self.config.thinking.as_ref().map(|base| {
+            if self.escalation.should_escalate() {
+                codingbuddy_core::ThinkingConfig::enabled(self.escalation.budget())
+            } else {
+                base.clone()
+            }
+        });
+        (self.config.model.clone(), thinking, self.config.max_tokens)
     }
 
     fn compaction_budget_for_next_turn(&self, tool_def_tokens: u64) -> (u64, u64, u64) {
@@ -899,7 +892,6 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
-        let mut last_model = self.config.model.clone();
 
         let mut verbosity_nudge_count: usize = 0;
 
@@ -1023,23 +1015,6 @@ impl<'a> ToolUseLoop<'a> {
             // Images only need to be sent once — clear after first turn to save tokens.
             if turns == 1 && !self.config.images.is_empty() {
                 self.config.images.clear();
-            }
-
-            // Emit model routing event when the model changes (escalation/de-escalation)
-            if request.model != last_model {
-                if let Some(ref cb) = self.event_cb {
-                    let reason = if codingbuddy_core::is_reasoner_model(&request.model) {
-                        "escalation"
-                    } else {
-                        "de-escalation"
-                    };
-                    cb(EventKind::ModelRoutingChanged {
-                        from_model: last_model.clone(),
-                        to_model: request.model.clone(),
-                        reason: reason.to_string(),
-                    });
-                }
-                last_model = request.model.clone();
             }
 
             let response = if let Some(ref cb) = self.stream_cb {
@@ -2185,10 +2160,8 @@ impl<'a> ToolUseLoop<'a> {
 
     /// Build a ChatRequest from current state.
     ///
-    /// Applies dynamic thinking budget escalation and model routing:
-    /// - Complex + escalated → route to `deepseek-reasoner` (native thinking, 64K output)
-    /// - De-escalated (3 consecutive successes) → route back to `deepseek-chat`
-    /// - Reasoner model → strip sampling params (temperature, top_p, etc.)
+    /// Applies dynamic thinking budget escalation based on evidence.
+    /// Uses model capabilities to decide tool_choice and temperature handling.
     fn build_request(&self) -> ChatRequest {
         let tools = if self.config.read_only {
             self.tools
@@ -2200,7 +2173,7 @@ impl<'a> ToolUseLoop<'a> {
             self.tools.clone()
         };
 
-        // Phase-based tool filtering for Complex tasks
+        // Phase-based tool filtering (only when phase loop is enabled)
         let tools = if let Some(phase) = self.phase {
             tools
                 .into_iter()
@@ -2210,10 +2183,8 @@ impl<'a> ToolUseLoop<'a> {
             tools
         };
 
-        // Force tool use on the first 2 LLM calls for each new question so the model
-        // explores the codebase instead of fabricating an answer. DeepSeek-chat needs
-        // stronger forcing than Claude — it tends to answer from memory on the first turn,
-        // then switch to tools only after being nudged.
+        // Force tool use on the first LLM call for each new question so the model
+        // explores the codebase instead of fabricating an answer.
         let last_user_idx = self
             .messages
             .iter()
@@ -2223,7 +2194,6 @@ impl<'a> ToolUseLoop<'a> {
             .iter()
             .filter(|m| matches!(m, ChatMessage::Assistant { .. }))
             .count();
-        // Require tool use for the first LLM round per user question (Code mode only)
         let tool_choice = if llm_turns_this_question < 1 && !self.config.read_only {
             ToolChoice::required()
         } else {
@@ -2232,15 +2202,14 @@ impl<'a> ToolUseLoop<'a> {
 
         let (model, thinking, max_tokens) = self.next_request_route();
 
-        // Strip sampling parameters and tool_choice for reasoner model (incompatible)
-        let is_reasoner = codingbuddy_core::is_reasoner_model(&model);
-        let temperature = if is_reasoner {
-            None
+        // Use model capabilities to decide what to strip
+        let caps = codingbuddy_core::model_capabilities(self.config.provider_kind, &model);
+        let temperature = if caps.supports_reasoning_mode {
+            None // Reasoner models don't support temperature
         } else {
             self.config.temperature
         };
-        // deepseek-reasoner does not support tool_choice=required — always use auto
-        let tool_choice = if is_reasoner {
+        let tool_choice = if !caps.supports_tool_choice {
             ToolChoice::auto()
         } else {
             tool_choice

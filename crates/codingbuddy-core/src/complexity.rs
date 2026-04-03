@@ -1,19 +1,13 @@
 /// Thinking budget control for CodingBuddy.
 ///
-/// DeepSeek expands to fill the budget you give it — unlike Claude which
-/// self-regulates. So we use two budgets and switch based on evidence:
-///
+/// Two budgets, switched by evidence from tool outputs:
 /// - `DEFAULT_THINK_BUDGET`: Moderate baseline for most tasks.
-/// - `HARD_THINK_BUDGET`: Opened only when tool outputs prove the model needs it
-///   (compile failures, test failures, repeated errors, multi-file refactors).
+/// - `HARD_THINK_BUDGET`: Opened when tool outputs prove the model needs it
+///   (compile failures, test failures, repeated errors).
 ///
 /// The tool loop escalates dynamically based on *observed* failure states,
-/// not heuristic prompt classification.
-/// Prompt complexity — used for planning injection, not budget selection.
-///
-/// Budget is controlled by `DEFAULT_THINK_BUDGET` vs `HARD_THINK_BUDGET`,
-/// switched by evidence. Complexity only determines whether the system prompt
-/// includes the full planning protocol or lightweight guidance.
+/// not heuristic prompt classification. Only applies to models that support
+/// thinking configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptComplexity {
     /// Quick fixes, renames, trivial single-location changes.
@@ -26,11 +20,10 @@ pub enum PromptComplexity {
 
 // ── Thinking Budgets ──────────────────────────────────────────────────────────
 //
-// Two budgets, not a spectrum. The default is moderate so DeepSeek doesn't
-// waste tokens on easy tasks. The hard budget opens when evidence demands it.
+// Two budgets, not a spectrum. The default is moderate for most tasks.
+// The hard budget opens when evidence demands it.
 
 /// Moderate baseline. Enough for single-feature work, debugging, exploration.
-/// DeepSeek will use most of this even for simple tasks, so don't over-allocate.
 pub const DEFAULT_THINK_BUDGET: u32 = 8_192;
 
 /// Hard budget. Opened on compile/test failures, multi-file refactors, or

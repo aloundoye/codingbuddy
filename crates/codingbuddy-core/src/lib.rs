@@ -2541,6 +2541,10 @@ pub struct AgentLoopConfig {
     /// Maximum turns (LLM calls) for the tool-use loop. Defaults to 50.
     #[serde(default = "default_tool_loop_max_turns")]
     pub tool_loop_max_turns: u64,
+    /// Enable the Explore→Plan→Execute→Verify phase loop for Complex tasks.
+    /// Default: false. When false, all tools are available at all times.
+    #[serde(default)]
+    pub phase_loop_enabled: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -2574,6 +2578,7 @@ impl Default for AgentLoopConfig {
             team: TeamOrchestrationConfig::default(),
             lint: LintConfig::default(),
             tool_loop_max_turns: default_tool_loop_max_turns(),
+            phase_loop_enabled: false,
         }
     }
 }

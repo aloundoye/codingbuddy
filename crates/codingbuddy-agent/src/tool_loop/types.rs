@@ -140,6 +140,9 @@ pub struct ToolLoopConfig {
     pub initial_context: Vec<ChatMessage>,
     /// Active agent profile name for logging (e.g. "build", "explore", "plan").
     pub profile_name: Option<String>,
+    /// Enable the phase loop (Explore→Plan→Execute→Verify) for Complex tasks.
+    /// Default: false. When false, all tools are available at all times.
+    pub phase_loop_enabled: bool,
     /// Optional persisted phase to resume from the session record.
     pub initial_phase: Option<codingbuddy_core::TaskPhase>,
     /// Optional explicit session to append events/history into.
@@ -173,6 +176,7 @@ impl Default for ToolLoopConfig {
             images: vec![],
             initial_context: vec![],
             profile_name: None,
+            phase_loop_enabled: false,
             initial_phase: None,
             session_id: None,
             edit_validator: None,
