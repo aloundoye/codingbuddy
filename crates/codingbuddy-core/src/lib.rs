@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub mod complexity;
 mod llm_capabilities;
+pub mod prompts;
 mod tool_metadata;
 pub use llm_capabilities::{
     CapabilityOverride, CapabilityRegistryOverrides, CapabilityResolution, ModelCapabilities,

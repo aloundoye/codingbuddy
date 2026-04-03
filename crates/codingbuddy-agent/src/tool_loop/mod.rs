@@ -139,7 +139,7 @@ pub struct ToolUseLoop<'a> {
     /// Evidence-driven escalation signals from tool outputs.
     /// When the model hits compile errors, test failures, or patch rejections,
     /// the thinking budget automatically escalates.
-    escalation: crate::complexity::EscalationSignals,
+    escalation: codingbuddy_core::complexity::EscalationSignals,
     /// Recent error messages for stuck detection. When the same error
     /// appears 3+ times, inject stronger guidance to try a different approach.
     recent_errors: VecDeque<String>,
@@ -196,7 +196,7 @@ impl<'a> ToolUseLoop<'a> {
         for msg in &config.initial_context {
             messages.push(msg.clone());
         }
-        if config.complexity == crate::complexity::PromptComplexity::Complex {
+        if config.complexity == codingbuddy_core::complexity::PromptComplexity::Complex {
             messages.push(ChatMessage::System {
                 content: COMPLEX_TODO_POLICY.to_string(),
             });
@@ -211,7 +211,7 @@ impl<'a> ToolUseLoop<'a> {
 
         // Phase loop: only for Complex tasks
         let initial_phase = config.initial_phase.or_else(|| {
-            if config.complexity == crate::complexity::PromptComplexity::Complex {
+            if config.complexity == codingbuddy_core::complexity::PromptComplexity::Complex {
                 Some(codingbuddy_core::TaskPhase::Explore)
             } else {
                 None
@@ -231,7 +231,7 @@ impl<'a> ToolUseLoop<'a> {
             hooks: None,
             event_cb: None,
             checkpoint_cb: None,
-            escalation: crate::complexity::EscalationSignals::default(),
+            escalation: codingbuddy_core::complexity::EscalationSignals::default(),
             recent_errors: VecDeque::new(),
             recovery_injected: false,
             output_scanner: codingbuddy_policy::output_scanner::OutputScanner::new(),
@@ -312,7 +312,7 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     fn continuation_anchor_message(&self) -> Option<String> {
-        if self.config.complexity != crate::complexity::PromptComplexity::Complex {
+        if self.config.complexity != codingbuddy_core::complexity::PromptComplexity::Complex {
             return None;
         }
 
@@ -382,7 +382,7 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     fn should_track_checklist_discipline(&self) -> bool {
-        self.config.complexity == crate::complexity::PromptComplexity::Complex
+        self.config.complexity == codingbuddy_core::complexity::PromptComplexity::Complex
     }
 
     fn maybe_inject_complex_checklist_nudge(&mut self, batch_calls: &[LlmToolCall]) {
@@ -434,7 +434,8 @@ impl<'a> ToolUseLoop<'a> {
 
     fn next_request_route(&self) -> (String, Option<codingbuddy_core::ThinkingConfig>, u32) {
         // Model routing: use reasoner for Complex+escalated tasks
-        let use_reasoner = self.config.complexity == crate::complexity::PromptComplexity::Complex
+        let use_reasoner = self.config.complexity
+            == codingbuddy_core::complexity::PromptComplexity::Complex
             && self.escalation.should_escalate();
 
         if use_reasoner {

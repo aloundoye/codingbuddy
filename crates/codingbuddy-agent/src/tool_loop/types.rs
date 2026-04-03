@@ -117,7 +117,7 @@ pub struct ToolLoopConfig {
     /// Model name used by `extended_thinking` agent-level tool.
     pub extended_thinking_model: String,
     /// Detected complexity of the user prompt.
-    pub complexity: crate::complexity::PromptComplexity,
+    pub complexity: codingbuddy_core::complexity::PromptComplexity,
     /// Optional worker for executing spawn_task subagents.
     pub subagent_worker: Option<SubagentWorker>,
     /// Optional callback for looking up and running skills (slash commands).
@@ -157,10 +157,10 @@ impl Default for ToolLoopConfig {
             max_turns: DEFAULT_MAX_TURNS,
             read_only: false,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(
-                crate::complexity::MEDIUM_THINK_BUDGET,
+                codingbuddy_core::complexity::MEDIUM_THINK_BUDGET,
             )),
             extended_thinking_model: codingbuddy_core::CODINGBUDDY_V32_REASONER_MODEL.to_string(),
-            complexity: crate::complexity::PromptComplexity::Medium,
+            complexity: codingbuddy_core::complexity::PromptComplexity::Medium,
             subagent_worker: None,
             skill_runner: None,
             workspace: None,

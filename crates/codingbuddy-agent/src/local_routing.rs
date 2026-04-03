@@ -4,7 +4,7 @@
 //! can answer faster and at zero API cost. This module provides the routing decision logic
 //! and a facade that tries local inference first, falling back to API on failure.
 
-use crate::complexity::PromptComplexity;
+use codingbuddy_core::complexity::PromptComplexity;
 
 /// Criteria for routing a request to local inference.
 #[derive(Debug, Clone)]
