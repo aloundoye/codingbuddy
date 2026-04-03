@@ -136,16 +136,17 @@ fn test_cache_bounded_at_max_entries() {
         default_tools(),
     );
 
-    // Insert 300 entries (exceeds MAX_CACHE_ENTRIES = 256)
+    // Insert 300 entries (exceeds super::super::cache::MAX_CACHE_ENTRIES = 256)
     for i in 0..300 {
         let args = serde_json::json!({"path": format!("/file_{i}.rs")});
         let result = serde_json::json!(format!("content of file {i}"));
-        loop_.cache_store("fs_read", &args, &result);
+        loop_.tool_cache.store("fs_read", &args, &result);
     }
 
     assert!(
-        loop_.tool_cache.len() <= MAX_CACHE_ENTRIES,
-        "cache should be bounded at {MAX_CACHE_ENTRIES}, got {}",
+        loop_.tool_cache.len() <= super::super::cache::MAX_CACHE_ENTRIES,
+        "cache should be bounded at {}, got {}",
+        super::super::cache::MAX_CACHE_ENTRIES,
         loop_.tool_cache.len()
     );
 }

@@ -23,6 +23,7 @@ pub mod types;
 
 mod agent_tools;
 mod anti_hallucination;
+pub(crate) mod cache;
 mod compaction;
 mod event_emission;
 mod helpers;
@@ -99,26 +100,6 @@ const MID_CONVERSATION_REMINDER: &str =
 const COMPLEX_TODO_POLICY: &str = "For complex tasks, maintain a live checklist with todo_read/todo_write. \
 Initialize it before edits, keep exactly one in_progress item, and update it after each meaningful step.";
 
-/// TTL for cached read-only tool results (in seconds).
-const TOOL_CACHE_TTL_SECS: u64 = 60;
-/// Extended TTL for fs_read — files rarely change between agent turns.
-const TOOL_CACHE_TTL_READ_SECS: u64 = 120;
-
-/// Tools whose results can be cached (all read-only).
-const CACHEABLE_TOOLS: &[&str] = &["fs_read", "fs_glob", "fs_grep", "fs_list", "index_query"];
-
-/// Maximum number of entries in the tool result cache.
-/// When exceeded, the oldest entry (by insertion order approximation) is evicted.
-const MAX_CACHE_ENTRIES: usize = 256;
-
-/// Cached tool result entry.
-struct CacheEntry {
-    result: serde_json::Value,
-    timestamp: Instant,
-    /// Unhashed "tool_name:args" string for path-based invalidation.
-    raw_key: String,
-}
-
 /// The core tool-use conversation loop.
 ///
 /// Implements the think→act→observe pattern where the LLM freely decides
@@ -147,10 +128,8 @@ pub struct ToolUseLoop<'a> {
     recovery_injected: bool,
     /// Pre-compiled output scanner for injection/secret detection.
     output_scanner: codingbuddy_policy::output_scanner::OutputScanner,
-    /// Cache for read-only tool results. Keyed by SHA-256 hash of (tool_name, args).
-    /// Entries expire after `TOOL_CACHE_TTL_SECS`. Invalidated when write tools
-    /// modify the cached path. Bounded at `MAX_CACHE_ENTRIES`.
-    tool_cache: HashMap<String, CacheEntry>,
+    /// Cache for read-only tool results (see [`cache::ToolCache`]).
+    tool_cache: cache::ToolCache,
     /// Circuit breaker: tracks consecutive failures per tool name.
     /// When a tool fails `CIRCUIT_BREAKER_THRESHOLD` times in a row, it is
     /// disabled for `CIRCUIT_BREAKER_COOLDOWN_TURNS`.
@@ -235,7 +214,7 @@ impl<'a> ToolUseLoop<'a> {
             recent_errors: VecDeque::new(),
             recovery_injected: false,
             output_scanner: codingbuddy_policy::output_scanner::OutputScanner::new(),
-            tool_cache: HashMap::new(),
+            tool_cache: cache::ToolCache::new(),
             circuit_breaker: HashMap::new(),
             cost_tracker: {
                 let mut ct = CostTracker::default();
@@ -257,16 +236,6 @@ impl<'a> ToolUseLoop<'a> {
     /// Install tools that can be revealed on demand via `tool_search`.
     pub fn set_discoverable_tools(&mut self, tools: Vec<ToolDefinition>) {
         self.discoverable_tools = tools;
-    }
-
-    /// Build the raw cache input string and its SHA-256 hash key.
-    /// Returns `(hash_key, raw_string)` from a single `format!` call.
-    fn cache_key_with_raw(tool_name: &str, args: &serde_json::Value) -> (String, String) {
-        use sha2::{Digest, Sha256};
-        let raw = format!("{}:{}", tool_name, args);
-        let hash = Sha256::digest(raw.as_bytes());
-        let bytes: [u8; 8] = hash[..8].try_into().expect("SHA-256 always >= 8 bytes");
-        (format!("{:016x}", u64::from_be_bytes(bytes)), raw)
     }
 
     fn workspace_store(&self) -> Result<Store> {
@@ -764,103 +733,6 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
-    /// Build a bounded cache key by hashing the tool name + args with SHA-256.
-    fn cache_key(tool_name: &str, args: &serde_json::Value) -> String {
-        Self::cache_key_with_raw(tool_name, args).0
-    }
-
-    /// Check the tool result cache for a matching entry.
-    fn cache_lookup(
-        &mut self,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> Option<serde_json::Value> {
-        if !CACHEABLE_TOOLS.contains(&tool_name) {
-            return None;
-        }
-
-        let key = Self::cache_key(tool_name, args);
-        let ttl = if tool_name == "fs_read" {
-            TOOL_CACHE_TTL_READ_SECS
-        } else {
-            TOOL_CACHE_TTL_SECS
-        };
-        if let Some(entry) = self.tool_cache.get(&key)
-            && entry.timestamp.elapsed().as_secs() < ttl
-        {
-            return Some(entry.result.clone());
-        }
-        // Expired or not found — remove it
-        self.tool_cache.remove(&key);
-        None
-    }
-
-    /// Store a tool result in the cache.
-    /// Enforces `MAX_CACHE_ENTRIES` by evicting the oldest entry when full.
-    fn cache_store(
-        &mut self,
-        tool_name: &str,
-        args: &serde_json::Value,
-        result: &serde_json::Value,
-    ) {
-        if !CACHEABLE_TOOLS.contains(&tool_name) {
-            return;
-        }
-        let (key, raw) = Self::cache_key_with_raw(tool_name, args);
-        self.tool_cache.insert(
-            key,
-            CacheEntry {
-                result: result.clone(),
-                timestamp: Instant::now(),
-                raw_key: raw,
-            },
-        );
-
-        // Evict oldest entry if cache exceeds maximum size (single insert → at most 1 eviction)
-        if self.tool_cache.len() > MAX_CACHE_ENTRIES
-            && let Some(oldest_key) = self
-                .tool_cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.timestamp)
-                .map(|(k, _)| k.clone())
-        {
-            self.tool_cache.remove(&oldest_key);
-        }
-    }
-
-    /// Invalidate cache entries after a write tool modifies a path.
-    ///
-    /// Glob, list, and index queries can match any path, so we evict ALL of those
-    /// on any write. Only `fs_read` and `fs_grep` entries use path-containment checks.
-    fn cache_invalidate_path(&mut self, path: &str) {
-        let quoted = format!("\"{path}\"");
-        let parent_quoted = path
-            .rsplit_once('/')
-            .map(|(parent, _)| format!("\"{parent}\""));
-
-        self.tool_cache.retain(|_key, entry| {
-            // Always evict glob, list, and index queries — they could match any path.
-            // raw_key format is "tool_name:{args}", so starts_with avoids false matches
-            // from arguments that happen to contain these tool names.
-            if entry.raw_key.starts_with("fs_glob:")
-                || entry.raw_key.starts_with("fs_list:")
-                || entry.raw_key.starts_with("index_query:")
-            {
-                return false;
-            }
-            // For path-specific tools (fs_read, fs_grep, etc.), check containment.
-            if entry.raw_key.contains(&quoted) {
-                return false;
-            }
-            if let Some(ref pq) = parent_quoted
-                && entry.raw_key.contains(pq.as_str())
-            {
-                return false;
-            }
-            true
-        });
-    }
-
     /// Clean up old tool output files (>7 days). Runs at most once per session.
     fn cleanup_old_tool_outputs(&mut self) {
         if self.tool_output_cleanup_done {
@@ -1215,10 +1087,6 @@ impl<'a> ToolUseLoop<'a> {
                 }
             }
 
-            // Evict expired cache entries to prevent unbounded memory growth
-            self.tool_cache
-                .retain(|_, entry| entry.timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS);
-
             // T3.3: Decrement circuit breaker cooldowns at start of each turn
             for state in self.circuit_breaker.values_mut() {
                 if state.cooldown_remaining > 0 {
@@ -1441,7 +1309,7 @@ impl<'a> ToolUseLoop<'a> {
                     }
 
                     // Cache lookup
-                    let cached = self.cache_lookup(&effective_call.name, &parsed_args);
+                    let cached = self.tool_cache.lookup(&effective_call.name, &parsed_args);
                     pre_validated.push((effective_call, cached, None));
                 }
 
@@ -1563,13 +1431,14 @@ impl<'a> ToolUseLoop<'a> {
                     // Cache store AFTER privacy filtering — cache only holds filtered data.
                     if result.success {
                         if let ChatMessage::Tool { ref content, .. } = msg {
-                            self.cache_store(
+                            self.tool_cache.store(
                                 &effective_call.name,
                                 &args,
                                 &serde_json::Value::String(content.clone()),
                             );
                         } else {
-                            self.cache_store(&effective_call.name, &args, &result.output);
+                            self.tool_cache
+                                .store(&effective_call.name, &args, &result.output);
                         }
                     }
 
@@ -2011,7 +1880,7 @@ impl<'a> ToolUseLoop<'a> {
         // ── Cache lookup ──
         // For read-only tools, check if we have a recent cached result.
         // Reuse the already-parsed args from tool_call instead of re-parsing.
-        if let Some(cached_result) = self.cache_lookup(&llm_call.name, &parsed_args) {
+        if let Some(cached_result) = self.tool_cache.lookup(&llm_call.name, &parsed_args) {
             if let Some(ref cb) = self.event_cb {
                 cb(EventKind::ToolCacheHit {
                     tool_name: llm_call.name.clone(),
@@ -2101,7 +1970,7 @@ impl<'a> ToolUseLoop<'a> {
         // NOTE: Cache store moved below privacy filtering so cache only holds filtered data.
         for path in &modified_paths {
             if let Some(path_str) = path.to_str() {
-                self.cache_invalidate_path(path_str);
+                self.tool_cache.invalidate_path(path_str);
             }
         }
 
@@ -2223,13 +2092,14 @@ impl<'a> ToolUseLoop<'a> {
         // Cache successful read-only results with privacy-filtered content.
         if success {
             if let ChatMessage::Tool { ref content, .. } = msg {
-                self.cache_store(
+                self.tool_cache.store(
                     &llm_call.name,
                     &parsed_args,
                     &serde_json::Value::String(content.clone()),
                 );
             } else {
-                self.cache_store(&llm_call.name, &parsed_args, &result.output);
+                self.tool_cache
+                    .store(&llm_call.name, &parsed_args, &result.output);
             }
         }
 
