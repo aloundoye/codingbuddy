@@ -17,6 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 mod provider_transform;
+pub mod providers;
 
 #[derive(Debug, Clone)]
 struct PreparedPayload {
@@ -156,7 +157,7 @@ impl ApiClient {
     fn provider_kind(&self) -> Result<ProviderKind> {
         self.cfg.active_provider_kind().ok_or_else(|| {
             anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
                 self.cfg.provider
             )
         })
@@ -171,9 +172,21 @@ impl ApiClient {
         builder: reqwest::blocking::RequestBuilder,
         api_key: Option<&str>,
     ) -> reqwest::blocking::RequestBuilder {
-        match api_key {
-            Some(key) if !key.trim().is_empty() => builder.bearer_auth(key),
-            _ => builder,
+        let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
+        match provider {
+            ProviderKind::Anthropic => {
+                let builder = builder
+                    .header("anthropic-version", providers::anthropic::ANTHROPIC_VERSION)
+                    .header("content-type", "application/json");
+                match api_key {
+                    Some(key) if !key.trim().is_empty() => builder.header("x-api-key", key),
+                    _ => builder,
+                }
+            }
+            _ => match api_key {
+                Some(key) if !key.trim().is_empty() => builder.bearer_auth(key),
+                _ => builder,
+            },
         }
     }
 
@@ -214,9 +227,18 @@ impl ApiClient {
                     format!("{prefix}/completions")
                 }
             }
+            ProviderKind::Anthropic => {
+                return format!("{base}/v1/messages");
+            }
+            ProviderKind::Google => {
+                // Google uses model-specific URLs; handled separately in build/send
+                // Return a placeholder that gets replaced in complete_chat_inner
+                if is_chat {
+                    return format!("{base}/v1beta/openai/chat/completions");
+                }
+                return format!("{base}/v1beta/openai/completions");
+            }
             ProviderKind::OpenAiCompatible
-            | ProviderKind::Anthropic
-            | ProviderKind::Google
             | ProviderKind::Groq
             | ProviderKind::OpenRouter
             | ProviderKind::Ollama => {
@@ -441,10 +463,48 @@ impl ApiClient {
         let provider = self.provider_config();
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
                 self.cfg.provider
             )
         })?;
+
+        // Native providers: build their own payload format
+        match capabilities.provider {
+            ProviderKind::Anthropic => {
+                let max_cap = max_output_tokens_for_model(
+                    capabilities.provider,
+                    &req.model,
+                    req.thinking
+                        .as_ref()
+                        .is_some_and(|t| t.thinking_type == "enabled"),
+                );
+                let payload =
+                    providers::anthropic::build_payload(req, req.max_tokens.min(max_cap))?;
+                return Ok(PreparedPayload {
+                    payload,
+                    compatibility: AppliedCompatibility {
+                        provider: "anthropic".to_string(),
+                        family: capabilities.family.as_key().to_string(),
+                        transforms: vec!["native_anthropic_messages_api".to_string()],
+                        degraded_inputs: vec![],
+                    },
+                });
+            }
+            ProviderKind::Google => {
+                let max_cap = max_output_tokens_for_model(capabilities.provider, &req.model, false);
+                let payload = providers::google::build_payload(req, req.max_tokens.min(max_cap))?;
+                return Ok(PreparedPayload {
+                    payload,
+                    compatibility: AppliedCompatibility {
+                        provider: "google".to_string(),
+                        family: capabilities.family.as_key().to_string(),
+                        transforms: vec!["native_gemini_generate_content_api".to_string()],
+                        degraded_inputs: vec![],
+                    },
+                });
+            }
+            _ => {} // Fall through to OpenAI-compatible path
+        }
         let requested_thinking = req
             .thinking
             .as_ref()
@@ -568,21 +628,39 @@ impl ApiClient {
         let prepared = self.build_chat_payload(req)?;
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
                 self.cfg.provider
             )
         })?;
 
+        // Build provider-specific endpoint
+        let endpoint = match capabilities.provider {
+            ProviderKind::Google => {
+                let provider = self.provider_config();
+                let base = provider.base_url.trim_end_matches('/');
+                let url = providers::google::endpoint(base, &req.model, false);
+                if let Some(key) = api_key {
+                    providers::google::append_api_key(&url, key)
+                } else {
+                    url
+                }
+            }
+            _ => self.resolved_endpoint(true, false, false),
+        };
+
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
-            let response = self
-                .apply_auth(
-                    self.client.post(self.resolved_endpoint(true, false, false)),
-                    api_key,
-                )
-                .json(&prepared.payload)
-                .send();
+            let builder = match capabilities.provider {
+                ProviderKind::Google => {
+                    // Google uses API key in URL, no auth header
+                    self.client.post(&endpoint).json(&prepared.payload)
+                }
+                _ => self
+                    .apply_auth(self.client.post(&endpoint), api_key)
+                    .json(&prepared.payload),
+            };
+            let response = builder.send();
 
             match response {
                 Ok(resp) => {
@@ -591,15 +669,20 @@ impl ApiClient {
                     let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
-                        let response = parse_non_streaming_payload(&body)?;
-                        return Ok(
-                            provider_transform::postprocess_chat_response_with_compatibility(
-                                response,
-                                &capabilities,
-                                &req.tools,
-                                prepared.compatibility.clone(),
-                            ),
-                        );
+                        let response = match capabilities.provider {
+                            ProviderKind::Anthropic => providers::anthropic::parse_response(&body)?,
+                            ProviderKind::Google => providers::google::parse_response(&body)?,
+                            _ => {
+                                let r = parse_non_streaming_payload(&body)?;
+                                provider_transform::postprocess_chat_response_with_compatibility(
+                                    r,
+                                    &capabilities,
+                                    &req.tools,
+                                    prepared.compatibility.clone(),
+                                )
+                            }
+                        };
+                        return Ok(response);
                     }
                     last_err = Some(with_compatibility_context(
                         format_api_error(status, &body, attempt, self.cfg.max_retries),
@@ -819,7 +902,7 @@ impl ApiClient {
         let mut prepared = self.build_chat_payload(req)?;
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
                 self.cfg.provider
             )
         })?;
@@ -1097,7 +1180,7 @@ impl ApiClient {
             .capability_resolution_for_model(&req.model)
             .ok_or_else(|| {
                 anyhow!(
-                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
                     self.cfg.provider
                 )
             })?;
@@ -1489,7 +1572,7 @@ impl LlmClient for ApiClient {
             .capability_resolution_for_model(&req.model)
             .ok_or_else(|| {
                 anyhow!(
-                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
                     self.cfg.provider
                 )
             })?;
@@ -1528,7 +1611,7 @@ impl LlmClient for ApiClient {
             .capability_resolution_for_model(&req.model)
             .ok_or_else(|| {
                 anyhow!(
-                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
                     self.cfg.provider
                 )
             })?;
@@ -4150,7 +4233,14 @@ mod tests {
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
-        assert_eq!(payload["model"], "gemini-2.5-flash");
-        assert!(payload["messages"].is_array());
+        // Native Gemini format: uses contents array, not messages
+        assert!(
+            payload["contents"].is_array(),
+            "Google native format should use contents array"
+        );
+        assert!(
+            payload.get("generationConfig").is_some(),
+            "Google native format should have generationConfig"
+        );
     }
 }

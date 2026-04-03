@@ -285,6 +285,73 @@ fn normalize_review_status(value: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn run_models(cwd: &Path, json_mode: bool) -> Result<()> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let active = cfg.llm.provider.clone();
+    let mut providers: Vec<(&str, &str, &str, &str, bool)> = Vec::new();
+
+    for (name, config) in &cfg.llm.providers {
+        let has_key = if config.api_key_env.is_empty() {
+            name == "ollama" // Ollama doesn't need a key
+        } else {
+            std::env::var(&config.api_key_env).is_ok()
+        };
+        let reasoner = config.models.reasoner.as_deref().unwrap_or("-");
+        providers.push((
+            name,
+            &config.models.chat,
+            reasoner,
+            &config.api_key_env,
+            has_key,
+        ));
+    }
+
+    providers.sort_by_key(|(name, _, _, _, _)| *name);
+
+    if json_mode {
+        let entries: Vec<serde_json::Value> = providers
+            .iter()
+            .map(|(name, chat, reasoner, env, has_key)| {
+                json!({
+                    "provider": name,
+                    "chat_model": chat,
+                    "reasoner_model": reasoner,
+                    "api_key_env": env,
+                    "api_key_available": has_key,
+                    "active": *name == active.as_str(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        println!("Available providers and models:\n");
+        println!(
+            "  {:<20} {:<30} {:<30} STATUS",
+            "PROVIDER", "CHAT MODEL", "REASONER MODEL"
+        );
+        println!("  {}", "-".repeat(95));
+        for (name, chat, reasoner, _env, has_key) in &providers {
+            let status = if *name == active.as_str() {
+                if *has_key {
+                    "active"
+                } else {
+                    "active (no key!)"
+                }
+            } else if *has_key {
+                "ready"
+            } else {
+                "no key"
+            };
+            println!("  {:<20} {:<30} {:<30} {}", name, chat, reasoner, status);
+        }
+        println!("\nActive: {} ({})", active, cfg.llm.active_base_model());
+        println!(
+            "Tip: Set provider API key env vars to auto-detect. Priority: ANTHROPIC > OPENAI > DEEPSEEK > GOOGLE > GROQ."
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
     let cfg = AppConfig::ensure(cwd)?;
     let store = Store::new(cwd)?;

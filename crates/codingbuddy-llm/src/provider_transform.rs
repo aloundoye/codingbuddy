@@ -611,7 +611,7 @@ fn placeholder_tool_definition() -> Value {
     })
 }
 
-fn sanitize_gemini_schema(schema: &mut Value) -> bool {
+pub(crate) fn sanitize_gemini_schema(schema: &mut Value) -> bool {
     let before = schema.clone();
     match schema {
         Value::Array(items) => {
