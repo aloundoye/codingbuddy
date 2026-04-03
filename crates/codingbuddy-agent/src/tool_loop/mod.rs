@@ -261,7 +261,7 @@ impl<'a> ToolUseLoop<'a> {
         use sha2::{Digest, Sha256};
         let raw = format!("{}:{}", tool_name, args);
         let hash = Sha256::digest(raw.as_bytes());
-        let bytes: [u8; 8] = hash[..8].try_into().unwrap();
+        let bytes: [u8; 8] = hash[..8].try_into().expect("SHA-256 always >= 8 bytes");
         (format!("{:016x}", u64::from_be_bytes(bytes)), raw)
     }
 

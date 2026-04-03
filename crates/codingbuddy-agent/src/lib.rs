@@ -2,12 +2,14 @@ pub mod agent_profiles;
 mod analysis;
 pub mod apply;
 pub mod complexity;
+pub mod context;
 mod gather_context;
 mod intent;
 pub mod local_routing;
 pub mod prompts;
 mod repo_map;
 mod shared;
+pub mod skills;
 mod team;
 pub mod tool_bridge;
 pub mod tool_loop;
@@ -117,9 +119,25 @@ pub struct AgentEngine {
 
 impl AgentEngine {
     pub fn new(workspace: &Path) -> Result<Self> {
+        let profile = std::env::var("CODINGBUDDY_STARTUP_TRACE").is_ok();
+        let t0 = std::time::Instant::now();
+
         let cfg = AppConfig::ensure(workspace)?;
+        if profile {
+            eprintln!("[profile] config load: {:?}", t0.elapsed());
+        }
+
         let llm = Box::new(ApiClient::new(cfg.llm.clone())?);
-        Self::new_with_components(workspace, cfg, llm)
+        if profile {
+            eprintln!("[profile] llm client: {:?}", t0.elapsed());
+        }
+
+        let result = Self::new_with_components(workspace, cfg, llm);
+        if profile {
+            eprintln!("[profile] engine init: {:?}", t0.elapsed());
+        }
+
+        result
     }
 
     pub fn new_with_llm(workspace: &Path, llm: Box<dyn LlmClient + Send + Sync>) -> Result<Self> {
@@ -138,10 +156,14 @@ impl AgentEngine {
         }
 
         let store = Store::new(workspace)?;
+
+        // Spawn MCP discovery after Store init to avoid SQLite migration races.
+        let mcp_workspace = workspace.to_path_buf();
+        let mcp_handle = std::thread::spawn(move || McpManager::new(&mcp_workspace).ok());
+
         let observer = Observer::new(workspace, &cfg.telemetry)?;
         let mut policy = PolicyEngine::from_app_config(&cfg.policy);
 
-        // Load persistent bash approvals from store.
         let project_hash = format!("{:x}", {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -161,8 +183,7 @@ impl AgentEngine {
 
         let mut tool_host = LocalToolHost::new(workspace, policy.clone())?;
 
-        // Wire MCP executor so tool_host can dispatch mcp__* tool calls.
-        let mcp = McpManager::new(workspace).ok();
+        let mcp = mcp_handle.join().ok().flatten();
         if let Some(mcp_mgr) = &mcp {
             let servers = mcp_mgr.list_servers().unwrap_or_default();
             if !servers.is_empty() {
@@ -191,7 +212,6 @@ impl AgentEngine {
 
         let tool_host = Arc::new(tool_host);
 
-        // Best-effort checkpoint cleanup on session start.
         if cfg.cleanup_period_days > 0
             && let Ok(mem) = codingbuddy_memory::MemoryManager::new(workspace)
         {
@@ -490,7 +510,7 @@ impl AgentEngine {
         let skill_paths: Vec<String> = self.cfg.skills.paths.to_vec();
 
         Some(Arc::new(move |skill_name: &str, args: Option<&str>| {
-            let manager = codingbuddy_skills::SkillManager::new(&workspace)?;
+            let manager = crate::skills::SkillManager::new(&workspace)?;
             let output = manager.run(skill_name, args, &skill_paths);
             match output {
                 Ok(run_output) => Ok(Some(tool_loop::SkillInvocationResult {
@@ -960,7 +980,7 @@ impl AgentEngine {
 
         // Enrich with dependency-analysis hub files
         let mut packet = bootstrap.packet;
-        if let Ok(mut ctx_mgr) = codingbuddy_context::ContextManager::new(&self.workspace)
+        if let Ok(mut ctx_mgr) = crate::context::ContextManager::new(&self.workspace)
             && ctx_mgr.analyze_workspace().is_ok()
         {
             let suggestions = ctx_mgr.suggest_relevant_files(prompt, 10);
@@ -1258,7 +1278,7 @@ fn build_retriever_callback(
     let retriever = match retriever {
         Ok(r) => std::sync::Arc::new(std::sync::Mutex::new(r)),
         Err(e) => {
-            eprintln!("[deepseek] retriever init failed ({e}), retrieval disabled");
+            eprintln!("[codingbuddy] retriever init failed ({e}), retrieval disabled");
             return None;
         }
     };
@@ -1276,7 +1296,7 @@ fn build_retriever_callback(
             // Lazy index on first call
             if !indexed.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Err(e) = retriever.build_index(&workspace_path) {
-                    eprintln!("[deepseek] index build failed: {e}");
+                    eprintln!("[codingbuddy] index build failed: {e}");
                 }
                 indexed.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1572,8 +1592,7 @@ mod tests {
     #[test]
     fn context_manager_handles_missing_repo() {
         // ContextManager should gracefully handle a non-existent or empty workspace
-        let result =
-            codingbuddy_context::ContextManager::new("/tmp/nonexistent_codingbuddy_test_dir");
+        let result = crate::context::ContextManager::new("/tmp/nonexistent_codingbuddy_test_dir");
         // Should succeed (creates empty graph) — not panic
         assert!(
             result.is_ok(),
@@ -1600,8 +1619,7 @@ mod tests {
         )
         .expect("write handler.rs");
 
-        let mut ctx_mgr =
-            codingbuddy_context::ContextManager::new(&workspace).expect("context manager");
+        let mut ctx_mgr = crate::context::ContextManager::new(&workspace).expect("context manager");
         ctx_mgr.analyze_workspace().expect("analyze");
 
         let suggestions = ctx_mgr.suggest_relevant_files("handler", 5);

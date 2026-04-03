@@ -676,7 +676,7 @@ impl MemoryManager {
             .current_dir(workspace)
             .output();
 
-        if git_status.is_err() || !git_status.as_ref().unwrap().status.success() {
+        if !git_status.as_ref().is_ok_and(|s| s.status.success()) {
             // Not a git repo — fall back to file-based checkpoint
             let record = self.create_checkpoint(reason)?;
             return Ok(ShadowCommit {

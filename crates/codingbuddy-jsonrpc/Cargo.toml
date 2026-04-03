@@ -14,7 +14,6 @@ uuid.workspace = true
 sha2.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-store = { path = "../codingbuddy-store" }
-codingbuddy-context = { path = "../codingbuddy-context" }
 codingbuddy-agent = { path = "../codingbuddy-agent" }
 
 [dev-dependencies]

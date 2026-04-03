@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
+use codingbuddy_agent::context::ContextManager;
+use codingbuddy_agent::skills::SkillManager;
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
-use codingbuddy_context::ContextManager;
 use codingbuddy_core::{
     AppConfig, ApprovedToolCall, EventKind, StreamChunk, ToolCall, ToolHost, runtime_dir,
     stream_chunk_to_event_json,
@@ -9,7 +10,6 @@ use codingbuddy_core::{
 use codingbuddy_mcp::McpManager;
 use codingbuddy_memory::{ExportFormat, MemoryManager};
 use codingbuddy_policy::PolicyEngine;
-use codingbuddy_skills::SkillManager;
 use codingbuddy_store::{SessionTodoRecord, Store, SubagentRunRecord};
 use codingbuddy_tools::LocalToolHost;
 use codingbuddy_ui::{
@@ -1331,9 +1331,9 @@ pub(crate) fn run_chat(
                 }
                 SlashCommand::Unknown { name, args } => {
                     // Try custom commands from .codingbuddy/commands/
-                    let custom_cmds = codingbuddy_skills::load_custom_commands(cwd);
+                    let custom_cmds = codingbuddy_agent::skills::load_custom_commands(cwd);
                     if let Some(cmd) = custom_cmds.iter().find(|c| c.name == name) {
-                        let rendered = codingbuddy_skills::render_custom_command(
+                        let rendered = codingbuddy_agent::skills::render_custom_command(
                             cmd,
                             &args.join(" "),
                             cwd,
@@ -1419,7 +1419,9 @@ pub(crate) fn run_chat(
                     }
                 });
 
-                let _ = writeln!(handle, "{}", serde_json::to_string(&val).unwrap());
+                if let Ok(json_str) = serde_json::to_string(&val) {
+                    let _ = writeln!(handle, "{}", json_str);
+                }
                 let _ = handle.flush();
             }));
         } else if !json_mode {

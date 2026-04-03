@@ -194,9 +194,37 @@ impl ErrorHandler {
             )
             .with_suggestions(vec![
                 "Check your .codingbuddy/settings.json file".to_string(),
-                "Set the DEEPSEEK_API_KEY environment variable".to_string(),
-                "Run `deepseek --init` to initialize configuration".to_string(),
+                "Set the API key for your provider (e.g. DEEPSEEK_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)".to_string(),
+                "Run `codingbuddy init` to initialize configuration".to_string(),
             ]);
+        }
+
+        // Auth errors (401, unauthorized, invalid key)
+        if lower_error.contains("status: 401")
+            || lower_error.contains("status 401")
+            || lower_error.contains("unauthorized")
+            || lower_error.contains("invalid api key")
+            || lower_error.contains("invalid_api_key")
+        {
+            return EnhancedError::new("Authentication Error", error_message, ErrorType::Network)
+                .with_suggestions(vec![
+                    "Your API key may be expired or invalid".to_string(),
+                    "Run `codingbuddy config set api_key` to update it".to_string(),
+                    "Check that the correct provider is configured in settings.json".to_string(),
+                ]);
+        }
+
+        // Rate limit errors (429)
+        if lower_error.contains("status: 429")
+            || lower_error.contains("status 429")
+            || lower_error.contains("rate limit")
+            || lower_error.contains("too many requests")
+        {
+            return EnhancedError::new("Rate Limit Error", error_message, ErrorType::Network)
+                .with_suggestions(vec![
+                    "You've hit the API rate limit — wait a moment and retry".to_string(),
+                    "Consider using a model with higher rate limits".to_string(),
+                ]);
         }
 
         // Network errors

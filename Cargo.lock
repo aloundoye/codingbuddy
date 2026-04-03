@@ -549,7 +549,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
- "codingbuddy-context",
  "codingbuddy-core",
  "codingbuddy-diff",
  "codingbuddy-hooks",
@@ -560,21 +559,37 @@ dependencies = [
  "codingbuddy-mcp",
  "codingbuddy-memory",
  "codingbuddy-policy",
- "codingbuddy-skills",
  "codingbuddy-store",
  "codingbuddy-subagent",
  "codingbuddy-testkit",
  "codingbuddy-tools",
  "glob",
  "ignore",
+ "indexmap",
  "notify",
+ "petgraph",
+ "rayon",
  "regex",
  "reqwest 0.13.2",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "streaming-iterator",
  "tempfile",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+ "tree-sitter-go",
+ "tree-sitter-haskell",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+ "tree-sitter-zig",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -588,7 +603,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "codingbuddy-agent",
- "codingbuddy-context",
  "codingbuddy-core",
  "codingbuddy-diff",
  "codingbuddy-index",
@@ -597,7 +611,6 @@ dependencies = [
  "codingbuddy-mcp",
  "codingbuddy-memory",
  "codingbuddy-policy",
- "codingbuddy-skills",
  "codingbuddy-store",
  "codingbuddy-subagent",
  "codingbuddy-tools",
@@ -614,35 +627,6 @@ dependencies = [
  "tempfile",
  "termimad",
  "uuid",
-]
-
-[[package]]
-name = "codingbuddy-context"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "ignore",
- "indexmap",
- "petgraph",
- "rayon",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "streaming-iterator",
- "tempfile",
- "tree-sitter",
- "tree-sitter-c-sharp",
- "tree-sitter-go",
- "tree-sitter-haskell",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-swift",
- "tree-sitter-typescript",
- "tree-sitter-zig",
- "walkdir",
 ]
 
 [[package]]
@@ -710,7 +694,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "codingbuddy-agent",
- "codingbuddy-context",
  "codingbuddy-core",
  "codingbuddy-store",
  "serde",
@@ -822,20 +805,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tree-sitter",
  "tree-sitter-bash",
-]
-
-[[package]]
-name = "codingbuddy-skills"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "codingbuddy-core",
- "codingbuddy-store",
- "glob",
- "serde",
- "serde_json",
- "uuid",
- "walkdir",
 ]
 
 [[package]]

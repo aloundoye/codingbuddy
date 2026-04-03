@@ -92,7 +92,6 @@ Available providers: `deepseek` (default), `openai-compatible`, `anthropic`, `go
 | `codingbuddy-ui` | TUI rendering (ratatui/crossterm), autocomplete, vim mode, ghost text |
 | `codingbuddy-diff` | Unified diff parsing, patch staging |
 | `codingbuddy-context` | Context enrichment, dependency analysis |
-| `codingbuddy-skills` | Skill discovery, forked execution |
 | `codingbuddy-subagent` | Background tasks, worktree isolation |
 | `codingbuddy-jsonrpc` | JSON-RPC server for IDE integration |
 | `codingbuddy-testkit` | Test utilities |

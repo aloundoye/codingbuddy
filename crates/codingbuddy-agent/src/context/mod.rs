@@ -33,21 +33,22 @@ static IMPORT_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(build_i
 fn build_import_patterns() -> HashMap<String, Regex> {
     let mut patterns = HashMap::new();
 
-    let rust =
-        Regex::new(r#"^\s*(?:pub\s+)?(?:use|crate|mod|extern\s+crate)\s+([\w_:]+)"#).unwrap();
+    let rust = Regex::new(r#"^\s*(?:pub\s+)?(?:use|crate|mod|extern\s+crate)\s+([\w_:]+)"#)
+        .expect("valid regex");
     patterns.insert("rs".to_string(), rust);
 
     let javascript =
-        Regex::new(r#"^\s*(?:import|export|require)\s*(?:\(|\{)?\s*['\"]([^'\"]+)['\"]"#).unwrap();
+        Regex::new(r#"^\s*(?:import|export|require)\s*(?:\(|\{)?\s*['\"]([^'\"]+)['\"]"#)
+            .expect("valid regex");
     patterns.insert("js".to_string(), javascript.clone());
     patterns.insert("ts".to_string(), javascript.clone());
     patterns.insert("jsx".to_string(), javascript.clone());
     patterns.insert("tsx".to_string(), javascript);
 
-    let python = Regex::new(r#"^\s*(?:import|from)\s+([\w\.]+)"#).unwrap();
+    let python = Regex::new(r#"^\s*(?:import|from)\s+([\w\.]+)"#).expect("valid regex");
     patterns.insert("py".to_string(), python);
 
-    let java = Regex::new(r#"^\s*(?:import|package)\s+([\w\.]+)"#).unwrap();
+    let java = Regex::new(r#"^\s*(?:import|package)\s+([\w\.]+)"#).expect("valid regex");
     patterns.insert("java".to_string(), java);
 
     // Matches both:
@@ -55,7 +56,8 @@ fn build_import_patterns() -> HashMap<String, Regex> {
     // import (
     //   "fmt"
     // )
-    let go = Regex::new(r#"^\s*(?:import\s+)?(?:[\w\.]+\s+)?["`]([^"`]+)["`]\s*$"#).unwrap();
+    let go = Regex::new(r#"^\s*(?:import\s+)?(?:[\w\.]+\s+)?["`]([^"`]+)["`]\s*$"#)
+        .expect("valid regex");
     patterns.insert("go".to_string(), go);
 
     patterns
@@ -475,7 +477,7 @@ impl ContextSelector {
         }
 
         // Extract potential file references from query
-        let file_pattern = Regex::new(r"@([\w\./\-_]+)").unwrap();
+        let file_pattern = Regex::new(r"@([\w\./\-_]+)").expect("valid regex");
         let mut suggestions = Vec::new();
 
         for cap in file_pattern.captures_iter(query) {
@@ -614,7 +616,7 @@ mod tests {
         Ok(())
     }
 
-    // ── should_include_file tests ──
+    // -- should_include_file tests --
 
     #[test]
     fn includes_source_files_by_extension() -> Result<()> {
@@ -639,7 +641,7 @@ mod tests {
         Ok(())
     }
 
-    // ── import pattern tests ──
+    // -- import pattern tests --
 
     #[test]
     fn rust_import_pattern_matches() {
@@ -669,7 +671,7 @@ mod tests {
         assert!(js.is_match(r#"require("express")"#));
     }
 
-    // ── track_recent_file tests ──
+    // -- track_recent_file tests --
 
     #[test]
     fn track_recent_file_deduplicates() -> Result<()> {
@@ -702,7 +704,7 @@ mod tests {
         Ok(())
     }
 
-    // ── compress_context tests ──
+    // -- compress_context tests --
 
     #[test]
     fn short_context_not_compressed() -> Result<()> {
@@ -714,7 +716,7 @@ mod tests {
         Ok(())
     }
 
-    // ── ContextSelector tests ──
+    // -- ContextSelector tests --
 
     #[test]
     fn context_selector_empty_query_returns_empty() -> Result<()> {
@@ -769,7 +771,7 @@ mod tests {
         Ok(())
     }
 
-    // ── P2.6: Language-scoped import resolution ──
+    // -- P2.6: Language-scoped import resolution --
 
     #[test]
     fn test_rust_import_does_not_try_js_extensions() -> Result<()> {

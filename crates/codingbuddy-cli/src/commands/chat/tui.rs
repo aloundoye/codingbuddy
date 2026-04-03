@@ -890,9 +890,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             text
                         }
                         SlashCommand::Unknown { name, args } => {
-                            let custom_cmds = codingbuddy_skills::load_custom_commands(cwd);
+                            let custom_cmds = codingbuddy_agent::skills::load_custom_commands(cwd);
                             if let Some(cmd) = custom_cmds.iter().find(|c| c.name == name) {
-                                codingbuddy_skills::render_custom_command(
+                                codingbuddy_agent::skills::render_custom_command(
                                     cmd,
                                     &args.join(" "),
                                     cwd,

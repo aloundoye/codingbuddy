@@ -131,7 +131,9 @@ fn check_top_level_chaining(root: &tree_sitter::Node) -> bool {
     // that's fine. We only block if there are 2+ top-level *statement* nodes.
     let statement_count = (0..root.child_count())
         .filter(|i| {
-            let child = root.child(*i).unwrap();
+            let Some(child) = root.child(*i) else {
+                return false;
+            };
             !child.is_extra() && child.kind() != "\n"
         })
         .count();

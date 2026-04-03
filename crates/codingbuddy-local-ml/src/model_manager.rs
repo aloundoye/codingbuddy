@@ -1058,10 +1058,14 @@ impl ModelManager {
                         // after joining.
                         match outcome {
                             Ok(pair) => {
-                                results.lock().unwrap().push(Ok(pair));
+                                if let Ok(mut r) = results.lock() {
+                                    r.push(Ok(pair));
+                                }
                             }
                             Err(e) => {
-                                results.lock().unwrap().push(Err((filename.to_string(), e)));
+                                if let Ok(mut r) = results.lock() {
+                                    r.push(Err((filename.to_string(), e)));
+                                }
                             }
                         }
                     });
@@ -1069,7 +1073,7 @@ impl ModelManager {
             });
 
             // Process results (single-threaded after thread::scope join)
-            let results = results.into_inner().unwrap();
+            let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
             for result in results {
                 match result {
                     Ok((filename, digest)) => {

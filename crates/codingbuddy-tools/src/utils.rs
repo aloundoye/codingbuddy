@@ -145,7 +145,9 @@ pub(crate) fn strip_html_tags(html: &str) -> String {
 
     let document = Html::parse_document(html);
 
-    let body_sel = Selector::parse("body").unwrap_or_else(|_| Selector::parse("*").unwrap());
+    let body_sel = Selector::parse("body")
+        .or_else(|_| Selector::parse("*"))
+        .expect("valid CSS selector");
 
     let mut out = String::with_capacity(html.len() / 2);
 
@@ -218,9 +220,11 @@ pub(crate) fn parse_search_results_css(html: &str, max_results: usize) -> Vec<se
         Err(_) => return results,
     };
     let link_sel = Selector::parse(".result__a, .result-title-a, a.result__a")
-        .unwrap_or_else(|_| Selector::parse("a").unwrap());
+        .or_else(|_| Selector::parse("a"))
+        .expect("valid CSS selector");
     let snippet_sel = Selector::parse(".result__snippet, .result-snippet")
-        .unwrap_or_else(|_| Selector::parse(".snippet").unwrap());
+        .or_else(|_| Selector::parse(".snippet"))
+        .expect("valid CSS selector");
 
     for element in document.select(&result_sel) {
         if results.len() >= max_results {
@@ -400,7 +404,9 @@ pub(crate) fn generate_unified_diff(path: &str, before: &str, after: &str) -> St
                 if idx.saturating_sub(prev) > context * 2 {
                     // Close previous hunk
                     let end = (prev + context).min(ops.len() - 1);
-                    hunks.push((hunk_start.unwrap(), end));
+                    if let Some(start) = hunk_start {
+                        hunks.push((start, end));
+                    }
                     hunk_start = Some(idx.saturating_sub(context));
                 }
             } else {

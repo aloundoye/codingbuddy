@@ -815,15 +815,17 @@ where
         if autocomplete_dropdown.is_some() {
             match key.code {
                 KeyCode::Up | KeyCode::BackTab => {
-                    autocomplete_dropdown.as_mut().unwrap().up();
-                    let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
-                    info_line = lines.join("  ");
+                    if let Some(ref mut ac) = autocomplete_dropdown {
+                        ac.up();
+                        info_line = ac.display_lines(6).join("  ");
+                    }
                     continue;
                 }
                 KeyCode::Down | KeyCode::Tab => {
-                    autocomplete_dropdown.as_mut().unwrap().down();
-                    let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
-                    info_line = lines.join("  ");
+                    if let Some(ref mut ac) = autocomplete_dropdown {
+                        ac.down();
+                        info_line = ac.display_lines(6).join("  ");
+                    }
                     continue;
                 }
                 KeyCode::Enter | KeyCode::Right => {
@@ -857,27 +859,17 @@ where
                     continue;
                 }
                 KeyCode::Char(ch) => {
-                    // Continue typing — update suggestions
                     input.insert(cursor_pos.min(input.len()), ch);
                     cursor_pos += 1;
                     if let Some(ref ac) = autocomplete_dropdown {
-                        let slash_mode = ac.trigger_pos == 0 && input.starts_with('/');
-                        let suggestions = if slash_mode {
-                            let prefix = &input[1..cursor_pos];
-                            slash_command_suggestions(prefix, 8)
-                        } else {
-                            let prefix = &input[ac.trigger_pos + 1..cursor_pos];
-                            autocomplete_at_suggestions(prefix, &workspace_path)
-                        };
-                        if suggestions.is_empty() {
-                            autocomplete_dropdown = None;
-                            info_line = String::new();
-                        } else {
-                            autocomplete_dropdown =
-                                Some(AutocompleteState::new(suggestions, ac.trigger_pos));
-                            let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
-                            info_line = lines.join("  ");
-                        }
+                        let (new_dd, new_info) = input::refresh_autocomplete(
+                            &input,
+                            cursor_pos,
+                            ac.trigger_pos,
+                            &workspace_path,
+                        );
+                        autocomplete_dropdown = new_dd;
+                        info_line = new_info;
                     }
                     continue;
                 }
@@ -887,29 +879,18 @@ where
                         cursor_pos -= 1;
                     }
                     if let Some(ref ac) = autocomplete_dropdown {
-                        let slash_mode = ac.trigger_pos == 0 && input.starts_with('/');
                         if cursor_pos <= ac.trigger_pos {
-                            // Deleted the trigger char itself (@ or /)
                             autocomplete_dropdown = None;
                             info_line = String::new();
                         } else {
-                            let suggestions = if slash_mode {
-                                let prefix = &input[1..cursor_pos];
-                                slash_command_suggestions(prefix, 8)
-                            } else {
-                                let prefix = &input[ac.trigger_pos + 1..cursor_pos];
-                                autocomplete_at_suggestions(prefix, &workspace_path)
-                            };
-                            if suggestions.is_empty() {
-                                autocomplete_dropdown = None;
-                                info_line = String::new();
-                            } else {
-                                autocomplete_dropdown =
-                                    Some(AutocompleteState::new(suggestions, ac.trigger_pos));
-                                let lines =
-                                    autocomplete_dropdown.as_ref().unwrap().display_lines(6);
-                                info_line = lines.join("  ");
-                            }
+                            let (new_dd, new_info) = input::refresh_autocomplete(
+                                &input,
+                                cursor_pos,
+                                ac.trigger_pos,
+                                &workspace_path,
+                            );
+                            autocomplete_dropdown = new_dd;
+                            info_line = new_info;
                         }
                     }
                     continue;
@@ -1892,18 +1873,17 @@ where
                         let trigger = cursor_pos - 1;
                         let suggestions = autocomplete_at_suggestions("", &workspace_path);
                         if !suggestions.is_empty() {
-                            autocomplete_dropdown =
-                                Some(AutocompleteState::new(suggestions, trigger));
-                            let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
-                            info_line = lines.join("  ");
+                            let new_ac = AutocompleteState::new(suggestions, trigger);
+                            info_line = new_ac.display_lines(6).join("  ");
+                            autocomplete_dropdown = Some(new_ac);
                         }
                     } else if ch == '/' && cursor_pos == 1 && input == "/" {
                         // Trigger slash command autocomplete at start of input
                         let suggestions = slash_command_suggestions("", 8);
                         if !suggestions.is_empty() {
-                            autocomplete_dropdown = Some(AutocompleteState::new(suggestions, 0));
-                            let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
-                            info_line = lines.join("  ");
+                            let new_ac = AutocompleteState::new(suggestions, 0);
+                            info_line = new_ac.display_lines(6).join("  ");
+                            autocomplete_dropdown = Some(new_ac);
                         }
                     }
                 }

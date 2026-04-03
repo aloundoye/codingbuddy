@@ -14,10 +14,8 @@ members = [
   "crates/codingbuddy-memory",
   "crates/codingbuddy-mcp",
   "crates/codingbuddy-subagent",
-  "crates/codingbuddy-skills",
   "crates/codingbuddy-hooks",
   "crates/codingbuddy-jsonrpc",
-  "crates/codingbuddy-context",
   "crates/codingbuddy-local-ml",
   "crates/codingbuddy-lsp",
 ]

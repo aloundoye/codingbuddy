@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 // Enhanced context management
-use codingbuddy_context::ContextManager;
+use codingbuddy_agent::context::ContextManager;
 
 /// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]

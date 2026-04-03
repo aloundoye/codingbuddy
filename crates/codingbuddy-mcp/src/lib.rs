@@ -1155,7 +1155,7 @@ impl McpConnectionPool {
         timeout: Duration,
     ) -> Result<serde_json::Value> {
         let key = server.id.clone();
-        let mut pool = self.connections.lock().unwrap();
+        let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
 
         // Evict idle connections
         pool.retain(|_, conn| conn.last_used.elapsed() < self.idle_timeout);
@@ -1189,7 +1189,7 @@ impl McpConnectionPool {
                 let _ = conn.stdin.flush();
                 let response = wait_for_mcp_response(&conn.rx, request_id, timeout);
                 // Re-insert connection into pool
-                let mut pool = self.connections.lock().unwrap();
+                let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
                 pool.insert(key.clone(), conn);
                 return match response {
                     Some(value) => Ok(value),
@@ -1205,7 +1205,7 @@ impl McpConnectionPool {
 
         // Create new connection (lock already released above)
         let conn = self.create_connection(server)?;
-        let mut pool = self.connections.lock().unwrap();
+        let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
 
         let request_id = conn.next_request_id;
         let mut conn = conn;
@@ -1287,7 +1287,7 @@ impl McpConnectionPool {
 
     /// Gracefully shut down all pooled connections.
     pub fn shutdown(&self) {
-        let mut pool = self.connections.lock().unwrap();
+        let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
         for (id, mut conn) in pool.drain() {
             let _ = id;
             let _ = conn.child.kill();

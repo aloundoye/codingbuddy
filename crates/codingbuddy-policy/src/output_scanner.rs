@@ -60,61 +60,65 @@ impl OutputScanner {
         let injection_patterns = vec![
             InjectionPattern {
                 name: "ignore_instructions",
-                regex: Regex::new(r"(?i)ignore\s+(all\s+)?previous\s+instructions").unwrap(),
+                regex: Regex::new(r"(?i)ignore\s+(all\s+)?previous\s+instructions")
+                    .expect("valid regex"),
                 severity: Severity::High,
             },
             InjectionPattern {
                 name: "role_hijack",
-                regex: Regex::new(r"(?i)you\s+are\s+now\s+(a|an)\b").unwrap(),
+                regex: Regex::new(r"(?i)you\s+are\s+now\s+(a|an)\b").expect("valid regex"),
                 severity: Severity::High,
             },
             InjectionPattern {
                 name: "system_override",
-                regex: Regex::new(r"(?i)system\s*:\s*you\s+(are|must|should)").unwrap(),
+                regex: Regex::new(r"(?i)system\s*:\s*you\s+(are|must|should)")
+                    .expect("valid regex"),
                 severity: Severity::High,
             },
             InjectionPattern {
                 name: "disregard_prior",
-                regex: Regex::new(r"(?i)disregard\s+(all\s+)?(above|prior|previous)").unwrap(),
+                regex: Regex::new(r"(?i)disregard\s+(all\s+)?(above|prior|previous)")
+                    .expect("valid regex"),
                 severity: Severity::High,
             },
             InjectionPattern {
                 name: "new_instructions",
-                regex: Regex::new(r"(?i)new\s+instructions?\s*:").unwrap(),
+                regex: Regex::new(r"(?i)new\s+instructions?\s*:").expect("valid regex"),
                 severity: Severity::High,
             },
         ];
 
         let secret_patterns = vec![
             SecretPattern {
-                regex: Regex::new(r"sk-[a-zA-Z0-9]{20,}").unwrap(),
+                regex: Regex::new(r"sk-[a-zA-Z0-9]{20,}").expect("valid regex"),
                 placeholder: "[REDACTED:api_key]",
             },
             SecretPattern {
-                regex: Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+                regex: Regex::new(r"AKIA[0-9A-Z]{16}").expect("valid regex"),
                 placeholder: "[REDACTED:aws_key]",
             },
             SecretPattern {
-                regex: Regex::new(r"ghp_[a-zA-Z0-9]{36,}").unwrap(),
+                regex: Regex::new(r"ghp_[a-zA-Z0-9]{36,}").expect("valid regex"),
                 placeholder: "[REDACTED:github_token]",
             },
             SecretPattern {
-                regex: Regex::new(r"glpat-[a-zA-Z0-9\-]{20,}").unwrap(),
+                regex: Regex::new(r"glpat-[a-zA-Z0-9\-]{20,}").expect("valid regex"),
                 placeholder: "[REDACTED:gitlab_token]",
             },
             SecretPattern {
                 regex: Regex::new(
                     r"(?s)-----BEGIN[A-Z ]*PRIVATE KEY-----.*?-----END[A-Z ]*PRIVATE KEY-----",
                 )
-                .unwrap(),
+                .expect("valid regex"),
                 placeholder: "[REDACTED:private_key]",
             },
             SecretPattern {
-                regex: Regex::new(r"(?i)(postgres|mysql|mongodb|redis)://[^\s]+:[^\s]+@").unwrap(),
+                regex: Regex::new(r"(?i)(postgres|mysql|mongodb|redis)://[^\s]+:[^\s]+@")
+                    .expect("valid regex"),
                 placeholder: "[REDACTED:connection_string]",
             },
             SecretPattern {
-                regex: Regex::new(r"(?m)^[A-Z_]{3,}=\S{8,}").unwrap(),
+                regex: Regex::new(r"(?m)^[A-Z_]{3,}=\S{8,}").expect("valid regex"),
                 placeholder: "[REDACTED:env_value]",
             },
         ];
@@ -186,7 +190,7 @@ impl OutputScanner {
     fn check_base64_injection(&self, text: &str, warnings: &mut Vec<InjectionWarning>) {
         use regex::Regex;
         // Match base64 strings >100 chars (contiguous alphanumeric + /+=)
-        let b64_re = Regex::new(r"[A-Za-z0-9+/=]{100,}").unwrap();
+        let b64_re = Regex::new(r"[A-Za-z0-9+/=]{100,}").expect("valid regex");
         for m in b64_re.find_iter(text) {
             let b64_str = m.as_str();
             // Attempt decoding
