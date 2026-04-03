@@ -140,19 +140,19 @@ MCP tools (`mcp__*`) always pass through regardless of profile.
 | Shortcut | Action |
 |----------|--------|
 | **Enter** | Send message |
-| **\\ + Enter** | Multiline input (newline without sending) |
-| **Ctrl+C** | Cancel current generation |
-| **Ctrl+L** | Clear screen |
+| **Shift+Enter** | Multiline input (newline without sending) |
+| **Ctrl+C** | Cancel current generation / exit |
+| **F1** | Help modal (keybindings, commands, tips) |
+| **PageUp** | Scroll mode (native terminal scrollback) |
 | **Ctrl+R** | Reverse history search |
-| **Ctrl+B** | Background current task |
-| **Esc Esc** | Open rewind menu (undo to checkpoint) |
-| **Alt+P** | Switch model (chat ↔ reasoner) |
-| **Alt+T** | Toggle thinking mode |
-| **Shift+Tab** | Cycle permission mode (ask → auto → locked) |
+| **Shift+Tab** | Cycle agent profile (build→explore→plan→bash→general) |
 | **Tab** | Accept autocomplete / ghost text suggestion |
 | **Alt+Right** | Accept one word of ghost text |
-| **Esc** | Dismiss autocomplete / ghost text |
+| **Esc** | Dismiss overlay / vim normal mode |
 | **Ctrl+V** | Paste (includes image paste support) |
+| **Y** | Approve tool call (at approval prompt) |
+| **A** | Always approve this pattern (persistent) |
+| **Any other key** | Deny tool call (at approval prompt) |
 
 ### Input shortcuts
 
@@ -171,59 +171,47 @@ Type these in the chat input:
 
 | Command | Description |
 |---------|-------------|
+| `/help` | Help modal (or press F1) |
 | `/ask` | Switch to ask (read-only) mode |
 | `/code` | Switch to code (full agent) mode |
-| `/architect` | Switch to architect mode |
-| `/chat-mode` | Show/change current mode |
-| `/model` | Interactive model selector |
-| `/settings` | Open settings |
+| `/model <name>` | Switch model (picker with provider filtering) |
+| `/agent <profile>` | Switch agent (build/explore/plan/bash/general) |
+| `/provider <name>` | Switch provider |
+| `/config` | Show configuration |
+
+### Session & History
+
+| Command | Description |
+|---------|-------------|
+| `/branch create <n>` | Fork current session into a named branch |
+| `/branch list` | List session branches |
+| `/undo` | Revert last turn + file changes |
+| `/redo` | Revert to specific checkpoint |
+| `/rewind` | Pick checkpoint to revert to |
+| `/clear` | Reset conversation |
+| `/compact [focus]` | Compact conversation history |
+| `/cost` | Session cost breakdown |
+| `/status` | Show current status |
 
 ### Context & Workspace
 
 | Command | Description |
 |---------|-------------|
-| `/add <path>` | Add file to context |
-| `/drop <path>` | Remove file from context |
-| `/read-only <path>` | Add file as read-only reference |
-| `/map` | Show repo map (ranked file listing) |
-| `/map-refresh` | Rebuild repo map |
-| `/context` | Show context window usage (colored bar) |
-| `/compact [focus]` | Compact conversation history (optional focus topic to preserve) |
-
-### Git & Code
-
-| Command | Description |
-|---------|-------------|
+| `/context` | Show context window usage |
+| `/diff` | Show current diff |
 | `/stage` | Stage changes |
 | `/unstage` | Unstage changes |
-| `/diff` | Show current diff |
-| `/commit` | Commit staged changes (interactive message) |
-| `/undo` | Undo last commit |
+| `/commit` | Commit staged changes |
 | `/git <args>` | Git passthrough |
-| `/run <cmd>` | Run a command |
-| `/test` | Run project tests |
-| `/lint` | Run project linter |
-
-### Session
-
-| Command | Description |
-|---------|-------------|
-| `/load` | Load a saved session |
-| `/save` | Save current session |
-| `/paste` | Paste from clipboard |
-| `/copy` | Copy last response |
-| `/stats` | Show session statistics |
-| `/memory` | Open memory file in editor |
-| `/rename <name>` | Rename current session |
-| `/theme` | Cycle color theme |
 
 ### Integrations
 
 | Command | Description |
 |---------|-------------|
-| `/web <query>` | Web search |
-| `/voice` | Voice input |
-| `/mcp` | Interactive MCP server menu |
+| `/skills` | List available skills |
+| `/mcp` | Manage MCP servers |
+| `/vim` | Toggle vim keybindings |
+| `/exit` | Exit CodingBuddy |
 
 ---
 
@@ -398,13 +386,34 @@ codingbuddy --permission-mode auto chat
 codingbuddy permissions set --approve-bash auto --approve-edits ask
 ```
 
-### Command Allowlist
+### 4-Stage Permission Evaluation
 
-Commands matching the allowlist run without approval in `auto` mode:
+When a tool needs approval, CodingBuddy evaluates in order:
+
+1. **Auto-deny**: Default deny rules block dangerous commands immediately
+2. **Glob pattern rules**: User-defined rules from `permission_rules` in config match first
+3. **Hook auto-approve**: `PermissionRequest` hooks can auto-approve matching patterns
+4. **User prompt**: Graduated severity badges — [SHELL] red, [EDIT] yellow, [ACTION] cyan
+
+At the prompt, press:
+- **Y** — approve this time
+- **A** — always approve this pattern (saved to SQLite, persists across sessions)
+- **Any other key** — deny
+
+### Permission Rules from Config
+
+Define glob-based rules in `settings.json`:
 
 ```json
 {
   "policy": {
+    "permission_rules": [
+      {"rule": "Bash(cargo *)", "decision": "allow"},
+      {"rule": "Bash(npm test *)", "decision": "allow"},
+      {"rule": "Bash(git commit*)", "decision": "allow"},
+      {"rule": "Edit(*.env*)", "decision": "ask"},
+      {"rule": "Edit(*.lock)", "decision": "deny"}
+    ],
     "allowlist": ["cargo test", "cargo build", "npm test", "git status", "git diff"]
   }
 }
@@ -629,22 +638,63 @@ MCP server prompts are available as slash commands. Environment variables in ser
 
 ## Local ML
 
-An optional layer that runs ML models locally on your machine for code retrieval, privacy scanning, and inline completions. See `docs/LOCAL_ML_GUIDE.md` for the full guide.
+An optional feature-gated layer (`--features local-ml`) that runs ML models locally on your machine. When the feature is disabled (default), mock backends are used — the system still works but with simpler retrieval.
 
-### Quick Enable
+### What Local ML Provides
+
+| Feature | Without `local-ml` | With `local-ml` |
+|---------|-------------------|-----------------|
+| **Code retrieval** | BM25 keyword search | Hybrid: Vector (Jina Code v2) + BM25 with Reciprocal Rank Fusion |
+| **Ghost text** | History-based suggestions | DeepSeek Coder 1.3B real completions (Tab/Alt+Right accept) |
+| **Privacy scanning** | Regex pattern detection | 3-layer: path globs + content regex + ML-based secret detection |
+| **Reranking** | No reranking | Cross-encoder reranking for search results |
+
+### Building with Local ML
+
+```bash
+cargo build --release --bin codingbuddy --features local-ml
+# Or with HNSW vector index:
+cargo build --release --bin codingbuddy --features local-ml-usearch
+```
+
+### Configuration
 
 ```json
 {
   "local_ml": {
-    "enabled": true
+    "enabled": true,
+    "embeddings": {
+      "model_id": "jinaai/jina-embeddings-v2-base-code"
+    },
+    "autocomplete": {
+      "model_id": "deepseek-ai/deepseek-coder-1.3b-base",
+      "device": "metal",
+      "max_tokens": 64
+    },
+    "privacy": {
+      "enabled": true,
+      "policy": "redact"
+    }
   }
 }
 ```
 
-This gives you:
-- **Hybrid retrieval**: Automatically searches your codebase and injects relevant code before the LLM responds
-- **Privacy scanning**: Detects secrets in tool outputs and redacts them before they reach the API
-- **Ghost text**: Inline code completions in the TUI (requires `--features local-ml` build for real completions)
+### Memory-Aware Model Loading
+
+The system automatically adjusts model loading based on available RAM:
+- **Full**: Load complete model with full context
+- **ReducedContext**: Load with smaller context window
+- **CpuOnly**: Skip GPU, use CPU inference
+- **Skip**: Don't load (insufficient memory) — falls back to mock backend
+
+### Architecture
+
+The `codingbuddy-local-ml` crate (7,200 lines) provides:
+- `EmbeddingsBackend` / `LocalGenBackend` / `VectorIndexBackend` traits with mock + Candle implementations
+- `chunk_workspace()` with overlapping windows and gitignore-aware file scanning
+- `HybridRetriever` combining vector + BM25 scores via Reciprocal Rank Fusion
+- `ModelManager` with parallel downloads, stall detection, and resume support
+- `PrivacyRouter` with 3-layer detection and Block/Redact/LocalOnlySummary policies
 
 ### Privacy Commands
 
