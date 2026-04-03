@@ -4,7 +4,6 @@ pub mod apply;
 pub mod context;
 mod gather_context;
 mod intent;
-pub mod local_routing;
 mod repo_map;
 mod shared;
 pub mod skills;
@@ -825,6 +824,7 @@ impl AgentEngine {
             images: options.images.clone(),
             initial_context,
             profile_name: profile.map(|p| p.name.to_string()),
+            phase_loop_enabled: self.cfg.agent_loop.phase_loop_enabled,
             initial_phase,
             session_id: Some(session.session_id),
             edit_validator: if self.cfg.lsp.enabled {

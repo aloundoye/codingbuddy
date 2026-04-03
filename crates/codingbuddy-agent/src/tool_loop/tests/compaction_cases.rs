@@ -330,6 +330,7 @@ fn compaction_injects_active_work_state_snapshot() {
         ToolLoopConfig {
             workspace: Some(temp.path().to_path_buf()),
             session_id: Some(session_id),
+            phase_loop_enabled: true,
             initial_phase: Some(TaskPhase::Execute),
             ..Default::default()
         },

@@ -82,6 +82,17 @@ fn init_workspace(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Enable the phase loop in workspace settings (off by default).
+fn enable_phase_loop(path: &Path) -> Result<()> {
+    let settings_dir = path.join(".codingbuddy");
+    fs::create_dir_all(&settings_dir)?;
+    fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"agent_loop":{"phase_loop_enabled":true}}"#,
+    )?;
+    Ok(())
+}
+
 fn build_engine(path: &Path, responses: Vec<LlmResponse>) -> Result<AgentEngine> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(ScriptedLlm::new(responses));
     AgentEngine::new_with_llm(path, llm)
@@ -1365,6 +1376,7 @@ fn exit_plan_mode_persists_plan_and_session_state() -> Result<()> {
 fn complex_prompt_auto_enters_plan_and_persists_draft_state() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
+    enable_phase_loop(temp.path())?;
 
     let engine = build_engine(
         temp.path(),
@@ -1419,6 +1431,7 @@ fn complex_prompt_auto_enters_plan_and_persists_draft_state() -> Result<()> {
 fn approved_plan_execution_emits_full_phase_path_and_loads_plan_context() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
+    enable_phase_loop(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![
         tool_call_response(vec![("call_1", "tool_search", r#"{"query":"plan mode"}"#)]),
