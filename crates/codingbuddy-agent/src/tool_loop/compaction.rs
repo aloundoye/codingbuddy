@@ -308,3 +308,83 @@ pub(crate) fn extract_memory_observations(messages: &[ChatMessage]) -> Vec<Strin
     observations.truncate(5);
     observations
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_summary_preserves_errors_and_tool_usage() {
+        let messages = vec![
+            ChatMessage::User {
+                content: "Fix the auth bug".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("I'll fix it".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![codingbuddy_core::LlmToolCall {
+                    id: "tc1".to_string(),
+                    name: "fs_edit".to_string(),
+                    arguments: r#"{"path":"src/auth.rs","old_string":"a","new_string":"b"}"#
+                        .to_string(),
+                }],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "tc1".to_string(),
+                content: "error: cannot find value `foo`".to_string(),
+            },
+        ];
+        let summary = build_compaction_summary(&messages);
+        assert!(
+            summary.contains("src/auth.rs"),
+            "should preserve file paths from tool calls: {summary}"
+        );
+        assert!(
+            summary.contains("error") || summary.contains("cannot find"),
+            "should preserve errors: {summary}"
+        );
+        assert!(
+            summary.contains("fs_edit"),
+            "should track tool usage: {summary}"
+        );
+    }
+
+    #[test]
+    fn memory_extraction_captures_corrections() {
+        let messages = vec![
+            ChatMessage::User {
+                content: "don't do that, use the other approach".to_string(),
+            },
+            ChatMessage::User {
+                content: "always use cargo test instead of nextest".to_string(),
+            },
+            ChatMessage::User {
+                content: "just a normal question about the code".to_string(),
+            },
+        ];
+        let obs = extract_memory_observations(&messages);
+        assert_eq!(obs.len(), 2);
+        assert!(obs[0].starts_with("[correction]"));
+        assert!(obs[1].starts_with("[preference]"));
+    }
+
+    #[test]
+    fn memory_extraction_skips_short_messages() {
+        let messages = vec![ChatMessage::User {
+            content: "stop".to_string(),
+        }];
+        let obs = extract_memory_observations(&messages);
+        assert!(obs.is_empty(), "short messages should be skipped");
+    }
+
+    #[test]
+    fn memory_extraction_caps_at_five() {
+        let messages: Vec<ChatMessage> = (0..10)
+            .map(|i| ChatMessage::User {
+                content: format!("don't do approach {i}, use the other method instead"),
+            })
+            .collect();
+        let obs = extract_memory_observations(&messages);
+        assert!(obs.len() <= 5, "should cap at 5 observations");
+    }
+}
