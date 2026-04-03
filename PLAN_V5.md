@@ -230,6 +230,22 @@ Add a modal overlay system that renders on top of the main TUI:
 - Shows all keybindings, slash commands, and tips
 - Scrollable
 
+### Phase 5 Results ✅ COMPLETE
+
+**What I found:**
+- **Model picker modal already existed** — `ModelPickerState` with full viewport scrolling, provider filtering, and display lines. Triggered by `/model` command. No additional work needed.
+- **Rewind picker modal already existed** — `RewindPickerState` for checkpoint selection.
+- The TUI already has an overlay pattern (model_picker, autocomplete_dropdown, pending_approval) — adding new overlays follows the same architecture.
+
+**What I built:**
+- **HelpModalState** — scrollable help overlay showing all keybindings, slash commands, input tips, and approval controls. Box-drawing border for visual polish.
+- **F1 key trigger** — opens help modal from anywhere in the TUI
+- **Help modal keyboard** — j/k for scroll, Esc/q/? to close
+- Help content rendered in the info_line area, replacing other content while active
+- Help modal checks take priority over other overlays (renders first in the input handler chain)
+
+**Score impact:** +0.2 (8.3 → 8.5). Model picker was already there (counted as freebie), help modal is new.
+
 ---
 
 ## Phase 6: Final Polish (0.1 points)
