@@ -180,7 +180,8 @@ where
     let mut cursor_pos: usize = 0;
     let mut history_cursor: Option<usize> = None;
     let mut saved_input = String::new();
-    let mut info_line = String::from(" Ctrl+C exit | Tab autocomplete | /model to switch models");
+    let mut info_line =
+        String::from(" Ctrl+C exit | Tab autocomplete | Shift+Tab agent | /model models");
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
     let mut cursor_visible;
@@ -215,6 +216,7 @@ where
     let mut last_phase_heartbeat_at = Instant::now();
     let mut last_mission_refresh_at = Instant::now();
     let mut model_picker: Option<ModelPickerState> = None;
+    let mut active_profile_display: Option<String> = None;
     let mut pending_images: Vec<PathBuf> = Vec::new();
     let mut autocomplete_dropdown: Option<AutocompleteState> = None;
     let mut ml_ghost: GhostTextState = GhostTextState::default();
@@ -795,9 +797,10 @@ where
                 // Number shortcuts for quick selection (1-9)
                 KeyCode::Char(ch) if ch.is_ascii_digit() && ch != '0' => {
                     let idx = (ch as usize) - ('1' as usize);
-                    if idx < MODEL_CHOICES.len() {
+                    if idx < mp.count() {
+                        mp.selected = idx;
+                        let chosen = mp.confirm();
                         model_picker = None;
-                        let chosen = MODEL_CHOICES[idx].0;
                         let model_cmd = format!("/model {chosen}");
                         on_submit(&model_cmd);
                         info_line = format!("Model: {chosen}");
@@ -947,6 +950,26 @@ where
                     format!("denied `{tool_name}`")
                 };
             }
+            continue;
+        }
+
+        // Shift+Tab: cycle agent profile (when no overlay is active)
+        if key.code == KeyCode::BackTab
+            && model_picker.is_none()
+            && autocomplete_dropdown.is_none()
+            && !reverse_search_active
+        {
+            let profiles = crate::state::AGENT_PROFILE_NAMES;
+            let current_idx = profiles
+                .iter()
+                .position(|p| active_profile_display.as_deref() == Some(*p))
+                .unwrap_or(0);
+            let next_idx = (current_idx + 1) % profiles.len();
+            let next_profile = profiles[next_idx];
+            active_profile_display = Some(next_profile.to_string());
+            let cmd = format!("/agent {next_profile}");
+            on_submit(&cmd);
+            info_line = format!("Agent: {next_profile} (Shift+Tab to cycle)");
             continue;
         }
 

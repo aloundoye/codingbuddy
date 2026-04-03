@@ -361,6 +361,11 @@ impl AgentEngine {
         self.subagent_worker.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Discover available models from the active provider's API.
+    pub fn discover_models(&self) -> Vec<String> {
+        self.llm.list_models()
+    }
+
     fn active_plan_prompt_addendum(&self, session: &Session) -> Result<Option<String>> {
         if !matches!(
             session.status,

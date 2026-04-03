@@ -50,6 +50,12 @@ pub trait LlmClient {
     fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback)
     -> Result<LlmResponse>;
 
+    /// Discover available models from the provider's API.
+    /// Default: returns empty (no discovery support).
+    fn list_models(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Beta FIM completion (Fill-In-The-Middle)
     fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse>;
 
@@ -112,6 +118,39 @@ impl ApiClient {
     /// Attach a cancellation token that will be checked during streaming.
     pub fn set_cancel_token(&mut self, token: CancellationToken) {
         self.cancel_token = Some(token);
+    }
+
+    /// Discover available models from the provider's /v1/models endpoint.
+    /// Returns a list of model IDs. Fails gracefully (empty vec) on error.
+    fn discover_models_from_api(&self) -> Vec<String> {
+        let provider = self.provider_config();
+        let base = provider.base_url.trim_end_matches('/');
+        let prefix = if provider.openai_compat_prefix {
+            "/v1"
+        } else {
+            ""
+        };
+        let url = format!("{base}{prefix}/models");
+        let mut req = self.client.get(&url);
+        if let Some(ref key) = self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = match req.timeout(Duration::from_secs(5)).send() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let body: serde_json::Value = match resp.json() {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        body.get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn provider_kind(&self) -> Result<ProviderKind> {
@@ -1511,6 +1550,10 @@ impl LlmClient for ApiClient {
             normalized_req.model = self.resolve_request_model(&req.model)?;
         }
         self.complete_fim_streaming_inner(&normalized_req, key.as_deref(), cb)
+    }
+
+    fn list_models(&self) -> Vec<String> {
+        self.discover_models_from_api()
     }
 }
 
