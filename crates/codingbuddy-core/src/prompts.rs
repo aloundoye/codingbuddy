@@ -339,9 +339,9 @@ pub fn build_model_aware_system_prompt(
     // Select base prompt by model family, then by model tier.
     // Non-DeepSeek model families are checked first so that e.g. "qwen-reasoner"
     // still gets the Qwen prompt rather than the generic reasoner prompt.
-    use codingbuddy_core::{ModelFamily, detect_model_family};
+    use crate::{ModelFamily, detect_model_family};
     let family = detect_model_family(model);
-    let is_reasoner = codingbuddy_core::is_reasoner_model(model);
+    let is_reasoner = crate::is_reasoner_model(model);
 
     let base_prompt = match family {
         ModelFamily::Qwen => QWEN_SYSTEM_PROMPT,

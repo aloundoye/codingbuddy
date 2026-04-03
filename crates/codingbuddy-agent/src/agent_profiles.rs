@@ -4,7 +4,7 @@
 //! availability per task type reduces the decision space and improves accuracy.
 //! Profiles are selected based on `ChatMode` and prompt content.
 
-use crate::complexity::PromptComplexity;
+use codingbuddy_core::complexity::PromptComplexity;
 use codingbuddy_core::{ToolAgentRole, ToolName};
 
 /// An agent profile constrains tool availability and adds a system prompt addendum.

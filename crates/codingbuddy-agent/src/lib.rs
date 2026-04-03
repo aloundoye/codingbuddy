@@ -1,12 +1,10 @@
 pub mod agent_profiles;
 mod analysis;
 pub mod apply;
-pub mod complexity;
 pub mod context;
 mod gather_context;
 mod intent;
 pub mod local_routing;
-pub mod prompts;
 mod repo_map;
 mod shared;
 pub mod skills;
@@ -678,26 +676,27 @@ impl AgentEngine {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-        let ws_context = prompts::WorkspaceContext {
+        let ws_context = codingbuddy_core::prompts::WorkspaceContext {
             cwd: self.workspace.display().to_string(),
             git_branch,
             os: std::env::consts::OS.to_string(),
         };
 
         // Classify complexity before building system prompt (planning injection depends on it).
-        let complexity = complexity::classify_complexity(prompt);
+        let complexity = codingbuddy_core::complexity::classify_complexity(prompt);
 
         // Build repo map for Complex tasks so the model knows the project structure
-        let repo_map_summary = if complexity == complexity::PromptComplexity::Complex {
-            Some(shared::build_repo_map(
-                &self.workspace,
-                prompt,
-                40, // top 40 files
-                &options.additional_dirs,
-            ))
-        } else {
-            None
-        };
+        let repo_map_summary =
+            if complexity == codingbuddy_core::complexity::PromptComplexity::Complex {
+                Some(shared::build_repo_map(
+                    &self.workspace,
+                    prompt,
+                    40, // top 40 files
+                    &options.additional_dirs,
+                ))
+            } else {
+                None
+            };
 
         // Select agent profile: manual override takes precedence over auto-selection.
         let profile = options
@@ -725,7 +724,7 @@ impl AgentEngine {
             });
         }
 
-        let mut system_prompt = prompts::build_model_aware_system_prompt(
+        let mut system_prompt = codingbuddy_core::prompts::build_model_aware_system_prompt(
             project_memory.as_deref(),
             options.system_prompt_override.as_deref(),
             options.system_prompt_append.as_deref(),
@@ -749,9 +748,9 @@ impl AgentEngine {
         // Complexity-driven initial budget, with evidence-driven escalation in the loop.
         // force_max_think is an explicit user override to maximum.
         let think_budget = if options.force_max_think {
-            complexity::MAX_THINK_BUDGET // 64K
+            codingbuddy_core::complexity::MAX_THINK_BUDGET // 64K
         } else {
-            complexity::thinking_budget_for(complexity) // Simple 8K / Medium 16K / Complex 32K
+            codingbuddy_core::complexity::thinking_budget_for(complexity) // Simple 8K / Medium 16K / Complex 32K
         };
 
         // Gather lightweight bootstrap context so the model starts with project awareness.
@@ -1415,7 +1414,7 @@ fn should_run_team_orchestration(
             if !engine.cfg.agent_loop.team.auto_enabled {
                 return false;
             }
-            crate::complexity::score_prompt(prompt)
+            codingbuddy_core::complexity::score_prompt(prompt)
                 >= engine.cfg.agent_loop.team.complexity_threshold
         }
     }

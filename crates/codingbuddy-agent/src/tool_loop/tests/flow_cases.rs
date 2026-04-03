@@ -517,7 +517,7 @@ fn complex_continuation_injects_anchor_context() {
     ]);
     let tool_host = Arc::new(MockToolHost::new(vec![], true));
     let config = ToolLoopConfig {
-        complexity: crate::complexity::PromptComplexity::Complex,
+        complexity: codingbuddy_core::complexity::PromptComplexity::Complex,
         workspace: Some(workspace),
         session_id: Some(session.session_id),
         initial_phase: Some(TaskPhase::Verify),
@@ -618,7 +618,7 @@ fn complex_write_without_todo_refresh_injects_checklist_nudge() {
         },
     ];
     let config = ToolLoopConfig {
-        complexity: crate::complexity::PromptComplexity::Complex,
+        complexity: codingbuddy_core::complexity::PromptComplexity::Complex,
         workspace: Some(workspace),
         session_id: Some(session.session_id),
         initial_phase: Some(TaskPhase::Verify),

@@ -309,7 +309,7 @@ fn evidence_driven_escalation_on_tool_failures() {
 
     let config = ToolLoopConfig {
         thinking: Some(codingbuddy_core::ThinkingConfig::enabled(
-            crate::complexity::DEFAULT_THINK_BUDGET,
+            codingbuddy_core::complexity::DEFAULT_THINK_BUDGET,
         )),
         ..Default::default()
     };

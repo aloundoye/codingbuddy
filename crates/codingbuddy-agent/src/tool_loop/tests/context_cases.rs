@@ -469,7 +469,7 @@ fn complex_escalated_routes_to_reasoner() {
     ));
 
     let config = ToolLoopConfig {
-        complexity: crate::complexity::PromptComplexity::Complex,
+        complexity: codingbuddy_core::complexity::PromptComplexity::Complex,
         ..Default::default()
     };
 
@@ -494,7 +494,7 @@ fn complex_escalated_routes_to_reasoner() {
 
 #[test]
 fn de_escalated_routes_back_to_chat() {
-    let mut signals = crate::complexity::EscalationSignals {
+    let mut signals = codingbuddy_core::complexity::EscalationSignals {
         compile_error: true,
         ..Default::default()
     };
@@ -505,7 +505,10 @@ fn de_escalated_routes_back_to_chat() {
     signals.record_success();
     signals.record_success();
     assert!(!signals.should_escalate(), "3 successes should de-escalate");
-    assert_eq!(signals.budget(), crate::complexity::DEFAULT_THINK_BUDGET);
+    assert_eq!(
+        signals.budget(),
+        codingbuddy_core::complexity::DEFAULT_THINK_BUDGET
+    );
 }
 
 #[test]
