@@ -804,6 +804,71 @@ impl GhostTextState {
     }
 }
 
+/// Help modal — shows keybindings, slash commands, tips in a scrollable overlay.
+pub struct HelpModalState {
+    pub scroll: usize,
+    pub lines: Vec<String>,
+}
+
+impl HelpModalState {
+    pub fn new() -> Self {
+        let lines = vec![
+            "╭─────────────── CodingBuddy Help ───────────────╮".to_string(),
+            "│                                                 │".to_string(),
+            "│  KEYBINDINGS                                    │".to_string(),
+            "│  Enter        Send message (Shift+Enter newline)│".to_string(),
+            "│  Ctrl+C       Cancel / interrupt / exit         │".to_string(),
+            "│  PageUp       Scroll mode (native terminal)     │".to_string(),
+            "│  Tab/S-Tab    Autocomplete / cycle agent        │".to_string(),
+            "│  Ctrl+R       Reverse search history            │".to_string(),
+            "│  Ctrl+P       Toggle plan collapse              │".to_string(),
+            "│  Ctrl+M       Mission control panel             │".to_string(),
+            "│  Esc          Cancel overlay / vim normal mode   │".to_string(),
+            "│                                                 │".to_string(),
+            "│  SLASH COMMANDS                                 │".to_string(),
+            "│  /help        This help screen                  │".to_string(),
+            "│  /model       Switch LLM model                  │".to_string(),
+            "│  /agent       Switch agent profile              │".to_string(),
+            "│  /clear       Clear conversation                │".to_string(),
+            "│  /compact     Force context compaction           │".to_string(),
+            "│  /undo        Revert last turn + file changes   │".to_string(),
+            "│  /rewind      Revert to specific checkpoint     │".to_string(),
+            "│  /branch      Create/list session branches      │".to_string(),
+            "│  /cost        Show session cost breakdown        │".to_string(),
+            "│  /status      Show current status               │".to_string(),
+            "│  /config      Show configuration                │".to_string(),
+            "│  /mcp         Manage MCP servers                │".to_string(),
+            "│  /skills      List available skills              │".to_string(),
+            "│  /vim         Toggle vim mode                    │".to_string(),
+            "│  /exit        Exit CodingBuddy                  │".to_string(),
+            "│                                                 │".to_string(),
+            "│  INPUT                                          │".to_string(),
+            "│  @file        Attach file to context             │".to_string(),
+            "│  /command     Slash command autocomplete         │".to_string(),
+            "│  Y/A/N        Approve/Always/Deny tool calls    │".to_string(),
+            "│                                                 │".to_string(),
+            "│  Press Esc or ? to close                        │".to_string(),
+            "╰─────────────────────────────────────────────────╯".to_string(),
+        ];
+        Self { scroll: 0, lines }
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self) {
+        if self.scroll + 15 < self.lines.len() {
+            self.scroll += 1;
+        }
+    }
+
+    pub fn visible_lines(&self, max_rows: usize) -> &[String] {
+        let end = (self.scroll + max_rows).min(self.lines.len());
+        &self.lines[self.scroll..end]
+    }
+}
+
 /// Type alias for the ML completion callback.
 ///
 /// Takes the current input text and returns an optional completion suggestion.

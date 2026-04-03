@@ -224,6 +224,7 @@ where
     let mut last_phase_heartbeat_at = Instant::now();
     let mut last_mission_refresh_at = Instant::now();
     let mut model_picker: Option<ModelPickerState> = None;
+    let mut help_modal: Option<state::HelpModalState> = None;
     let mut active_profile_display: Option<String> = None;
     let mut pending_images: Vec<PathBuf> = Vec::new();
     let mut autocomplete_dropdown: Option<AutocompleteState> = None;
@@ -732,6 +733,12 @@ where
             }
         }
 
+        // Help modal content displayed in info_line
+        if let Some(ref hm) = help_modal {
+            let visible = hm.visible_lines(6);
+            info_line = visible.join("\n");
+        }
+
         // Handle pending approval prompts via keyboard
         if let Some((ref tool_name, ref args_summary, _)) = pending_approval {
             let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
@@ -778,6 +785,20 @@ where
         };
         // Only handle key press events (ignore release/repeat on platforms that send them)
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        // ── Help modal overlay ────────────────────────────────────────────
+        if let Some(ref mut hm) = help_modal {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    help_modal = None;
+                    info_line = String::new();
+                }
+                KeyCode::Up | KeyCode::Char('k') => hm.scroll_up(),
+                KeyCode::Down | KeyCode::Char('j') => hm.scroll_down(),
+                _ => {}
+            }
             continue;
         }
 
@@ -1879,6 +1900,11 @@ where
             continue;
         }
         match key.code {
+            KeyCode::F(1) => {
+                help_modal = Some(state::HelpModalState::new());
+                info_line = "Help — scroll with j/k, close with Esc".to_string();
+                continue;
+            }
             KeyCode::PageUp => {
                 // Pause TUI so user can scroll in native terminal scrollback
                 disable_raw_mode()?;
