@@ -70,6 +70,10 @@ pub struct SkillInvocationResult {
     pub disallowed_tools: Vec<String>,
     /// Whether model auto-invocation is disabled.
     pub disable_model_invocation: bool,
+    /// Model override for this skill (e.g. "deepseek-reasoner").
+    pub model_override: Option<String>,
+    /// Effort hint for thinking budget adjustment.
+    pub effort: Option<String>,
 }
 
 /// Callback for looking up and running a skill by name.

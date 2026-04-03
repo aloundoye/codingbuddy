@@ -321,6 +321,22 @@ pub(super) fn handle_task_update(
         status: status.to_string(),
     });
 
+    // Fire TaskCompleted hook when a task finishes
+    if (status == "completed" || status == "done")
+        && let Some(ref hooks) = tool_loop.hooks
+    {
+        let input = HookInput {
+            event: HookEvent::TaskCompleted.as_str().to_string(),
+            tool_name: Some("task_update".to_string()),
+            tool_input: Some(args.clone()),
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: tool_loop.workspace_str().to_string(),
+        };
+        ToolUseLoop::fire_hook_logged(hooks, HookEvent::TaskCompleted, &input);
+    }
+
     Ok(serde_json::json!({
         "task_id": task_id,
         "status": status,
