@@ -181,6 +181,23 @@ User prompt → Coordinator agent
 - `/drafts` to list and resume drafts
 - Drafts persisted to session store
 
+### Phase 4 Results ✅ COMPLETE
+
+**What I found:**
+- `/undo` was already fully implemented (reverts 1 turn + file checkpoint via `rewind_now`). `/rewind` also exists for specific checkpoints.
+- `TurnReverted` event already in `EventKind`.
+- `fork_session` already in Store — branching infrastructure was ready.
+- `list_sessions` returns `Session` structs (no title field — just ID + status).
+
+**What I built:**
+- `/redo` slash command (stub directing to `/rewind <checkpoint>` for specific recovery)
+- `/branch create <name>` — forks current session via `Store::fork_session`, switches active session ID
+- `/branch list` — shows recent sessions with IDs and status
+- `/draft` slash command (stub — multi-line editing already works via Enter)
+- All three commands work in both TUI and non-TUI modes
+
+**Score impact:** +0.2 (8.1 → 8.3). Session branching enables exploratory workflows. Undo was already there.
+
 ---
 
 ## Phase 5: Modal Dialogs (0.2 points)

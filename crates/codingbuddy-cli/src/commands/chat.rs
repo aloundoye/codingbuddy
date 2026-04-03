@@ -733,6 +733,52 @@ pub(crate) fn run_chat(
                         println!("{output}");
                     }
                 }
+                SlashCommand::Redo => {
+                    println!(
+                        "redo: re-applying last undone turn is not yet supported in non-TUI mode"
+                    );
+                }
+                SlashCommand::Branch(args) => {
+                    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+                    match sub {
+                        "list" | "ls" => {
+                            let store = codingbuddy_store::Store::new(cwd)?;
+                            let sessions = store.list_sessions()?;
+                            println!("Session branches ({} total):", sessions.len());
+                            for s in sessions.iter().take(20) {
+                                let marker = if Some(s.session_id) == selected_session_id {
+                                    "* "
+                                } else {
+                                    "  "
+                                };
+                                println!(
+                                    "{marker}{} — {:?}",
+                                    &s.session_id.to_string()[..8],
+                                    s.status
+                                );
+                            }
+                        }
+                        "create" | "new" => {
+                            let name = args.get(1).cloned().unwrap_or_else(|| "branch".to_string());
+                            if let Some(sid) = selected_session_id {
+                                let store = codingbuddy_store::Store::new(cwd)?;
+                                let forked = store.fork_session(sid)?;
+                                selected_session_id = Some(forked.session_id);
+                                println!(
+                                    "Created branch '{}' (session {})",
+                                    name,
+                                    &forked.session_id.to_string()[..8]
+                                );
+                            } else {
+                                println!("No active session to branch from");
+                            }
+                        }
+                        _ => println!("Usage: /branch [list|create <name>]"),
+                    }
+                }
+                SlashCommand::Draft(_args) => {
+                    println!("Drafts are only available in TUI mode");
+                }
                 SlashCommand::Status => {
                     let status =
                         current_ui_status(cwd, &cfg, force_max_think, selected_session_id)?;
