@@ -396,7 +396,7 @@ pub(crate) fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'
                 }
                 spans.push(Span::styled(
                     text[i + 1..i + 1 + end].to_string(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(super::theme::theme().code_inline),
                 ));
                 i = i + 1 + end + 1;
                 seg_start = i;
@@ -445,7 +445,7 @@ pub(crate) fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'
                 spans.extend(parse_inline_markdown(
                     &text[i + 2..i + 2 + end],
                     base_style
-                        .fg(Color::DarkGray)
+                        .fg(super::theme::theme().muted)
                         .add_modifier(Modifier::CROSSED_OUT),
                 ));
                 i = i + 2 + end + 2;
@@ -466,15 +466,14 @@ pub(crate) fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'
                         if i > seg_start {
                             spans.push(Span::styled(text[seg_start..i].to_string(), base_style));
                         }
+                        let lt = super::theme::theme();
                         spans.push(Span::styled(
                             link_text.to_string(),
-                            base_style
-                                .fg(Color::LightBlue)
-                                .add_modifier(Modifier::UNDERLINED),
+                            base_style.fg(lt.primary).add_modifier(Modifier::UNDERLINED),
                         ));
                         spans.push(Span::styled(
                             format!(" ({link_url})"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(lt.muted),
                         ));
                         i = after_bracket + 1 + close_paren + 1;
                         seg_start = i;
@@ -500,14 +499,15 @@ pub(crate) fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'
 /// horizontal rules, inline formatting). Used by both first-line and
 /// continuation-line renderers.
 pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
-    let body_style = Style::default().fg(Color::White);
+    let t = super::theme::theme();
+    let body_style = t.assistant_body_style();
 
     // Code fence
     if text.starts_with("```") {
         return Line::from(vec![Span::styled(
             text.to_string(),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(t.code_fence)
                 .add_modifier(Modifier::DIM),
         )]);
     }
@@ -516,7 +516,7 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
     if text == "---" || text == "***" || text == "___" {
         return Line::from(vec![Span::styled(
             "  ─────────────────────────────────────────".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.separator),
         )]);
     }
 
@@ -533,14 +533,14 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
         if !heading_text.is_empty() {
             let heading_style = match level {
                 1 => Style::default()
-                    .fg(Color::Cyan)
+                    .fg(t.bold_heading)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 2 => Style::default()
-                    .fg(Color::Cyan)
+                    .fg(t.bold_heading)
                     .add_modifier(Modifier::BOLD),
-                3 => Style::default().fg(Color::Cyan),
+                3 => Style::default().fg(t.bold_heading),
                 _ => Style::default()
-                    .fg(Color::White)
+                    .fg(t.assistant_body)
                     .add_modifier(Modifier::BOLD),
             };
             let mut spans = vec![];
@@ -551,7 +551,7 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
 
     // Blockquote
     if let Some(quote) = text.strip_prefix("> ") {
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(t.muted);
         let mut spans = vec![Span::styled("│ ".to_string(), dim)];
         spans.extend(parse_inline_markdown(quote, dim));
         return Line::from(spans);
@@ -562,10 +562,7 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
         .strip_prefix("- [ ] ")
         .or_else(|| text.strip_prefix("* [ ] "))
     {
-        let mut spans = vec![Span::styled(
-            "☐ ".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )];
+        let mut spans = vec![Span::styled("☐ ".to_string(), Style::default().fg(t.muted))];
         spans.extend(parse_inline_markdown(rest, body_style));
         return Line::from(spans);
     }
@@ -577,13 +574,11 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
     {
         let mut spans = vec![Span::styled(
             "☑ ".to_string(),
-            Style::default().fg(Color::Green),
+            Style::default().fg(t.success),
         )];
         spans.extend(parse_inline_markdown(
             rest,
-            body_style
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::CROSSED_OUT),
+            body_style.fg(t.muted).add_modifier(Modifier::CROSSED_OUT),
         ));
         return Line::from(spans);
     }
@@ -592,7 +587,7 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
     if let Some(item) = text.strip_prefix("- ").or_else(|| text.strip_prefix("* ")) {
         let mut spans = vec![Span::styled(
             "• ".to_string(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(t.primary),
         )];
         spans.extend(parse_inline_markdown(item, body_style));
         return Line::from(spans);
@@ -607,7 +602,7 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
         let item = &text[dot_pos + 2..];
         let mut spans = vec![Span::styled(
             num.to_string(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(t.primary),
         )];
         spans.extend(parse_inline_markdown(item, body_style));
         return Line::from(spans);
@@ -616,38 +611,33 @@ pub(crate) fn render_assistant_markdown(text: &str) -> Line<'static> {
     // Table rows: lines starting and ending with `|`
     if text.len() >= 2 && text.starts_with('|') && text.ends_with('|') {
         let trimmed = &text[1..text.len() - 1];
-        // Separator row (e.g. |---|---|)
+        let border_style = Style::default().fg(t.table_border);
+        // Separator row (e.g. |---|---|) — render as horizontal rule
         if trimmed
             .chars()
             .all(|c| c == '-' || c == '|' || c == ':' || c == ' ')
         {
-            return Line::from(vec![Span::styled(
-                text.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )]);
+            let cell_count = trimmed.split('|').count();
+            let col_width = 12;
+            let mut sep = String::from("├");
+            for i in 0..cell_count {
+                sep.push_str(&"─".repeat(col_width + 2));
+                sep.push(if i + 1 < cell_count { '┼' } else { '┤' });
+            }
+            return Line::from(vec![Span::styled(sep, border_style)]);
         }
-        // Data/header row
+        // Data/header row — detect if this is the first row (header) via bold styling
         let cells: Vec<&str> = trimmed.split('|').map(|c| c.trim()).collect();
-        let mut spans = vec![Span::styled(
-            "│".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )];
+        let mut spans = vec![Span::styled("│".to_string(), border_style)];
         for (i, cell) in cells.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(
-                    "│".to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ));
+                spans.push(Span::styled("│".to_string(), border_style));
             }
-            spans.push(Span::styled(
-                format!(" {cell} "),
-                Style::default().fg(Color::White),
-            ));
+            // Pad cell to minimum width for alignment
+            let padded = format!(" {cell:<12} ");
+            spans.push(Span::styled(padded, Style::default().fg(t.table_cell)));
         }
-        spans.push(Span::styled(
-            "│".to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled("│".to_string(), border_style));
         return Line::from(spans);
     }
 
@@ -689,6 +679,7 @@ pub(crate) fn looks_like_unfenced_diff_line(line: &str) -> bool {
 }
 
 pub(crate) fn render_diff_line(line: &str) -> Line<'static> {
+    let t = super::theme::theme();
     if line.starts_with("diff --git")
         || line.starts_with("index ")
         || line.starts_with("--- ")
@@ -696,14 +687,14 @@ pub(crate) fn render_diff_line(line: &str) -> Line<'static> {
     {
         return Line::from(vec![Span::styled(
             line.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.diff_meta),
         )]);
     }
     if line.starts_with("@@") {
         return Line::from(vec![Span::styled(
             line.to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(t.diff_hunk)
                 .add_modifier(Modifier::BOLD),
         )]);
     }
@@ -711,31 +702,31 @@ pub(crate) fn render_diff_line(line: &str) -> Line<'static> {
         return Line::from(vec![
             Span::styled(
                 "+".to_string(),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.diff_add).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(rest.to_string(), Style::default().fg(Color::Green)),
+            Span::styled(rest.to_string(), Style::default().fg(t.diff_add)),
         ]);
     }
     if let Some(rest) = line.strip_prefix('-') {
         return Line::from(vec![
             Span::styled(
                 "-".to_string(),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(t.diff_remove)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(rest.to_string(), Style::default().fg(Color::Red)),
+            Span::styled(rest.to_string(), Style::default().fg(t.diff_remove)),
         ]);
     }
     if let Some(rest) = line.strip_prefix(' ') {
         return Line::from(vec![
-            Span::styled(" ".to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(" ".to_string(), Style::default().fg(t.muted)),
+            Span::styled(rest.to_string(), Style::default().fg(t.muted)),
         ]);
     }
     Line::from(vec![Span::styled(
         line.to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(t.muted),
     )])
 }
 
@@ -985,55 +976,30 @@ pub(crate) fn style_transcript_line(
         return style_transcript_line(&meta_entry, false, false, "");
     }
 
+    let t = super::theme::theme();
     let (prefix, prefix_style, mut body_style) = match entry.kind {
-        MessageKind::User => (
-            "❯ ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
-        ),
-        MessageKind::Assistant => ("  ", Style::default(), Style::default().fg(Color::White)),
-        MessageKind::System => (
-            "⚙ ",
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::DarkGray),
-        ),
-        MessageKind::ToolCall => (
-            "⚡ ",
-            Style::default().fg(Color::Yellow),
-            Style::default().fg(Color::Yellow),
-        ),
+        MessageKind::User => ("❯ ", t.user_prefix_style(), t.user_body_style()),
+        MessageKind::Assistant => ("  ", Style::default(), t.assistant_body_style()),
+        MessageKind::System => ("⚙ ", t.system_style(), t.system_style()),
+        MessageKind::ToolCall => ("⚡ ", t.tool_call_style(), t.tool_call_style()),
         MessageKind::ToolResult => (
             "  ↳ ",
-            Style::default().fg(Color::Green),
-            Style::default().fg(Color::Green),
+            Style::default().fg(t.tool_result_ok),
+            Style::default().fg(t.tool_result_ok),
         ),
-        MessageKind::Error => (
-            "✗ ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Red),
-        ),
-        MessageKind::Thinking => (
-            "  ◐ ",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::ITALIC),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ),
+        MessageKind::Error => ("✗ ", t.error_style(), t.error_body_style()),
+        MessageKind::Thinking => ("  ◐ ", t.thinking_prefix_style(), t.thinking_body_style()),
     };
 
     let text = &entry.text;
     if entry.kind == MessageKind::ToolResult {
         let lower = text.to_ascii_lowercase();
         if lower.contains("error") || lower.contains("failed") || lower.contains("denied") {
-            body_style = Style::default().fg(Color::Red);
+            body_style = Style::default().fg(t.tool_result_err);
         } else if lower.contains("ok") {
-            body_style = Style::default().fg(Color::Green);
+            body_style = Style::default().fg(t.tool_result_ok);
         } else {
-            body_style = Style::default().fg(Color::DarkGray);
+            body_style = Style::default().fg(t.tool_result_neutral);
         }
     }
 
@@ -1075,26 +1041,25 @@ pub(crate) fn style_continuation_line(
         return style_transcript_line(&meta_entry, false, false, "");
     }
 
+    let t = super::theme::theme();
     let mut body_style = match entry.kind {
-        MessageKind::User => Style::default().fg(Color::White),
-        MessageKind::Assistant => Style::default().fg(Color::White),
-        MessageKind::System => Style::default().fg(Color::DarkGray),
-        MessageKind::ToolCall => Style::default().fg(Color::Yellow),
-        MessageKind::ToolResult => Style::default().fg(Color::Green),
-        MessageKind::Error => Style::default().fg(Color::Red),
-        MessageKind::Thinking => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
+        MessageKind::User => t.user_body_style(),
+        MessageKind::Assistant => t.assistant_body_style(),
+        MessageKind::System => t.system_style(),
+        MessageKind::ToolCall => t.tool_call_style(),
+        MessageKind::ToolResult => Style::default().fg(t.tool_result_ok),
+        MessageKind::Error => t.error_body_style(),
+        MessageKind::Thinking => t.thinking_body_style(),
     };
     let text = &entry.text;
     if entry.kind == MessageKind::ToolResult {
         let lower = text.to_ascii_lowercase();
         if lower.contains("error") || lower.contains("failed") || lower.contains("denied") {
-            body_style = Style::default().fg(Color::Red);
+            body_style = Style::default().fg(t.tool_result_err);
         } else if lower.contains("ok") {
-            body_style = Style::default().fg(Color::Green);
+            body_style = Style::default().fg(t.tool_result_ok);
         } else {
-            body_style = Style::default().fg(Color::DarkGray);
+            body_style = Style::default().fg(t.tool_result_neutral);
         }
     }
     if in_code_block && entry.kind == MessageKind::Assistant && !text.starts_with("```") {
