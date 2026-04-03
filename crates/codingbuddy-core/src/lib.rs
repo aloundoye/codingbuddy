@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 pub mod complexity;
 mod llm_capabilities;
+pub mod profiler;
 pub mod prompts;
 mod tool_metadata;
 pub use llm_capabilities::{

@@ -1318,19 +1318,19 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let profile = std::env::var("CODINGBUDDY_STARTUP_TRACE").is_ok();
-    let t0 = std::time::Instant::now();
+    let mut prof = codingbuddy_core::profiler::StartupProfiler::new();
 
     let mut cli = Cli::parse();
-    if profile {
-        eprintln!("[profile] cli parse: {:?}", t0.elapsed());
-    }
+    prof.mark("cli_parse");
 
     validate_cli_flags(&cli)?;
     let cwd = std::env::current_dir()?;
 
-    // Phase 0.4: Auto-migrate legacy .deepseek/ config to .codingbuddy/
-    migrate_legacy_config(&cwd);
+    // Only migrate if legacy directory exists (skip the check on most runs)
+    if cwd.join(".deepseek").exists() {
+        migrate_legacy_config(&cwd);
+        prof.mark("legacy_migration");
+    }
 
     if cli.ide {
         // SAFETY: called before any threads are spawned in main()
@@ -1427,6 +1427,8 @@ fn run() -> Result<()> {
         .command
         .take()
         .unwrap_or(Commands::Chat(ChatArgs::default()));
+    prof.mark("pre_dispatch");
+    prof.finish();
 
     match command {
         Commands::Chat(args) => {
