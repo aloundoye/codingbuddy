@@ -1014,16 +1014,31 @@ impl AgentEngine {
     }
 
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
+        // Fire SessionStart hook
+        let session_start_input = codingbuddy_hooks::HookInput {
+            event: codingbuddy_hooks::HookEvent::SessionStart
+                .as_str()
+                .to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            prompt: Some(prompt.to_string()),
+            session_type: Some("startup".to_string()),
+            workspace: self.workspace.display().to_string(),
+        };
+        let _ = self.hooks.fire(
+            codingbuddy_hooks::HookEvent::SessionStart,
+            &session_start_input,
+        );
+
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
         let session = self.ensure_session_record_for(options.session_id)?;
         options.session_id = Some(session.session_id);
 
-        // Load chat history from the store if possible
         if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
             options.chat_history = projection.chat_messages;
         }
 
-        // Record User Turn
         self.append_event_best_effort_for_session(
             Some(session.session_id),
             EventKind::ChatTurn {
@@ -1056,7 +1071,25 @@ impl AgentEngine {
             );
         }
 
-        // Fire Stop hooks for post-processing (logging, notifications, etc.)
+        // Fire SessionEnd hook
+        let session_end_input = codingbuddy_hooks::HookInput {
+            event: codingbuddy_hooks::HookEvent::SessionEnd
+                .as_str()
+                .to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_result: result
+                .as_ref()
+                .ok()
+                .map(|s| serde_json::Value::String(s.clone())),
+            prompt: None,
+            session_type: None,
+            workspace: self.workspace.display().to_string(),
+        };
+        let _ = self
+            .hooks
+            .fire(codingbuddy_hooks::HookEvent::SessionEnd, &session_end_input);
+
         self.fire_stop();
 
         result
