@@ -345,8 +345,8 @@ fn tool_cache_stores_and_retrieves() {
     let result = serde_json::json!({"content": "fn main() {}"});
 
     // Store and retrieve
-    loop_.cache_store("fs_read", &args, &result);
-    let cached = loop_.cache_lookup("fs_read", &args);
+    loop_.tool_cache.store("fs_read", &args, &result);
+    let cached = loop_.tool_cache.lookup("fs_read", &args);
     assert_eq!(cached, Some(result));
 }
 
@@ -366,8 +366,8 @@ fn tool_cache_skips_non_cacheable() {
     let args = serde_json::json!({"command": "ls"});
     let result = serde_json::json!({"output": "file1\nfile2"});
 
-    loop_.cache_store("bash_run", &args, &result);
-    let cached = loop_.cache_lookup("bash_run", &args);
+    loop_.tool_cache.store("bash_run", &args, &result);
+    let cached = loop_.tool_cache.lookup("bash_run", &args);
     assert_eq!(cached, None, "bash_run should not be cached");
 }
 
@@ -387,13 +387,13 @@ fn tool_cache_invalidation_by_path() {
     let args = serde_json::json!({"path": "/foo/bar.rs"});
     let result = serde_json::json!({"content": "fn main() {}"});
 
-    loop_.cache_store("fs_read", &args, &result);
-    assert!(loop_.cache_lookup("fs_read", &args).is_some());
+    loop_.tool_cache.store("fs_read", &args, &result);
+    assert!(loop_.tool_cache.lookup("fs_read", &args).is_some());
 
     // Invalidate by path
-    loop_.cache_invalidate_path("/foo/bar.rs");
+    loop_.tool_cache.invalidate_path("/foo/bar.rs");
     assert!(
-        loop_.cache_lookup("fs_read", &args).is_none(),
+        loop_.tool_cache.lookup("fs_read", &args).is_none(),
         "cache should be invalidated after path write"
     );
 }
