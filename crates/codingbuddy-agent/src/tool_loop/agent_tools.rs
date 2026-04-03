@@ -70,6 +70,7 @@ pub(super) fn handle_agent_level_tool(
         "task_output" => handle_task_output(tool_loop, &args)?,
         "task_stop" => handle_task_stop(tool_loop, &args)?,
         "spawn_task" => handle_spawn_task(tool_loop, &args)?,
+        "send_message" => handle_send_message(tool_loop, &args)?,
         "enter_plan_mode" => handle_enter_plan_mode(tool_loop)?,
         "exit_plan_mode" => handle_exit_plan_mode(tool_loop, &args)?,
         "skill" => handle_skill(tool_loop, &args)?,
@@ -616,6 +617,67 @@ pub(super) fn handle_task_output(
         }
     })
     .to_string())
+}
+
+/// Send a follow-up message to a completed or running subagent.
+/// Looks up the agent's session by run_id and re-invokes with the message.
+pub(super) fn handle_send_message(
+    tool_loop: &ToolUseLoop<'_>,
+    args: &serde_json::Value,
+) -> Result<String> {
+    let to = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("send_message requires 'to' (agent run_id or name)"))?;
+    let message = args
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("send_message requires 'message'"))?;
+
+    // Look up the subagent run to find its child session
+    let store = tool_loop.workspace_store()?;
+    let run_id = Uuid::parse_str(to);
+    let run = if let Ok(id) = run_id {
+        store.load_subagent_run(id)?
+    } else {
+        // Try to find by name in recent runs
+        store
+            .list_subagent_runs(tool_loop.config.session_id, 20)?
+            .into_iter()
+            .find(|r| r.name == to)
+    };
+
+    let Some(run) = run else {
+        return Ok(format!(
+            "Agent '{to}' not found. Use task_output to check available agents."
+        ));
+    };
+
+    // Re-invoke the subagent worker with the follow-up message
+    let Some(ref worker) = tool_loop.config.subagent_worker else {
+        return Ok("Subagent worker not available in this context.".to_string());
+    };
+
+    let request = super::types::SubagentRequest {
+        run_id: run.run_id,
+        task_id: None,
+        parent_session_id: tool_loop.config.session_id,
+        child_session_id: run.child_session_id,
+        prompt: message.to_string(),
+        task_name: format!("followup:{}", run.name),
+        subagent_type: "general-purpose".to_string(),
+        model_override: None,
+        max_turns: Some(5),
+        run_in_background: false,
+    };
+
+    match worker(request) {
+        Ok(result) => Ok(result),
+        Err(e) => Ok(format!(
+            "Failed to send message to agent '{}': {e}",
+            run.name
+        )),
+    }
 }
 
 pub(super) fn handle_task_stop(
