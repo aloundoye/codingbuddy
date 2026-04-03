@@ -1105,6 +1105,9 @@ pub enum EventKind {
         to_model: String,
         reason: String,
     },
+    /// Auto-extracted memory observations from compacted conversation.
+    #[serde(alias = "MemoryObservationsV1")]
+    MemoryObservations { observations: Vec<String> },
 }
 
 impl EventKind {
@@ -1275,6 +1278,8 @@ impl EventKind {
             | Self::ToolCacheHit { .. }
             | Self::ErrorRecoveryTriggered { .. }
             | Self::ModelRoutingChanged { .. } => "tool_loop",
+
+            Self::MemoryObservations { .. } => "memory",
         }
     }
 

@@ -3699,6 +3699,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::ToolCacheHit { .. } => "ToolCacheHit@v1",
         EventKind::ErrorRecoveryTriggered { .. } => "ErrorRecoveryTriggered@v1",
         EventKind::ModelRoutingChanged { .. } => "ModelRoutingChanged@v1",
+        EventKind::MemoryObservations { .. } => "MemoryObservations@v1",
     }
 }
 

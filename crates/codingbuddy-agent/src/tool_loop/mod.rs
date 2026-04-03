@@ -56,7 +56,8 @@ use anti_hallucination::{
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
-    build_compaction_summary_with_llm, extract_tool_path, truncate_line,
+    build_compaction_summary_with_llm, extract_memory_observations, extract_tool_path,
+    truncate_line,
 };
 use helpers::{is_read_only_api_name, summarize_args};
 use safety::{
@@ -2083,8 +2084,34 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
 
+        // Run LSP diagnostics once per language (not per file) to avoid
+        // redundant workspace-wide checks like `cargo check`.
+        let mut lsp_diagnostics_text = String::new();
+        if success
+            && !modified_paths.is_empty()
+            && let Some(ref validator) = self.config.edit_validator
+        {
+            let mut checked_extensions = std::collections::HashSet::new();
+            for path in &modified_paths {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !checked_extensions.insert(ext) {
+                    continue;
+                }
+                if let Ok(diags) = validator.check_file(path)
+                    && !diags.is_empty()
+                {
+                    lsp_diagnostics_text
+                        .push_str(&codingbuddy_lsp::EditValidator::format_for_llm(&diags));
+                    lsp_diagnostics_text.push('\n');
+                }
+            }
+        }
+
         // Scan tool output for evidence-driven budget escalation signals
-        // (compile errors, test failures, patch rejections, search misses).
         if let Some(output_str) = result.output.as_str() {
             self.escalation.scan_tool_output(&llm_call.name, output_str);
             if !success {
@@ -2178,6 +2205,23 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
 
+        // Append LSP diagnostics directly to the tool result message for provider compatibility
+        let msg = if !lsp_diagnostics_text.is_empty() {
+            match msg {
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                } => ChatMessage::Tool {
+                    tool_call_id,
+                    content: format!(
+                        "{content}\n\n⚠ Post-edit diagnostics:\n{lsp_diagnostics_text}Fix these before proceeding."
+                    ),
+                },
+                other => other,
+            }
+        } else {
+            msg
+        };
         self.messages.push(msg);
 
         self.emit_injection_warnings(&injection_warnings);
@@ -2503,6 +2547,17 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
         self.pinned_directives.truncate(20);
+
+        // Auto-extract memory observations from compacted messages.
+        // These capture user corrections and decisions that should persist.
+        let auto_memories = extract_memory_observations(compacted_msgs);
+        if !auto_memories.is_empty()
+            && let Some(ref cb) = self.event_cb
+        {
+            cb(EventKind::MemoryObservations {
+                observations: auto_memories,
+            });
+        }
 
         // Build the new message list in a local vec, validate, then swap.
         // This avoids cloning the entire (potentially large) messages vec for rollback.

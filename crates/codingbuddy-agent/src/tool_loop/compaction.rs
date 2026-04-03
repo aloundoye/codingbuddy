@@ -253,3 +253,58 @@ pub(crate) fn count_tool_usage(tools: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Extract memory-worthy observations from conversation messages.
+///
+/// Scans user messages for corrections ("don't", "never", "always", "stop"),
+/// architecture decisions ("we use", "because", "the reason"), and preferences
+/// that should persist across sessions.
+pub(crate) fn extract_memory_observations(messages: &[ChatMessage]) -> Vec<String> {
+    let mut observations = Vec::new();
+
+    for msg in messages {
+        let text = match msg {
+            ChatMessage::User { content } => content.as_str(),
+            _ => continue,
+        };
+
+        // Skip very short messages (commands, not observations)
+        if text.len() < 15 {
+            continue;
+        }
+
+        let lower = text.to_lowercase();
+        let is_correction = lower.contains("don't do ")
+            || lower.contains("do not use ")
+            || lower.contains("never use ")
+            || lower.contains("stop doing ")
+            || lower.contains("stop using ")
+            || lower.contains("no, don't");
+        let is_preference = lower.contains("always use ")
+            || lower.contains("prefer ")
+            || lower.contains("instead of ");
+        let is_decision = lower.contains("we use ")
+            || lower.contains("the convention is ")
+            || lower.contains("the reason is ")
+            || lower.contains("our architecture ");
+
+        if is_correction || is_preference || is_decision {
+            // Truncate to first 200 chars for memory storage
+            let end = text.len().min(200);
+            let snippet = &text[..text.floor_char_boundary(end)];
+            let kind = if is_correction {
+                "correction"
+            } else if is_preference {
+                "preference"
+            } else {
+                "decision"
+            };
+            observations.push(format!("[{kind}] {snippet}"));
+        }
+    }
+
+    // Deduplicate and cap at 5 observations per compaction
+    observations.dedup();
+    observations.truncate(5);
+    observations
+}
