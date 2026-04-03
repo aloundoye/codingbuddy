@@ -3213,14 +3213,22 @@ impl Default for BudgetsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
+    /// "auto" (detect), "dark", or "light"
+    #[serde(default = "default_theme_mode")]
+    pub mode: String,
     pub primary: String,
     pub secondary: String,
     pub error: String,
 }
 
+fn default_theme_mode() -> String {
+    "auto".to_string()
+}
+
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
+            mode: "auto".to_string(),
             primary: "Cyan".to_string(),
             secondary: "Yellow".to_string(),
             error: "Red".to_string(),

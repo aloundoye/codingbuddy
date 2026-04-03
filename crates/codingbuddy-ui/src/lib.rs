@@ -83,7 +83,7 @@ where
 pub fn run_tui_shell_with_bindings<F, S>(
     mut status: UiStatus,
     bindings: KeyBindings,
-    _theme: TuiTheme,
+    tui_theme: TuiTheme,
     reduced_motion: bool,
     stream_rx: mpsc::Receiver<TuiStreamEvent>,
     mut on_submit: F,
@@ -94,6 +94,8 @@ where
     F: FnMut(&str),
     S: FnMut() -> Option<UiStatus>,
 {
+    // Install the theme globally so rendering functions can access it.
+    theme::init_theme(tui_theme);
     // Install a SIGINT handler that sets a flag instead of killing the process.
     let sigint_flag = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
@@ -1836,6 +1838,24 @@ where
             continue;
         }
         match key.code {
+            KeyCode::PageUp => {
+                // Pause TUI so user can scroll in native terminal scrollback
+                disable_raw_mode()?;
+                {
+                    use std::io::Write;
+                    let mut out = io::stdout();
+                    let _ = write!(
+                        out,
+                        "\x1b[?25h\r\n\x1b[33m  ▲ Scroll mode — use terminal scroll. Press any key to return.\x1b[0m\r\n"
+                    );
+                    let _ = out.flush();
+                }
+                // Wait in cooked mode so terminal scroll works, then restore raw mode
+                let _ = event::read();
+                enable_raw_mode()?;
+                info_line = "returned from scroll mode".to_string();
+                continue;
+            }
             KeyCode::Backspace => {
                 if cursor_pos > 0 && cursor_pos <= input.len() {
                     input.remove(cursor_pos - 1);

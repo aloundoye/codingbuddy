@@ -74,7 +74,10 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         initial_session_id,
     )?;
     let bindings = load_tui_keybindings(cwd, cfg);
-    let theme = TuiTheme::from_config(&cfg.theme.primary, &cfg.theme.secondary, &cfg.theme.error);
+    let theme = match cfg.theme.mode.as_str() {
+        "dark" | "light" => TuiTheme::from_preference(&cfg.theme.mode),
+        _ => TuiTheme::from_preference("auto"),
+    };
     let fmt_refresh = Arc::clone(&force_max_think);
     let additional_dirs_for_closure = Arc::clone(&additional_dirs);
     let read_only_for_closure = Arc::clone(&read_only_mode);

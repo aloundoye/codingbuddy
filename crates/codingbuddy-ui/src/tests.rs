@@ -632,7 +632,8 @@ fn render_table_row() {
 fn render_table_separator() {
     let line = render_assistant_markdown("|---|---|---|");
     let text: String = line.iter().map(|s| s.content.to_string()).collect();
-    assert!(text.contains("---"));
+    // Table separators now render with box-drawing characters
+    assert!(text.contains('─') || text.contains("---"));
 }
 
 #[test]
