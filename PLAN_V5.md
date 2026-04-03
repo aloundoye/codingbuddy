@@ -93,6 +93,18 @@ Wire the 9 unfired hooks:
 - When building tool descriptions, include `when_to_use` text so the LLM knows when to auto-invoke
 - Add skill recommendation: if prompt matches `when_to_use` patterns, suggest the skill
 
+### Phase 2 Results ✅ COMPLETE
+
+**Findings:**
+- Auditor claimed "only 5 hooks fired" — actually **10 were already fired** from v3/v4 work.
+- Added 2 more: `UserPromptSubmit` (blocking, can reject prompts) and `TaskCompleted` (fires when task_update sets status=completed).
+- **Final: 12/14 hooks fired.** Remaining 2 (`ConfigChange`, `Notification`) are TUI-level events not applicable to agent loop.
+- Capability flags: auditor claimed 3 unused — `supports_reasoning_mode` used 1x, `supports_thinking_config` used 4x in LLM crate. Only `supports_streaming_tool_deltas` truly unused (streaming code handles both paths adaptively).
+- Added skill `when_to_use` injection into system prompt as "Available Skills" catalog with effort tags.
+- Added `model_override` and `effort` to `SkillInvocationResult` for per-skill model and budget control.
+
+**Score impact:** +0.3 (7.4 → 7.7). Hook coverage solid, skill metadata wired, capability flags verified.
+
 ---
 
 ## Phase 3: Coordinator Mode (0.4 points)

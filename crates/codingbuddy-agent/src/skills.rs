@@ -67,6 +67,10 @@ pub struct SkillRunOutput {
     pub disallowed_tools: Vec<String>,
     /// Whether model auto-invocation is disabled for this skill.
     pub disable_model_invocation: bool,
+    /// Model override for this skill execution.
+    pub model: Option<String>,
+    /// Effort hint (low/medium/high) for thinking budget.
+    pub effort: Option<String>,
 }
 
 pub struct SkillManager {
@@ -282,6 +286,8 @@ impl SkillManager {
             allowed_tools: skill.allowed_tools.clone(),
             disallowed_tools: skill.disallowed_tools.clone(),
             disable_model_invocation: skill.disable_model_invocation,
+            model: skill.model.clone(),
+            effort: skill.effort.clone(),
         })
     }
 

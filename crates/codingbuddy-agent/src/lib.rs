@@ -511,6 +511,8 @@ impl AgentEngine {
                     allowed_tools: run_output.allowed_tools,
                     disallowed_tools: run_output.disallowed_tools,
                     disable_model_invocation: run_output.disable_model_invocation,
+                    model_override: run_output.model,
+                    effort: run_output.effort,
                 })),
                 Err(e) => {
                     let msg = e.to_string();
@@ -732,9 +734,27 @@ impl AgentEngine {
             system_prompt.push_str(&plan_addendum);
         }
 
-        // Append profile-specific system prompt addendum
         if let Some(p) = profile {
             system_prompt.push_str(p.system_prompt_addendum);
+        }
+
+        // Append skill catalog with when_to_use hints so the LLM knows available skills
+        if let Ok(skill_mgr) = crate::skills::SkillManager::new(&self.workspace)
+            && let Ok(skills) = skill_mgr.list(&self.cfg.skills.paths)
+        {
+            let skill_hints: Vec<String> = skills
+                .iter()
+                .filter_map(|s| {
+                    s.when_to_use.as_ref().map(|hint| {
+                        let effort_tag = s.effort.as_deref().unwrap_or("medium");
+                        format!("- `{}` [{}]: {}", s.id, effort_tag, hint)
+                    })
+                })
+                .collect();
+            if !skill_hints.is_empty() {
+                system_prompt.push_str("\n\n## Available Skills\nInvoke with the `skill` tool:\n");
+                system_prompt.push_str(&skill_hints.join("\n"));
+            }
         }
 
         let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
@@ -1031,6 +1051,26 @@ impl AgentEngine {
             codingbuddy_hooks::HookEvent::SessionStart,
             &session_start_input,
         );
+
+        // Fire UserPromptSubmit hook (blocking — can modify prompt)
+        let user_submit_input = codingbuddy_hooks::HookInput {
+            event: codingbuddy_hooks::HookEvent::UserPromptSubmit
+                .as_str()
+                .to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            prompt: Some(prompt.to_string()),
+            session_type: None,
+            workspace: self.workspace.display().to_string(),
+        };
+        let submit_result = self.hooks.fire(
+            codingbuddy_hooks::HookEvent::UserPromptSubmit,
+            &user_submit_input,
+        );
+        if submit_result.blocked {
+            return Err(anyhow!("prompt blocked by UserPromptSubmit hook"));
+        }
 
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
         let session = self.ensure_session_record_for(options.session_id)?;
