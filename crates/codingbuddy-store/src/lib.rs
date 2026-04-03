@@ -1408,15 +1408,40 @@ impl Store {
         project_hash: &str,
     ) -> Result<bool> {
         let conn = self.db()?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM persistent_approvals
-             WHERE tool_name = ?1 AND command_pattern = ?2 AND project_hash = ?3",
-            params![tool_name, command, project_hash],
-            |r| r.get(0),
+        // Load all patterns for this tool+project and check glob matching
+        let mut stmt = conn.prepare(
+            "SELECT command_pattern FROM persistent_approvals
+             WHERE tool_name = ?1 AND project_hash = ?2",
         )?;
-        Ok(count > 0)
+        let patterns: Vec<String> = stmt
+            .query_map(params![tool_name, project_hash], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for pattern in &patterns {
+            if glob_matches_command(pattern, command) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
+}
 
+/// Simple glob matching for persistent approval patterns.
+/// Supports trailing `*` wildcard (e.g., "cargo *" matches "cargo test").
+fn glob_matches_command(pattern: &str, command: &str) -> bool {
+    if pattern == command {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix(" *") {
+        return command.starts_with(prefix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return command.starts_with(prefix);
+    }
+    false
+}
+
+impl Store {
     pub fn list_persistent_approvals(&self, project_hash: &str) -> Result<Vec<PersistentApproval>> {
         let conn = self.db()?;
         let mut stmt = conn.prepare(

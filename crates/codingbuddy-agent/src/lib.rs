@@ -742,18 +742,38 @@ impl AgentEngine {
         if let Ok(skill_mgr) = crate::skills::SkillManager::new(&self.workspace)
             && let Ok(skills) = skill_mgr.list(&self.cfg.skills.paths)
         {
-            let skill_hints: Vec<String> = skills
-                .iter()
-                .filter_map(|s| {
-                    s.when_to_use.as_ref().map(|hint| {
-                        let effort_tag = s.effort.as_deref().unwrap_or("medium");
-                        format!("- `{}` [{}]: {}", s.id, effort_tag, hint)
-                    })
-                })
-                .collect();
-            if !skill_hints.is_empty() {
-                system_prompt.push_str("\n\n## Available Skills\nInvoke with the `skill` tool:\n");
-                system_prompt.push_str(&skill_hints.join("\n"));
+            let prompt_lower = prompt.to_lowercase();
+            let mut recommended: Vec<String> = Vec::new();
+            let mut available: Vec<String> = Vec::new();
+
+            for s in &skills {
+                let Some(hint) = s.when_to_use.as_ref() else {
+                    continue;
+                };
+                let effort_tag = s.effort.as_deref().unwrap_or("medium");
+                let line = format!("- `{}` [{}]: {}", s.id, effort_tag, hint);
+
+                // Check if prompt matches the when_to_use keywords
+                let hint_words: Vec<&str> = hint.split_whitespace().collect();
+                let matches = hint_words
+                    .iter()
+                    .filter(|w| w.len() > 3)
+                    .any(|w| prompt_lower.contains(&w.to_lowercase()));
+                if matches {
+                    recommended.push(line);
+                } else {
+                    available.push(line);
+                }
+            }
+
+            if !recommended.is_empty() {
+                system_prompt.push_str("\n\n## Recommended Skills (match this task)\n");
+                system_prompt.push_str("Consider invoking these with the `skill` tool:\n");
+                system_prompt.push_str(&recommended.join("\n"));
+            }
+            if !available.is_empty() {
+                system_prompt.push_str("\n\n## Other Available Skills\n");
+                system_prompt.push_str(&available.join("\n"));
             }
         }
 
