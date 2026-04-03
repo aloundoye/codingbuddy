@@ -425,59 +425,147 @@ pub fn format_relative_time(timestamp: &str) -> String {
     timestamp.chars().take(19).collect()
 }
 
+// ─── Agent Profile Cycling ──────────────────────────────────────────────────
+
+/// Profile names for Shift+Tab cycling.
+pub(crate) const AGENT_PROFILE_NAMES: &[&str] = &["build", "explore", "plan", "bash", "general"];
+
 // ─── Model Picker ───────────────────────────────────────────────────────────
 
+/// A model choice with provider tag for filtering.
+pub(crate) struct ModelChoice {
+    pub id: &'static str,
+    pub description: &'static str,
+    pub provider: &'static str,
+}
+
 /// Available model choices for the interactive `/model` picker.
-/// Organized by provider — covers current models from each.
-pub(crate) const MODEL_CHOICES: &[(&str, &str)] = &[
+pub(crate) const MODEL_CHOICES: &[ModelChoice] = &[
     // ── DeepSeek ──
-    (
-        "deepseek-chat",
-        "DeepSeek V3 — fast, tool-capable (default)",
-    ),
-    ("deepseek-reasoner", "DeepSeek R1 — deep reasoning + tools"),
+    ModelChoice {
+        id: "deepseek-chat",
+        description: "DeepSeek V3 — fast, tool-capable (default)",
+        provider: "deepseek",
+    },
+    ModelChoice {
+        id: "deepseek-reasoner",
+        description: "DeepSeek R1 — deep reasoning + tools",
+        provider: "deepseek",
+    },
     // ── OpenAI ──
-    ("gpt-4.1", "GPT-4.1 — latest, strong coding"),
-    ("gpt-4.1-mini", "GPT-4.1 Mini — fast, affordable"),
-    ("gpt-4.1-nano", "GPT-4.1 Nano — ultra-fast"),
-    ("gpt-4o", "GPT-4o — multimodal all-rounder"),
-    ("gpt-4o-mini", "GPT-4o Mini — cheap, fast"),
-    ("o3", "o3 — strongest reasoning"),
-    ("o3-mini", "o3-mini — fast reasoning"),
-    ("o4-mini", "o4-mini — latest reasoning"),
+    ModelChoice {
+        id: "gpt-4.1",
+        description: "GPT-4.1 — latest, strong coding",
+        provider: "openai-compatible",
+    },
+    ModelChoice {
+        id: "gpt-4.1-mini",
+        description: "GPT-4.1 Mini — fast, affordable",
+        provider: "openai-compatible",
+    },
+    ModelChoice {
+        id: "gpt-4.1-nano",
+        description: "GPT-4.1 Nano — ultra-fast",
+        provider: "openai-compatible",
+    },
+    ModelChoice {
+        id: "gpt-4o",
+        description: "GPT-4o — multimodal all-rounder",
+        provider: "openai-compatible",
+    },
+    ModelChoice {
+        id: "gpt-4o-mini",
+        description: "GPT-4o Mini — cheap, fast",
+        provider: "openai-compatible",
+    },
+    ModelChoice {
+        id: "o3",
+        description: "o3 — strongest reasoning",
+        provider: "openai-compatible",
+    },
+    ModelChoice {
+        id: "o3-mini",
+        description: "o3-mini — fast reasoning",
+        provider: "openai-compatible",
+    },
+    ModelChoice {
+        id: "o4-mini",
+        description: "o4-mini — latest reasoning",
+        provider: "openai-compatible",
+    },
     // ── Anthropic ──
-    ("claude-opus-4-20250514", "Claude Opus 4 — most capable"),
-    (
-        "claude-sonnet-4-20250514",
-        "Claude Sonnet 4 — best coding value",
-    ),
-    (
-        "claude-haiku-4-5-20251001",
-        "Claude Haiku 4.5 — fast + cheap",
-    ),
+    ModelChoice {
+        id: "claude-opus-4-20250514",
+        description: "Claude Opus 4 — most capable",
+        provider: "anthropic",
+    },
+    ModelChoice {
+        id: "claude-sonnet-4-20250514",
+        description: "Claude Sonnet 4 — best coding value",
+        provider: "anthropic",
+    },
+    ModelChoice {
+        id: "claude-haiku-4-5-20251001",
+        description: "Claude Haiku 4.5 — fast + cheap",
+        provider: "anthropic",
+    },
     // ── Google ──
-    ("gemini-2.5-pro", "Gemini 2.5 Pro — thorough, large context"),
-    ("gemini-2.5-flash", "Gemini 2.5 Flash — fast, cheap"),
-    // ── Groq (hosted) ──
-    ("llama-3.3-70b-versatile", "Llama 3.3 70B — fast via Groq"),
-    ("llama-3.1-8b-instant", "Llama 3.1 8B — ultra-fast via Groq"),
-    // ── Qwen (Ollama / local) ──
-    ("qwen2.5-coder:32b", "Qwen 2.5 Coder 32B — local, strong"),
-    ("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B — local, light"),
-    // ── OpenRouter (any model) ──
-    (
-        "anthropic/claude-sonnet-4",
-        "Claude Sonnet 4 via OpenRouter",
-    ),
-    ("deepseek/deepseek-r1", "DeepSeek R1 via OpenRouter"),
-    ("google/gemini-2.5-pro", "Gemini 2.5 Pro via OpenRouter"),
+    ModelChoice {
+        id: "gemini-2.5-pro",
+        description: "Gemini 2.5 Pro — thorough, large context",
+        provider: "google",
+    },
+    ModelChoice {
+        id: "gemini-2.5-flash",
+        description: "Gemini 2.5 Flash — fast, cheap",
+        provider: "google",
+    },
+    // ── Groq ──
+    ModelChoice {
+        id: "llama-3.3-70b-versatile",
+        description: "Llama 3.3 70B — fast via Groq",
+        provider: "groq",
+    },
+    ModelChoice {
+        id: "llama-3.1-8b-instant",
+        description: "Llama 3.1 8B — ultra-fast via Groq",
+        provider: "groq",
+    },
+    // ── Qwen / Ollama ──
+    ModelChoice {
+        id: "qwen2.5-coder:32b",
+        description: "Qwen 2.5 Coder 32B — local, strong",
+        provider: "ollama",
+    },
+    ModelChoice {
+        id: "qwen2.5-coder:7b",
+        description: "Qwen 2.5 Coder 7B — local, light",
+        provider: "ollama",
+    },
+    // ── OpenRouter ──
+    ModelChoice {
+        id: "anthropic/claude-sonnet-4",
+        description: "Claude Sonnet 4 via OpenRouter",
+        provider: "openrouter",
+    },
+    ModelChoice {
+        id: "deepseek/deepseek-r1",
+        description: "DeepSeek R1 via OpenRouter",
+        provider: "openrouter",
+    },
+    ModelChoice {
+        id: "google/gemini-2.5-pro",
+        description: "Gemini 2.5 Pro via OpenRouter",
+        provider: "openrouter",
+    },
 ];
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelPickerState {
     pub selected: usize,
-    /// Viewport offset for scrolling through long lists.
     pub viewport_offset: usize,
+    /// Filtered indices into MODEL_CHOICES. Empty = show all.
+    filtered_indices: Vec<usize>,
 }
 
 const MODEL_PICKER_VISIBLE: usize = 8;
@@ -486,31 +574,76 @@ impl ModelPickerState {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Create a picker filtered to a specific provider.
+    pub fn with_provider_filter(provider: &str) -> Self {
+        let filtered: Vec<usize> = MODEL_CHOICES
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.provider == provider)
+            .map(|(i, _)| i)
+            .collect();
+        Self {
+            selected: 0,
+            viewport_offset: 0,
+            filtered_indices: filtered,
+        }
+    }
+
+    fn visible_choices(&self) -> Vec<(usize, &'static ModelChoice)> {
+        if self.filtered_indices.is_empty() {
+            MODEL_CHOICES.iter().enumerate().collect()
+        } else {
+            self.filtered_indices
+                .iter()
+                .map(|&i| (i, &MODEL_CHOICES[i]))
+                .collect()
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        if self.filtered_indices.is_empty() {
+            MODEL_CHOICES.len()
+        } else {
+            self.filtered_indices.len()
+        }
+    }
+
     pub fn up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
         if self.selected < self.viewport_offset {
             self.viewport_offset = self.selected;
         }
     }
+
     pub fn down(&mut self) {
-        self.selected = (self.selected + 1).min(MODEL_CHOICES.len() - 1);
+        self.selected = (self.selected + 1).min(self.count().saturating_sub(1));
         if self.selected >= self.viewport_offset + MODEL_PICKER_VISIBLE {
             self.viewport_offset = self.selected + 1 - MODEL_PICKER_VISIBLE;
         }
     }
+
     pub fn confirm(&self) -> &'static str {
-        MODEL_CHOICES[self.selected].0
+        let choices = self.visible_choices();
+        if self.selected < choices.len() {
+            choices[self.selected].1.id
+        } else {
+            MODEL_CHOICES[0].id
+        }
     }
-    /// Format visible lines for display in the info area.
+
+    /// Format visible lines for display.
     pub fn display_lines(&self) -> Vec<String> {
-        let end = (self.viewport_offset + MODEL_PICKER_VISIBLE).min(MODEL_CHOICES.len());
-        MODEL_CHOICES[self.viewport_offset..end]
+        let choices = self.visible_choices();
+        let end = (self.viewport_offset + MODEL_PICKER_VISIBLE).min(choices.len());
+        let start = self.viewport_offset.min(end);
+        choices[start..end]
             .iter()
             .enumerate()
-            .map(|(i, (name, desc))| {
-                let idx = self.viewport_offset + i;
+            .map(|(i, (_, m))| {
+                let idx = start + i;
                 let marker = if idx == self.selected { ">" } else { " " };
-                format!(" {marker} {name}  {desc}")
+                format!(" {marker} {}  {}", m.id, m.description)
             })
             .collect()
     }
