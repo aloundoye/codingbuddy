@@ -2870,6 +2870,19 @@ pub struct PolicyConfig {
     /// Review mode: controls which tools are sent to the LLM.
     #[serde(default)]
     pub review_mode: ReviewMode,
+    /// User-defined permission rules. Format: `Tool(pattern)` with allow/deny/ask decisions.
+    /// Examples: `[{"rule": "Bash(cargo *)", "decision": "allow"}]`
+    #[serde(default)]
+    pub permission_rules: Vec<PermissionRuleConfig>,
+}
+
+/// A permission rule from user configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRuleConfig {
+    /// Rule pattern: `"Bash(cargo *)"`, `"Edit(src/**/*.rs)"`, `"Mcp(server_id)"`
+    pub rule: String,
+    /// Decision: `"allow"`, `"deny"`, or `"ask"`
+    pub decision: String,
 }
 
 impl Default for PolicyConfig {
@@ -2905,6 +2918,7 @@ impl Default for PolicyConfig {
             lint_after_edit: None,
             sandbox: SandboxConfig::default(),
             review_mode: ReviewMode::Off,
+            permission_rules: vec![],
         }
     }
 }

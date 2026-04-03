@@ -517,7 +517,14 @@ impl PolicyEngine {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             permission_mode: PermissionMode::from_str_lossy(&cfg.permission_mode.to_string()),
-            permission_rules: vec![],
+            permission_rules: cfg
+                .permission_rules
+                .iter()
+                .map(|r| PermissionRule {
+                    rule: r.rule.clone(),
+                    decision: r.decision.clone(),
+                })
+                .collect(),
             persistent_bash_approvals: vec![],
         };
         if let Some(team_policy) = load_team_policy_override() {
