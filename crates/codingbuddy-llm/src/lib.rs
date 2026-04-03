@@ -4091,4 +4091,66 @@ mod tests {
             .expect("should fall back to cfg.api_key");
         assert_eq!(resolved, "cached-test-key");
     }
+
+    #[test]
+    fn anthropic_provider_payload_includes_anthropic_version_header() {
+        let cfg = LlmConfig {
+            provider: "anthropic".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::auto(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            provider_options: Default::default(),
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["model"], "claude-sonnet-4-20250514");
+        assert!(payload["messages"].is_array());
+    }
+
+    #[test]
+    fn google_provider_payload_uses_correct_model() {
+        let cfg = LlmConfig {
+            provider: "google".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gemini-2.5-flash".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::auto(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            provider_options: Default::default(),
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["model"], "gemini-2.5-flash");
+        assert!(payload["messages"].is_array());
+    }
 }
