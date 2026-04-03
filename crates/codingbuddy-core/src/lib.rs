@@ -1953,6 +1953,9 @@ pub struct AppConfig {
     pub index: IndexConfig,
     pub budgets: BudgetsConfig,
     pub theme: ThemeConfig,
+    /// Post-edit LSP validation config (which languages to check after edits).
+    #[serde(default)]
+    pub lsp: LspValidationConfig,
     pub local_ml: LocalMlConfig,
     /// Hooks configuration (maps event names to hook definitions).
     /// Stored as raw JSON, parsed by codingbuddy-hooks at runtime.
@@ -3251,6 +3254,28 @@ impl Default for ThemeConfig {
             primary: "Cyan".to_string(),
             secondary: "Yellow".to_string(),
             error: "Red".to_string(),
+        }
+    }
+}
+
+/// Configuration for post-edit LSP validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspValidationConfig {
+    /// Global enable/disable toggle.
+    pub enabled: bool,
+    /// Per-language enable/disable (e.g. `{"rust": false}` to skip cargo check).
+    pub languages: std::collections::HashMap<String, bool>,
+    /// Timeout in seconds for each check command (default: 30).
+    pub timeout_seconds: u64,
+}
+
+impl Default for LspValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            languages: std::collections::HashMap::new(),
+            timeout_seconds: 30,
         }
     }
 }
