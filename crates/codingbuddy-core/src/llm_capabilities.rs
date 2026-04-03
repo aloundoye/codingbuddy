@@ -35,6 +35,7 @@ pub enum ModelFamily {
     Qwen,
     Gemini,
     OpenAi,
+    Claude,
     Llama,
     Mistral,
     Generic,
@@ -49,6 +50,7 @@ impl ModelFamily {
             ModelFamily::Gemini => "gemini",
             ModelFamily::OpenAi => "openai",
             ModelFamily::Llama => "llama",
+            ModelFamily::Claude => "claude",
             ModelFamily::Mistral => "mistral",
             ModelFamily::Generic => "generic",
         }
@@ -196,6 +198,8 @@ pub fn detect_model_family(model: &str) -> ModelFamily {
         || lower.starts_with("o4")
     {
         ModelFamily::OpenAi
+    } else if lower.contains("claude") || lower.contains("opus") || lower.contains("sonnet") {
+        ModelFamily::Claude
     } else if lower.contains("llama") {
         ModelFamily::Llama
     } else if lower.contains("mistral") {
