@@ -915,7 +915,51 @@ pub(super) fn handle_spawn_task(
             };
             ToolUseLoop::fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
         }
-        let result = match worker(request) {
+        // Auto-promote: if foreground agent takes >60s, report as backgrounded
+        let result = if !run_in_background {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker_clone = worker.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(worker_clone(request));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Auto-promoted to background — record as running
+                    let _ = store.update_task_status(task_id, "running", None);
+                    let _ = store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
+                        run_id,
+                        session_id: Some(parent_session.session_id),
+                        task_id: Some(task_id),
+                        child_session_id: Some(child_session.session_id),
+                        background_job_id: None,
+                        name: task_name.to_string(),
+                        goal: prompt.to_string(),
+                        status: "running".to_string(),
+                        output: None,
+                        error: None,
+                        created_at: now.clone(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                    tool_loop.emit(codingbuddy_core::StreamChunk::Error {
+                        message: format!("Agent '{task_name}' auto-promoted to background after 60s. Results will arrive as a notification."),
+                        recoverable: true,
+                    });
+                    return Ok(serde_json::json!({
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "status": "auto-backgrounded",
+                        "message": "Agent exceeded 60s timeout, running in background. Results will arrive as a notification."
+                    }).to_string());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(anyhow!("subagent worker disconnected"))
+                }
+            }
+        } else {
+            worker(request)
+        };
+        let result = match result {
             Ok(result) => {
                 if run_in_background {
                     let payload = serde_json::from_str::<serde_json::Value>(&result)

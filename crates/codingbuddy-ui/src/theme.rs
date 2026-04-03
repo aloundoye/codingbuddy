@@ -147,12 +147,54 @@ impl TuiTheme {
         }
     }
 
+    /// Colorblind-safe theme (deuteranopia). Avoids red/green distinction,
+    /// uses blue/orange/yellow instead. Based on Wong (2011) palette.
+    pub fn colorblind() -> Self {
+        Self {
+            primary: Color::Rgb(0, 114, 178),   // Blue
+            secondary: Color::Rgb(230, 159, 0), // Orange
+            error: Color::Rgb(213, 94, 0),      // Vermillion (red-safe)
+            success: Color::Rgb(0, 158, 115),   // Bluish green
+            warning: Color::Rgb(240, 228, 66),  // Yellow
+
+            user_prefix: Color::Rgb(0, 114, 178), // Blue
+            user_body: Color::White,
+            assistant_body: Color::White,
+            system_fg: Color::DarkGray,
+            tool_call: Color::Rgb(230, 159, 0),      // Orange
+            tool_result_ok: Color::Rgb(0, 158, 115), // Bluish green
+            tool_result_err: Color::Rgb(213, 94, 0), // Vermillion
+            tool_result_neutral: Color::DarkGray,
+            thinking: Color::Rgb(204, 121, 167), // Reddish purple
+            thinking_body: Color::DarkGray,
+
+            diff_add: Color::Rgb(0, 158, 115), // Bluish green (not plain green)
+            diff_remove: Color::Rgb(213, 94, 0), // Vermillion (not plain red)
+            diff_hunk: Color::Rgb(0, 114, 178), // Blue
+            diff_meta: Color::DarkGray,
+
+            code_inline: Color::Rgb(230, 159, 0), // Orange
+            code_fence: Color::DarkGray,
+
+            table_border: Color::DarkGray,
+            table_header: Color::Rgb(0, 114, 178),
+            table_cell: Color::White,
+
+            separator: Color::DarkGray,
+            muted: Color::DarkGray,
+            bold_heading: Color::Rgb(0, 114, 178),
+
+            is_light: false,
+        }
+    }
+
     /// Select theme based on config or auto-detect.
-    /// `preference`: "dark", "light", or "auto" (default).
+    /// `preference`: "dark", "light", "colorblind", or "auto" (default).
     pub fn from_preference(preference: &str) -> Self {
         match preference.to_ascii_lowercase().as_str() {
             "light" => Self::light(),
             "dark" => Self::dark(),
+            "colorblind" | "colour-blind" | "cb" => Self::colorblind(),
             _ => {
                 if detect_light_background() {
                     Self::light()

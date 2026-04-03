@@ -163,6 +163,17 @@ v2→v5 added dozens of features. Auditors checked if code exists, not if it run
 | Kairos scheduling | Skip — enterprise feature | Skip |
 | IDE bridge | Skip — separate product (VS Code ext) | Skip |
 
+### Phase 2 Results ✅ COMPLETE
+
+**What I built:**
+- **Colorblind theme** (`TuiTheme::colorblind()`) — Wong (2011) deuteranopia-safe palette using blue/orange/vermillion/bluish-green instead of red/green. Configurable via `theme.mode = "colorblind"`.
+- **Skill auto-recommendation** — when prompt keywords match a skill's `when_to_use`, the skill appears under "Recommended Skills" in the system prompt (vs "Other Available Skills" for non-matching).
+- **Background agent auto-promotion** — foreground subagents that exceed 60s are automatically promoted to background via `recv_timeout`. The coordinator gets an immediate response with `status: "auto-backgrounded"` and results arrive as notifications when the worker finishes.
+
+**What I found (already existed):**
+- **78 slash commands** already defined (not "30+" as auditor claimed). Includes /test, /lint, /run, /review, /search, /doctor, /git, /commit, /stage, /diff, /vim, /export, /debug, /hooks, /resume, /stats, /theme, etc.
+- Vim mode already implemented with normal/insert/visual modes, operators (d, c, y), motions (w, b, e, $, 0), and text objects (iw, i", a').
+
 ---
 
 ## Phase 3: Fix Everything That Fails
