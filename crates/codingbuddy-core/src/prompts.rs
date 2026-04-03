@@ -306,6 +306,24 @@ After EVERY file modification, you MUST:\n\
 Every 5 tool calls, ask yourself: have I verified all file paths exist? \
 Am I working on the right files? Have I read the files I'm about to edit?\n";
 
+/// Coordinator mode guidance injected for Complex tasks. Teaches the model
+/// to break tasks into parallel subtasks using spawn_task.
+pub const COORDINATOR_GUIDANCE: &str = "\n\n\
+## Coordinator Mode (Complex Task)\n\
+For this complex task, you should act as a **coordinator**:\n\
+\n\
+1. **Analyze** — Identify independent subtasks that can run in parallel.\n\
+2. **Spawn workers** — Use `spawn_task` with `run_in_background: true` for each independent subtask:\n\
+   - Use `subagent_type: \"explore\"` for research/reading tasks\n\
+   - Use `subagent_type: \"bash\"` for build/test tasks\n\
+   - Use `subagent_type: \"general-purpose\"` for implementation tasks\n\
+3. **Continue working** — Don't wait idle. Work on other subtasks while workers run.\n\
+4. **Collect results** — Worker results arrive as system notifications. Read them and synthesize.\n\
+5. **Verify** — After all subtasks complete, verify the combined result.\n\
+\n\
+**When to parallelize:** 2+ independent file edits, research + implementation, test + lint.\n\
+**When NOT to parallelize:** Sequential dependencies, single-file changes, simple questions.\n";
+
 /// Build system prompt with model-specific base prompt selection.
 ///
 /// Selects the appropriate system prompt by model family:
@@ -369,9 +387,13 @@ pub fn build_model_aware_system_prompt(
         // Strong models and specialized prompts are self-contained.
         base
     } else if is_reasoner {
-        format!("{base}{REASONER_GUIDANCE}")
+        if complexity == PromptComplexity::Complex {
+            format!("{base}{REASONER_GUIDANCE}{COORDINATOR_GUIDANCE}")
+        } else {
+            format!("{base}{REASONER_GUIDANCE}")
+        }
     } else if complexity == PromptComplexity::Complex {
-        format!("{base}{CHAT_PRESCRIPTIVE_GUIDANCE}")
+        format!("{base}{CHAT_PRESCRIPTIVE_GUIDANCE}{COORDINATOR_GUIDANCE}")
     } else if complexity == PromptComplexity::Medium {
         // Chain-of-thought for non-reasoner models on medium tasks
         format!("{base}{COT_GUIDANCE}")

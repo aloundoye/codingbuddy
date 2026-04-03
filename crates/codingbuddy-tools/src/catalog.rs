@@ -945,6 +945,28 @@ Always set in_progress before starting, completed only when fully done".to_strin
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
+                name: "send_message".to_string(),
+                description: "Send a follow-up message to a running or completed subagent. Use this to continue a previously spawned agent's work, ask for clarification, or provide additional instructions. The agent resumes with its full context preserved.".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "to": {
+                            "type": "string",
+                            "description": "The agent's run_id (UUID) or name to send the message to"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "The message/instruction to send to the agent"
+                        }
+                    },
+                    "required": ["to", "message"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
                 name: "task_stop".to_string(),
                 description: "Stop a running delegated background task. Use this when a spawned task is hung, no longer needed, or should be cancelled before completion.".to_string(),
                 strict: None,

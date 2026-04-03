@@ -1097,6 +1097,7 @@ fn agent_level_tools_excluded_from_plan_mode() {
                 | "task_output"
                 | "task_stop"
                 | "spawn_task"
+                | "send_message"
                 | "extended_thinking"
                 | "exit_plan_mode"
         );

@@ -209,6 +209,14 @@ impl ToolName {
                 tier: ToolTier::Contextual,
                 allowed_roles: BUILD_PLAN_GENERAL,
             },
+            Self::SendMessage => ToolMetadata {
+                read_only: false,
+                phase_access: PLAN_EXECUTE_VERIFY,
+                agent_level: true,
+                review_blocked: false,
+                tier: ToolTier::Contextual,
+                allowed_roles: BUILD_PLAN_GENERAL,
+            },
             Self::EnterPlanMode => ToolMetadata {
                 read_only: false,
                 phase_access: EXPLORE_EXECUTE_VERIFY,
