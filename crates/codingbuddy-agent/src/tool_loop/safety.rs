@@ -101,6 +101,56 @@ pub(crate) struct CircuitBreakerState {
     pub(crate) cooldown_remaining: usize,
 }
 
+// ── Denial tracking ──
+
+/// Number of denials before injecting "try a different approach" guidance.
+pub(crate) const DENIAL_GUIDANCE_THRESHOLD: usize = 3;
+
+/// Window in seconds — denials older than this are forgotten.
+pub(crate) const DENIAL_WINDOW_SECS: u64 = 60;
+
+/// Guidance injected when too many denials occur.
+pub(crate) const DENIAL_GUIDANCE: &str = "The user has denied your tool calls multiple times. \
+     STOP trying this approach. Either ask the user what they want, \
+     use a different tool, or explain your plan and get approval before acting.";
+
+/// Tracks user denials of tool calls to detect when the agent is repeatedly
+/// attempting actions the user doesn't want.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DenialTracker {
+    /// Recent denials: (tool_name, timestamp).
+    denials: Vec<(String, std::time::Instant)>,
+    /// Whether guidance has been injected for the current denial burst.
+    pub(crate) guidance_injected: bool,
+}
+
+impl DenialTracker {
+    /// Record a denial. Returns `true` if the threshold is reached and
+    /// guidance should be injected.
+    pub(crate) fn record_denial(&mut self, tool_name: &str) -> bool {
+        let now = std::time::Instant::now();
+
+        // Evict old denials outside the window
+        let cutoff = now - std::time::Duration::from_secs(DENIAL_WINDOW_SECS);
+        self.denials.retain(|(_, ts)| *ts >= cutoff);
+
+        self.denials.push((tool_name.to_string(), now));
+
+        self.denials.len() >= DENIAL_GUIDANCE_THRESHOLD && !self.guidance_injected
+    }
+
+    /// Whether there are any recent denials tracked.
+    pub(crate) fn denials_pending(&self) -> bool {
+        !self.denials.is_empty()
+    }
+
+    /// Reset after the agent uses a different approach.
+    pub(crate) fn reset(&mut self) {
+        self.denials.clear();
+        self.guidance_injected = false;
+    }
+}
+
 // ── Cost tracking ──
 
 /// Default cost warning threshold in USD. One-shot warning at this level.
