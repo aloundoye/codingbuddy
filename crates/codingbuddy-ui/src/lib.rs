@@ -160,6 +160,12 @@ where
     )?;
 
     let workspace_path = PathBuf::from(status.working_directory.clone());
+    let project_hash_cached = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        workspace_path.to_string_lossy().as_bytes().hash(&mut h);
+        format!("{:x}", h.finish())
+    };
     let ui_cfg = codingbuddy_core::AppConfig::load(&workspace_path)
         .unwrap_or_default()
         .ui;
@@ -447,14 +453,29 @@ where
             // Row A+2..B: input prompt
             if let Some((tool_name, args_summary, _)) = pending_approval.as_ref() {
                 let compact_args = truncate_inline(&args_summary.replace('\n', " "), 56);
-                let prompt = format!(
-                    " ACTION NEEDED: `{tool_name}` {compact_args} | Press Y to approve, any other key to deny "
-                );
-                let bg = if approval_flash_on {
-                    Color::LightYellow
+                // Graduated severity: dangerous commands get red, edits get yellow, reads get dim
+                let (severity, bg) = if tool_name.starts_with("bash") {
+                    if approval_flash_on {
+                        ("SHELL", Color::LightRed)
+                    } else {
+                        ("SHELL", Color::Red)
+                    }
+                } else if tool_name.starts_with("fs_edit")
+                    || tool_name.starts_with("fs_write")
+                    || tool_name.starts_with("fs.edit")
+                    || tool_name.starts_with("fs.write")
+                {
+                    if approval_flash_on {
+                        ("EDIT", Color::LightYellow)
+                    } else {
+                        ("EDIT", Color::Yellow)
+                    }
                 } else {
-                    Color::LightRed
+                    ("ACTION", if approval_flash_on { Color::LightCyan } else { Color::Cyan })
                 };
+                let prompt = format!(
+                    " [{severity}] `{tool_name}` {compact_args} | Y=approve A=always any=deny "
+                );
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![Span::styled(
                         truncate_inline(&prompt, width.saturating_sub(1) as usize),
@@ -715,7 +736,7 @@ where
         if let Some((ref tool_name, ref args_summary, _)) = pending_approval {
             let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
             info_line = format!(
-                "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
+                "ACTION REQUIRED: `{tool_name}` {compact_args} [Y=approve / A=always allow / any=deny]"
             );
         }
 
@@ -922,16 +943,36 @@ where
             break;
         }
 
-        // Handle pending approval y/N
+        // Handle pending approval: Y=once, A=always, other=deny
         if pending_approval.is_some() {
-            let approved = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
-            if let Some((tool_name, _, response_tx)) = pending_approval.take() {
+            let approved = matches!(
+                key.code,
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') | KeyCode::Char('A')
+            );
+            let always = matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'));
+            if let Some((tool_name, args_summary, response_tx)) = pending_approval.take() {
                 let _ = response_tx.send(approved);
-                info_line = if approved {
-                    format!("approved `{tool_name}`")
+                if always && approved {
+                    let pattern = derive_approval_pattern(&tool_name, &args_summary);
+                    let persisted = codingbuddy_store::Store::new(&workspace_path)
+                        .and_then(|store| {
+                            store.insert_persistent_approval(
+                                &tool_name,
+                                &pattern,
+                                &project_hash_cached,
+                            )
+                        })
+                        .is_ok();
+                    info_line = if persisted {
+                        format!("always allowed `{tool_name}` ({pattern})")
+                    } else {
+                        format!("approved `{tool_name}` (could not persist)")
+                    };
+                } else if approved {
+                    info_line = format!("approved `{tool_name}`");
                 } else {
-                    format!("denied `{tool_name}`")
-                };
+                    info_line = format!("denied `{tool_name}`");
+                }
             }
             continue;
         }
@@ -1917,6 +1958,34 @@ where
     terminal.show_cursor()?;
     drop(_guard);
     Ok(())
+}
+
+/// Derive a glob pattern from a tool name and args for persistent approval.
+/// Parses args as JSON to extract the command or path reliably.
+fn derive_approval_pattern(tool_name: &str, args_summary: &str) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(args_summary).unwrap_or(serde_json::Value::Null);
+
+    if tool_name.starts_with("bash") {
+        let cmd = parsed
+            .get("cmd")
+            .or_else(|| parsed.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let first_word = cmd.split_whitespace().next().unwrap_or("*");
+        format!("{first_word} *")
+    } else {
+        let path = parsed
+            .get("path")
+            .or_else(|| parsed.get("file_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
+        if let Some((dir, _)) = path.rsplit_once('/') {
+            format!("{dir}/*")
+        } else {
+            "*".to_string()
+        }
+    }
 }
 
 #[cfg(test)]

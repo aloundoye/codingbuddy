@@ -197,11 +197,12 @@ pub(crate) fn render_statusline_spans(
     use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
 
+    let t = super::theme::theme();
     let mode_color = match status.permission_mode.as_str() {
-        "auto" => Color::Green,
-        "plan" => Color::Blue,
-        "locked" => Color::Red,
-        _ => Color::Yellow,
+        "auto" => t.success,
+        "plan" => t.primary,
+        "locked" => t.error,
+        _ => t.warning,
     };
     let mode_label = match status.permission_mode.as_str() {
         "auto" => " AUTO ",
@@ -215,14 +216,12 @@ pub(crate) fn render_statusline_spans(
     if is_thinking {
         spans.push(Span::styled(
             format!(" {} Thinking ", spinner_frame),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.thinking).add_modifier(Modifier::BOLD),
         ));
     } else if let Some(tool) = active_tool {
         spans.push(Span::styled(
             format!(" {} {} ", spinner_frame, tool),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.tool_call),
         ));
     }
 
@@ -237,9 +236,7 @@ pub(crate) fn render_statusline_spans(
     };
     spans.push(Span::styled(
         model_display,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
@@ -265,21 +262,21 @@ pub(crate) fn render_statusline_spans(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!(" {} tasks ", status.active_tasks),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(t.thinking),
         ));
     }
 
     if !status.workflow_phase.is_empty() && status.workflow_phase != "idle" {
         let phase_color = match status.workflow_phase.as_str() {
-            "explore" => Color::Cyan,
-            "plan" => Color::Blue,
-            "approval" => Color::Yellow,
-            "execute" => Color::Green,
-            "verify" => Color::Magenta,
-            "completed" => Color::Green,
-            "failed" => Color::Red,
-            "paused" => Color::Gray,
-            _ => Color::White,
+            "explore" => t.primary,
+            "plan" => t.bold_heading,
+            "approval" => t.warning,
+            "execute" => t.success,
+            "verify" => t.thinking,
+            "completed" => t.success,
+            "failed" => t.error,
+            "paused" => t.muted,
+            _ => t.assistant_body,
         };
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -295,7 +292,7 @@ pub(crate) fn render_statusline_spans(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!(" PLAN:{} ", status.plan_state.to_ascii_uppercase()),
-            Style::default().fg(Color::Blue),
+            Style::default().fg(t.primary),
         ));
     }
 
@@ -303,7 +300,7 @@ pub(crate) fn render_statusline_spans(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!(" {} jobs ", status.background_jobs),
-            Style::default().fg(Color::Blue),
+            Style::default().fg(t.primary),
         ));
     }
 
@@ -314,7 +311,7 @@ pub(crate) fn render_statusline_spans(
                 " subagents {}/{} ",
                 status.running_subagents, status.failed_subagents
             ),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(t.thinking),
         ));
     }
 
@@ -322,7 +319,7 @@ pub(crate) fn render_statusline_spans(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!(" step {} ", status.current_step),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.muted),
         ));
     }
 
@@ -330,7 +327,7 @@ pub(crate) fn render_statusline_spans(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!(" todo {} ", status.current_todo),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.muted),
         ));
     }
 
@@ -340,7 +337,7 @@ pub(crate) fn render_statusline_spans(
             " AUTOPILOT ".to_string(),
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Green)
+                .bg(t.success)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -353,19 +350,19 @@ pub(crate) fn render_statusline_spans(
         spans.push(Span::styled(
             format!(" {} ", status.agent_mode),
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
+                .fg(Color::Black)
+                .bg(t.primary)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
     if !status.active_profile.is_empty() {
         let profile_color = match status.active_profile.as_str() {
-            "build" => Color::Green,
-            "explore" => Color::Cyan,
-            "plan" => Color::Yellow,
-            "bash" => Color::Magenta,
-            _ => Color::Blue,
+            "build" => t.success,
+            "explore" => t.primary,
+            "plan" => t.warning,
+            "bash" => t.thinking,
+            _ => t.primary,
         };
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -381,11 +378,11 @@ pub(crate) fn render_statusline_spans(
         let pct =
             (status.context_used_tokens as f64 / status.context_max_tokens as f64 * 100.0) as u64;
         let ctx_color = if pct > 80 {
-            Color::Red
+            t.error
         } else if pct > 60 {
-            Color::Yellow
+            t.warning
         } else {
-            Color::Green
+            t.success
         };
         // Visual token budget bar: [████░░░░] 42%
         let bar_width = 8u64;
@@ -407,7 +404,7 @@ pub(crate) fn render_statusline_spans(
     if status.session_turns > 0 {
         spans.push(Span::styled(
             format!(" turn {} ", status.session_turns),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.muted),
         ));
     }
 
@@ -428,20 +425,20 @@ pub(crate) fn render_statusline_spans(
 
     spans.push(Span::styled(
         format!(" ${:.4} ", status.estimated_cost_usd),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(t.muted),
     ));
 
     if status.compaction_count > 0 || status.replay_count > 0 {
         spans.push(Span::styled(
             format!(" c/r {}/{} ", status.compaction_count, status.replay_count),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.muted),
         ));
     }
 
     if !status.capability_summary.is_empty() {
         spans.push(Span::styled(
             format!(" {} ", status.capability_summary),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.muted),
         ));
     }
 
@@ -450,7 +447,7 @@ pub(crate) fn render_statusline_spans(
             format!(" {} ", mode),
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Gray)
+                .bg(t.muted)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -458,16 +455,14 @@ pub(crate) fn render_statusline_spans(
     if let Some(pct) = scroll_pct {
         spans.push(Span::styled(
             format!(" {}% ", pct),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.muted),
         ));
     }
 
     if has_new_content_below {
         spans.push(Span::styled(
             " \u{2193} new ".to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
         ));
     }
 
