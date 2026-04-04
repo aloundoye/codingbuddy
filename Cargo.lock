@@ -875,6 +875,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "strsim",
+ "tempfile",
+ "toml",
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",

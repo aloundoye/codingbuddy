@@ -1,5 +1,6 @@
 pub mod bash_ast;
 mod command_guard;
+pub mod custom_tools;
 mod fuzzy_edit;
 mod plugins;
 mod sandbox;

@@ -53,6 +53,9 @@ type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 fn runtime_tool_definitions(workspace: &Path) -> Vec<codingbuddy_core::ToolDefinition> {
     let mut tools = tool_definitions();
     tools.extend(plugin_tool_definitions(workspace));
+    tools.extend(codingbuddy_tools::custom_tools::custom_tool_definitions(
+        workspace,
+    ));
     tools
 }
 

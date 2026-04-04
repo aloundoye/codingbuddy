@@ -229,6 +229,9 @@ pub struct HookOutput {
     /// For PreToolUse/PermissionRequest: allow/deny/ask.
     #[serde(skip_serializing_if = "Option::is_none", rename = "permissionDecision")]
     pub permission_decision: Option<String>,
+    /// For PostToolUse: modified tool result to use instead of the original.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "modifiedResult")]
+    pub modified_result: Option<String>,
     /// Inject additional context into the conversation.
     #[serde(skip_serializing_if = "Option::is_none", rename = "additionalContext")]
     pub additional_context: Option<String>,
@@ -266,6 +269,8 @@ pub struct HookResult {
     pub block_reason: Option<String>,
     /// Modified tool input from the last hook that provided one.
     pub updated_input: Option<serde_json::Value>,
+    /// Modified tool result from PostToolUse hook.
+    pub modified_result: Option<String>,
     /// Additional context from hooks.
     pub additional_context: Vec<String>,
     /// Permission decision from a PermissionRequest hook (allow/deny/ask).
@@ -365,6 +370,9 @@ impl HookRuntime {
                 }
                 if let Some(ref ui) = run.output.updated_input {
                     result.updated_input = Some(ui.clone());
+                }
+                if let Some(ref mr) = run.output.modified_result {
+                    result.modified_result = Some(mr.clone());
                 }
                 if let Some(ref ctx) = run.output.additional_context {
                     result.additional_context.push(ctx.clone());
