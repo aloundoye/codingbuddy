@@ -177,6 +177,10 @@ impl ApiClient {
             ProviderKind::Anthropic => {
                 let builder = builder
                     .header("anthropic-version", providers::anthropic::ANTHROPIC_VERSION)
+                    .header(
+                        "anthropic-beta",
+                        "prompt-caching-2024-07-31,output-128k-2025-02-19",
+                    )
                     .header("content-type", "application/json");
                 match api_key {
                     Some(key) if !key.trim().is_empty() => builder.header("x-api-key", key),
@@ -906,19 +910,44 @@ impl ApiClient {
                 self.cfg.provider
             )
         })?;
-        prepared.payload["stream"] = json!(true);
-        prepared.payload["stream_options"] = json!({"include_usage": true});
+        // Native providers handle streaming differently
+        let is_native = matches!(
+            capabilities.provider,
+            ProviderKind::Anthropic | ProviderKind::Google
+        );
+        if !is_native {
+            prepared.payload["stream"] = json!(true);
+            prepared.payload["stream_options"] = json!({"include_usage": true});
+        } else if capabilities.provider == ProviderKind::Anthropic {
+            prepared.payload["stream"] = json!(true);
+        }
+        // Google uses ?alt=sse in the URL for streaming, no body flag needed
+
+        // Build provider-specific endpoint for streaming
+        let stream_endpoint = match capabilities.provider {
+            ProviderKind::Google => {
+                let provider = self.provider_config();
+                let base = provider.base_url.trim_end_matches('/');
+                let url = providers::google::endpoint(base, &req.model, true);
+                if let Some(key) = api_key {
+                    providers::google::append_api_key(&url, key)
+                } else {
+                    url
+                }
+            }
+            _ => self.resolved_endpoint(true, false, false),
+        };
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
-            let response = self
-                .apply_auth(
-                    self.client.post(self.resolved_endpoint(true, false, false)),
-                    api_key,
-                )
-                .json(&prepared.payload)
-                .send();
+            let builder = match capabilities.provider {
+                ProviderKind::Google => self.client.post(&stream_endpoint).json(&prepared.payload),
+                _ => self
+                    .apply_auth(self.client.post(&stream_endpoint), api_key)
+                    .json(&prepared.payload),
+            };
+            let response = builder.send();
 
             match response {
                 Ok(resp) => {
@@ -932,11 +961,12 @@ impl ApiClient {
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
                         let mut completed_tool_calls: Vec<LlmToolCall> = Vec::new();
-                        // Suppress text display once structured tool_calls
-                        // deltas arrive — the text fragments between tool calls
-                        // are noise that confuses the TUI display.
                         let mut has_structured_tool_calls = false;
                         let mut usage: Option<codingbuddy_core::TokenUsage> = None;
+
+                        // Native provider streaming state
+                        let mut anthropic_event_type = String::new();
+                        let mut native_state = providers::NativeStreamState::default();
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
@@ -956,6 +986,14 @@ impl ApiClient {
                                 }
                             };
                             let trimmed = line.trim();
+
+                            // Anthropic SSE uses "event:" prefix lines before "data:" lines
+                            if trimmed.starts_with("event:") {
+                                anthropic_event_type =
+                                    trimmed.trim_start_matches("event:").trim().to_string();
+                                continue;
+                            }
+
                             if !trimmed.starts_with("data:") {
                                 continue;
                             }
@@ -968,6 +1006,43 @@ impl ApiClient {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+
+                            // ── Native Anthropic streaming ──
+                            if capabilities.provider == ProviderKind::Anthropic {
+                                let evt_type = if anthropic_event_type.is_empty() {
+                                    value.get("type").and_then(|v| v.as_str()).unwrap_or("")
+                                } else {
+                                    &anthropic_event_type
+                                };
+                                let raw =
+                                    providers::anthropic::parse_streaming_event(evt_type, &value);
+                                let evt = providers::from_anthropic_event(raw);
+                                let done = native_state.handle_event(evt, &*cb);
+                                anthropic_event_type.clear();
+                                if done {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            // ── Native Google streaming ──
+                            if capabilities.provider == ProviderKind::Google {
+                                let raw = providers::google::parse_streaming_chunk(&value);
+                                let events = providers::from_google_event(raw);
+                                let mut done = false;
+                                for evt in events {
+                                    done = native_state.handle_event(evt, &*cb);
+                                    if done {
+                                        break;
+                                    }
+                                }
+                                if done {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            // ── OpenAI-compatible streaming (default) ──
                             if let Some(usage_value) = value.get("usage")
                                 && !usage_value.is_null()
                             {
@@ -1006,7 +1081,6 @@ impl ApiClient {
                                     merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
                                 }
                             }
-                            // Some providers send non-streamed `message` instead of `delta`.
                             if let Some(message) = choice.get("message") {
                                 if let Some(content) =
                                     message.get("content").and_then(|v| v.as_str())
@@ -1057,6 +1131,23 @@ impl ApiClient {
                             tool_calls.extend(completed_tool_calls);
                         }
 
+                        // Merge native provider state into the response
+                        if is_native {
+                            if !native_state.content.is_empty() {
+                                content_out = native_state.content;
+                            }
+                            if !native_state.reasoning.is_empty() {
+                                reasoning_out = native_state.reasoning;
+                            }
+                            tool_calls.extend(native_state.tool_calls);
+                            if native_state.finish_reason.is_some() {
+                                finish_reason = native_state.finish_reason;
+                            }
+                            if native_state.usage.is_some() {
+                                usage = native_state.usage;
+                            }
+                        }
+
                         let text = if !content_out.is_empty() {
                             content_out
                         } else if !reasoning_out.is_empty() {
@@ -1073,6 +1164,10 @@ impl ApiClient {
                             usage,
                             compatibility: None,
                         };
+                        // Native providers handle their own format; OpenAI-compat needs postprocessing
+                        if is_native {
+                            return Ok(response);
+                        }
                         return Ok(
                             provider_transform::postprocess_chat_response_with_compatibility(
                                 response,
