@@ -68,6 +68,9 @@ use safety::{
     FINISH_REASON_DOOM_LOOP, MAX_RECENT_ERRORS, STUCK_DETECTION_GUIDANCE,
 };
 
+/// Maximum retries when response is truncated (finish_reason == "length").
+const MAX_TRUNCATION_RETRIES: u8 = 3;
+
 /// Context window usage percentage that triggers lightweight pruning (Phase 1).
 pub const PRUNE_THRESHOLD_PCT: f64 = 0.80;
 
@@ -893,6 +896,7 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
+        let mut truncation_retries: u8 = 0;
 
         let mut verbosity_nudge_count: usize = 0;
 
@@ -1073,6 +1077,29 @@ impl<'a> ToolUseLoop<'a> {
             // Handle content filter before anything else
             if response.finish_reason == "content_filter" {
                 return Err(anyhow!("Response blocked by content filter"));
+            }
+
+            // Output token recovery: when the model hits max_output_tokens,
+            // ask it to be more concise and retry (up to 3 attempts).
+            if response.finish_reason == "length" && truncation_retries < MAX_TRUNCATION_RETRIES {
+                truncation_retries += 1;
+                self.messages.push(ChatMessage::System {
+                    content: format!(
+                        "Your previous response was truncated (hit output token limit). \
+                         Please complete your response more concisely. \
+                         (Recovery attempt {}/{})",
+                        truncation_retries, MAX_TRUNCATION_RETRIES
+                    ),
+                });
+                // Re-add partial content so the model can continue from where it left off
+                if !response.text.is_empty() {
+                    self.messages.push(ChatMessage::Assistant {
+                        content: Some(response.text.clone()),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                    });
+                }
+                continue; // Retry the LLM call
             }
 
             // No tool calls → return the text response (or nudge to use tools)
@@ -1650,11 +1677,10 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         // ── Circuit breaker ──
-        // If this tool has failed too many times consecutively, reject it
-        // with guidance to try a different approach.
         if let Some(state) = self.circuit_breaker.get(&llm_call.name)
-            && state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD
-            && state.cooldown_remaining > 0
+            && (state.permanently_disabled
+                || (state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD
+                    && state.cooldown_remaining > 0))
         {
             let duration = start.elapsed().as_millis() as u64;
             self.emit(StreamChunk::ToolCallEnd {
@@ -1922,7 +1948,6 @@ impl<'a> ToolUseLoop<'a> {
         let success = result.success;
 
         // ── Circuit breaker update ──
-        // Track consecutive failures per tool for circuit-breaking.
         let cb_state = self
             .circuit_breaker
             .entry(llm_call.name.clone())
@@ -1932,7 +1957,20 @@ impl<'a> ToolUseLoop<'a> {
             cb_state.cooldown_remaining = 0;
         } else {
             cb_state.consecutive_failures += 1;
+            cb_state.last_error = Some({
+                // Extract error from string or JSON object {"error": "..."}
+                let err_text = result
+                    .output
+                    .as_str()
+                    .or_else(|| result.output.get("error").and_then(|e| e.as_str()))
+                    .unwrap_or("unknown error");
+                err_text.chars().take(200).collect::<String>()
+            });
             if cb_state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                cb_state.session_trip_count += 1;
+                if cb_state.session_trip_count >= 2 {
+                    cb_state.permanently_disabled = true;
+                }
                 cb_state.cooldown_remaining = CIRCUIT_BREAKER_COOLDOWN_TURNS;
                 if let Some(ref cb) = self.event_cb {
                     cb(EventKind::CircuitBreakerTripped {
@@ -1941,7 +1979,21 @@ impl<'a> ToolUseLoop<'a> {
                         cooldown_turns: CIRCUIT_BREAKER_COOLDOWN_TURNS as u64,
                     });
                 }
-                cb_state.consecutive_failures = 0; // Reset count for next cycle
+                // Inject system message so the LLM knows why and can self-correct
+                let last_err = cb_state.last_error.as_deref().unwrap_or("unknown error");
+                let permanent = if cb_state.permanently_disabled {
+                    " This tool is now PERMANENTLY disabled for this session."
+                } else {
+                    ""
+                };
+                self.messages.push(ChatMessage::System {
+                    content: format!(
+                        "Tool '{}' has been temporarily disabled after {} consecutive failures. \
+                         Last error: {}. Try a different approach.{}",
+                        llm_call.name, CIRCUIT_BREAKER_THRESHOLD, last_err, permanent
+                    ),
+                });
+                cb_state.consecutive_failures = 0;
             }
         }
 

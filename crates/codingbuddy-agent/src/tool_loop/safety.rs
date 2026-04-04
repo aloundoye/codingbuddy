@@ -99,6 +99,12 @@ pub(crate) struct CircuitBreakerState {
     pub(crate) consecutive_failures: usize,
     /// Turns remaining in cooldown (0 = active).
     pub(crate) cooldown_remaining: usize,
+    /// Number of times this tool has tripped the circuit breaker in this session.
+    pub(crate) session_trip_count: usize,
+    /// Last error message (for LLM feedback).
+    pub(crate) last_error: Option<String>,
+    /// Permanently disabled for the rest of the session (double-trip).
+    pub(crate) permanently_disabled: bool,
 }
 
 // ── Denial tracking ──

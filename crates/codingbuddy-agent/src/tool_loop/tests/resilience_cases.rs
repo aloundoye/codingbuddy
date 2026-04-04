@@ -298,6 +298,7 @@ fn circuit_breaker_cooldown_decrements() {
     let mut cb = CircuitBreakerState {
         consecutive_failures: CIRCUIT_BREAKER_THRESHOLD,
         cooldown_remaining: CIRCUIT_BREAKER_COOLDOWN_TURNS,
+        ..Default::default()
     };
     // Simulate one turn of cooldown decrement
     if cb.cooldown_remaining > 0 {
@@ -319,6 +320,7 @@ fn circuit_breaker_resets_on_success() {
     let mut cb = CircuitBreakerState {
         consecutive_failures: 2,
         cooldown_remaining: 0,
+        ..Default::default()
     };
     // Success resets the counter
     cb.consecutive_failures = 0;

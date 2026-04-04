@@ -1,3 +1,4 @@
+pub mod bash_classifier;
 pub mod output_scanner;
 pub mod shell_parse;
 
@@ -653,6 +654,22 @@ impl PolicyEngine {
         if call.name == "bash.run"
             && let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
             && self.cfg.persistent_bash_approvals.iter().any(|p| p == cmd)
+        {
+            return false;
+        }
+
+        // Auto-approve safe bash commands in permissive modes only.
+        // Plan and Locked modes require approval for all writes including safe bash.
+        if !matches!(
+            self.permission_mode,
+            PermissionMode::Plan | PermissionMode::Locked
+        ) && (call.name == "bash.run" || call.name == "bash_run")
+            && let Some(cmd) = call
+                .args
+                .get("cmd")
+                .or_else(|| call.args.get("command"))
+                .and_then(|v| v.as_str())
+            && bash_classifier::classify_bash_command(cmd) == bash_classifier::BashSafety::Safe
         {
             return false;
         }
