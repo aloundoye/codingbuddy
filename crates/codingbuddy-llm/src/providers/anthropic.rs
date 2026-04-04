@@ -101,12 +101,16 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
     });
 
     if !system_parts.is_empty() {
+        // Add cache_control to the last system block for prompt caching
+        if let Some(last) = system_parts.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
         payload["system"] = json!(system_parts);
     }
 
     // Tool definitions
     if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
             .map(|t| {
@@ -117,6 +121,10 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
                 })
             })
             .collect();
+        // Add cache_control to the last tool for prompt caching
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
         payload["tools"] = json!(tools);
     }
 
