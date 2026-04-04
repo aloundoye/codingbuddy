@@ -29,6 +29,7 @@ mod event_emission;
 mod helpers;
 pub mod phases;
 mod safety;
+pub mod streaming_executor;
 
 // Re-export public API from submodules
 pub use types::*;
@@ -1221,13 +1222,16 @@ impl<'a> ToolUseLoop<'a> {
             let mut batch_had_failure = false;
             let mut batch_had_success = false;
 
-            // Partition: read-only tools with auto-approval can run in parallel;
-            // write tools, unknown tools, and agent-level tools run sequentially.
+            // Partition by concurrency_safe metadata: safe tools run in parallel,
+            // everything else runs sequentially.
             let (parallel_calls, sequential_calls): (Vec<_>, Vec<_>) =
                 response.tool_calls.iter().partition(|c| {
-                    !tool_bridge::is_agent_level_tool(&c.name)
-                        && !tool_bridge::is_write_tool(&c.name)
-                        && codingbuddy_core::ReviewMode::is_read_only_tool(&c.name)
+                    codingbuddy_core::ToolName::from_api_name(&c.name)
+                        .map(|tn| {
+                            let meta = tn.metadata();
+                            meta.concurrency_safe && !meta.agent_level
+                        })
+                        .unwrap_or(false)
                 });
 
             // Execute independent read-only tools in parallel using thread scope.
