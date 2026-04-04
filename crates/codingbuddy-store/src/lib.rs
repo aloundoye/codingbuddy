@@ -729,6 +729,21 @@ impl Store {
         Ok(())
     }
 
+    /// Force-flush JSONL events file and SQLite WAL to disk.
+    /// Called after each complete LLM turn so a killed process can resume.
+    pub fn flush_sync(&self) -> Result<()> {
+        // Open with write access so fsync flushes pending writes from append_event
+        if self.events_path.exists() {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.events_path)?;
+            file.sync_all()?;
+        }
+        let conn = self.db()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        Ok(())
+    }
+
     pub fn save_session(&self, session: &Session) -> Result<()> {
         let conn = self.db()?;
         conn.execute(

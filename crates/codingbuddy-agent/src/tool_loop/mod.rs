@@ -1512,6 +1512,11 @@ impl<'a> ToolUseLoop<'a> {
 
             self.maybe_inject_complex_checklist_nudge(&response.tool_calls);
 
+            // Flush transcript to disk so a killed process can resume from here
+            if let Ok(store) = self.workspace_store() {
+                let _ = store.flush_sync();
+            }
+
             // Update escalation signals based on batch outcome
             if batch_had_success {
                 self.escalation.record_success();
@@ -1942,7 +1947,7 @@ impl<'a> ToolUseLoop<'a> {
             invocation_id: proposal.invocation_id,
             call: proposal.call,
         };
-        let result = self.tool_host.execute(approved_call);
+        let mut result = self.tool_host.execute(approved_call);
 
         let duration = start.elapsed().as_millis() as u64;
         let success = result.success;
@@ -2089,11 +2094,28 @@ impl<'a> ToolUseLoop<'a> {
             },
         });
 
-        // Persist large outputs to disk so the model can re-read the full content.
+        // Persist large outputs to disk BEFORE truncation so the full content is saved
         let file_hint = result
             .output
             .as_str()
             .and_then(|s| self.persist_large_output(&llm_call.name, s));
+
+        // Per-tool output truncation using metadata-driven max_result_chars
+        let max_chars = codingbuddy_core::ToolName::from_api_name(&llm_call.name)
+            .map(|tn| tn.metadata().max_result_chars)
+            .unwrap_or(50_000);
+        if let Some(text) = result.output.as_str()
+            && text.len() > max_chars
+        {
+            let truncated = &text[..text.floor_char_boundary(max_chars)];
+            let footer = format!(
+                "\n\n[Output truncated. Showing first {} of {} characters. \
+                 Use more specific queries to narrow results.]",
+                max_chars,
+                text.len()
+            );
+            result.output = serde_json::Value::String(format!("{truncated}{footer}"));
+        }
 
         // Convert result to ChatMessage::Tool and append, scanning for security issues
         let (msg, injection_warnings) = tool_bridge::tool_result_to_message(

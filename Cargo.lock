@@ -635,6 +635,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "notify",
  "proptest",
  "serde",
  "serde_json",

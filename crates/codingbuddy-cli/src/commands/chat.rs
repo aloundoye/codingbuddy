@@ -1951,6 +1951,19 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn print_resume_banner(session: &codingbuddy_core::Session, turn_count: usize) {
+    let id_prefix = &session.session_id.to_string()[..8];
+    eprintln!(
+        "Resuming session {id_prefix} ({turn_count} messages, state={:?})",
+        session.status
+    );
+    if session.status == codingbuddy_core::SessionState::ExecutingStep {
+        eprintln!(
+            "Warning: Previous session was interrupted during tool execution. Results may be incomplete."
+        );
+    }
+}
+
 pub(crate) fn run_continue_session(
     cwd: &Path,
     json_mode: bool,
@@ -1962,14 +1975,8 @@ pub(crate) fn run_continue_session(
         .ok_or_else(|| anyhow!("no previous session to continue"))?;
     let projection = store.rebuild_from_events(session.session_id)?;
     if !json_mode {
-        println!(
-            "resuming session {} ({} turns, state={:?})",
-            session.session_id,
-            projection.transcript.len(),
-            session.status
-        );
+        print_resume_banner(&session, projection.transcript.len());
     }
-    // Enter chat mode with the continued session context
     run_chat(
         cwd,
         json_mode,
@@ -1995,12 +2002,7 @@ pub(crate) fn run_resume_specific(
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
     let projection = store.rebuild_from_events(session.session_id)?;
     if !json_mode {
-        println!(
-            "resuming session {} ({} turns, state={:?})",
-            session.session_id,
-            projection.transcript.len(),
-            session.status
-        );
+        print_resume_banner(&session, projection.transcript.len());
     }
     run_chat(
         cwd,
