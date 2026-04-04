@@ -2182,7 +2182,9 @@ impl AppConfig {
             merge_json_value(&mut merged, &value);
         }
 
-        Ok(serde_json::from_value(merged)?)
+        let mut cfg: Self = serde_json::from_value(merged)?;
+        cfg.llm.auto_detect_provider();
+        Ok(cfg)
     }
 
     pub fn ensure(workspace: &Path) -> Result<Self> {
@@ -2198,7 +2200,8 @@ impl AppConfig {
             path.parent()
                 .ok_or_else(|| anyhow::anyhow!("invalid config path"))?,
         )?;
-        let cfg = Self::default();
+        let mut cfg = Self::default();
+        cfg.llm.auto_detect_provider();
         cfg.save(workspace)?;
         Ok(cfg)
     }
@@ -2315,6 +2318,45 @@ impl LlmConfig {
                 chat: self.base_model.clone(),
                 reasoner: Some(self.max_think_model.clone()),
             },
+        }
+    }
+
+    /// Auto-detect the best provider from available API key env vars.
+    ///
+    /// Checks env vars in priority order (best model quality first) and
+    /// switches the active provider if the current one has no key available.
+    /// Called once at config load time — explicit config always wins.
+    pub fn auto_detect_provider(&mut self) {
+        // If the current provider already has a key, keep it
+        let current = self.active_provider();
+        if !current.api_key_env.is_empty() && std::env::var(&current.api_key_env).is_ok() {
+            return;
+        }
+        // Also accept explicit api_key in config
+        if self.api_key.is_some() {
+            return;
+        }
+
+        // Check providers in priority order (best model quality first)
+        const DETECTION_ORDER: &[(&str, &str)] = &[
+            ("anthropic", "ANTHROPIC_API_KEY"),
+            ("openai-compatible", "OPENAI_API_KEY"),
+            ("deepseek", "DEEPSEEK_API_KEY"),
+            ("google", "GOOGLE_API_KEY"),
+            ("groq", "GROQ_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+        ];
+
+        for &(provider_name, env_var) in DETECTION_ORDER {
+            if std::env::var(env_var).is_ok() && self.providers.contains_key(provider_name) {
+                self.provider = provider_name.to_string();
+                let p = self.active_provider();
+                self.base_url = p.base_url.clone();
+                self.api_key_env = p.api_key_env.clone();
+                self.base_model = p.models.chat.clone();
+                self.max_think_model = p.models.reasoner.unwrap_or_else(|| p.models.chat.clone());
+                return;
+            }
         }
     }
 

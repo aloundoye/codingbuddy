@@ -33,7 +33,6 @@ pub const SYSTEM_PROMPT: &str = r#"You are CodingBuddy, an expert coding assista
 Tool descriptions contain detailed usage instructions.
 "#;
 
-
 /// Workspace context injected into the system prompt environment section.
 pub struct WorkspaceContext {
     pub cwd: String,

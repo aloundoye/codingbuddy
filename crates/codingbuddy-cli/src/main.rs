@@ -46,7 +46,7 @@ use commands::serve::{run_completions, run_native_host, run_serve};
 use commands::session::{SessionCmd, run_session_cmd};
 use commands::setup::run_setup;
 use commands::skills::run_skills;
-use commands::status::{run_context, run_status, run_usage};
+use commands::status::{run_context, run_models, run_status, run_usage};
 use commands::tasks::run_tasks;
 use commands::update::run_update;
 use context::{
@@ -365,6 +365,8 @@ enum Commands {
     },
     /// Show current agent status summary.
     Status,
+    /// List available models for each configured provider.
+    Models,
     /// Interactive setup wizard for API key, local ML, and privacy.
     Setup(SetupArgs),
     /// Display token and cost usage.
@@ -1527,6 +1529,7 @@ fn run() -> Result<()> {
         Commands::Background { command } => run_background(&cwd, command, cli.json),
         Commands::Session { command } => run_session_cmd(&cwd, command, cli.json),
         Commands::Status => run_status(&cwd, cli.json),
+        Commands::Models => run_models(&cwd, cli.json),
         Commands::Setup(args) => run_setup(&cwd, args, cli.json),
         Commands::Usage(args) => run_usage(&cwd, args, cli.json),
         Commands::Compact(args) => run_compact(&cwd, args, cli.json),
