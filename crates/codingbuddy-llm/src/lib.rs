@@ -963,6 +963,7 @@ impl ApiClient {
                         let mut completed_tool_calls: Vec<LlmToolCall> = Vec::new();
                         let mut has_structured_tool_calls = false;
                         let mut usage: Option<codingbuddy_core::TokenUsage> = None;
+                        let mut last_emitted_tool_index: u64 = 0;
 
                         // Native provider streaming state
                         let mut anthropic_event_type = String::new();
@@ -1079,6 +1080,25 @@ impl ApiClient {
                                 {
                                     has_structured_tool_calls = true;
                                     merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
+                                    // Emit ToolCallReady for tool calls whose next index has started
+                                    if tool_call_parts.len() > 1 {
+                                        for (&idx, tc) in &tool_call_parts {
+                                            if idx >= last_emitted_tool_index
+                                                && idx
+                                                    < *tool_call_parts.keys().last().unwrap_or(&0)
+                                                && !tc.name.is_empty()
+                                            {
+                                                cb(StreamChunk::ToolCallReady {
+                                                    id: tc.id.clone().unwrap_or_else(|| {
+                                                        format!("tool_call_{}", idx + 1)
+                                                    }),
+                                                    name: tc.name.clone(),
+                                                    arguments: tc.arguments.clone(),
+                                                });
+                                                last_emitted_tool_index = idx + 1;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if let Some(message) = choice.get("message") {

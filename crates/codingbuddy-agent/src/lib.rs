@@ -844,7 +844,21 @@ impl AgentEngine {
         // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.
         let builtin_tools = runtime_tool_definitions(&self.workspace);
         let signals = detect_signals(prompt, &self.workspace);
-        let (mut tools, mut discoverable_tools) = tiered_tool_definitions(builtin_tools, &signals);
+        let (tiered_tools, mut discoverable_tools) =
+            tiered_tool_definitions(builtin_tools, &signals);
+
+        // Move deferred tools to discoverable (discovered via tool_search, not sent by default)
+        let mut tools = Vec::with_capacity(tiered_tools.len());
+        for tool in tiered_tools {
+            let is_deferred = codingbuddy_core::ToolName::from_api_name(&tool.function.name)
+                .map(|tn| tn.metadata().deferred)
+                .unwrap_or(false);
+            if is_deferred {
+                discoverable_tools.push(tool);
+            } else {
+                tools.push(tool);
+            }
+        }
         if let Some(ref mcp) = self.mcp
             && let Ok(mcp_tools) = mcp.discover_tools()
         {

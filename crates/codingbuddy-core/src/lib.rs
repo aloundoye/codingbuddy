@@ -17,8 +17,8 @@ pub use llm_capabilities::{
     model_capabilities_with_registry, normalize_provider_kind, resolve_model_capabilities,
 };
 pub use tool_metadata::{
-    ToolAgentRole, ToolMetadata, ToolPhaseAccess, ToolTier, is_api_tool_name_read_only,
-    is_internal_tool_name_read_only,
+    InterruptBehavior, ToolAgentRole, ToolMetadata, ToolPhaseAccess, ToolTier,
+    is_api_tool_name_read_only, is_internal_tool_name_read_only,
 };
 
 pub type Result<T> = anyhow::Result<T>;
@@ -1467,6 +1467,13 @@ pub enum StreamChunk {
     WatchTriggered { digest: u64, comment_count: usize },
     /// A security warning detected in tool output (prompt injection, suspicious patterns).
     SecurityWarning { message: String },
+    /// A tool call's arguments are fully streamed and ready for execution.
+    /// Emitted during LLM streaming to enable early dispatch.
+    ToolCallReady {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     /// Clear any previously streamed text — the response contains tool calls,
     /// so the interleaved text fragments should be discarded from the display.
     ClearStreamingText,
@@ -1573,6 +1580,16 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
         StreamChunk::SecurityWarning { message } => serde_json::json!({
             "type": "security_warning",
             "message": message,
+        }),
+        StreamChunk::ToolCallReady {
+            id,
+            name,
+            arguments,
+        } => serde_json::json!({
+            "type": "tool_call_ready",
+            "id": id,
+            "name": name,
+            "arguments": arguments,
         }),
         StreamChunk::ClearStreamingText => serde_json::json!({
             "type": "clear_streaming_text",

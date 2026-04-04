@@ -1449,6 +1449,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::Error { .. } => "Error",
                         codingbuddy_core::StreamChunk::PhaseTransition { .. } => "PhaseTransition",
                         codingbuddy_core::StreamChunk::ModelChanged { .. } => "ModelChanged",
+                        codingbuddy_core::StreamChunk::ToolCallReady { .. } => "ToolCallReady",
                         codingbuddy_core::StreamChunk::Done { .. } => "Done",
                     },
                     "payload": match &chunk {
@@ -1578,6 +1579,7 @@ pub(crate) fn run_chat(
                     codingbuddy_core::StreamChunk::UsageUpdate { .. } => {}
                     codingbuddy_core::StreamChunk::ClearStreamingText => {}
                     codingbuddy_core::StreamChunk::SnapshotRecorded { .. } => {}
+                    codingbuddy_core::StreamChunk::ToolCallReady { .. } => {}
                     codingbuddy_core::StreamChunk::Done { .. } => {
                         // Flush any remaining partial line from the renderer
                         if let Ok(mut renderer) = md_clone.lock() {
@@ -1895,6 +1897,7 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     // written to stdout.
                 }
                 StreamChunk::SnapshotRecorded { .. } => {}
+                StreamChunk::ToolCallReady { .. } => {}
                 StreamChunk::Done { .. } => {
                     let _ = writeln!(handle);
                     let _ = handle.flush();
