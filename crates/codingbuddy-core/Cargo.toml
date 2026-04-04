@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 strsim.workspace = true

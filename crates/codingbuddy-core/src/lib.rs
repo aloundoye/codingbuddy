@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub mod complexity;
+pub mod config_watcher;
 pub mod cost;
 mod llm_capabilities;
 pub mod profiler;

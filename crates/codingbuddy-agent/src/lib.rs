@@ -112,6 +112,10 @@ pub struct AgentEngine {
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
     pub(crate) hooks: HookRuntime,
     mcp: Option<McpManager>,
+    /// Watches settings files for hot-reload. The background thread keeps the watch alive;
+    /// poll via `config_watcher.as_ref().and_then(|w| w.poll_change())`.
+    #[allow(dead_code)]
+    config_watcher: Option<codingbuddy_core::config_watcher::ConfigWatcher>,
 }
 
 impl AgentEngine {
@@ -229,6 +233,7 @@ impl AgentEngine {
             subagent_worker: Mutex::new(None),
             hooks,
             mcp,
+            config_watcher: codingbuddy_core::config_watcher::watch_settings(workspace).ok(),
         })
     }
 
