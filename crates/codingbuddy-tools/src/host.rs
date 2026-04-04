@@ -1,6 +1,26 @@
 use super::utils::*;
 use super::*;
 
+/// Device and proc paths that could hang or produce infinite/dangerous output.
+const BLOCKED_DEVICE_PREFIXES: &[&str] = &[
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/null",
+    "/dev/tty",
+    "/proc/self/fd/",
+    "/proc/self/mem",
+];
+
+fn is_blocked_device_path(path: &str) -> bool {
+    BLOCKED_DEVICE_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 fn is_review_blocked(tool_name: &str) -> bool {
     codingbuddy_core::ToolName::from_internal_name(tool_name).is_some_and(|t| t.is_review_blocked())
 }
@@ -115,6 +135,11 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("path missing"))?;
+                if is_blocked_device_path(path) {
+                    anyhow::bail!(
+                        "Cannot read device/proc file: {path}. These can hang or produce infinite output."
+                    );
+                }
                 self.policy.check_path(path)?;
                 let full = self.workspace.join(path);
                 let bytes = fs::read(&full)?;

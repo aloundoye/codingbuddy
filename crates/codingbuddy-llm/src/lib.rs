@@ -18,6 +18,7 @@ use std::time::Duration;
 
 mod provider_transform;
 pub mod providers;
+pub mod retry;
 
 #[derive(Debug, Clone)]
 struct PreparedPayload {
@@ -1886,17 +1887,11 @@ fn with_compatibility_context(
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-    )
+    retry::RetryCategory::from_status(status).should_retry()
 }
 
 fn should_retry_transport_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect() || err.is_request()
+    retry::classify_transport_error(err).should_retry()
 }
 
 /// Parse `retry-after-ms` (milliseconds) header, returns value in seconds for

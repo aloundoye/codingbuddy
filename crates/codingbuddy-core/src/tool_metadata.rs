@@ -233,10 +233,7 @@ impl ToolName {
                 destructive: false,
                 deferred: matches!(
                     self,
-                    Self::PatchStage
-                        | Self::PatchApply
-                        | Self::PatchDirect
-                        | Self::NotebookEdit
+                    Self::PatchStage | Self::PatchApply | Self::PatchDirect | Self::NotebookEdit
                 ),
                 max_result_chars: 50_000,
                 interrupt_behavior: InterruptBehavior::Block,
