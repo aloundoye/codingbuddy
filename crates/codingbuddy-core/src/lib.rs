@@ -260,6 +260,10 @@ pub enum ToolName {
     Skill,
     KillShell,
     Batch,
+    LspHover,
+    LspDefinition,
+    LspReferences,
+    LspSymbols,
 }
 
 impl ToolName {
@@ -308,6 +312,10 @@ impl ToolName {
             "skill" => Self::Skill,
             "kill_shell" => Self::KillShell,
             "batch" => Self::Batch,
+            "lsp_hover" => Self::LspHover,
+            "lsp_definition" => Self::LspDefinition,
+            "lsp_references" => Self::LspReferences,
+            "lsp_symbols" => Self::LspSymbols,
             _ => return None,
         })
     }
@@ -357,6 +365,10 @@ impl ToolName {
             "skill" => Self::Skill,
             "kill_shell" => Self::KillShell,
             "batch" => Self::Batch,
+            "lsp.hover" | "lsp_hover" => Self::LspHover,
+            "lsp.definition" | "lsp_definition" => Self::LspDefinition,
+            "lsp.references" | "lsp_references" => Self::LspReferences,
+            "lsp.symbols" | "lsp_symbols" => Self::LspSymbols,
             _ => return None,
         })
     }
@@ -405,6 +417,10 @@ impl ToolName {
             Self::Skill => "skill",
             Self::KillShell => "kill_shell",
             Self::Batch => "batch",
+            Self::LspHover => "lsp.hover",
+            Self::LspDefinition => "lsp.definition",
+            Self::LspReferences => "lsp.references",
+            Self::LspSymbols => "lsp.symbols",
         }
     }
 
@@ -452,6 +468,10 @@ impl ToolName {
             Self::Skill => "skill",
             Self::KillShell => "kill_shell",
             Self::Batch => "batch",
+            Self::LspHover => "lsp_hover",
+            Self::LspDefinition => "lsp_definition",
+            Self::LspReferences => "lsp_references",
+            Self::LspSymbols => "lsp_symbols",
         }
     }
 
@@ -515,6 +535,10 @@ impl ToolName {
         Self::Skill,
         Self::KillShell,
         Self::Batch,
+        Self::LspHover,
+        Self::LspDefinition,
+        Self::LspReferences,
+        Self::LspSymbols,
     ];
 }
 

@@ -861,6 +861,7 @@ dependencies = [
  "codingbuddy-diff",
  "codingbuddy-hooks",
  "codingbuddy-index",
+ "codingbuddy-lsp",
  "codingbuddy-memory",
  "codingbuddy-policy",
  "codingbuddy-store",

@@ -692,6 +692,87 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
                 }),
             },
         },
+        // ── LSP tools (code intelligence) ───────────────────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "lsp_hover".to_string(),
+                description: "Get type information and documentation for a symbol at a specific position in a file.\n\n\
+Use this when you need to understand the type, signature, or documentation of a function, variable, \
+class, or other symbol. Works with 50+ languages via Language Server Protocol.\n\n\
+Returns the hover information (type signature, docs) from the language server. \
+If no LSP server is available for the file type, returns a message saying so.\n\n\
+The file must exist and the position must be valid (1-based line and column).".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path to the file" },
+                        "line": { "type": "integer", "description": "1-based line number" },
+                        "column": { "type": "integer", "description": "1-based column number" }
+                    },
+                    "required": ["path", "line", "column"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "lsp_definition".to_string(),
+                description: "Jump to the definition of a symbol at a specific position.\n\n\
+Returns the file path and line number where the symbol is defined. \
+Works for functions, types, variables, imports, and other symbols across 50+ languages.\n\n\
+If the symbol has multiple definitions (e.g. overloaded functions), returns all locations.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path to the file" },
+                        "line": { "type": "integer", "description": "1-based line number" },
+                        "column": { "type": "integer", "description": "1-based column number" }
+                    },
+                    "required": ["path", "line", "column"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "lsp_references".to_string(),
+                description: "Find all references to a symbol at a specific position.\n\n\
+Returns a list of file paths and line numbers where the symbol is used. \
+Includes the declaration itself. Works across files in the workspace.\n\n\
+Useful for understanding the impact of a change before refactoring.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path to the file" },
+                        "line": { "type": "integer", "description": "1-based line number" },
+                        "column": { "type": "integer", "description": "1-based column number" }
+                    },
+                    "required": ["path", "line", "column"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "lsp_symbols".to_string(),
+                description: "List all symbols (functions, classes, types, variables) in a file.\n\n\
+Returns a hierarchical outline of the file's structure. Each symbol includes \
+its name, kind (function, class, struct, etc.), and line number.\n\n\
+Use this to quickly understand the structure of a file without reading the entire content.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path to the file" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
         // ── Agent-level tools (handled by AgentEngine, not LocalToolHost) ───
         ToolDefinition {
             tool_type: "function".to_string(),

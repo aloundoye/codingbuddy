@@ -25,6 +25,23 @@ fn is_review_blocked(tool_name: &str) -> bool {
     codingbuddy_core::ToolName::from_internal_name(tool_name).is_some_and(|t| t.is_review_blocked())
 }
 
+/// Extract (path, line, column) from LSP tool arguments.
+fn extract_lsp_position(args: &serde_json::Value) -> Result<(&str, u32, u32)> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing required parameter 'path'"))?;
+    let line = args
+        .get("line")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("missing required parameter 'line'"))? as u32;
+    let col = args
+        .get("column")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("missing required parameter 'column'"))? as u32;
+    Ok((path, line, col))
+}
+
 /// Callback type for executing MCP tool calls.
 /// Takes (server_id, tool_name, arguments) and returns the tool result.
 pub type McpExecutor =
@@ -48,6 +65,8 @@ pub struct LocalToolHost {
     mcp_executor: Option<McpExecutor>,
     /// Optional progress callback for streaming live bash output.
     progress_callback: std::sync::Mutex<Option<super::shell::ProgressCallback>>,
+    /// LSP server manager for code intelligence tools.
+    lsp_manager: codingbuddy_lsp::server_manager::LspServerManager,
 }
 
 impl LocalToolHost {
@@ -91,6 +110,7 @@ impl LocalToolHost {
             review_mode: false,
             mcp_executor: None,
             progress_callback: std::sync::Mutex::new(None),
+            lsp_manager: codingbuddy_lsp::server_manager::LspServerManager::new(workspace),
         })
     }
 
@@ -1080,6 +1100,30 @@ impl LocalToolHost {
                     "source": source,
                 }))
             }
+            "lsp.hover" | "lsp_hover" => {
+                let (path, line, col) = extract_lsp_position(&call.args)?;
+                let result = self.lsp_manager.hover(Path::new(path), line, col)?;
+                Ok(json!({ "hover": result }))
+            }
+            "lsp.definition" | "lsp_definition" => {
+                let (path, line, col) = extract_lsp_position(&call.args)?;
+                let result = self.lsp_manager.definition(Path::new(path), line, col)?;
+                Ok(json!({ "definition": result }))
+            }
+            "lsp.references" | "lsp_references" => {
+                let (path, line, col) = extract_lsp_position(&call.args)?;
+                let result = self.lsp_manager.references(Path::new(path), line, col)?;
+                Ok(json!({ "references": result }))
+            }
+            "lsp.symbols" | "lsp_symbols" => {
+                let path = call
+                    .args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing required parameter 'path'"))?;
+                let result = self.lsp_manager.symbols(Path::new(path))?;
+                Ok(json!({ "symbols": result }))
+            }
             name if name.starts_with("plugin__") => self.run_plugin_tool(name, &call.args),
             name if name.starts_with("mcp__") => {
                 let rest = &name[5..]; // skip "mcp__"
@@ -1122,6 +1166,14 @@ impl LocalToolHost {
                     "notebook.read",
                     "index.query",
                     "diagnostics.check",
+                    "lsp.hover",
+                    "lsp_hover",
+                    "lsp.definition",
+                    "lsp_definition",
+                    "lsp.references",
+                    "lsp_references",
+                    "lsp.symbols",
+                    "lsp_symbols",
                 ];
                 for tc in tool_calls {
                     let tool_name = tc.get("tool").and_then(|v| v.as_str()).unwrap_or("");
