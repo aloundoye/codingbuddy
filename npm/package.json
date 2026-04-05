@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/alassanendoye/codingbuddy"
+    "url": "https://github.com/aloundoye/codingbuddy"
   },
   "bin": {
     "codingbuddy": "bin/codingbuddy"
