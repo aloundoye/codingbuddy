@@ -1729,9 +1729,9 @@ impl<'a> ToolUseLoop<'a> {
         };
 
         // Convert LLM call to internal format
-        let tool_call = tool_bridge::llm_tool_call_to_internal(&llm_call);
+        let mut tool_call = tool_bridge::llm_tool_call_to_internal(&llm_call);
         // Save parsed args before tool_call is moved into propose()
-        let parsed_args = tool_call.args.clone();
+        let mut parsed_args = tool_call.args.clone();
 
         // ── JSON schema validation ──
         // Validate arguments against the tool's schema before executing.
@@ -1783,6 +1783,7 @@ impl<'a> ToolUseLoop<'a> {
             };
             let hook_result = hooks.fire(HookEvent::PreToolUse, &input);
             if hook_result.blocked {
+                let extra = hook_result.block_reason.as_deref().unwrap_or("");
                 let duration = start.elapsed().as_millis() as u64;
                 self.emit(StreamChunk::ToolCallEnd {
                     tool_name: llm_call.name.clone(),
@@ -1790,10 +1791,15 @@ impl<'a> ToolUseLoop<'a> {
                     success: false,
                     summary: "blocked by hook".to_string(),
                 });
-                self.messages.push(tool_bridge::tool_error_to_message(
-                    &llm_call.id,
-                    "Tool call blocked by pre-tool-use hook. Try a different approach.",
-                ));
+                let msg = if extra.is_empty() {
+                    "Tool call blocked by pre-tool-use hook. Try a different approach.".to_string()
+                } else {
+                    format!(
+                        "Tool call blocked by pre-tool-use hook: {extra}. Try a different approach."
+                    )
+                };
+                self.messages
+                    .push(tool_bridge::tool_error_to_message(&llm_call.id, &msg));
                 records.push(ToolCallRecord {
                     tool_name: llm_call.name.clone(),
                     tool_call_id: llm_call.id.clone(),
@@ -1804,6 +1810,11 @@ impl<'a> ToolUseLoop<'a> {
                     result_preview: None,
                 });
                 return Ok(records);
+            }
+            // Apply modified arguments from hook (input modification)
+            if let Some(modified_args) = hook_result.updated_input {
+                tool_call.args = modified_args;
+                parsed_args = tool_call.args.clone();
             }
         }
 
@@ -2062,7 +2073,18 @@ impl<'a> ToolUseLoop<'a> {
                 session_type: None,
                 workspace: self.workspace_str().to_string(),
             };
-            Self::fire_hook_logged(hooks, HookEvent::PostToolUse, &input);
+            let post_hook_result = hooks.fire(HookEvent::PostToolUse, &input);
+            for run in &post_hook_result.runs {
+                if !run.success {
+                    eprintln!(
+                        "[hooks] PostToolUse hook failed: {}",
+                        run.handler_description
+                    );
+                }
+            }
+            if let Some(modified) = post_hook_result.modified_result {
+                result.output = serde_json::Value::String(modified);
+            }
             if !success {
                 let fail_input = HookInput {
                     event: HookEvent::PostToolUseFailure.as_str().to_string(),
