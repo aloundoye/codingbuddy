@@ -266,6 +266,11 @@ impl AgentEngine {
         self.cfg.agent_loop.lint.enabled = true;
     }
 
+    /// Apply a `provider/model-id` spec (e.g. `"anthropic/claude-sonnet-4-6-20250514"`).
+    pub fn apply_model_spec(&mut self, spec: &str) {
+        self.cfg.llm.apply_model_spec(spec);
+    }
+
     pub fn validate_api_key(&self) -> Result<()> {
         let provider = self.cfg.llm.active_provider();
         let model = self.cfg.llm.active_base_model();

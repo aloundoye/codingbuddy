@@ -186,11 +186,10 @@ For this complex task, you should act as a **coordinator**:\n\
 **When to parallelize:** 2+ independent file edits, research + implementation, test + lint.\n\
 **When NOT to parallelize:** Sequential dependencies, single-file changes, simple questions.\n";
 
-/// Build system prompt for any model. Model-agnostic — same base prompt for all.
+/// Build system prompt tailored to the active model family.
 ///
-/// Layers complexity guidance and coordinator guidance on top of the unified
-/// base prompt. The `_model` parameter is accepted for call-site compatibility
-/// but not used — all models get the same prompt.
+/// The base prompt is shared across all models, but model-specific guidance
+/// is appended based on the model family to optimize instruction-following.
 pub fn build_model_aware_system_prompt(
     project_memory: Option<&str>,
     system_prompt_override: Option<&str>,
@@ -198,7 +197,7 @@ pub fn build_model_aware_system_prompt(
     workspace_context: Option<&WorkspaceContext>,
     complexity: PromptComplexity,
     repo_map_summary: Option<&str>,
-    _model: &str,
+    model: &str,
 ) -> String {
     let base = build_tool_use_system_prompt_with_complexity(
         project_memory,
@@ -209,11 +208,62 @@ pub fn build_model_aware_system_prompt(
         repo_map_summary,
     );
 
-    // Add coordinator guidance for complex tasks (skip if user override)
-    if system_prompt_override.is_none() && complexity == PromptComplexity::Complex {
-        format!("{base}{COORDINATOR_GUIDANCE}")
-    } else {
-        base
+    // Skip model-specific guidance if user provided override
+    if system_prompt_override.is_some() {
+        return base;
+    }
+
+    let mut prompt = base;
+
+    // Add coordinator guidance for complex tasks
+    if complexity == PromptComplexity::Complex {
+        prompt.push_str(COORDINATOR_GUIDANCE);
+    }
+
+    // Add model-family-specific guidance
+    let family = crate::llm_capabilities::detect_model_family(model);
+    let family_hint = model_family_guidance(family);
+    if !family_hint.is_empty() {
+        prompt.push_str(family_hint);
+    }
+
+    prompt
+}
+
+/// Model-family-specific hints appended to the system prompt.
+/// Optimizes instruction-following for each model's strengths.
+fn model_family_guidance(family: crate::llm_capabilities::ModelFamily) -> &'static str {
+    use crate::llm_capabilities::ModelFamily;
+    match family {
+        ModelFamily::Claude => {
+            "\n\n## Model Hints\n\
+            You excel at tool use and long context. Use parallel tool calls aggressively.\n\
+            Prefer fs_edit for surgical changes. Read relevant files before any edit.\n"
+        }
+        ModelFamily::OpenAi => {
+            "\n\n## Model Hints\n\
+            Use structured JSON arguments for all tool calls.\n\
+            When multiple tools are needed, call them in sequence — verify each result before proceeding.\n"
+        }
+        ModelFamily::Qwen => {
+            "\n\n## Model Hints\n\
+            Keep responses extremely concise (1-4 lines unless showing code).\n\
+            Prefer patch_direct or multi_edit over individual fs_edit calls for multi-site changes.\n\
+            Always include the required parameters in tool calls.\n"
+        }
+        ModelFamily::Gemini => {
+            "\n\n## Model Hints\n\
+            Be methodical: read files thoroughly before planning changes.\n\
+            Use fs_grep to find all call sites before modifying any interface.\n\
+            Verify changes with build/test commands after each modification.\n"
+        }
+        ModelFamily::Llama => {
+            "\n\n## Model Hints\n\
+            Focus on one change at a time. Read the file, make the edit, verify.\n\
+            Use patch_direct for multi-line changes — it's more reliable than fs_edit for complex edits.\n\
+            Always specify all required tool parameters explicitly.\n"
+        }
+        ModelFamily::Deepseek | ModelFamily::Mistral | ModelFamily::Generic => "",
     }
 }
 

@@ -39,6 +39,10 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
             engine.set_lint_command(lang.trim(), cmd.trim());
         }
     }
+    // Apply --model flag with provider/model syntax support
+    if let Some(ref model_spec) = cli.model {
+        engine.apply_model_spec(model_spec);
+    }
 }
 
 /// Subagent orchestration connects the parallel Worker execution to isolated engine scopes.
