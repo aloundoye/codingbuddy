@@ -53,8 +53,8 @@ use crate::tool_bridge;
 
 use anti_hallucination::{
     HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS,
-    check_response_consistency, contains_shell_command_pattern, extract_user_directives,
-    has_unverified_file_references,
+    MAX_SHELL_NUDGE_ATTEMPTS, SHELL_COMMAND_NUDGE, check_response_consistency,
+    contains_shell_command_pattern, extract_user_directives, has_unverified_file_references,
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
@@ -578,7 +578,7 @@ impl<'a> ToolUseLoop<'a> {
         if lower.starts_with("your response is too verbose") {
             return true;
         }
-        trimmed == HALLUCINATION_NUDGE
+        trimmed == HALLUCINATION_NUDGE || trimmed == SHELL_COMMAND_NUDGE
     }
 
     fn replayable_user_prompt(messages: &[ChatMessage]) -> Option<String> {
@@ -933,6 +933,7 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
+        let mut shell_nudge_count: usize = 0;
         let mut truncation_retries: u8 = 0;
 
         let mut verbosity_nudge_count: usize = 0;
@@ -1151,6 +1152,33 @@ impl<'a> ToolUseLoop<'a> {
             if response.tool_calls.is_empty() {
                 let text = response.text.clone();
 
+                // Shell command detection — separate counter and higher limit.
+                // The model should NEVER output bash scripts as text. This check
+                // runs independently from the general hallucination nudge so that
+                // shell commands are always caught even after MAX_NUDGE_ATTEMPTS.
+                let has_shell_cmd =
+                    shell_nudge_count < MAX_SHELL_NUDGE_ATTEMPTS
+                        && contains_shell_command_pattern(&text);
+
+                if has_shell_cmd {
+                    shell_nudge_count += 1;
+                    if let Some(ref cb) = self.event_cb {
+                        cb(EventKind::HallucinationNudgeFired {
+                            nudge_count: shell_nudge_count as u64,
+                            trigger: "shell_command_pattern".to_string(),
+                        });
+                    }
+                    self.messages.push(ChatMessage::Assistant {
+                        content: Some(text),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                    });
+                    self.messages.push(ChatMessage::User {
+                        content: SHELL_COMMAND_NUDGE.to_string(),
+                    });
+                    continue;
+                }
+
                 // Anti-hallucination guard: if the model responds with a long text
                 // without using tools, nudge it to use tools instead of guessing.
                 // Fires in ALL modes including Ask/read-only — that's where users
@@ -1158,28 +1186,21 @@ impl<'a> ToolUseLoop<'a> {
                 // Allows up to MAX_NUDGE_ATTEMPTS nudges per turn before letting through.
                 // NOTE: No `tool_calls_made.is_empty()` guard — the model can revert to
                 // hallucination at any point, even after using tools earlier.
-                let (has_unverified_refs, has_shell_cmd) = if nudge_count < MAX_NUDGE_ATTEMPTS {
-                    (
-                        has_unverified_file_references(&text, &tool_calls_made),
-                        contains_shell_command_pattern(&text),
-                    )
+                let has_unverified_refs = if nudge_count < MAX_NUDGE_ATTEMPTS {
+                    has_unverified_file_references(&text, &tool_calls_made)
                 } else {
-                    (false, false)
+                    false
                 };
                 let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
-                    && (text.len() > HALLUCINATION_NUDGE_THRESHOLD
-                        || has_unverified_refs
-                        || has_shell_cmd);
+                    && (text.len() > HALLUCINATION_NUDGE_THRESHOLD || has_unverified_refs);
 
                 if should_nudge {
                     // Don't emit this attempt — inject a nudge and retry
                     nudge_count += 1;
-                    let trigger = if text.len() > HALLUCINATION_NUDGE_THRESHOLD {
-                        "long_response"
-                    } else if has_unverified_refs {
+                    let trigger = if has_unverified_refs {
                         "unverified_file_ref"
                     } else {
-                        "shell_command_pattern"
+                        "long_response"
                     };
                     if let Some(ref cb) = self.event_cb {
                         cb(EventKind::HallucinationNudgeFired {
