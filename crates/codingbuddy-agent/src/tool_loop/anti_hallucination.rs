@@ -31,10 +31,6 @@ pub(crate) const SHELL_COMMAND_NUDGE: &str = "STOP. You are outputting shell com
      - To search: call `fs_glob` or `fs_grep`\n\
      Execute actions through tools, do not print them as text.";
 
-/// Maximum number of shell-command-specific nudges. Separate from the general
-/// hallucination nudge counter so shell commands are always caught.
-pub(crate) const MAX_SHELL_NUDGE_ATTEMPTS: usize = 5;
-
 /// Known file extensions for path detection.
 const FILE_EXTENSIONS: &[&str] = &[
     ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".cpp", ".c", ".h", ".hpp", ".rb",
@@ -242,6 +238,37 @@ pub(crate) fn contains_shell_command_pattern(text: &str) -> bool {
     });
 
     BARE_SHELL.is_match(text)
+}
+
+/// Regex matching fenced bash/sh/shell/zsh code blocks.
+fn shell_block_regex() -> &'static regex::Regex {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?ms)^```(?:bash|sh|shell|zsh)\s*\n(.*?)^```").expect("valid regex")
+    });
+    &RE
+}
+
+/// Extract shell commands from bash/sh code blocks in the model's text response.
+///
+/// Returns a vec of individual command strings extracted from fenced code blocks.
+/// Multi-line blocks are joined into a single command string (the shell can handle
+/// compound commands, loops, etc.). Only extracts from bash/sh/shell/zsh blocks.
+pub(crate) fn extract_shell_commands(text: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    for cap in shell_block_regex().captures_iter(text) {
+        let block = cap[1].trim();
+        if !block.is_empty() {
+            commands.push(block.to_string());
+        }
+    }
+    commands
+}
+
+/// Strip bash/sh code blocks from text, leaving only the prose content.
+/// Used to extract the non-command parts of a response for the assistant message.
+pub(crate) fn strip_shell_blocks(text: &str) -> String {
+    shell_block_regex().replace_all(text, "").trim().to_string()
 }
 
 // ── Numeric consistency checking ──
@@ -539,5 +566,40 @@ mod tests {
             result.is_none(),
             "off-by-one difference should not trigger correction"
         );
+    }
+
+    #[test]
+    fn extract_shell_commands_from_code_blocks() {
+        let text = "I'll update the version:\n\n\
+            ```bash\ncd /project\nsed -i 's/old/new/' Cargo.toml\n```\n\n\
+            Then verify:\n\n\
+            ```sh\ncargo build\ncargo test\n```";
+        let commands = extract_shell_commands(text);
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].contains("sed -i"));
+        assert!(commands[1].contains("cargo build"));
+    }
+
+    #[test]
+    fn extract_shell_commands_skips_non_bash_blocks() {
+        let text = "Here's the code:\n\n\
+            ```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n\
+            And some bash:\n\n\
+            ```bash\necho hello\n```";
+        let commands = extract_shell_commands(text);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "echo hello");
+    }
+
+    #[test]
+    fn strip_shell_blocks_preserves_prose() {
+        let text = "First I'll check:\n\n\
+            ```bash\ngrep version Cargo.toml\n```\n\n\
+            Then update.";
+        let prose = strip_shell_blocks(text);
+        assert!(prose.contains("First I'll check"));
+        assert!(prose.contains("Then update"));
+        assert!(!prose.contains("grep version"));
+        assert!(!prose.contains("```bash"));
     }
 }

@@ -532,6 +532,60 @@ fn shell_command_pattern_detected() {
 }
 
 #[test]
+fn shell_blocks_auto_converted_to_tool_calls() {
+    // When the model outputs bash code blocks as text instead of calling tools,
+    // the loop should auto-convert them to bash_run tool calls.
+    let bash_response = make_text_response(
+        "I'll check the version:\n\n\
+         ```bash\ngrep version Cargo.toml\necho \"done\"\n```\n\n\
+         Then I'll update it.",
+    );
+    let llm = ScriptedLlm::new(vec![
+        bash_response,
+        make_text_response("Version bumped to 0.4.1."),
+    ]);
+
+    // The auto-converted bash_run call will be executed, returning a mock result.
+    let tool_host = Arc::new(MockToolHost::new(
+        vec![ToolResult {
+            invocation_id: uuid::Uuid::nil(),
+            success: true,
+            output: serde_json::json!({"stdout": "version = \"0.3.0\"", "exit_code": 0}),
+        }],
+        true,
+    ));
+
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host,
+        ToolLoopConfig::default(),
+        "system".to_string(),
+        default_tools(),
+    );
+
+    let result = loop_.run("bump the version").unwrap();
+    // The loop should have:
+    // 1. Received the bash text response
+    // 2. Auto-converted it to a bash_run tool call
+    // 3. Executed the tool call
+    // 4. Fed the result back to the LLM
+    // 5. Got the final text response
+    assert_eq!(result.response, "Version bumped to 0.4.1.");
+    assert!(
+        result.turns >= 2,
+        "should have at least 2 turns (auto-converted tool call + final response)"
+    );
+    // Verify a bash_run tool was executed
+    assert!(
+        result
+            .tool_calls_made
+            .iter()
+            .any(|tc| tc.tool_name == "bash_run"),
+        "should have executed a bash_run tool call"
+    );
+}
+
+#[test]
 fn tool_choice_required_per_new_question() {
     // In multi-turn, tool_choice=required should reset for each new user question.
     // The ScriptedLlm lets us verify via the request the loop builds.

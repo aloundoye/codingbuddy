@@ -53,8 +53,9 @@ use crate::tool_bridge;
 
 use anti_hallucination::{
     HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS,
-    MAX_SHELL_NUDGE_ATTEMPTS, SHELL_COMMAND_NUDGE, check_response_consistency,
-    contains_shell_command_pattern, extract_user_directives, has_unverified_file_references,
+    SHELL_COMMAND_NUDGE, check_response_consistency, contains_shell_command_pattern,
+    extract_shell_commands, extract_user_directives, has_unverified_file_references,
+    strip_shell_blocks,
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
@@ -933,7 +934,6 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
-        let mut shell_nudge_count: usize = 0;
         let mut truncation_retries: u8 = 0;
 
         let mut verbosity_nudge_count: usize = 0;
@@ -1068,7 +1068,7 @@ impl<'a> ToolUseLoop<'a> {
                 self.config.images.clear();
             }
 
-            let response = if let Some(ref cb) = self.stream_cb {
+            let mut response = if let Some(ref cb) = self.stream_cb {
                 self.llm.complete_chat_streaming(&request, cb.clone())?
             } else {
                 self.llm.complete_chat(&request)?
@@ -1148,36 +1148,44 @@ impl<'a> ToolUseLoop<'a> {
                 continue; // Retry the LLM call
             }
 
+            // Shell command auto-conversion: when the model outputs bash code
+            // blocks as text instead of calling tools, extract the commands and
+            // synthesize bash_run tool calls. This works around models (e.g.
+            // DeepSeek) that ignore tool_choice=required. The synthetic calls
+            // go through the normal permission pipeline. Must run BEFORE the
+            // tool_calls.is_empty() check so the converted calls flow into the
+            // normal tool execution path.
+            if response.tool_calls.is_empty() && contains_shell_command_pattern(&response.text) {
+                let commands = extract_shell_commands(&response.text);
+                if !commands.is_empty() {
+                    let prose = strip_shell_blocks(&response.text);
+                    response.tool_calls = commands
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, cmd)| LlmToolCall {
+                            id: format!("synthetic_{}", Uuid::new_v4().as_simple()),
+                            name: "bash_run".to_string(),
+                            arguments: serde_json::json!({
+                                "command": cmd,
+                                "description": format!("(auto-converted from text) command {}", i + 1),
+                            })
+                            .to_string(),
+                        })
+                        .collect();
+                    response.text = prose;
+
+                    if let Some(ref cb) = self.event_cb {
+                        cb(EventKind::HallucinationNudgeFired {
+                            nudge_count: response.tool_calls.len() as u64,
+                            trigger: "shell_auto_convert".to_string(),
+                        });
+                    }
+                }
+            }
+
             // No tool calls → return the text response (or nudge to use tools)
             if response.tool_calls.is_empty() {
                 let text = response.text.clone();
-
-                // Shell command detection — separate counter and higher limit.
-                // The model should NEVER output bash scripts as text. This check
-                // runs independently from the general hallucination nudge so that
-                // shell commands are always caught even after MAX_NUDGE_ATTEMPTS.
-                let has_shell_cmd =
-                    shell_nudge_count < MAX_SHELL_NUDGE_ATTEMPTS
-                        && contains_shell_command_pattern(&text);
-
-                if has_shell_cmd {
-                    shell_nudge_count += 1;
-                    if let Some(ref cb) = self.event_cb {
-                        cb(EventKind::HallucinationNudgeFired {
-                            nudge_count: shell_nudge_count as u64,
-                            trigger: "shell_command_pattern".to_string(),
-                        });
-                    }
-                    self.messages.push(ChatMessage::Assistant {
-                        content: Some(text),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                    });
-                    self.messages.push(ChatMessage::User {
-                        content: SHELL_COMMAND_NUDGE.to_string(),
-                    });
-                    continue;
-                }
 
                 // Anti-hallucination guard: if the model responds with a long text
                 // without using tools, nudge it to use tools instead of guessing.
