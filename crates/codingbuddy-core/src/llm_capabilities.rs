@@ -74,6 +74,20 @@ pub enum ThinkingCapability {
     ImplicitReasoning,
 }
 
+impl ThinkingCapability {
+    /// Whether this model accepts an explicit ThinkingConfig in the payload.
+    #[must_use]
+    pub fn accepts_thinking_config(self) -> bool {
+        matches!(self, Self::ExtendedThinking)
+    }
+
+    /// Whether this model has any form of reasoning capability.
+    #[must_use]
+    pub fn has_reasoning(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PreferredEditTool {

@@ -226,6 +226,43 @@ pub struct HookInput {
     pub workspace: String,
 }
 
+impl HookInput {
+    /// Create a new HookInput with just the event and workspace path.
+    /// All optional fields default to `None`.
+    pub fn new(event: HookEvent, workspace: &str) -> Self {
+        Self {
+            event: event.as_str().to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: workspace.to_string(),
+        }
+    }
+
+    pub fn with_tool(mut self, name: &str, input: serde_json::Value) -> Self {
+        self.tool_name = Some(name.to_string());
+        self.tool_input = Some(input);
+        self
+    }
+
+    pub fn with_result(mut self, result: serde_json::Value) -> Self {
+        self.tool_result = Some(result);
+        self
+    }
+
+    pub fn with_prompt(mut self, prompt: &str) -> Self {
+        self.prompt = Some(prompt.to_string());
+        self
+    }
+
+    pub fn with_session_type(mut self, session_type: &str) -> Self {
+        self.session_type = Some(session_type.to_string());
+        self
+    }
+}
+
 /// Decision from a hook's stdout JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HookOutput {

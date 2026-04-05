@@ -198,12 +198,32 @@ impl Default for CostTracker {
 }
 
 impl CostTracker {
-    /// Set pricing based on model name. Delegates to `codingbuddy_core::cost::get_pricing`.
+    /// Set pricing based on model name. Uses per-model pricing table from `cost.rs`.
     pub fn set_pricing_for_model(&mut self, model: &str) {
         let pricing = codingbuddy_core::cost::get_pricing(model);
         self.cost_per_million_input = pricing.input_per_million;
         self.cost_per_million_output = pricing.output_per_million;
         self.cache_discount = pricing.cache_discount;
+    }
+
+    /// Set pricing from resolved model capabilities. Falls back to the per-model
+    /// pricing table if the capabilities have zero costs (e.g. Ollama, OpenRouter).
+    #[allow(dead_code)]
+    pub fn set_pricing_from_capabilities(
+        &mut self,
+        model: &str,
+        caps: &codingbuddy_core::ModelCapabilities,
+    ) {
+        if caps.cost_per_mtok_input > 0.0 || caps.cost_per_mtok_output > 0.0 {
+            self.cost_per_million_input = caps.cost_per_mtok_input;
+            self.cost_per_million_output = caps.cost_per_mtok_output;
+        } else {
+            // Capabilities don't have pricing (local/free provider) — use per-model table
+            let pricing = codingbuddy_core::cost::get_pricing(model);
+            self.cost_per_million_input = pricing.input_per_million;
+            self.cost_per_million_output = pricing.output_per_million;
+            self.cache_discount = pricing.cache_discount;
+        }
     }
 
     /// Record token usage from an API response.

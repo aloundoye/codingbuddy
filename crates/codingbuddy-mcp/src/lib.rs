@@ -633,6 +633,89 @@ impl McpManager {
         self.refresh_tools()
     }
 
+    /// Fetch a prompt template with resolved arguments from an MCP server.
+    ///
+    /// Returns the rendered prompt messages as a JSON array.
+    pub fn get_prompt(
+        &self,
+        server_id: &str,
+        prompt_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let server = self
+            .get_server(server_id)?
+            .ok_or_else(|| anyhow!("MCP server '{server_id}' not found"))?;
+        let params = json!({
+            "name": prompt_name,
+            "arguments": arguments,
+        });
+        match server.transport {
+            McpTransport::Stdio => {
+                let response = execute_mcp_stdio_request(
+                    &server,
+                    "prompts/get",
+                    params,
+                    5,
+                    Duration::from_secs(10),
+                )?;
+                response
+                    .get("result")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("prompts/get returned no result"))
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("server has no URL"))?;
+                let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+                let response: serde_json::Value = client
+                    .post(url)
+                    .json(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "prompts/get",
+                        "params": params,
+                    }))
+                    .send()?
+                    .json()?;
+                response
+                    .get("result")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("prompts/get returned no result"))
+            }
+        }
+    }
+
+    /// Handle an MCP elicitation request — the server is asking the user for input.
+    ///
+    /// Takes the elicitation parameters (message, schema) and a callback that
+    /// prompts the user. Returns the user's response to send back to the server.
+    pub fn handle_elicitation(
+        &self,
+        server_id: &str,
+        params: &serde_json::Value,
+        user_prompt_cb: &dyn Fn(&str, &serde_json::Value) -> Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let message = params
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Server requests input");
+        let schema = params.get("requestedSchema").cloned().unwrap_or(json!({}));
+        match user_prompt_cb(message, &schema) {
+            Some(response) => Ok(json!({
+                "action": "accept",
+                "content": response,
+            })),
+            None => Ok(json!({
+                "action": "decline",
+                "content": {
+                    "reason": format!("User declined elicitation from server '{server_id}'")
+                },
+            })),
+        }
+    }
+
     /// Load managed MCP config (enterprise lockdown).
     /// This is read from a system-wide location and cannot be overridden by users.
     pub fn load_managed_mcp_config() -> Option<McpConfig> {

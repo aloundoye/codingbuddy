@@ -514,7 +514,8 @@ impl ApiClient {
             .thinking
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
-        let thinking_enabled = requested_thinking && capabilities.supports_thinking_config;
+        let thinking_enabled =
+            requested_thinking && capabilities.thinking_capability.accepts_thinking_config();
         let prepared_messages = provider_transform::preflight_chat_messages(req, &capabilities)?;
         let mut compatibility = AppliedCompatibility {
             provider: capabilities.provider.as_key().to_string(),
@@ -577,7 +578,7 @@ impl ApiClient {
         // Safety net: deepseek-reasoner thinks natively and rejects both
         // `thinking` config AND `tool_choice` (HTTP 400). The callers should
         // already omit these, but guard here as the last line of defense.
-        if capabilities.supports_thinking_config
+        if capabilities.thinking_capability.accepts_thinking_config()
             && let Some(ref thinking) = req.thinking
         {
             payload["thinking"] = serde_json::to_value(thinking)?;
@@ -1271,7 +1272,7 @@ impl ApiClient {
             && self
                 .cfg
                 .capabilities_for_model(&req.model)
-                .is_some_and(|caps| caps.supports_thinking_config);
+                .is_some_and(|caps| caps.thinking_capability.accepts_thinking_config());
         if !thinking_enabled {
             return Ok(());
         }
@@ -1350,24 +1351,35 @@ impl ApiClient {
             .thinking
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
-        if thinking_requested && !caps.supports_thinking_config {
-            if caps.provider == ProviderKind::OpenAiCompatible {
-                // OpenAI-compatible proxies may accept a coarse reasoning hint via
-                // `reasoning_effort`; handled by provider payload compatibility.
-                return Ok(());
+        if thinking_requested && !caps.thinking_capability.accepts_thinking_config() {
+            match caps.thinking_capability {
+                codingbuddy_core::ThinkingCapability::ImplicitReasoning => {
+                    // OpenAI o1/o3 style: reasoning is implicit, coarse hint via reasoning_effort
+                    return Ok(());
+                }
+                codingbuddy_core::ThinkingCapability::NativeReasoning => {
+                    return Err(anyhow!(
+                        "model '{}' uses native reasoning mode and rejects explicit thinking config (capability rules: {}); remove thinking config for this model",
+                        req.model,
+                        applied_rules
+                    ));
+                }
+                codingbuddy_core::ThinkingCapability::None => {
+                    // OpenAI-compatible proxies may accept a coarse reasoning hint
+                    // via `reasoning_effort`; handled by provider payload compatibility.
+                    if caps.provider == ProviderKind::OpenAiCompatible {
+                        return Ok(());
+                    }
+                    return Err(anyhow!(
+                        "model '{}' does not support thinking config (capability rules: {}); disable thinking or switch models",
+                        req.model,
+                        applied_rules
+                    ));
+                }
+                codingbuddy_core::ThinkingCapability::ExtendedThinking => {
+                    // Should not reach here — accepts_thinking_config() is true
+                }
             }
-            if caps.supports_reasoning_mode {
-                return Err(anyhow!(
-                    "model '{}' uses native reasoning mode and rejects explicit thinking config (capability rules: {}); remove thinking config for this model",
-                    req.model,
-                    applied_rules
-                ));
-            }
-            return Err(anyhow!(
-                "model '{}' does not support thinking config (capability rules: {}); disable thinking or switch models",
-                req.model,
-                applied_rules
-            ));
         }
 
         if !thinking_requested && req.top_logprobs.is_some() && req.logprobs != Some(true) {

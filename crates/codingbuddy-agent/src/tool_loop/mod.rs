@@ -162,6 +162,9 @@ pub struct ToolUseLoop<'a> {
     phase_edit_calls: usize,
     /// Active worktree isolation (if enter_worktree was called).
     pub(crate) active_worktree: Option<codingbuddy_subagent::WorktreeIsolation>,
+    /// Recently accessed file paths, ordered by most recent access.
+    /// Used for post-compaction re-injection of active context.
+    recent_file_accesses: Vec<String>,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -241,6 +244,7 @@ impl<'a> ToolUseLoop<'a> {
             phase_read_only_calls: 0,
             phase_edit_calls: 0,
             active_worktree: None,
+            recent_file_accesses: Vec::new(),
         }
     }
 
@@ -2065,6 +2069,11 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
 
+        // Track file accesses for post-compaction re-injection
+        if success && let Some(path) = parsed_args.get("path").and_then(|v| v.as_str()) {
+            self.track_file_access(path);
+        }
+
         // Fire PostToolUse hook
         if let Some(ref hooks) = self.hooks {
             let input = HookInput {
@@ -2494,15 +2503,8 @@ impl<'a> ToolUseLoop<'a> {
 
         // Fire PreCompact hook if configured
         if let Some(ref hooks) = self.hooks {
-            let input = HookInput {
-                event: "pre_compact".to_string(),
-                tool_name: None,
-                tool_input: None,
-                tool_result: Some(serde_json::Value::String(summary.clone())),
-                prompt: None,
-                session_type: None,
-                workspace: self.workspace_str().to_string(),
-            };
+            let mut input = HookInput::new(HookEvent::PreCompact, self.workspace_str());
+            input.tool_result = Some(serde_json::Value::String(summary.clone()));
             Self::fire_hook_logged(hooks, HookEvent::PreCompact, &input);
         }
 
@@ -2577,17 +2579,16 @@ impl<'a> ToolUseLoop<'a> {
 
         self.messages = new_messages;
 
+        // Re-inject recently active files so the model retains awareness
+        if let Some(file_context) = self.build_post_compact_file_context(5) {
+            self.messages.push(ChatMessage::System {
+                content: file_context,
+            });
+        }
+
         // Fire PostCompact hook if configured
         if let Some(ref hooks) = self.hooks {
-            let input = HookInput {
-                event: HookEvent::PostCompact.as_str().to_string(),
-                tool_name: None,
-                tool_input: None,
-                tool_result: None,
-                prompt: None,
-                session_type: None,
-                workspace: self.workspace_str().to_string(),
-            };
+            let input = HookInput::new(HookEvent::PostCompact, self.workspace_str());
             Self::fire_hook_logged(hooks, HookEvent::PostCompact, &input);
         }
 
@@ -2753,6 +2754,37 @@ impl<'a> ToolUseLoop<'a> {
     /// Emit a stream chunk to the callback.
     fn emit(&self, chunk: StreamChunk) {
         event_emission::emit(self, chunk);
+    }
+
+    /// Track a file path access for post-compaction re-injection.
+    fn track_file_access(&mut self, path: &str) {
+        // Move to front if already tracked, otherwise push
+        self.recent_file_accesses.retain(|p| p != path);
+        self.recent_file_accesses.insert(0, path.to_string());
+        // Keep at most 20 tracked paths
+        self.recent_file_accesses.truncate(20);
+    }
+
+    /// Build re-injection context from recently accessed files after compaction.
+    /// Returns a System message summarizing the top N most-accessed files.
+    fn build_post_compact_file_context(&self, max_files: usize) -> Option<String> {
+        let files: Vec<&str> = self
+            .recent_file_accesses
+            .iter()
+            .take(max_files)
+            .map(|s| s.as_str())
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        let file_list = files
+            .iter()
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "RECENTLY ACTIVE FILES (re-read if needed for current task):\n{file_list}"
+        ))
     }
 }
 
