@@ -1607,49 +1607,76 @@ pub struct McpOAuthToken {
 }
 
 /// Store an OAuth token for an MCP server.
+/// Tries system keychain first, falls back to file-based storage.
 pub fn store_mcp_token(server_id: &str, token: &McpOAuthToken) -> Result<()> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| anyhow::anyhow!("cannot determine home directory"))?;
-    let dir = PathBuf::from(home).join(".codingbuddy/mcp-tokens");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", server_id));
-    let json = serde_json::to_string_pretty(token)?;
-    fs::write(&path, json)?;
-    // Restrict permissions on Unix
-    #[cfg(unix)]
+    let json = serde_json::to_string(token)?;
+
+    if let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id)
+        && entry.set_password(&json).is_ok()
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&path, perms)?;
+        return Ok(());
     }
-    Ok(())
+
+    store_token_file(server_id, &json)
 }
 
 /// Load a stored OAuth token for an MCP server.
+/// Tries system keychain first, falls back to file-based storage.
 pub fn load_mcp_token(server_id: &str) -> Result<Option<McpOAuthToken>> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| anyhow::anyhow!("cannot determine home directory"))?;
-    let path = PathBuf::from(home).join(format!(".codingbuddy/mcp-tokens/{}.json", server_id));
-    if !path.exists() {
-        return Ok(None);
+    if let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id)
+        && let Ok(json) = entry.get_password()
+        && let Ok(token) = serde_json::from_str::<McpOAuthToken>(&json)
+    {
+        return Ok(Some(token));
     }
-    let raw = fs::read_to_string(path)?;
-    let token: McpOAuthToken = serde_json::from_str(&raw)?;
-    Ok(Some(token))
+
+    load_token_file(server_id)
 }
 
-/// Delete a stored OAuth token.
+/// Delete a stored OAuth token from both keychain and file.
 pub fn delete_mcp_token(server_id: &str) -> Result<()> {
+    if let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id) {
+        let _ = entry.delete_credential();
+    }
+    delete_token_file(server_id)
+}
+
+fn token_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| anyhow::anyhow!("cannot determine home directory"))?;
-    let path = PathBuf::from(home).join(format!(".codingbuddy/mcp-tokens/{}.json", server_id));
-    if path.exists() {
-        fs::remove_file(path)?;
+    Ok(PathBuf::from(home).join(".codingbuddy/mcp-tokens"))
+}
+
+fn store_token_file(server_id: &str, json: &str) -> Result<()> {
+    let dir = token_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{server_id}.json"));
+    fs::write(&path, json)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+fn load_token_file(server_id: &str) -> Result<Option<McpOAuthToken>> {
+    let path = token_dir()?.join(format!("{server_id}.json"));
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn delete_token_file(server_id: &str) -> Result<()> {
+    let path = token_dir()?.join(format!("{server_id}.json"));
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ── OAuth 2.0 for MCP ────────────────────────────────────────────────────────
