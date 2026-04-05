@@ -230,7 +230,17 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         SlashCommand::Init => {
                             let manager = MemoryManager::new(cwd)?;
                             let path = manager.ensure_initialized()?;
-                            format!("initialized memory at {}", path.display())
+                            let detected = crate::commands::init::detect_project(cwd);
+                            let settings_written =
+                                crate::commands::init::write_project_settings(cwd, &detected)
+                                    .unwrap_or(false);
+                            let mut msg = format!("initialized memory at {}", path.display());
+                            let summary = detected.summary(settings_written);
+                            if !summary.is_empty() {
+                                msg.push('\n');
+                                msg.push_str(&summary);
+                            }
+                            msg
                         }
                         SlashCommand::Clear => "cleared".to_string(),
                         SlashCommand::Compact(focus) => {

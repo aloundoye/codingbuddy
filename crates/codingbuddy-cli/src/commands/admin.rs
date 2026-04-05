@@ -160,177 +160,351 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
     let payload = doctor_payload(cwd, &args)?;
     if json_mode {
         print_json(&payload)?;
-    } else {
-        println!(
-            "doctor: os={} arch={} shell={}",
-            payload["os"].as_str().unwrap_or_default(),
-            payload["arch"].as_str().unwrap_or_default(),
-            payload["shell"].as_str().unwrap_or_default()
-        );
-        println!(
-            "toolchain: {} | {}",
-            payload["toolchain"]["rustc"]
-                .as_str()
-                .unwrap_or("unavailable"),
+        return Ok(());
+    }
+
+    // ── Header ──
+    println!("\x1b[1mCodingBuddy Doctor\x1b[0m");
+    println!();
+
+    // ── Environment ──
+    print_section("Environment");
+    print_check(
+        true,
+        &format!(
+            "OS: {} {}",
+            payload["os"].as_str().unwrap_or("?"),
+            payload["arch"].as_str().unwrap_or("?"),
+        ),
+    );
+    print_check(
+        true,
+        &format!("Shell: {}", payload["shell"].as_str().unwrap_or("?"),),
+    );
+    if let Some(bin) = payload["binary_path"].as_str() {
+        print_check(true, &format!("Binary: {bin}"));
+    }
+    println!();
+
+    // ── Toolchain ──
+    print_section("Toolchain");
+    let git_ok = payload["checks"]["git"].as_bool().unwrap_or(false);
+    let rg_ok = payload["checks"]["rg"].as_bool().unwrap_or(false);
+    let cargo_ok = payload["checks"]["cargo"].as_bool().unwrap_or(false);
+    print_check(
+        git_ok,
+        &format!("git: {}", if git_ok { "found" } else { "NOT FOUND" }),
+    );
+    print_check(
+        rg_ok,
+        &format!(
+            "ripgrep (rg): {}",
+            if rg_ok {
+                "found"
+            } else {
+                "NOT FOUND — file search will be slower"
+            }
+        ),
+    );
+    print_check(
+        cargo_ok,
+        &format!(
+            "cargo: {}",
             payload["toolchain"]["cargo"]
                 .as_str()
-                .unwrap_or("unavailable")
-        );
-        println!(
-            "llm: profile={} base={} max={} endpoint={} api_key_env_set={} api_key_configured={}",
-            payload["llm"]["profile"].as_str().unwrap_or_default(),
-            payload["llm"]["base_model"].as_str().unwrap_or_default(),
-            payload["llm"]["max_think_model"]
+                .unwrap_or("not found")
+        ),
+    );
+    let tsc_ok = payload["checks"]["tsc"].as_bool().unwrap_or(false);
+    let python_ok = payload["checks"]["python"].as_bool().unwrap_or(false);
+    let go_ok = payload["checks"]["go"].as_bool().unwrap_or(false);
+    print_check(
+        tsc_ok,
+        &format!(
+            "tsc: {}",
+            if tsc_ok {
+                "found (TypeScript validation)"
+            } else {
+                "not found (TypeScript validation disabled)"
+            }
+        ),
+    );
+    print_check(
+        python_ok,
+        &format!(
+            "python: {}",
+            if python_ok {
+                "found (Python validation)"
+            } else {
+                "not found (Python validation disabled)"
+            }
+        ),
+    );
+    print_check(
+        go_ok,
+        &format!(
+            "go: {}",
+            if go_ok {
+                "found (Go validation)"
+            } else {
+                "not found (Go validation disabled)"
+            }
+        ),
+    );
+    let gh_ok = payload["checks"]["gh"].as_bool().unwrap_or(false);
+    print_check(
+        gh_ok,
+        &format!(
+            "gh: {}",
+            if gh_ok {
+                "found (GitHub CLI)"
+            } else {
+                "not found (GitHub features unavailable)"
+            }
+        ),
+    );
+    println!();
+
+    // ── LLM Provider ──
+    print_section("LLM Provider");
+    let api_key_ok = payload["llm"]["api_key_env_set"].as_bool().unwrap_or(false)
+        || payload["llm"]["api_key_configured"]
+            .as_bool()
+            .unwrap_or(false);
+    print_check(
+        api_key_ok,
+        &format!(
+            "API key: {}",
+            if api_key_ok {
+                "configured"
+            } else {
+                "MISSING — run `codingbuddy setup`"
+            },
+        ),
+    );
+    print_check(
+        true,
+        &format!(
+            "Provider: {} ({})",
+            payload["llm"]["provider"].as_str().unwrap_or("?"),
+            payload["llm"]["active_provider_kind"]
                 .as_str()
-                .unwrap_or_default(),
-            payload["llm"]["endpoint"].as_str().unwrap_or_default(),
-            payload["llm"]["api_key_env_set"].as_bool().unwrap_or(false),
-            payload["llm"]["api_key_configured"]
+                .unwrap_or("unknown"),
+        ),
+    );
+    print_check(
+        true,
+        &format!(
+            "Models: base={} reasoner={}",
+            payload["llm"]["base_model"].as_str().unwrap_or("?"),
+            payload["llm"]["max_think_model"].as_str().unwrap_or("none"),
+        ),
+    );
+    if let Some(models) = payload["llm"]["capability_profiles"].as_array() {
+        for item in models {
+            let model = item["model"].as_str().unwrap_or("?");
+            let tools = item["constraints"]["tool_protocol"]["tool_calling"]
                 .as_bool()
-                .unwrap_or(false),
-        );
-        if let Some(kind) = payload["llm"]["active_provider_kind"].as_str() {
-            println!("llm provider kind: {kind}");
+                .unwrap_or(false);
+            let thinking = item["constraints"]["reasoning"]["thinking_config"]
+                .as_bool()
+                .unwrap_or(false)
+                || item["constraints"]["reasoning"]["reasoning_mode"]
+                    .as_bool()
+                    .unwrap_or(false);
+            let images = item["constraints"]["modality"]["image_input"]
+                .as_bool()
+                .unwrap_or(false);
+            let features: Vec<&str> = [
+                if tools { Some("tools") } else { None },
+                if thinking { Some("thinking") } else { None },
+                if images { Some("vision") } else { None },
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            print_check(true, &format!("  {model}: {}", features.join(", ")));
         }
-        if let Some(models) = payload["llm"]["capability_profiles"].as_array()
-            && !models.is_empty()
+    }
+    println!();
+
+    // ── MCP Servers ──
+    print_section("MCP Servers");
+    match codingbuddy_mcp::McpManager::new(cwd) {
+        Ok(mcp_manager) => match mcp_manager.list_servers() {
+            Ok(mcp_servers) if mcp_servers.is_empty() => {
+                print_info("No MCP servers configured");
+            }
+            Ok(mcp_servers) => {
+                for server in &mcp_servers {
+                    let transport = match server.transport {
+                        codingbuddy_mcp::McpTransport::Stdio => {
+                            let cmd = server.command.as_deref().unwrap_or("?");
+                            format!("stdio: {cmd}")
+                        }
+                        codingbuddy_mcp::McpTransport::Http => {
+                            let url = server.url.as_deref().unwrap_or("?");
+                            format!("http: {url}")
+                        }
+                        codingbuddy_mcp::McpTransport::Sse => {
+                            let url = server.url.as_deref().unwrap_or("?");
+                            format!("sse: {url}")
+                        }
+                    };
+                    print_check(server.enabled, &format!("{}: {transport}", server.id));
+                }
+            }
+            Err(_) => print_info("Could not load MCP server list"),
+        },
+        Err(_) => print_info("MCP manager unavailable"),
+    }
+    println!();
+
+    // ── Plugins ──
+    print_section("Plugins");
+    let installed = payload["plugins"]["installed"].as_u64().unwrap_or(0);
+    let enabled = payload["plugins"]["enabled"].as_u64().unwrap_or(0);
+    if installed == 0 {
+        print_info("No plugins installed");
+    } else {
+        print_check(true, &format!("{installed} installed, {enabled} enabled"));
+    }
+    println!();
+
+    // ── Local ML ──
+    print_section("Local ML");
+    let ml_enabled = payload["local_ml"]["enabled"].as_bool().unwrap_or(false);
+    print_check(
+        ml_enabled,
+        &format!(
+            "Local ML: {}",
+            if ml_enabled {
+                "enabled"
+            } else {
+                "disabled (run `codingbuddy setup --local-ml` to enable)"
+            },
+        ),
+    );
+    if ml_enabled {
+        let privacy = payload["local_ml"]["privacy_enabled"]
+            .as_bool()
+            .unwrap_or(false);
+        let autocomplete = payload["local_ml"]["autocomplete_enabled"]
+            .as_bool()
+            .unwrap_or(false);
+        print_check(
+            privacy,
+            &format!(
+                "Privacy scanning: {}",
+                if privacy { "enabled" } else { "disabled" }
+            ),
+        );
+        print_check(
+            autocomplete,
+            &format!(
+                "Autocomplete: {}",
+                if autocomplete { "enabled" } else { "disabled" }
+            ),
+        );
+        if let Some(summary) = payload["local_ml"]["runtime"]["summary"].as_str()
+            && !summary.is_empty()
         {
-            println!("capabilities:");
-            for item in models {
-                let model = item["model"].as_str().unwrap_or_default();
-                let provider = item["provider"].as_str().unwrap_or_default();
-                let family = item["family"].as_str().unwrap_or_default();
-                let thinking = item["constraints"]["reasoning"]["thinking_config"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let reasoning = item["constraints"]["reasoning"]["reasoning_mode"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let tool_choice = item["constraints"]["tool_protocol"]["tool_choice"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let images = item["constraints"]["modality"]["image_input"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let rules = item["applied_rules"]
-                    .as_array()
-                    .map_or(0usize, std::vec::Vec::len);
-                let compatibility = item["compatibility"]["summary"]
-                    .as_str()
-                    .unwrap_or_default();
-                println!(
-                    "- model={} provider={} family={} thinking={} reasoning={} tool_choice={} images={} rules={}",
-                    model, provider, family, thinking, reasoning, tool_choice, images, rules
+            print_info(&format!("Runtime: {summary}"));
+        }
+    }
+    println!();
+
+    // ── Storage ──
+    print_section("Storage");
+    let runtime_dir = payload["runtime_dir"].as_str().unwrap_or("?");
+    print_check(true, &format!("Runtime: {runtime_dir}"));
+    if let Some(bytes) = payload["storage"]["bytes"].as_u64() {
+        let mb = bytes as f64 / 1_048_576.0;
+        let healthy = mb < 500.0;
+        print_check(
+            healthy,
+            &format!(
+                "Session storage: {:.1} MB{}",
+                mb,
+                if !healthy {
+                    " (consider running `codingbuddy clean`)"
+                } else {
+                    ""
+                },
+            ),
+        );
+    }
+    if let Some(count) = payload["storage"]["session_count"].as_u64() {
+        print_check(true, &format!("{count} sessions stored"));
+    }
+    println!();
+
+    // ── Config ──
+    print_section("Configuration");
+    if let Some(paths) = payload["config_paths"].as_object() {
+        for (name, path) in paths {
+            if let Some(p) = path.as_str() {
+                let exists = std::path::Path::new(p).exists();
+                print_check(
+                    exists,
+                    &format!("{name}: {p}{}", if exists { "" } else { " (not found)" }),
                 );
-                if !compatibility.is_empty() {
-                    println!("  compatibility={compatibility}");
-                }
-            }
-        }
-        println!(
-            "plugins: enabled={} installed={}",
-            payload["plugins"]["enabled"].as_u64().unwrap_or(0),
-            payload["plugins"]["installed"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "local_ml: enabled={} privacy={} autocomplete={}",
-            payload["local_ml"]["enabled"].as_bool().unwrap_or(false),
-            payload["local_ml"]["privacy_enabled"]
-                .as_bool()
-                .unwrap_or(false),
-            payload["local_ml"]["autocomplete_enabled"]
-                .as_bool()
-                .unwrap_or(false),
-        );
-        if payload["local_ml"]["runtime"].is_object() {
-            let warm_models = payload["local_ml"]["runtime"]["warm_models"]
-                .as_array()
-                .map_or(0usize, std::vec::Vec::len);
-            let max_loaded = payload["local_ml"]["runtime"]["max_loaded_models"]
-                .as_u64()
-                .unwrap_or(0);
-            let keep_warm = payload["local_ml"]["runtime"]["keep_warm_secs"]
-                .as_u64()
-                .unwrap_or(0);
-            let max_concurrent_requests =
-                payload["local_ml"]["runtime"]["scheduler"]["max_concurrent_requests"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let max_queue_depth = payload["local_ml"]["runtime"]["scheduler"]["max_queue_depth"]
-                .as_u64()
-                .unwrap_or(0);
-            let max_queue_wait_ms =
-                payload["local_ml"]["runtime"]["scheduler"]["max_queue_wait_ms"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let queue_peak = payload["local_ml"]["runtime"]["metrics"]["max_observed_queue_depth"]
-                .as_u64()
-                .unwrap_or(0);
-            let queue_enqueued = payload["local_ml"]["runtime"]["metrics"]["total_queue_enqueued"]
-                .as_u64()
-                .unwrap_or(0);
-            let queue_completed =
-                payload["local_ml"]["runtime"]["metrics"]["total_queue_completed"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let queue_rejected = payload["local_ml"]["runtime"]["metrics"]["total_queue_rejected"]
-                .as_u64()
-                .unwrap_or(0);
-            let queue_wait_timeouts =
-                payload["local_ml"]["runtime"]["metrics"]["total_queue_wait_timeouts"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let capacity_evictions =
-                payload["local_ml"]["runtime"]["metrics"]["total_capacity_evictions"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let idle_evictions = payload["local_ml"]["runtime"]["metrics"]["total_idle_evictions"]
-                .as_u64()
-                .unwrap_or(0);
-            let pressure_evictions =
-                payload["local_ml"]["runtime"]["metrics"]["total_memory_pressure_evictions"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let memory_denied =
-                payload["local_ml"]["runtime"]["metrics"]["total_memory_admission_denied"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let runner_reloads = payload["local_ml"]["runtime"]["metrics"]["total_runner_reloads"]
-                .as_u64()
-                .unwrap_or(0);
-            let runner_load_waits =
-                payload["local_ml"]["runtime"]["metrics"]["total_runner_load_waits"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let runner_load_failures =
-                payload["local_ml"]["runtime"]["metrics"]["total_runner_load_failures"]
-                    .as_u64()
-                    .unwrap_or(0);
-            let recent_events = payload["local_ml"]["runtime"]["recent_events"]
-                .as_array()
-                .map_or(0usize, std::vec::Vec::len);
-            println!(
-                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=concurrency:{max_concurrent_requests}/max:{max_queue_depth}/wait_ms:{max_queue_wait_ms}/enq:{queue_enqueued}/done:{queue_completed}/rejected:{queue_rejected}/timeouts:{queue_wait_timeouts}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions}/memory_pressure:{pressure_evictions} memory_denied:{memory_denied} load_waits:{runner_load_waits} reloads:{runner_reloads} load_failures:{runner_load_failures} events={recent_events}"
-            );
-            if let Some(summary) = payload["local_ml"]["runtime"]["summary"].as_str()
-                && !summary.is_empty()
-            {
-                println!("local_ml_runtime_summary: {summary}");
-            }
-        }
-        if let Some(warnings) = payload["warnings"].as_array()
-            && !warnings.is_empty()
-        {
-            println!("warnings:");
-            for warning in warnings {
-                if let Some(text) = warning.as_str() {
-                    println!("- {text}");
-                }
             }
         }
     }
+    println!();
+
+    // ── Hooks ──
+    print_section("Hooks");
+    let hooks_count = payload["hooks"]["count"].as_u64().unwrap_or(0);
+    if hooks_count == 0 {
+        print_info("No hooks configured");
+    } else {
+        print_check(true, &format!("{hooks_count} hook event(s) configured"));
+    }
+    println!();
+
+    // ── Warnings ──
+    if let Some(warnings) = payload["warnings"].as_array()
+        && !warnings.is_empty()
+    {
+        print_section("Warnings");
+        for warning in warnings {
+            if let Some(text) = warning.as_str() {
+                println!("  \x1b[33m!\x1b[0m {text}");
+            }
+        }
+        println!();
+    }
+
+    // ── Summary ──
+    let warning_count = payload["warnings"].as_array().map_or(0, |w| w.len());
+    if warning_count == 0 && api_key_ok {
+        println!("  \x1b[32mAll checks passed.\x1b[0m");
+    } else {
+        println!(
+            "  \x1b[33m{warning_count} warning(s) found.\x1b[0m Run \x1b[1mcodingbuddy setup\x1b[0m to fix."
+        );
+    }
 
     Ok(())
+}
+
+fn print_section(name: &str) {
+    println!("  \x1b[1;36m{name}\x1b[0m");
+}
+
+fn print_check(ok: bool, msg: &str) {
+    let icon = if ok {
+        "\x1b[32m✓\x1b[0m"
+    } else {
+        "\x1b[31m✗\x1b[0m"
+    };
+    println!("    {icon} {msg}");
+}
+
+fn print_info(msg: &str) {
+    println!("    \x1b[90m- {msg}\x1b[0m");
 }
 
 pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json::Value> {
@@ -366,7 +540,16 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         "rg": command_exists("rg"),
         "cargo": command_exists("cargo"),
         "shell": command_exists(shell.split(std::path::MAIN_SEPARATOR).next_back().unwrap_or("sh")),
+        "tsc": command_exists("tsc"),
+        "python": command_exists("python3") || command_exists("python"),
+        "go": command_exists("go"),
+        "gh": command_exists("gh"),
     });
+
+    let hooks_count = cfg.hooks.as_object().map_or(0, |m| m.len());
+
+    let storage_bytes = store.storage_bytes().ok();
+    let session_count = store.list_sessions().ok().map(|s| s.len());
 
     let mut warnings = Vec::new();
     if !api_key_env_set && !api_key_configured {
@@ -502,6 +685,13 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "privacy_enabled": cfg.local_ml.privacy.enabled,
             "autocomplete_enabled": cfg.local_ml.autocomplete.enabled,
             "runtime": local_ml_runtime,
+        },
+        "hooks": {
+            "count": hooks_count,
+        },
+        "storage": {
+            "bytes": storage_bytes,
+            "session_count": session_count,
         },
         "checks": checks,
         "warnings": warnings,
