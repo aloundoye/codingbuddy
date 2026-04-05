@@ -1461,6 +1461,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::Error { .. } => "Error",
                         codingbuddy_core::StreamChunk::PhaseTransition { .. } => "PhaseTransition",
                         codingbuddy_core::StreamChunk::ModelChanged { .. } => "ModelChanged",
+                        codingbuddy_core::StreamChunk::ConfigReloaded { .. } => "ConfigReloaded",
                         codingbuddy_core::StreamChunk::ToolCallReady { .. } => "ToolCallReady",
                         codingbuddy_core::StreamChunk::ToolProgress { .. } => "ToolProgress",
                         codingbuddy_core::StreamChunk::Done { .. } => "Done",
@@ -1479,6 +1480,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::WatchTriggered { digest, comment_count } => serde_json::json!({ "digest": digest, "comment_count": comment_count }),
                         codingbuddy_core::StreamChunk::Error { message, recoverable } => serde_json::json!({ "message": message, "recoverable": recoverable }),
                         codingbuddy_core::StreamChunk::ToolProgress { tool_name, data } => serde_json::json!({ "tool_name": tool_name, "data": data }),
+                        codingbuddy_core::StreamChunk::ConfigReloaded { path } => serde_json::json!({ "path": path }),
                         _ => serde_json::json!({}),
                     }
                 });
@@ -1589,6 +1591,9 @@ pub(crate) fn run_chat(
                         let mut handle = out.lock();
                         let _ = writeln!(handle, "  \x1b[36m⟳ Model:\x1b[0m {model}");
                         let _ = handle.flush();
+                    }
+                    codingbuddy_core::StreamChunk::ConfigReloaded { path } => {
+                        eprintln!("  \x1b[33m\u{27f3}\x1b[0m  Config reloaded: {path}");
                     }
                     codingbuddy_core::StreamChunk::UsageUpdate { .. } => {}
                     codingbuddy_core::StreamChunk::ClearStreamingText => {}
@@ -1911,6 +1916,9 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                 StreamChunk::ModelChanged { model } => {
                     let _ = writeln!(handle, "[model changed: {model}]");
                     let _ = handle.flush();
+                }
+                StreamChunk::ConfigReloaded { path } => {
+                    eprintln!("  \x1b[33m\u{27f3}\x1b[0m  Config reloaded: {path}");
                 }
                 StreamChunk::UsageUpdate { .. } => {}
                 StreamChunk::ClearStreamingText => {

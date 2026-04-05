@@ -360,6 +360,7 @@ fn compaction_summary_lists_modified_files() {
         ChatMessage::Tool {
             tool_call_id: "c1".to_string(),
             content: "Edited successfully".to_string(),
+            tool_name: None,
         },
         ChatMessage::Assistant {
             content: None,
@@ -373,6 +374,7 @@ fn compaction_summary_lists_modified_files() {
         ChatMessage::Tool {
             tool_call_id: "c2".to_string(),
             content: "# README".to_string(),
+            tool_name: None,
         },
     ];
     let summary = build_compaction_summary(&messages);
@@ -396,10 +398,12 @@ fn compaction_summary_captures_errors() {
         ChatMessage::Tool {
             tool_call_id: "c1".to_string(),
             content: "error[E0308]: mismatched types\n  expected `u32`".to_string(),
+            tool_name: None,
         },
         ChatMessage::Tool {
             tool_call_id: "c2".to_string(),
             content: "test result: FAILED. 1 failed".to_string(),
+            tool_name: None,
         },
     ];
     let summary = build_compaction_summary(&messages);

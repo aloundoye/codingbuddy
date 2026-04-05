@@ -88,6 +88,25 @@ const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
 
 /// Return `Some(args_json)` only for read tools (needed for anti-hallucination
 /// path extraction). Write/agent tools don't need the raw JSON stored.
+/// Transform the content of a `ChatMessage::Tool`, preserving all other fields.
+/// Non-Tool messages pass through unchanged.
+fn map_tool_content(msg: ChatMessage, f: impl FnOnce(String) -> String) -> ChatMessage {
+    if let ChatMessage::Tool {
+        tool_call_id,
+        content,
+        tool_name,
+    } = msg
+    {
+        ChatMessage::Tool {
+            tool_call_id,
+            content: f(content),
+            tool_name,
+        }
+    } else {
+        msg
+    }
+}
+
 fn args_json_for_record(tool_name: &str, raw_args: &str) -> Option<String> {
     if anti_hallucination::READ_TOOL_NAMES.contains(&tool_name) {
         Some(raw_args.to_string())
@@ -165,6 +184,8 @@ pub struct ToolUseLoop<'a> {
     /// Recently accessed file paths, ordered by most recent access.
     /// Used for post-compaction re-injection of active context.
     recent_file_accesses: Vec<String>,
+    /// Optional config watcher for hot-reload polling between turns.
+    config_watcher: Option<&'a codingbuddy_core::config_watcher::ConfigWatcher>,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -245,6 +266,7 @@ impl<'a> ToolUseLoop<'a> {
             phase_edit_calls: 0,
             active_worktree: None,
             recent_file_accesses: Vec::new(),
+            config_watcher: None,
         }
     }
 
@@ -840,6 +862,14 @@ impl<'a> ToolUseLoop<'a> {
         self.checkpoint_cb = Some(cb);
     }
 
+    /// Set the config watcher for hot-reload polling between tool-use turns.
+    pub fn set_config_watcher(
+        &mut self,
+        watcher: &'a codingbuddy_core::config_watcher::ConfigWatcher,
+    ) {
+        self.config_watcher = Some(watcher);
+    }
+
     /// Initialize from existing conversation history (for multi-turn).
     pub fn with_history(mut self, history: Vec<ChatMessage>) -> Self {
         // Insert history after system message
@@ -908,6 +938,14 @@ impl<'a> ToolUseLoop<'a> {
         let mut verbosity_nudge_count: usize = 0;
 
         loop {
+            // Poll config watcher for hot-reload between turns.
+            if let Some(watcher) = self.config_watcher
+                && let Some(changed_path) = watcher.poll_change()
+            {
+                let path_str = changed_path.display().to_string();
+                self.emit(StreamChunk::ConfigReloaded { path: path_str });
+            }
+
             // Check turn limit — on final turn, ask for a text-only summary.
             if turns >= self.config.max_turns {
                 // Inject a final system message asking for text-only summary
@@ -1006,7 +1044,7 @@ impl<'a> ToolUseLoop<'a> {
                             finish_reason: "context_overflow".to_string(),
                             usage: total_usage,
                             turns,
-                            messages: self.messages.clone(),
+                            messages: std::mem::take(&mut self.messages),
                         });
                     }
                 }
@@ -1406,6 +1444,7 @@ impl<'a> ToolUseLoop<'a> {
                         self.messages.push(ChatMessage::Tool {
                             tool_call_id: String::new(),
                             content: result.output.to_string(),
+                            tool_name: None,
                         });
                         continue;
                     };
@@ -1634,7 +1673,7 @@ impl<'a> ToolUseLoop<'a> {
                         finish_reason: FINISH_REASON_DOOM_LOOP.to_string(),
                         usage: total_usage,
                         turns,
-                        messages: self.messages.clone(),
+                        messages: std::mem::take(&mut self.messages),
                     });
                 }
             }
@@ -2160,16 +2199,7 @@ impl<'a> ToolUseLoop<'a> {
         );
         // Append file persistence hint to the truncated message content.
         let msg = if let Some(hint) = file_hint {
-            match msg {
-                ChatMessage::Tool {
-                    tool_call_id,
-                    content,
-                } => ChatMessage::Tool {
-                    tool_call_id,
-                    content: format!("{content}{hint}"),
-                },
-                other => other,
-            }
+            map_tool_content(msg, |c| format!("{c}{hint}"))
         } else {
             msg
         };
@@ -2192,18 +2222,11 @@ impl<'a> ToolUseLoop<'a> {
 
         // Append LSP diagnostics directly to the tool result message for provider compatibility
         let msg = if !lsp_diagnostics_text.is_empty() {
-            match msg {
-                ChatMessage::Tool {
-                    tool_call_id,
-                    content,
-                } => ChatMessage::Tool {
-                    tool_call_id,
-                    content: format!(
-                        "{content}\n\n⚠ Post-edit diagnostics:\n{lsp_diagnostics_text}Fix these before proceeding."
-                    ),
-                },
-                other => other,
-            }
+            map_tool_content(msg, |c| {
+                format!(
+                    "{c}\n\n⚠ Post-edit diagnostics:\n{lsp_diagnostics_text}Fix these before proceeding."
+                )
+            })
         } else {
             msg
         };
@@ -2719,19 +2742,7 @@ impl<'a> ToolUseLoop<'a> {
 
     /// Apply privacy router to a tool message, redacting sensitive content if configured.
     fn apply_privacy_to_message(&self, msg: ChatMessage) -> ChatMessage {
-        if let ChatMessage::Tool {
-            tool_call_id,
-            content,
-        } = msg
-        {
-            let filtered = self.apply_privacy_to_output(&content);
-            ChatMessage::Tool {
-                tool_call_id,
-                content: filtered,
-            }
-        } else {
-            msg
-        }
+        map_tool_content(msg, |content| self.apply_privacy_to_output(&content))
     }
 
     /// Get the workspace path as a `Path` reference.

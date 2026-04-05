@@ -123,6 +123,7 @@ fn subsequent_turns_use_auto_tool_choice() {
     loop_.messages.push(ChatMessage::Tool {
         tool_call_id: "call_1".to_string(),
         content: "file content".to_string(),
+        tool_name: None,
     });
 
     let request = loop_.build_request();
@@ -145,6 +146,7 @@ fn subsequent_turns_use_auto_tool_choice() {
     loop2.messages.push(ChatMessage::Tool {
         tool_call_id: "call_1".to_string(),
         content: "one result".to_string(),
+        tool_name: None,
     });
     let request2 = loop2.build_request();
     assert_eq!(

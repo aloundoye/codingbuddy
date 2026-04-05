@@ -128,8 +128,8 @@ impl ToolCache {
         });
     }
 
-    /// Number of cached entries (used by tests).
-    #[allow(dead_code)]
+    /// Number of cached entries.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

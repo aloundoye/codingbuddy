@@ -103,6 +103,7 @@ pub fn tool_result_to_message(
     let msg = ChatMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
         content,
+        tool_name: Some(tool_name.to_string()),
     };
     (msg, warnings)
 }
@@ -120,6 +121,7 @@ pub fn tool_error_to_message(tool_call_id: &str, error: &str) -> ChatMessage {
     ChatMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
         content: format!("Error: {error}"),
+        tool_name: None,
     }
 }
 
@@ -305,6 +307,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id,
                 content,
+                ..
             } => {
                 assert_eq!(tool_call_id, "call_1");
                 assert_eq!(content, "file contents here");

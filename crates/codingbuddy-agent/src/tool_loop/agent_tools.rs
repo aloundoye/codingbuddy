@@ -97,6 +97,7 @@ pub(super) fn handle_agent_level_tool(
     tool_loop.messages.push(ChatMessage::Tool {
         tool_call_id: llm_call.id.clone(),
         content,
+        tool_name: Some(llm_call.name.clone()),
     });
 
     Ok(vec![ToolCallRecord {

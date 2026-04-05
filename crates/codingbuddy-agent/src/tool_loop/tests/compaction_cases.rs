@@ -38,6 +38,7 @@ fn compaction_preserves_tool_result_pairing() {
         loop_.messages.push(ChatMessage::Tool {
             tool_call_id: format!("call_{i}"),
             content: format!("content of file{i}.rs — {}", "x".repeat(400)),
+            tool_name: None,
         });
     }
     loop_.messages.push(ChatMessage::User {
