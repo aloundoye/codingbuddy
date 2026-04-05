@@ -79,6 +79,7 @@ tree-sitter-zig = "1.1"
 jsonschema = "0.27"
 shell-words = "1.1"
 strsim = "0.11"
+tiny_http = "0.12"
 
 [profile.release]
 lto = "thin"
