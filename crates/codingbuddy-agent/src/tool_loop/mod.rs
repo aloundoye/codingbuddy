@@ -53,9 +53,8 @@ use crate::tool_bridge;
 
 use anti_hallucination::{
     HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS,
-    SHELL_COMMAND_NUDGE, check_response_consistency, contains_shell_command_pattern,
-    extract_shell_commands, extract_user_directives, has_unverified_file_references,
-    strip_shell_blocks,
+    SHELL_COMMAND_NUDGE, check_response_consistency, extract_shell_commands,
+    extract_user_directives, has_unverified_file_references, strip_shell_blocks,
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
@@ -1134,10 +1133,21 @@ impl<'a> ToolUseLoop<'a> {
             // MUST run before truncation recovery: long bash scripts often hit
             // the output token limit (finish_reason="length"), and the truncation
             // retry `continue` would skip this conversion entirely.
-            if response.tool_calls.is_empty() && contains_shell_command_pattern(&response.text) {
+            if response.tool_calls.is_empty() {
                 let commands = extract_shell_commands(&response.text);
                 if !commands.is_empty() {
+                    // Clear the streamed text from the TUI — the bash blocks
+                    // are being converted to tool calls, not displayed as text.
+                    self.emit(StreamChunk::ClearStreamingText);
+
                     let prose = strip_shell_blocks(&response.text);
+                    self.emit(StreamChunk::SecurityWarning {
+                        message: format!(
+                            "Auto-converting {} shell block(s) to bash_run tool calls",
+                            commands.len()
+                        ),
+                    });
+
                     response.tool_calls = commands
                         .into_iter()
                         .enumerate()

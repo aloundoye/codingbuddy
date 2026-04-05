@@ -208,6 +208,7 @@ pub(crate) fn has_unverified_file_references(
 /// 1. Any ` ```bash ` / ` ```sh ` / ` ```shell ` / ` ```zsh ` code block with 2+ lines of content
 ///    (the model should NEVER output shell scripts as text — always use tools).
 /// 2. Bare `$ command` patterns at line start for common CLI tools.
+#[cfg(test)]
 pub(crate) fn contains_shell_command_pattern(text: &str) -> bool {
     use std::sync::LazyLock;
 
