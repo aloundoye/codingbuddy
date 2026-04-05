@@ -22,6 +22,19 @@ pub(crate) const HALLUCINATION_NUDGE: &str = "STOP. You are answering without us
      You MUST use a tool to verify your answer. Call fs_read, fs_glob, or fs_grep \
      to check the actual code before responding. Do NOT guess file contents or project structure.";
 
+/// Nudge message specifically for when the model outputs shell commands as text.
+pub(crate) const SHELL_COMMAND_NUDGE: &str = "STOP. You are outputting shell commands as text \
+     instead of calling tools. NEVER write bash/shell code blocks in your response. Instead:\n\
+     - To run commands: call `bash_run` with the command string\n\
+     - To read files: call `fs_read`\n\
+     - To edit files: call `fs_edit` or `fs_write`\n\
+     - To search: call `fs_glob` or `fs_grep`\n\
+     Execute actions through tools, do not print them as text.";
+
+/// Maximum number of shell-command-specific nudges. Separate from the general
+/// hallucination nudge counter so shell commands are always caught.
+pub(crate) const MAX_SHELL_NUDGE_ATTEMPTS: usize = 5;
+
 /// Known file extensions for path detection.
 const FILE_EXTENSIONS: &[&str] = &[
     ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".cpp", ".c", ".h", ".hpp", ".rb",
@@ -194,16 +207,41 @@ pub(crate) fn has_unverified_file_references(
 // ── Shell command detection ──
 
 /// Detect when the model outputs shell commands as text instead of using tools.
-/// Catches patterns like `cat file.rs`, `grep pattern`, `find . -name ...` etc.
-/// that appear inside code blocks or as bare commands.
+///
+/// Two-layer detection:
+/// 1. Any ` ```bash ` / ` ```sh ` / ` ```shell ` / ` ```zsh ` code block with 2+ lines of content
+///    (the model should NEVER output shell scripts as text — always use tools).
+/// 2. Bare `$ command` patterns at line start for common CLI tools.
 pub(crate) fn contains_shell_command_pattern(text: &str) -> bool {
     use std::sync::LazyLock;
-    static SHELL_PATTERNS: LazyLock<regex::Regex> = LazyLock::new(|| {
+
+    // Layer 1: bash/shell code block with substantial content (2+ non-empty lines).
+    // This catches ALL shell scripts regardless of which commands they use.
+    static SHELL_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
-            r"(?m)(?:^```(?:bash|sh|shell|zsh)?\s*\n\s*(?:cat|head|tail|grep|find|ls|sed|awk)\s+|^\s*\$\s+(?:cat|head|tail|grep|find|ls|sed|awk)\s+)"
+            r"(?ms)^```(?:bash|sh|shell|zsh)\s*\n(.*?)```"
         ).expect("valid regex")
     });
-    SHELL_PATTERNS.is_match(text)
+
+    if let Some(cap) = SHELL_BLOCK.captures(text) {
+        let block_content = &cap[1];
+        let non_empty_lines = block_content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if non_empty_lines >= 2 {
+            return true;
+        }
+    }
+
+    // Layer 2: bare shell prompt patterns (`$ command`) with broad command coverage.
+    static BARE_SHELL: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?m)^\s*\$\s+(?:cat|head|tail|grep|rg|find|ls|sed|awk|cd|git|echo|mkdir|rm|cp|mv|curl|wget|chmod|chown|npm|npx|yarn|pnpm|cargo|pip|docker|kubectl|make|cmake|go|python|ruby|node|deno|bun|brew|apt|yum|dnf|pacman|for|while|if|export|source)\s+"
+        ).expect("valid regex")
+    });
+
+    BARE_SHELL.is_match(text)
 }
 
 // ── Numeric consistency checking ──

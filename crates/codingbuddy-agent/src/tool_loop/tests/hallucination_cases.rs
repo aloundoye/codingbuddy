@@ -474,23 +474,42 @@ fn single_unverified_path_triggers_nudge() {
 
 #[test]
 fn shell_command_pattern_detected() {
-    // Test that the shell command detection catches common patterns
+    // Layer 1: bash/shell code blocks with 2+ lines of content
     assert!(
-        contains_shell_command_pattern("```bash\ncat audit.md\n```"),
-        "cat in bash block should trigger"
+        contains_shell_command_pattern("```bash\ncd /project\ngrep -r TODO src/\n```"),
+        "multi-line bash block should trigger"
     );
     assert!(
-        contains_shell_command_pattern("```sh\ngrep -r TODO src/\n```"),
-        "grep in sh block should trigger"
+        contains_shell_command_pattern("```sh\nsed -i '' 's/old/new/' file.txt\necho done\n```"),
+        "multi-line sh block should trigger"
     );
     assert!(
-        contains_shell_command_pattern("```\nfind . -name '*.rs'\n```"),
-        "find in bare code block should trigger"
+        contains_shell_command_pattern(
+            "```bash\ngit add .\ngit commit -m \"bump version\"\n```"
+        ),
+        "git commands in bash block should trigger"
     );
+    assert!(
+        contains_shell_command_pattern(
+            "```bash\nfor crate in crates/*/Cargo.toml; do\n  echo $crate\ndone\n```"
+        ),
+        "for-loop in bash block should trigger"
+    );
+
+    // Layer 2: bare shell prompt patterns
     assert!(
         contains_shell_command_pattern("$ cat README.md"),
         "dollar-prompt cat should trigger"
     );
+    assert!(
+        contains_shell_command_pattern("$ git status"),
+        "dollar-prompt git should trigger"
+    );
+    assert!(
+        contains_shell_command_pattern("$ cargo build --release"),
+        "dollar-prompt cargo should trigger"
+    );
+
     // Should NOT trigger on normal prose
     assert!(
         !contains_shell_command_pattern("The cat sat on the mat."),
@@ -499,6 +518,16 @@ fn shell_command_pattern_detected() {
     assert!(
         !contains_shell_command_pattern("Use `fs_read` to read files"),
         "tool mention should not trigger"
+    );
+    // Single-line bash block should NOT trigger (might be legitimate example)
+    assert!(
+        !contains_shell_command_pattern("```bash\ncargo test\n```"),
+        "single-line bash block should not trigger"
+    );
+    // Non-bash code blocks should NOT trigger
+    assert!(
+        !contains_shell_command_pattern("```rust\nfn main() {\n    println!(\"hello\");\n}\n```"),
+        "rust code block should not trigger"
     );
 }
 
