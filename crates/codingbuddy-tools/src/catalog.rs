@@ -692,6 +692,64 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
                 }),
             },
         },
+        // ── GitHub tools (via gh CLI) ───────────────────────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "github_create_pr".to_string(),
+                description: "Create a GitHub pull request for the current branch.\n\n\
+Requires the `gh` CLI to be installed and authenticated. \
+Creates a PR from the current branch to the default base branch.\n\n\
+Returns the PR URL on success.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "PR title" },
+                        "body": { "type": "string", "description": "PR description (markdown)" },
+                        "base": { "type": "string", "description": "Base branch (default: repo default branch)" },
+                        "draft": { "type": "boolean", "description": "Create as draft PR (default: false)" }
+                    },
+                    "required": ["title", "body"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "github_list_issues".to_string(),
+                description: "List open GitHub issues for the current repository.\n\n\
+Requires the `gh` CLI. Returns issue number, title, labels, and assignees.\n\n\
+Use the `label` parameter to filter by label, or `limit` to control how many are returned.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string", "description": "Filter by label name" },
+                        "state": { "type": "string", "description": "Issue state: open, closed, all (default: open)" },
+                        "limit": { "type": "integer", "description": "Max issues to return (default: 20)" }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "github_view_pr".to_string(),
+                description: "View details of a GitHub pull request.\n\n\
+Requires the `gh` CLI. Returns title, body, status, review state, checks, and diff stats.\n\n\
+Pass a PR number or URL.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pr": { "type": "string", "description": "PR number or URL" }
+                    },
+                    "required": ["pr"]
+                }),
+            },
+        },
         // ── LSP tools (code intelligence) ───────────────────────────────
         ToolDefinition {
             tool_type: "function".to_string(),

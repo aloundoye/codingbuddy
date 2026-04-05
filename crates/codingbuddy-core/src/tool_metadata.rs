@@ -145,6 +145,8 @@ impl ToolName {
             | Self::LspDefinition
             | Self::LspReferences
             | Self::LspSymbols
+            | Self::GithubListIssues
+            | Self::GithubViewPr
             | Self::UserQuestion
             | Self::TaskGet
             | Self::TaskList
@@ -223,7 +225,8 @@ impl ToolName {
             | Self::PatchStage
             | Self::PatchApply
             | Self::PatchDirect
-            | Self::NotebookEdit => ToolMetadata {
+            | Self::NotebookEdit
+            | Self::GithubCreatePr => ToolMetadata {
                 read_only: false,
                 phase_access: EXECUTE_ONLY,
                 agent_level: false,

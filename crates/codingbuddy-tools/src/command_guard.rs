@@ -109,7 +109,7 @@ fn command_in_path(command: &str) -> bool {
     })
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     format!("'{escaped}'")
 }
