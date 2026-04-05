@@ -1125,8 +1125,49 @@ impl<'a> ToolUseLoop<'a> {
                 return Err(anyhow!("Response blocked by content filter"));
             }
 
+            // Shell command auto-conversion: when the model outputs bash code
+            // blocks as text instead of calling tools, extract the commands and
+            // synthesize bash_run tool calls. This works around models (e.g.
+            // DeepSeek) that ignore tool_choice=required. The synthetic calls
+            // go through the normal permission pipeline.
+            //
+            // MUST run before truncation recovery: long bash scripts often hit
+            // the output token limit (finish_reason="length"), and the truncation
+            // retry `continue` would skip this conversion entirely.
+            if response.tool_calls.is_empty() && contains_shell_command_pattern(&response.text) {
+                let commands = extract_shell_commands(&response.text);
+                if !commands.is_empty() {
+                    let prose = strip_shell_blocks(&response.text);
+                    response.tool_calls = commands
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, cmd)| LlmToolCall {
+                            id: format!("synthetic_{}", Uuid::new_v4().as_simple()),
+                            name: "bash_run".to_string(),
+                            arguments: serde_json::json!({
+                                "command": cmd,
+                                "description": format!("(auto-converted from text) command {}", i + 1),
+                            })
+                            .to_string(),
+                        })
+                        .collect();
+                    response.text = prose;
+                    // Override finish_reason so truncation recovery doesn't
+                    // re-swallow the now-converted tool calls.
+                    response.finish_reason = "tool_calls".to_string();
+
+                    if let Some(ref cb) = self.event_cb {
+                        cb(EventKind::HallucinationNudgeFired {
+                            nudge_count: response.tool_calls.len() as u64,
+                            trigger: "shell_auto_convert".to_string(),
+                        });
+                    }
+                }
+            }
+
             // Output token recovery: when the model hits max_output_tokens,
             // ask it to be more concise and retry (up to 3 attempts).
+            // Skipped when shell auto-conversion already extracted tool calls.
             if response.finish_reason == "length" && truncation_retries < MAX_TRUNCATION_RETRIES {
                 truncation_retries += 1;
                 self.messages.push(ChatMessage::System {
@@ -1146,41 +1187,6 @@ impl<'a> ToolUseLoop<'a> {
                     });
                 }
                 continue; // Retry the LLM call
-            }
-
-            // Shell command auto-conversion: when the model outputs bash code
-            // blocks as text instead of calling tools, extract the commands and
-            // synthesize bash_run tool calls. This works around models (e.g.
-            // DeepSeek) that ignore tool_choice=required. The synthetic calls
-            // go through the normal permission pipeline. Must run BEFORE the
-            // tool_calls.is_empty() check so the converted calls flow into the
-            // normal tool execution path.
-            if response.tool_calls.is_empty() && contains_shell_command_pattern(&response.text) {
-                let commands = extract_shell_commands(&response.text);
-                if !commands.is_empty() {
-                    let prose = strip_shell_blocks(&response.text);
-                    response.tool_calls = commands
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, cmd)| LlmToolCall {
-                            id: format!("synthetic_{}", Uuid::new_v4().as_simple()),
-                            name: "bash_run".to_string(),
-                            arguments: serde_json::json!({
-                                "command": cmd,
-                                "description": format!("(auto-converted from text) command {}", i + 1),
-                            })
-                            .to_string(),
-                        })
-                        .collect();
-                    response.text = prose;
-
-                    if let Some(ref cb) = self.event_cb {
-                        cb(EventKind::HallucinationNudgeFired {
-                            nudge_count: response.tool_calls.len() as u64,
-                            trigger: "shell_auto_convert".to_string(),
-                        });
-                    }
-                }
             }
 
             // No tool calls → return the text response (or nudge to use tools)
