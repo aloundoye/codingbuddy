@@ -553,32 +553,18 @@ impl AgentEngine {
         tool_name: &str,
         tool_input: &serde_json::Value,
     ) -> codingbuddy_hooks::HookResult {
-        let input = codingbuddy_hooks::HookInput {
-            event: codingbuddy_hooks::HookEvent::PreToolUse
-                .as_str()
-                .to_string(),
-            tool_name: Some(tool_name.to_string()),
-            tool_input: Some(tool_input.clone()),
-            tool_result: None,
-            prompt: None,
-            session_type: None,
-            workspace: self.workspace.display().to_string(),
-        };
+        let ws = self.workspace.display().to_string();
+        let input =
+            codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::PreToolUse, &ws)
+                .with_tool(tool_name, tool_input.clone());
         self.hooks
             .fire(codingbuddy_hooks::HookEvent::PreToolUse, &input)
     }
 
     /// Fire Stop hooks at end of agent execution.
     pub fn fire_stop(&self) {
-        let input = codingbuddy_hooks::HookInput {
-            event: codingbuddy_hooks::HookEvent::Stop.as_str().to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_result: None,
-            prompt: None,
-            session_type: None,
-            workspace: self.workspace.display().to_string(),
-        };
+        let ws = self.workspace.display().to_string();
+        let input = codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Stop, &ws);
         let _ = self.hooks.fire(codingbuddy_hooks::HookEvent::Stop, &input);
     }
 
@@ -1095,17 +1081,11 @@ impl AgentEngine {
 
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
         // Fire SessionStart hook
-        let session_start_input = codingbuddy_hooks::HookInput {
-            event: codingbuddy_hooks::HookEvent::SessionStart
-                .as_str()
-                .to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_result: None,
-            prompt: Some(prompt.to_string()),
-            session_type: Some("startup".to_string()),
-            workspace: self.workspace.display().to_string(),
-        };
+        let ws = self.workspace.display().to_string();
+        let session_start_input =
+            codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::SessionStart, &ws)
+                .with_prompt(prompt)
+                .with_session_type("startup");
         let _ = self.hooks.fire(
             codingbuddy_hooks::HookEvent::SessionStart,
             &session_start_input,
@@ -1116,32 +1096,17 @@ impl AgentEngine {
             .setup_fired
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            let setup_input = codingbuddy_hooks::HookInput {
-                event: codingbuddy_hooks::HookEvent::Setup.as_str().to_string(),
-                tool_name: None,
-                tool_input: None,
-                tool_result: None,
-                prompt: None,
-                session_type: None,
-                workspace: self.workspace.display().to_string(),
-            };
+            let setup_input =
+                codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Setup, &ws);
             let _ = self
                 .hooks
                 .fire(codingbuddy_hooks::HookEvent::Setup, &setup_input);
         }
 
         // Fire UserPromptSubmit hook (blocking — can modify prompt)
-        let user_submit_input = codingbuddy_hooks::HookInput {
-            event: codingbuddy_hooks::HookEvent::UserPromptSubmit
-                .as_str()
-                .to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_result: None,
-            prompt: Some(prompt.to_string()),
-            session_type: None,
-            workspace: self.workspace.display().to_string(),
-        };
+        let user_submit_input =
+            codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::UserPromptSubmit, &ws)
+                .with_prompt(prompt);
         let submit_result = self.hooks.fire(
             codingbuddy_hooks::HookEvent::UserPromptSubmit,
             &user_submit_input,
@@ -1191,20 +1156,13 @@ impl AgentEngine {
         }
 
         // Fire SessionEnd hook
-        let session_end_input = codingbuddy_hooks::HookInput {
-            event: codingbuddy_hooks::HookEvent::SessionEnd
-                .as_str()
-                .to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_result: result
-                .as_ref()
-                .ok()
-                .map(|s| serde_json::Value::String(s.clone())),
-            prompt: None,
-            session_type: None,
-            workspace: self.workspace.display().to_string(),
-        };
+        let ws = self.workspace.display().to_string();
+        let mut session_end_input =
+            codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::SessionEnd, &ws);
+        session_end_input.tool_result = result
+            .as_ref()
+            .ok()
+            .map(|s| serde_json::Value::String(s.clone()));
         let _ = self
             .hooks
             .fire(codingbuddy_hooks::HookEvent::SessionEnd, &session_end_input);

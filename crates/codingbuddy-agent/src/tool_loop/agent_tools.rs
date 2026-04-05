@@ -294,17 +294,12 @@ pub(super) fn handle_task_create(
 
     // Fire TaskCreated hook
     if let Some(ref hooks) = tool_loop.hooks {
-        let input = codingbuddy_hooks::HookInput {
-            event: codingbuddy_hooks::HookEvent::TaskCreated
-                .as_str()
-                .to_string(),
-            tool_name: Some("task_create".to_string()),
-            tool_input: Some(args.clone()),
-            tool_result: None,
-            prompt: Some(subject.to_string()),
-            session_type: None,
-            workspace: tool_loop.workspace_str().to_string(),
-        };
+        let input = codingbuddy_hooks::HookInput::new(
+            codingbuddy_hooks::HookEvent::TaskCreated,
+            tool_loop.workspace_str(),
+        )
+        .with_tool("task_create", args.clone())
+        .with_prompt(subject);
         super::ToolUseLoop::fire_hook_logged(
             hooks,
             codingbuddy_hooks::HookEvent::TaskCreated,

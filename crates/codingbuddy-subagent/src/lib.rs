@@ -290,6 +290,70 @@ impl BackgroundTaskRegistry {
             .unwrap_or_default()
     }
 
+    /// Submit a task with a progress callback for streaming updates to the parent.
+    ///
+    /// The progress callback receives (task_id, message) and can emit StreamChunk::ToolProgress.
+    pub fn submit_with_progress<F, P>(&self, prompt: String, worker: F, on_progress: P) -> Uuid
+    where
+        F: FnOnce(&dyn Fn(&str)) -> Result<String> + Send + 'static,
+        P: Fn(Uuid, &str) + Send + Sync + 'static,
+    {
+        let id = Uuid::now_v7();
+        let entry = BackgroundTaskEntry {
+            id,
+            prompt: prompt.clone(),
+            status: BackgroundTaskStatus::Running,
+            result: None,
+            error: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+        };
+
+        {
+            let mut tasks = self.tasks.lock().expect("background registry lock");
+            tasks.insert(id, entry);
+        }
+
+        let tasks_ref = self.tasks.clone();
+        let progress_cb = std::sync::Arc::new(on_progress);
+        thread::spawn(move || {
+            let progress_fn = {
+                let cb = progress_cb.clone();
+                move |msg: &str| {
+                    cb(id, msg);
+                }
+            };
+            let (status, result, error) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker(&progress_fn)
+                })) {
+                    Ok(Ok(output)) => (BackgroundTaskStatus::Completed, Some(output), None),
+                    Ok(Err(e)) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
+                    Err(panic) => {
+                        let panic_msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "subagent worker panicked".to_string()
+                        };
+                        (BackgroundTaskStatus::Failed, None, Some(panic_msg))
+                    }
+                };
+            let finished_at = chrono::Utc::now();
+            if let Ok(mut tasks) = tasks_ref.lock()
+                && let Some(entry) = tasks.get_mut(&id)
+            {
+                entry.status = status;
+                entry.result = result;
+                entry.error = error;
+                entry.finished_at = Some(finished_at);
+            }
+        });
+
+        id
+    }
+
     /// Get running task count.
     pub fn running_count(&self) -> usize {
         self.tasks
