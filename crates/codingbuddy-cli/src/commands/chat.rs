@@ -273,6 +273,7 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Init => {
+                    // Phase 1: Initialize memory
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
                     let version_id = manager.sync_memory_version("init")?;
@@ -284,14 +285,25 @@ pub(crate) fn run_chat(
                             note: "init".to_string(),
                         },
                     )?;
+
+                    // Phase 2: Detect project type and write settings
+                    let detected = super::init::detect_project(cwd);
+                    let settings_written = super::init::write_project_settings(cwd, &detected)?;
+
                     if json_mode {
                         print_json(&json!({
                             "initialized": true,
-                            "path": path,
+                            "memory_path": path,
                             "version_id": version_id,
+                            "project": detected,
+                            "settings_written": settings_written,
                         }))?;
                     } else {
                         println!("initialized memory at {}", path.display());
+                        let summary = detected.summary(settings_written);
+                        if !summary.is_empty() {
+                            println!("{summary}");
+                        }
                     }
                 }
                 SlashCommand::Clear => {

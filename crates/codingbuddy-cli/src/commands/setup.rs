@@ -13,41 +13,76 @@ use crate::output::print_json;
 /// Marker file that records we already ran first-time setup.
 const SETUP_MARKER: &str = ".setup_done";
 
-/// Called from `run_chat` on first run. Walks the user through the same
-/// setup wizard as `codingbuddy setup` (provider, API key, local ML, privacy),
-/// then writes a marker so it never asks again.
+/// Counter file that tracks how many times the soft onboarding banner has been shown.
+const BANNER_COUNTER: &str = ".banner_count";
+
+/// Maximum number of times to show the soft onboarding banner before auto-dismissing.
+const MAX_BANNER_SHOWS: u32 = 4;
+
+/// Called from `run_chat` on first run. Shows a soft, non-blocking banner
+/// suggesting the user run `codingbuddy setup` or `/init`. Never blocks.
 ///
-/// Returns `true` if the wizard ran and config was potentially modified.
+/// Returns `true` if config was potentially modified (only when fully configured
+/// and marker is auto-written).
 pub(crate) fn maybe_first_time_setup(cwd: &Path, cfg: &AppConfig) -> Result<bool> {
-    let marker = AppConfig::project_settings_path(cwd)
+    let settings_dir = AppConfig::project_settings_path(cwd)
         .parent()
-        .map(|p| p.join(SETUP_MARKER))
-        .unwrap_or_else(|| cwd.join(".codingbuddy").join(SETUP_MARKER));
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| cwd.join(".codingbuddy"));
+
+    let marker = settings_dir.join(SETUP_MARKER);
 
     if marker.exists() {
         return Ok(false);
     }
 
-    // If everything is already configured, just write the marker (no need to prompt)
+    // If everything is already configured, silently write the marker
     if has_api_key(cfg) && cfg.local_ml.enabled {
         write_setup_marker(&marker)?;
         return Ok(false);
     }
 
-    // Only prompt in interactive terminals — skip without writing marker
-    // so the wizard will be offered again in a future interactive session.
+    // Only show banner in interactive terminals
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         return Ok(false);
     }
 
-    println!();
-    println!("Welcome to CodingBuddy! Let's get you set up.\n");
+    // Check banner counter — stop showing after MAX_BANNER_SHOWS
+    let counter_path = settings_dir.join(BANNER_COUNTER);
+    let count = read_banner_count(&counter_path);
+    if count >= MAX_BANNER_SHOWS {
+        return Ok(false);
+    }
 
-    run_wizard_steps(cwd, cfg)?;
+    // Show soft, non-blocking banner
+    let missing = if !has_api_key(cfg) {
+        "API key not configured"
+    } else {
+        "local ML not configured"
+    };
+    eprintln!(
+        "  \x1b[33m!\x1b[0m {missing}. Run \x1b[1mcodingbuddy setup\x1b[0m to configure, or \x1b[1m/init\x1b[0m in chat."
+    );
+    eprintln!();
 
-    println!("Setup complete!\n");
-    write_setup_marker(&marker)?;
-    Ok(true)
+    // Increment counter
+    write_banner_count(&counter_path, count + 1);
+
+    Ok(false)
+}
+
+fn read_banner_count(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_banner_count(path: &Path, count: u32) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, count.to_string());
 }
 
 fn write_setup_marker(marker: &Path) -> Result<()> {
