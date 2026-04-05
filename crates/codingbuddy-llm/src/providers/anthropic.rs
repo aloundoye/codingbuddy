@@ -72,6 +72,7 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
             ChatMessage::Tool {
                 tool_call_id,
                 content,
+                ..
             } => {
                 // Tool results go in user messages as tool_result blocks.
                 let block = json!({
@@ -422,6 +423,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: "fn main() {}".to_string(),
+                tool_name: None,
             },
         ]);
         let payload = build_payload(&req, 4096).unwrap();

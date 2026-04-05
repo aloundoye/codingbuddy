@@ -3086,6 +3086,7 @@ mod tests {
                 ChatMessage::Tool {
                     tool_call_id: "call_1".to_string(),
                     content: "ok".to_string(),
+                    tool_name: None,
                 },
             ],
             tools: vec![],

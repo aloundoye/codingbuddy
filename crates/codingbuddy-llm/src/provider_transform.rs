@@ -140,6 +140,7 @@ pub(crate) fn preflight_chat_messages(
             ChatMessage::Tool {
                 tool_call_id,
                 content,
+                ..
             } => {
                 let normalized_tool_call_id = tool_call_id_map
                     .get(tool_call_id)
@@ -1023,6 +1024,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: " 123 bad id ".to_string(),
                 content: "ok".to_string(),
+                tool_name: None,
             },
         ];
 
@@ -1196,6 +1198,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "missing".to_string(),
                 content: "result".to_string(),
+                tool_name: None,
             },
         ];
 
@@ -1311,6 +1314,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "bad id".to_string(),
                 content: "ok".to_string(),
+                tool_name: None,
             },
             ChatMessage::User {
                 content: "continue".to_string(),
@@ -1343,6 +1347,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "bad-id!?".to_string(),
                 content: "ok".to_string(),
+                tool_name: None,
             },
         ];
 
@@ -1441,6 +1446,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: "ok".to_string(),
+                tool_name: None,
             },
         ];
 

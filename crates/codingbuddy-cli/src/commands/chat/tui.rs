@@ -1133,6 +1133,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
                 }
+                StreamChunk::ConfigReloaded { .. } => {}
                 StreamChunk::SnapshotRecorded { .. } => {}
                 StreamChunk::ToolCallReady { .. } => {}
                 StreamChunk::ToolProgress { tool_name, data } => {

@@ -84,15 +84,13 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
             ChatMessage::Tool {
                 tool_call_id: _,
                 content,
+                tool_name,
             } => {
                 // Gemini uses functionResponse parts in "user" role messages.
                 // Try to parse content as JSON; fall back to wrapping as {"result": text}
                 let response_val: Value =
                     serde_json::from_str(content).unwrap_or_else(|_| json!({ "result": content }));
-                // FIXME: ChatMessage::Tool lacks the tool name. Gemini's functionResponse
-                // requires it. Using a placeholder — may cause Gemini to reject or
-                // misattribute results if it validates against function declarations.
-                let tool_name = "tool_response";
+                let tool_name = tool_name.as_deref().unwrap_or("tool_response");
                 let part = json!({
                     "functionResponse": {
                         "name": tool_name,

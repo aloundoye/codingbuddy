@@ -1553,6 +1553,8 @@ pub enum StreamChunk {
     PhaseTransition { from: String, to: String },
     /// The active model was changed mid-session (via `/model` command).
     ModelChanged { model: String },
+    /// Config file changed on disk; agent reloaded settings.
+    ConfigReloaded { path: String },
     /// Live progress data from a running tool (e.g. bash stdout lines).
     ToolProgress { tool_name: String, data: String },
     /// Streaming is done; the final assembled response follows.
@@ -1692,6 +1694,10 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "type": "model_changed",
             "model": model,
         }),
+        StreamChunk::ConfigReloaded { path } => serde_json::json!({
+            "type": "config_reloaded",
+            "path": path,
+        }),
         StreamChunk::ToolProgress { tool_name, data } => serde_json::json!({
             "type": "tool_progress",
             "tool_name": tool_name,
@@ -1824,6 +1830,9 @@ pub enum ChatMessage {
     Tool {
         tool_call_id: String,
         content: String,
+        /// Function name that produced this result (used by Gemini's functionResponse).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        tool_name: Option<String>,
     },
 }
 
@@ -4323,6 +4332,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "c1".to_string(),
                 content: "result".to_string(),
+                tool_name: None,
             },
             ChatMessage::Assistant {
                 content: Some("thinking step 2".to_string()),

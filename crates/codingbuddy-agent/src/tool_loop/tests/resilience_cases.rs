@@ -424,6 +424,7 @@ fn prune_truncates_old_tool_outputs() {
     loop_.messages.push(ChatMessage::Tool {
         tool_call_id: "tc1".to_string(),
         content: long_output.clone(),
+        tool_name: None,
     });
     // Old turn group 2
     loop_.messages.push(ChatMessage::User {
@@ -432,6 +433,7 @@ fn prune_truncates_old_tool_outputs() {
     loop_.messages.push(ChatMessage::Tool {
         tool_call_id: "tc2".to_string(),
         content: long_output.clone(),
+        tool_name: None,
     });
     // Old turn group 3
     loop_.messages.push(ChatMessage::User {
@@ -440,6 +442,7 @@ fn prune_truncates_old_tool_outputs() {
     loop_.messages.push(ChatMessage::Tool {
         tool_call_id: "tc3".to_string(),
         content: long_output.clone(),
+        tool_name: None,
     });
     // Recent turns
     loop_.messages.push(ChatMessage::User {
@@ -448,6 +451,7 @@ fn prune_truncates_old_tool_outputs() {
     loop_.messages.push(ChatMessage::Tool {
         tool_call_id: "tc4".to_string(),
         content: long_output.clone(),
+        tool_name: None,
     });
 
     loop_.prune_old_tool_outputs();
@@ -499,6 +503,7 @@ fn prune_skips_short_outputs() {
         loop_.messages.push(ChatMessage::Tool {
             tool_call_id: format!("tc{i}"),
             content: short_output.clone(),
+            tool_name: None,
         });
     }
 

@@ -170,6 +170,7 @@ pub(crate) fn build_compaction_summary_with_llm(
             ChatMessage::Tool {
                 tool_call_id,
                 content,
+                ..
             } => {
                 conversation_text.push_str(&format!(
                     "TOOL_RESULT[{tool_call_id}]: {}\n",
@@ -332,6 +333,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "tc1".to_string(),
                 content: "error: cannot find value `foo`".to_string(),
+                tool_name: None,
             },
         ];
         let summary = build_compaction_summary(&messages);

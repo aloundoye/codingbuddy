@@ -208,6 +208,7 @@ fn anthropic_payload_converts_tool_results_to_tool_result_blocks() {
             ChatMessage::Tool {
                 tool_call_id: "toolu_abc".to_string(),
                 content: "fn main() { println!(\"hello\"); }".to_string(),
+                tool_name: None,
             },
         ],
         vec![],

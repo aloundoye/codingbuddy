@@ -117,7 +117,6 @@ pub struct AgentEngine {
     mcp: Option<McpManager>,
     /// Watches settings files for hot-reload. The background thread keeps the watch alive;
     /// poll via `config_watcher.as_ref().and_then(|w| w.poll_change())`.
-    #[allow(dead_code)]
     config_watcher: Option<codingbuddy_core::config_watcher::ConfigWatcher>,
     /// Whether the Setup hook has already fired this session (fires once).
     setup_fired: std::sync::atomic::AtomicBool,
@@ -982,6 +981,11 @@ impl AgentEngine {
                 serde_json::from_value(self.cfg.hooks.clone()).unwrap_or_default();
             let hooks = codingbuddy_hooks::HookRuntime::new(&self.workspace, hooks_config);
             loop_.set_hooks(hooks);
+        }
+
+        // Wire config watcher for hot-reload polling between tool-use turns
+        if let Some(ref watcher) = self.config_watcher {
+            loop_.set_config_watcher(watcher);
         }
 
         // Wire checkpoint callback — prefers git shadow commits, falls back to file snapshots
