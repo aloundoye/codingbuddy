@@ -4,7 +4,25 @@ use clap_complete::generate;
 use codingbuddy_jsonrpc::{JsonRpcRequest, JsonRpcResponse, RpcHandler};
 use serde_json::{Value, json};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
+
+const MAX_RPC_BODY_BYTES: u64 = 10 * 1024 * 1024;
+
+static HEADER_JSON: LazyLock<tiny_http::Header> =
+    LazyLock::new(|| "Content-Type: application/json".parse().unwrap());
+static HEADER_CORS: LazyLock<tiny_http::Header> =
+    LazyLock::new(|| "Access-Control-Allow-Origin: *".parse().unwrap());
+static HEADER_CORS_METHODS: LazyLock<tiny_http::Header> = LazyLock::new(|| {
+    "Access-Control-Allow-Methods: POST, GET, OPTIONS"
+        .parse()
+        .unwrap()
+});
+static HEADER_CORS_HEADERS: LazyLock<tiny_http::Header> = LazyLock::new(|| {
+    "Access-Control-Allow-Headers: Content-Type"
+        .parse()
+        .unwrap()
+});
 
 use crate::{Cli, CompletionsArgs, NativeHostArgs, ServeArgs};
 
@@ -31,10 +49,189 @@ pub(crate) fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
             let handler = codingbuddy_jsonrpc::IdeRpcHandler::new(&workspace)?;
             codingbuddy_jsonrpc::run_stdio_server(&handler)
         }
+        "http" => {
+            let bind = format!("{}:{}", args.host, args.port);
+            if json_mode {
+                println!(
+                    "{}",
+                    json!({"status": "starting", "transport": "http", "address": bind})
+                );
+            } else {
+                eprintln!("codingbuddy: starting HTTP server on http://{bind}");
+                if args.web {
+                    eprintln!("codingbuddy: web UI available at http://{bind}/");
+                }
+            }
+            let workspace = std::env::current_dir()?;
+            let handler = Arc::new(codingbuddy_jsonrpc::IdeRpcHandler::new(&workspace)?);
+            run_http_server(&bind, handler, args.web)
+        }
         other => Err(anyhow!(
-            "unsupported transport '{}' (supported: stdio)",
+            "unsupported transport '{}' (supported: stdio, http)",
             other
         )),
+    }
+}
+
+fn run_http_server(
+    bind: &str,
+    handler: Arc<codingbuddy_jsonrpc::IdeRpcHandler>,
+    serve_web: bool,
+) -> Result<()> {
+    let server =
+        tiny_http::Server::http(bind).map_err(|e| anyhow!("failed to bind HTTP server: {e}"))?;
+    let dist_dir = if serve_web { resolve_web_dist() } else { None };
+
+    for request in server.incoming_requests() {
+        let method = request.method().to_string();
+        let url = request.url().to_string();
+
+        match (method.as_str(), url.as_str()) {
+            ("POST", "/rpc") => handle_rpc_request(request, &handler),
+            ("GET", "/health") => {
+                let _ = request.respond(
+                    tiny_http::Response::from_string(r#"{"status":"ok"}"#)
+                        .with_header(HEADER_JSON.clone()),
+                );
+            }
+            ("GET", "/") if dist_dir.is_some() => {
+                serve_web_index(request, dist_dir.as_deref().unwrap())
+            }
+            ("GET", path) if dist_dir.is_some() && path.starts_with("/assets/") => {
+                serve_web_asset(request, dist_dir.as_deref().unwrap(), path)
+            }
+            ("OPTIONS", _) => {
+                let _ = request.respond(
+                    tiny_http::Response::from_string("")
+                        .with_header(HEADER_CORS.clone())
+                        .with_header(HEADER_CORS_METHODS.clone())
+                        .with_header(HEADER_CORS_HEADERS.clone()),
+                );
+            }
+            _ => {
+                let _ = request.respond(
+                    tiny_http::Response::from_string(r#"{"error":"not found"}"#)
+                        .with_status_code(404)
+                        .with_header(HEADER_JSON.clone()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn send_parse_error(request: tiny_http::Request) {
+    let _ = request.respond(
+        tiny_http::Response::from_string(
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#,
+        )
+        .with_status_code(400)
+        .with_header(HEADER_JSON.clone())
+        .with_header(HEADER_CORS.clone()),
+    );
+}
+
+fn handle_rpc_request(
+    mut request: tiny_http::Request,
+    handler: &codingbuddy_jsonrpc::IdeRpcHandler,
+) {
+    let mut body = String::new();
+    if request
+        .as_reader()
+        .take(MAX_RPC_BODY_BYTES)
+        .read_to_string(&mut body)
+        .is_err()
+    {
+        send_parse_error(request);
+        return;
+    }
+
+    let rpc_req = match serde_json::from_str::<JsonRpcRequest>(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            send_parse_error(request);
+            return;
+        }
+    };
+
+    let response = match handler.handle(&rpc_req.method, rpc_req.params) {
+        Ok(result) => JsonRpcResponse::success(rpc_req.id, result),
+        Err(e) => {
+            JsonRpcResponse::error(rpc_req.id, codingbuddy_jsonrpc::ERR_INTERNAL, e.to_string())
+        }
+    };
+
+    let json = serde_json::to_string(&response).unwrap_or_default();
+    let _ = request.respond(
+        tiny_http::Response::from_string(json)
+            .with_header(HEADER_JSON.clone())
+            .with_header(HEADER_CORS.clone()),
+    );
+}
+
+fn resolve_web_dist() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let beside_exe = exe.parent().map(|p| p.join("web/dist"));
+        if beside_exe.as_ref().is_some_and(|p| p.is_dir()) {
+            return beside_exe;
+        }
+    }
+    let workspace = std::env::current_dir().ok()?;
+    let dev = workspace.join("web/dist");
+    if dev.is_dir() {
+        return Some(dev);
+    }
+    None
+}
+
+fn serve_web_index(request: tiny_http::Request, dist: &Path) {
+    match std::fs::read_to_string(dist.join("index.html")) {
+        Ok(html) => {
+            let _ = request.respond(
+                tiny_http::Response::from_string(html).with_header(
+                    "Content-Type: text/html; charset=utf-8"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                ),
+            );
+        }
+        Err(_) => {
+            let _ = request
+                .respond(tiny_http::Response::from_string("not found").with_status_code(404));
+        }
+    }
+}
+
+fn serve_web_asset(request: tiny_http::Request, dist: &Path, path: &str) {
+    let clean = path.trim_start_matches('/');
+    if clean.contains("..") {
+        let _ =
+            request.respond(tiny_http::Response::from_string("forbidden").with_status_code(403));
+        return;
+    }
+    match std::fs::read(dist.join(clean)) {
+        Ok(data) => {
+            let content_type = if path.ends_with(".js") {
+                "application/javascript"
+            } else if path.ends_with(".css") {
+                "text/css"
+            } else if path.ends_with(".svg") {
+                "image/svg+xml"
+            } else {
+                "application/octet-stream"
+            };
+            let _ = request.respond(
+                tiny_http::Response::from_data(data).with_header(
+                    format!("Content-Type: {content_type}")
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                ),
+            );
+        }
+        Err(_) => {
+            let _ = request
+                .respond(tiny_http::Response::from_string("not found").with_status_code(404));
+        }
     }
 }
 

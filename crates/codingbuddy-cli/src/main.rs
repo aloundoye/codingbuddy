@@ -735,9 +735,18 @@ struct CompletionsArgs {
 
 #[derive(Args)]
 struct ServeArgs {
-    /// Transport to use: stdio (default).
+    /// Transport to use: stdio (default), http.
     #[arg(long, default_value = "stdio")]
     transport: String,
+    /// Host to bind HTTP server to (default: 127.0.0.1).
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// Port for HTTP server (default: 8199).
+    #[arg(long, default_value_t = 8199)]
+    port: u16,
+    /// Serve embedded web UI at / (only with --transport http).
+    #[arg(long)]
+    web: bool,
 }
 
 #[derive(Args)]

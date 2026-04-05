@@ -39,6 +39,7 @@ codingbuddy-subagent = { path = "../codingbuddy-subagent" }
 codingbuddy-jsonrpc = { path = "../codingbuddy-jsonrpc" }
 codingbuddy-local-ml = { path = "../codingbuddy-local-ml" }
 ignore.workspace = true
+tiny_http.workspace = true
 
 [features]
 default = ["local-ml"]

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
-    ChatMessage, EventKind, Session, SessionBudgets, SessionState, StreamChunk,
+    AppConfig, ChatMessage, EventKind, Session, SessionBudgets, SessionState, StreamChunk,
     stream_chunk_to_event_json,
 };
 use codingbuddy_store::Store;
@@ -1279,6 +1279,165 @@ impl IdeRpcHandler {
         }))
     }
 
+    // -- Model methods --
+
+    fn workspace_path(&self) -> &Path {
+        self.store.root.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    fn handle_model_list(&self, _params: Value) -> Result<Value> {
+        let cfg = AppConfig::load(self.workspace_path()).unwrap_or_default();
+        let active = &cfg.llm.base_model;
+        let provider = &cfg.llm.provider;
+
+        let mut models = Vec::new();
+        for (name, pcfg) in &cfg.llm.providers {
+            models.push(serde_json::json!({
+                "id": pcfg.models.chat,
+                "provider": name,
+                "role": "chat",
+                "active": pcfg.models.chat == *active && name == provider,
+            }));
+            if let Some(ref reasoner) = pcfg.models.reasoner {
+                models.push(serde_json::json!({
+                    "id": reasoner,
+                    "provider": name,
+                    "role": "reasoner",
+                    "active": reasoner == active && name == provider,
+                }));
+            }
+        }
+
+        // If the active model isn't listed in any provider, include it
+        if !models.iter().any(|m| m["active"] == true) {
+            models.push(serde_json::json!({
+                "id": active,
+                "provider": provider,
+                "role": "chat",
+                "active": true,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "models": models,
+            "active_model": active,
+            "active_provider": provider,
+        }))
+    }
+
+    // -- Config methods --
+
+    fn handle_config_get(&self, params: Value) -> Result<Value> {
+        let cfg = AppConfig::load(self.workspace_path()).unwrap_or_default();
+        let full = serde_json::to_value(&cfg)?;
+
+        if let Some(key) = params.get("key").and_then(|v| v.as_str()) {
+            // Dot-separated key path: "llm.base_model" -> cfg["llm"]["base_model"]
+            let mut current = &full;
+            for segment in key.split('.') {
+                current = match current.get(segment) {
+                    Some(v) => v,
+                    None => return Ok(serde_json::json!({ "key": key, "value": null })),
+                };
+            }
+            Ok(serde_json::json!({ "key": key, "value": current }))
+        } else {
+            Ok(serde_json::json!({ "config": full }))
+        }
+    }
+
+    fn handle_config_set(&self, params: Value) -> Result<Value> {
+        let key = params
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing 'key' parameter"))?;
+        let value = params
+            .get("value")
+            .ok_or_else(|| anyhow!("missing 'value' parameter"))?
+            .clone();
+
+        let settings_path = AppConfig::project_local_settings_path(self.workspace_path());
+
+        // Preserve existing settings so we only update the requested key
+        let mut settings: serde_json::Map<String, Value> = if settings_path.exists() {
+            let raw = fs::read_to_string(&settings_path)?;
+            serde_json::from_str(&raw).unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
+
+        // Set nested key via dot-path: "llm.base_model" -> {"llm": {"base_model": value}}
+        let segments: Vec<&str> = key.split('.').collect();
+        let mut target = &mut settings;
+        for &segment in &segments[..segments.len() - 1] {
+            target = target
+                .entry(segment)
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("config key segment '{segment}' is not an object"))?;
+        }
+        if let Some(last) = segments.last() {
+            target.insert((*last).to_string(), value.clone());
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+
+        Ok(serde_json::json!({
+            "key": key,
+            "value": value,
+            "persisted": true,
+            "path": settings_path.to_string_lossy(),
+        }))
+    }
+
+    // -- Tool progress --
+
+    fn handle_tool_progress(&self, params: Value) -> Result<Value> {
+        let prompt_id = require_uuid(&params, "prompt_id")?;
+        let cursor = params.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let streams = self.prompt_streams.lock().expect("prompt_streams lock");
+        let Some(chunks) = streams.get(&prompt_id) else {
+            return Ok(serde_json::json!({
+                "prompt_id": prompt_id.to_string(),
+                "events": [],
+                "next_cursor": cursor,
+                "done": true,
+            }));
+        };
+
+        // Filter for tool-related events only
+        let tool_events: Vec<&Value> = chunks
+            .iter()
+            .skip(cursor)
+            .filter(|c| {
+                c.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
+                    matches!(
+                        t,
+                        "tool_call_start" | "tool_call_end" | "tool_progress" | "security_warning"
+                    )
+                })
+            })
+            .collect();
+
+        let next_cursor = chunks.len();
+        let done = chunks
+            .last()
+            .and_then(|c| c.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "done");
+
+        Ok(serde_json::json!({
+            "prompt_id": prompt_id.to_string(),
+            "events": tool_events,
+            "next_cursor": next_cursor,
+            "done": done,
+        }))
+    }
+
     /// Register a pending tool approval that the IDE can approve/deny.
     pub fn add_pending_approval(&self, session_id: Uuid, invocation_id: &str, tool_name: &str) {
         self.approvals
@@ -1309,6 +1468,7 @@ impl RpcHandler for IdeRpcHandler {
                     "diagnostics/list", "events/poll",
                     "context/suggest", "context/analyze", "context/compress", "context/related", "context/debug",
                     "task/list", "task/update",
+                    "model/list", "config/get", "config/set", "tool/progress",
                     "status", "cancel", "shutdown"
                 ]
             })),
@@ -1356,6 +1516,14 @@ impl RpcHandler for IdeRpcHandler {
             // Task management
             "task/list" => self.handle_task_list(params),
             "task/update" => self.handle_task_update(params),
+
+            // Model & config
+            "model/list" => self.handle_model_list(params),
+            "config/get" => self.handle_config_get(params),
+            "config/set" => self.handle_config_set(params),
+
+            // Tool progress
+            "tool/progress" => self.handle_tool_progress(params),
 
             _ => Err(anyhow!("method not found: {method}")),
         }

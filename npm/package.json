@@ -1,0 +1,22 @@
+{
+  "name": "codingbuddy",
+  "version": "0.3.0",
+  "description": "AI-powered coding assistant CLI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alassanendoye/codingbuddy"
+  },
+  "bin": {
+    "codingbuddy": "bin/codingbuddy"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">=16"
+  },
+  "files": ["bin/", "install.js", "README.md"]
+}
