@@ -37,7 +37,9 @@ pub use plugins::{
 use plugins::{plugin_command_lookup_name, plugin_tool_api_name};
 use serde_json::json;
 use sha2::Digest;
-pub use shell::{PlatformShellRunner, PtyShellRunner, ShellRunResult, ShellRunner};
+pub use shell::{
+    PlatformShellRunner, ProgressCallback, PtyShellRunner, ShellRunResult, ShellRunner,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

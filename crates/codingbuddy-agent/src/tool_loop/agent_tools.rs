@@ -73,6 +73,8 @@ pub(super) fn handle_agent_level_tool(
         "send_message" => handle_send_message(tool_loop, &args)?,
         "enter_plan_mode" => handle_enter_plan_mode(tool_loop)?,
         "exit_plan_mode" => handle_exit_plan_mode(tool_loop, &args)?,
+        "enter_worktree" => handle_enter_worktree(tool_loop, &args)?,
+        "exit_worktree" => handle_exit_worktree(tool_loop, &args)?,
         "skill" => handle_skill(tool_loop, &args)?,
         _ => {
             format!(
@@ -289,6 +291,26 @@ pub(super) fn handle_task_create(
         updated_at: now,
     };
     store.insert_task(&record)?;
+
+    // Fire TaskCreated hook
+    if let Some(ref hooks) = tool_loop.hooks {
+        let input = codingbuddy_hooks::HookInput {
+            event: codingbuddy_hooks::HookEvent::TaskCreated
+                .as_str()
+                .to_string(),
+            tool_name: Some("task_create".to_string()),
+            tool_input: Some(args.clone()),
+            tool_result: None,
+            prompt: Some(subject.to_string()),
+            session_type: None,
+            workspace: tool_loop.workspace_str().to_string(),
+        };
+        super::ToolUseLoop::fire_hook_logged(
+            hooks,
+            codingbuddy_hooks::HookEvent::TaskCreated,
+            &input,
+        );
+    }
 
     Ok(serde_json::json!({
         "task_id": record.task_id,
@@ -1318,4 +1340,103 @@ pub(super) fn handle_skill(
     }
 
     Ok(response)
+}
+
+// ── Worktree isolation handlers ──────────────────────────────────────────
+
+pub(super) fn handle_enter_worktree(
+    tool_loop: &mut ToolUseLoop<'_>,
+    args: &serde_json::Value,
+) -> Result<String> {
+    if tool_loop.active_worktree.is_some() {
+        return Ok(
+            "A worktree is already active. Call exit_worktree first before creating a new one."
+                .to_string(),
+        );
+    }
+
+    let workspace = tool_loop.workspace_path().to_path_buf();
+    let branch_name = args
+        .get("branch_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let wt_name = if branch_name.is_empty() {
+        format!("session-{}", Uuid::now_v7().as_simple())
+    } else {
+        branch_name.replace('/', "-")
+    };
+
+    let wt = codingbuddy_subagent::WorktreeIsolation::create(&workspace, &wt_name)?;
+    let wt_path = wt.path().to_path_buf();
+    tool_loop.active_worktree = Some(wt);
+
+    Ok(format!(
+        "Worktree created at: {}\n\
+         All subsequent tool calls now operate in this isolated worktree.\n\
+         Call exit_worktree with action 'merge' or 'discard' when done.",
+        wt_path.display()
+    ))
+}
+
+pub(super) fn handle_exit_worktree(
+    tool_loop: &mut ToolUseLoop<'_>,
+    args: &serde_json::Value,
+) -> Result<String> {
+    let Some(mut wt) = tool_loop.active_worktree.take() else {
+        return Ok("No active worktree. Nothing to exit.".to_string());
+    };
+
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("discard");
+
+    let result = match action {
+        "merge" => {
+            let diff = wt.collect_diff().unwrap_or_default();
+            if diff.is_empty() {
+                wt.cleanup()?;
+                "Worktree exited (no changes to merge).".to_string()
+            } else {
+                // After .take(), workspace_path() returns the original workspace
+                let original = tool_loop.workspace_path();
+                let apply = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(original)
+                    .args(["apply", "--3way", "-"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+                match apply {
+                    Ok(mut child) => {
+                        if let Some(ref mut stdin) = child.stdin {
+                            use std::io::Write;
+                            let _ = stdin.write_all(diff.as_bytes());
+                        }
+                        let output = child.wait_with_output()?;
+                        wt.cleanup()?;
+                        if output.status.success() {
+                            "Worktree changes merged into main checkout.".to_string()
+                        } else {
+                            format!(
+                                "Worktree changes partially merged. Some conflicts may need manual resolution.\n{}",
+                                String::from_utf8_lossy(&output.stderr)
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        wt.cleanup()?;
+                        format!("Failed to apply worktree diff: {e}")
+                    }
+                }
+            }
+        }
+        _ => {
+            wt.cleanup()?;
+            "Worktree discarded. All experimental changes have been removed.".to_string()
+        }
+    };
+
+    Ok(result)
 }

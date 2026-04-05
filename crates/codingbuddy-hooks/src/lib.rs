@@ -42,6 +42,12 @@ pub enum HookEvent {
     SessionEnd,
     /// Task marked complete.
     TaskCompleted,
+    /// After context compaction finishes (inject restored context).
+    PostCompact,
+    /// Session setup/initialization (repo detection, build system check).
+    Setup,
+    /// A new task was created (via task_create tool).
+    TaskCreated,
 }
 
 impl HookEvent {
@@ -61,6 +67,9 @@ impl HookEvent {
             Self::PreCompact => "PreCompact",
             Self::SessionEnd => "SessionEnd",
             Self::TaskCompleted => "TaskCompleted",
+            Self::PostCompact => "PostCompact",
+            Self::Setup => "Setup",
+            Self::TaskCreated => "TaskCreated",
         }
     }
 
@@ -80,6 +89,9 @@ impl HookEvent {
             "PreCompact" | "precompact" => Some(Self::PreCompact),
             "SessionEnd" | "sessionend" => Some(Self::SessionEnd),
             "TaskCompleted" | "taskcompleted" => Some(Self::TaskCompleted),
+            "PostCompact" | "postcompact" => Some(Self::PostCompact),
+            "Setup" | "setup" => Some(Self::Setup),
+            "TaskCreated" | "taskcreated" => Some(Self::TaskCreated),
             _ => None,
         }
     }

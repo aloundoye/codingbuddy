@@ -119,6 +119,8 @@ pub struct AgentEngine {
     /// poll via `config_watcher.as_ref().and_then(|w| w.poll_change())`.
     #[allow(dead_code)]
     config_watcher: Option<codingbuddy_core::config_watcher::ConfigWatcher>,
+    /// Whether the Setup hook has already fired this session (fires once).
+    setup_fired: std::sync::atomic::AtomicBool,
 }
 
 impl AgentEngine {
@@ -237,6 +239,7 @@ impl AgentEngine {
             hooks,
             mcp,
             config_watcher: codingbuddy_core::config_watcher::watch_settings(workspace).ok(),
+            setup_fired: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -922,6 +925,15 @@ impl AgentEngine {
                 .map_err(|_| anyhow!("stream callback mutex poisoned"))?;
             if let Some(ref cb) = *guard {
                 loop_.set_stream_callback(cb.clone());
+                // Wire bash progress → ToolProgress stream chunk
+                let stream_cb = cb.clone();
+                self.tool_host
+                    .set_progress_callback(Arc::new(move |data: &str| {
+                        stream_cb(codingbuddy_core::StreamChunk::ToolProgress {
+                            tool_name: "bash_run".to_string(),
+                            data: data.to_string(),
+                        });
+                    }));
             }
         }
 
@@ -1093,6 +1105,25 @@ impl AgentEngine {
             codingbuddy_hooks::HookEvent::SessionStart,
             &session_start_input,
         );
+
+        // Fire Setup hook once per session (not per turn)
+        if !self
+            .setup_fired
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let setup_input = codingbuddy_hooks::HookInput {
+                event: codingbuddy_hooks::HookEvent::Setup.as_str().to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_result: None,
+                prompt: None,
+                session_type: None,
+                workspace: self.workspace.display().to_string(),
+            };
+            let _ = self
+                .hooks
+                .fire(codingbuddy_hooks::HookEvent::Setup, &setup_input);
+        }
 
         // Fire UserPromptSubmit hook (blocking — can modify prompt)
         let user_submit_input = codingbuddy_hooks::HookInput {

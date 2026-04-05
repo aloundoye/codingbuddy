@@ -160,6 +160,8 @@ pub struct ToolUseLoop<'a> {
     phase_read_only_calls: usize,
     /// Count of edit/write tool calls since entering Execute phase.
     phase_edit_calls: usize,
+    /// Active worktree isolation (if enter_worktree was called).
+    pub(crate) active_worktree: Option<codingbuddy_subagent::WorktreeIsolation>,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -238,6 +240,7 @@ impl<'a> ToolUseLoop<'a> {
             phase: initial_phase,
             phase_read_only_calls: 0,
             phase_edit_calls: 0,
+            active_worktree: None,
         }
     }
 
@@ -2574,6 +2577,20 @@ impl<'a> ToolUseLoop<'a> {
 
         self.messages = new_messages;
 
+        // Fire PostCompact hook if configured
+        if let Some(ref hooks) = self.hooks {
+            let input = HookInput {
+                event: HookEvent::PostCompact.as_str().to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_result: None,
+                prompt: None,
+                session_type: None,
+                workspace: self.workspace_str().to_string(),
+            };
+            Self::fire_hook_logged(hooks, HookEvent::PostCompact, &input);
+        }
+
         true
     }
 
@@ -2713,6 +2730,18 @@ impl<'a> ToolUseLoop<'a> {
             }
         } else {
             msg
+        }
+    }
+
+    /// Get the workspace path as a `Path` reference.
+    fn workspace_path(&self) -> &std::path::Path {
+        if let Some(ref wt) = self.active_worktree {
+            wt.path()
+        } else {
+            self.config
+                .workspace
+                .as_deref()
+                .unwrap_or(std::path::Path::new("."))
         }
     }
 

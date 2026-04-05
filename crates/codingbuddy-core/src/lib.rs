@@ -254,6 +254,8 @@ pub enum ToolName {
     TaskStop,
     EnterPlanMode,
     ExitPlanMode,
+    EnterWorktree,
+    ExitWorktree,
     Skill,
     KillShell,
     Batch,
@@ -300,6 +302,8 @@ impl ToolName {
             "task_stop" => Self::TaskStop,
             "enter_plan_mode" => Self::EnterPlanMode,
             "exit_plan_mode" => Self::ExitPlanMode,
+            "enter_worktree" => Self::EnterWorktree,
+            "exit_worktree" => Self::ExitWorktree,
             "skill" => Self::Skill,
             "kill_shell" => Self::KillShell,
             "batch" => Self::Batch,
@@ -347,6 +351,8 @@ impl ToolName {
             "task_stop" => Self::TaskStop,
             "enter_plan_mode" => Self::EnterPlanMode,
             "exit_plan_mode" => Self::ExitPlanMode,
+            "enter_worktree" => Self::EnterWorktree,
+            "exit_worktree" => Self::ExitWorktree,
             "skill" => Self::Skill,
             "kill_shell" => Self::KillShell,
             "batch" => Self::Batch,
@@ -393,6 +399,8 @@ impl ToolName {
             Self::TaskStop => "task_stop",
             Self::EnterPlanMode => "enter_plan_mode",
             Self::ExitPlanMode => "exit_plan_mode",
+            Self::EnterWorktree => "enter_worktree",
+            Self::ExitWorktree => "exit_worktree",
             Self::Skill => "skill",
             Self::KillShell => "kill_shell",
             Self::Batch => "batch",
@@ -438,6 +446,8 @@ impl ToolName {
             Self::TaskStop => "task_stop",
             Self::EnterPlanMode => "enter_plan_mode",
             Self::ExitPlanMode => "exit_plan_mode",
+            Self::EnterWorktree => "enter_worktree",
+            Self::ExitWorktree => "exit_worktree",
             Self::Skill => "skill",
             Self::KillShell => "kill_shell",
             Self::Batch => "batch",
@@ -494,10 +504,13 @@ impl ToolName {
         Self::TaskGet,
         Self::TaskList,
         Self::SpawnTask,
+        Self::SendMessage,
         Self::TaskOutput,
         Self::TaskStop,
         Self::EnterPlanMode,
         Self::ExitPlanMode,
+        Self::EnterWorktree,
+        Self::ExitWorktree,
         Self::Skill,
         Self::KillShell,
         Self::Batch,
@@ -1497,6 +1510,8 @@ pub enum StreamChunk {
     PhaseTransition { from: String, to: String },
     /// The active model was changed mid-session (via `/model` command).
     ModelChanged { model: String },
+    /// Live progress data from a running tool (e.g. bash stdout lines).
+    ToolProgress { tool_name: String, data: String },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -1633,6 +1648,11 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
         StreamChunk::ModelChanged { model } => serde_json::json!({
             "type": "model_changed",
             "model": model,
+        }),
+        StreamChunk::ToolProgress { tool_name, data } => serde_json::json!({
+            "type": "tool_progress",
+            "tool_name": tool_name,
+            "data": data,
         }),
         StreamChunk::Done { reason } => {
             let mut obj = serde_json::json!({ "type": "done" });

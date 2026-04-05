@@ -112,6 +112,8 @@ pub enum TuiStreamEvent {
     },
     /// Role/phase header for clear visual boundaries.
     RoleHeader { role: String, model: String },
+    /// Live progress data from a running tool (e.g. bash stdout).
+    ToolProgress { tool_name: String, data: String },
     /// An error occurred during agent execution.
     Error(String),
     /// Agent execution completed with the given output.
