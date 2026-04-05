@@ -1080,6 +1080,62 @@ For each task: id, subject, status, owner, blockedBy list\n\n\
                 }),
             },
         },
+        // ── Worktree isolation tools ─────────────────────────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "enter_worktree".to_string(),
+                description: "Create an isolated git worktree and switch the session's working directory into it. \
+This lets you experiment on a separate branch without affecting the main checkout. \
+All subsequent tool calls operate inside the worktree until you call exit_worktree.\n\n\
+## When to use\n\
+- Before making risky or experimental changes that you may want to discard\n\
+- When you need to work on a separate branch while preserving the main checkout\n\
+- For safe prototyping: try an approach, then merge or discard\n\n\
+## Important\n\
+- A new branch is created automatically from the current HEAD\n\
+- You MUST call exit_worktree when done to merge changes or clean up\n\
+- Only one worktree can be active at a time per session".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "branch_name": {
+                            "type": "string",
+                            "description": "Name for the worktree branch (e.g. 'experiment/try-new-api'). Auto-generated if omitted."
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "exit_worktree".to_string(),
+                description: "Exit the current git worktree and return to the main checkout. \
+Changes made in the worktree can be merged or discarded.\n\n\
+## When to use\n\
+- After finishing experimental work in a worktree\n\
+- To merge successful changes back to the main branch\n\
+- To discard failed experiments\n\n\
+## Actions\n\
+- merge: merge the worktree branch into the original branch, then clean up\n\
+- discard: delete the worktree and branch without merging".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["merge", "discard"],
+                            "description": "What to do with the worktree changes: 'merge' to keep, 'discard' to throw away"
+                        }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
         // ── Skill tool (LLM invokes slash commands) ──────────────────────
         ToolDefinition {
             tool_type: "function".to_string(),

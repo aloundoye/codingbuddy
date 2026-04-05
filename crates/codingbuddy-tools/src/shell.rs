@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
@@ -17,8 +18,24 @@ pub struct ShellRunResult {
     pub timed_out: bool,
 }
 
+/// Callback for streaming live output from a running command.
+pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub trait ShellRunner {
     fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult>;
+
+    /// Run with a progress callback that receives live output chunks.
+    fn run_with_progress(
+        &self,
+        cmd: &str,
+        cwd: &Path,
+        timeout: Duration,
+        on_progress: ProgressCallback,
+    ) -> Result<ShellRunResult> {
+        // Default: ignore progress callback, just run normally
+        let _ = on_progress;
+        self.run(cmd, cwd, timeout)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -74,18 +91,39 @@ impl ShellRunner for PtyShellRunner {
     fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
         #[cfg(unix)]
         if USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
-            && let Ok(result) = run_with_pty(cmd, cwd, timeout)
+            && let Ok(result) = run_with_pty(cmd, cwd, timeout, None)
         {
             return Ok(result);
         }
         // Fallback to standard pipe-based execution
         PlatformShellRunner.run(cmd, cwd, timeout)
     }
+
+    fn run_with_progress(
+        &self,
+        cmd: &str,
+        cwd: &Path,
+        timeout: Duration,
+        on_progress: ProgressCallback,
+    ) -> Result<ShellRunResult> {
+        #[cfg(unix)]
+        if USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(result) = run_with_pty(cmd, cwd, timeout, Some(on_progress))
+        {
+            return Ok(result);
+        }
+        PlatformShellRunner.run(cmd, cwd, timeout)
+    }
 }
 
 /// Run a command with a pseudo-terminal so child process sees isatty()=true.
 #[cfg(unix)]
-fn run_with_pty(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
+fn run_with_pty(
+    cmd: &str,
+    cwd: &Path,
+    timeout: Duration,
+    on_progress: Option<ProgressCallback>,
+) -> Result<ShellRunResult> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
@@ -168,6 +206,15 @@ fn run_with_pty(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResu
             Ok(0) => break,
             Ok(n) => {
                 output.extend_from_slice(&buf[..n]);
+                // Stream live progress to callback (raw lossy text —
+                // final result does the authoritative ANSI strip)
+                if let Some(ref cb) = on_progress {
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    let trimmed = chunk.trim();
+                    if !trimmed.is_empty() {
+                        cb(trimmed);
+                    }
+                }
                 if output.len() > 2_000_000 {
                     let _ = child.kill();
                     break;

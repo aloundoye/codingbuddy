@@ -289,6 +289,12 @@ pub(crate) fn handle_stream_event(
             state.shell.active_tool = None;
             StreamEventResult::Continue
         }
+        TuiStreamEvent::ToolProgress { tool_name, data } => {
+            // Show live output below the active tool spinner
+            let line = format!("  [{tool_name}] {data}");
+            state.shell.push_transcript(line);
+            StreamEventResult::Continue
+        }
         TuiStreamEvent::Done(output) => StreamEventResult::Done(output),
     }
 }

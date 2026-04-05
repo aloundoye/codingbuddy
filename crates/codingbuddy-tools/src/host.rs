@@ -46,6 +46,8 @@ pub struct LocalToolHost {
     diagnostics_after_edit: bool,
     review_mode: bool,
     mcp_executor: Option<McpExecutor>,
+    /// Optional progress callback for streaming live bash output.
+    progress_callback: std::sync::Mutex<Option<super::shell::ProgressCallback>>,
 }
 
 impl LocalToolHost {
@@ -88,12 +90,20 @@ impl LocalToolHost {
             diagnostics_after_edit: cfg.tools.diagnostics_after_edit,
             review_mode: false,
             mcp_executor: None,
+            progress_callback: std::sync::Mutex::new(None),
         })
     }
 
     /// Set the MCP executor callback for handling `mcp__*` tool calls.
     pub fn set_mcp_executor(&mut self, executor: McpExecutor) {
         self.mcp_executor = Some(executor);
+    }
+
+    /// Set a progress callback for streaming live bash output.
+    pub fn set_progress_callback(&self, cb: super::shell::ProgressCallback) {
+        if let Ok(mut guard) = self.progress_callback.lock() {
+            *guard = Some(cb);
+        }
     }
 
     pub fn index(&self) -> &codingbuddy_index::IndexService {
@@ -1164,9 +1174,14 @@ impl LocalToolHost {
     }
 
     fn run_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
-        let result = self
-            .runner
-            .run(cmd, &self.workspace, Duration::from_secs(timeout_secs))?;
+        let timeout = Duration::from_secs(timeout_secs);
+        let cb = self.progress_callback.lock().ok().and_then(|g| g.clone());
+        let result = if let Some(cb) = cb {
+            self.runner
+                .run_with_progress(cmd, &self.workspace, timeout, cb)?
+        } else {
+            self.runner.run(cmd, &self.workspace, timeout)?
+        };
         Ok(json!({
             "status": result.status,
             "stdout": result.stdout,

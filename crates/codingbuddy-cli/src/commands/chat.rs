@@ -1450,6 +1450,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::PhaseTransition { .. } => "PhaseTransition",
                         codingbuddy_core::StreamChunk::ModelChanged { .. } => "ModelChanged",
                         codingbuddy_core::StreamChunk::ToolCallReady { .. } => "ToolCallReady",
+                        codingbuddy_core::StreamChunk::ToolProgress { .. } => "ToolProgress",
                         codingbuddy_core::StreamChunk::Done { .. } => "Done",
                     },
                     "payload": match &chunk {
@@ -1465,6 +1466,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::ImageData { label, .. } => serde_json::json!({ "label": label }),
                         codingbuddy_core::StreamChunk::WatchTriggered { digest, comment_count } => serde_json::json!({ "digest": digest, "comment_count": comment_count }),
                         codingbuddy_core::StreamChunk::Error { message, recoverable } => serde_json::json!({ "message": message, "recoverable": recoverable }),
+                        codingbuddy_core::StreamChunk::ToolProgress { tool_name, data } => serde_json::json!({ "tool_name": tool_name, "data": data }),
                         _ => serde_json::json!({}),
                     }
                 });
@@ -1580,6 +1582,13 @@ pub(crate) fn run_chat(
                     codingbuddy_core::StreamChunk::ClearStreamingText => {}
                     codingbuddy_core::StreamChunk::SnapshotRecorded { .. } => {}
                     codingbuddy_core::StreamChunk::ToolCallReady { .. } => {}
+                    codingbuddy_core::StreamChunk::ToolProgress { tool_name, data } => {
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
+                        let _ = write!(handle, "  \x1b[90m[{tool_name}]\x1b[0m {data}");
+                        let _ = handle.flush();
+                    }
                     codingbuddy_core::StreamChunk::Done { .. } => {
                         // Flush any remaining partial line from the renderer
                         if let Ok(mut renderer) = md_clone.lock() {
@@ -1898,6 +1907,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                 }
                 StreamChunk::SnapshotRecorded { .. } => {}
                 StreamChunk::ToolCallReady { .. } => {}
+                StreamChunk::ToolProgress { tool_name, data } => {
+                    let _ = write!(handle, "[{tool_name}] {data}");
+                    let _ = handle.flush();
+                }
                 StreamChunk::Done { .. } => {
                     let _ = writeln!(handle);
                     let _ = handle.flush();

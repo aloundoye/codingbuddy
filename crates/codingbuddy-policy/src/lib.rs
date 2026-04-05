@@ -395,6 +395,7 @@ const MAX_AUDIT_ENTRIES: usize = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditDecision {
     AutoApproved,
+    Denied,
 }
 
 /// Audit log entry recorded when permissions are auto-approved (e.g. bypass mode).
@@ -860,6 +861,73 @@ impl PolicyEngine {
     /// Inject persistent bash command approvals (loaded from project store).
     pub fn set_persistent_bash_approvals(&mut self, approvals: Vec<String>) {
         self.cfg.persistent_bash_approvals = approvals;
+    }
+
+    /// Add a persistent permission rule at runtime (e.g. "always allow" from user choice).
+    /// The rule is appended to the active rules and takes effect immediately.
+    /// Returns the rule for the caller to persist to settings.json if desired.
+    pub fn add_runtime_rule(&mut self, rule: PermissionRule) -> &PermissionRule {
+        self.cfg.permission_rules.push(rule);
+        self.cfg.permission_rules.last().unwrap()
+    }
+
+    /// Get all current permission rules (including defaults and runtime additions).
+    pub fn permission_rules(&self) -> &[PermissionRule] {
+        &self.cfg.permission_rules
+    }
+
+    /// Record a user denial and return whether the denial threshold was reached.
+    /// After `DENIAL_AUTO_DENY_THRESHOLD` denials for the same tool pattern within
+    /// the window, the engine can auto-deny without prompting.
+    pub fn record_denial(&self, tool_name: &str) -> bool {
+        if let Ok(mut log) = self.audit_log.lock() {
+            let len = log.len();
+            if len >= MAX_AUDIT_ENTRIES {
+                log.drain(..len / 2);
+            }
+            log.push(AuditEntry {
+                tool_name: tool_name.to_string(),
+                mode: self.permission_mode,
+                decision: AuditDecision::Denied,
+                timestamp: std::time::SystemTime::now(),
+            });
+            let count = log
+                .iter()
+                .filter(|e| e.tool_name == tool_name && matches!(e.decision, AuditDecision::Denied))
+                .count();
+            count >= 3
+        } else {
+            false
+        }
+    }
+
+    /// Build a permission rule string from a tool call for "always allow" semantics.
+    pub fn build_allow_rule_for_call(call: &ToolCall) -> PermissionRule {
+        let specifier = if call.name == "bash.run" || call.name == "bash_run" {
+            if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str()) {
+                // Extract the command base (first word) for the glob pattern
+                let base = cmd.split_whitespace().next().unwrap_or(cmd);
+                format!("Bash({base} *)")
+            } else {
+                "Bash(*)".to_string()
+            }
+        } else if call.name.starts_with("fs.") || call.name.starts_with("fs_") {
+            if let Some(path) = call.args.get("path").and_then(|v| v.as_str()) {
+                let dir = std::path::Path::new(path)
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| ".".to_string());
+                format!("Edit({}/**)", dir)
+            } else {
+                "Edit(*)".to_string()
+            }
+        } else {
+            format!("Tool({})", call.name)
+        };
+        PermissionRule {
+            rule: specifier,
+            decision: "allow".to_string(),
+        }
     }
 }
 
