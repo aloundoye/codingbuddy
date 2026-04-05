@@ -1,5 +1,8 @@
+pub mod client;
 pub mod formatters;
+pub mod language_map;
 pub mod parsers;
+pub mod server_manager;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

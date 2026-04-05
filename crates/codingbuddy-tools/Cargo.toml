@@ -26,6 +26,7 @@ codingbuddy-store = { path = "../codingbuddy-store" }
 codingbuddy-hooks = { path = "../codingbuddy-hooks" }
 jsonschema.workspace = true
 codingbuddy-memory = { path = "../codingbuddy-memory" }
+codingbuddy-lsp = { path = "../codingbuddy-lsp" }
 strsim.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true

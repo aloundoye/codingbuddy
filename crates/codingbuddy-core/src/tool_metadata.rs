@@ -141,6 +141,10 @@ impl ToolName {
             | Self::IndexQuery
             | Self::DiagnosticsCheck
             | Self::Batch
+            | Self::LspHover
+            | Self::LspDefinition
+            | Self::LspReferences
+            | Self::LspSymbols
             | Self::UserQuestion
             | Self::TaskGet
             | Self::TaskList
