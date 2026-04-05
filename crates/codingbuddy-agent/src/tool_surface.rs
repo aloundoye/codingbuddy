@@ -282,6 +282,10 @@ mod tests {
             downgrades_tool_choice_required: true,
             uses_options_num_predict: true,
             requires_message_sequence_repair: false,
+            context_window_tokens: 32_000,
+            cost_per_mtok_input: 0.0,
+            cost_per_mtok_output: 0.0,
+            thinking_capability: codingbuddy_core::ThinkingCapability::None,
         };
 
         let (active, discoverable) = shape_tool_surface(active, discoverable, caps);

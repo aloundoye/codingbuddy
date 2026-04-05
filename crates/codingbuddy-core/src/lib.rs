@@ -14,8 +14,9 @@ pub mod prompts;
 mod tool_metadata;
 pub use llm_capabilities::{
     CapabilityOverride, CapabilityRegistryOverrides, CapabilityResolution, ModelCapabilities,
-    ModelFamily, PreferredEditTool, ProviderKind, detect_model_family, model_capabilities,
-    model_capabilities_with_registry, normalize_provider_kind, resolve_model_capabilities,
+    ModelFamily, PreferredEditTool, ProviderKind, ThinkingCapability, detect_model_family,
+    model_capabilities, model_capabilities_with_registry, normalize_provider_kind,
+    resolve_model_capabilities,
 };
 pub use tool_metadata::{
     InterruptBehavior, ToolAgentRole, ToolMetadata, ToolPhaseAccess, ToolTier,
@@ -2339,6 +2340,18 @@ pub struct LlmConfig {
     pub openai_compat_prefix: bool,
 }
 
+/// Known provider names and their corresponding API key environment variables.
+/// Used for auto-detection and provider enumeration.
+const KNOWN_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("openai-compatible", "OPENAI_API_KEY"),
+    ("deepseek", "DEEPSEEK_API_KEY"),
+    ("google", "GOOGLE_API_KEY"),
+    ("groq", "GROQ_API_KEY"),
+    ("openrouter", "OPENROUTER_API_KEY"),
+    ("ollama", "OLLAMA_HOST"),
+];
+
 impl LlmConfig {
     /// Returns the active provider config. Falls back to constructing one from
     /// the top-level fields if the provider key is not in the map.
@@ -2377,16 +2390,7 @@ impl LlmConfig {
         }
 
         // Check providers in priority order (best model quality first)
-        const DETECTION_ORDER: &[(&str, &str)] = &[
-            ("anthropic", "ANTHROPIC_API_KEY"),
-            ("openai-compatible", "OPENAI_API_KEY"),
-            ("deepseek", "DEEPSEEK_API_KEY"),
-            ("google", "GOOGLE_API_KEY"),
-            ("groq", "GROQ_API_KEY"),
-            ("openrouter", "OPENROUTER_API_KEY"),
-        ];
-
-        for &(provider_name, env_var) in DETECTION_ORDER {
+        for &(provider_name, env_var) in KNOWN_PROVIDER_ENV_VARS {
             if std::env::var(env_var).is_ok() && self.providers.contains_key(provider_name) {
                 self.provider = provider_name.to_string();
                 let p = self.active_provider();
@@ -2433,6 +2437,74 @@ impl LlmConfig {
         self.capability_resolution_for_model(model)
             .map(|resolution| resolution.capabilities)
     }
+
+    /// Parse a `provider/model-id` spec and apply it to this config.
+    ///
+    /// Accepts:
+    /// - `"anthropic/claude-sonnet-4-6-20250514"` → sets provider + model
+    /// - `"deepseek-chat"` → sets model only (keeps current provider)
+    /// - `"ollama/qwen2.5-coder:7b"` → sets provider + model
+    pub fn apply_model_spec(&mut self, spec: &str) {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return;
+        }
+        // Check for provider/model syntax — split on first `/`
+        // but only if the part before `/` looks like a provider name
+        if let Some((maybe_provider, model)) = spec.split_once('/')
+            && normalize_provider_kind(maybe_provider).is_some()
+            && self.providers.contains_key(maybe_provider)
+        {
+            self.provider = maybe_provider.to_string();
+            let p = self.active_provider();
+            self.base_url = p.base_url.clone();
+            self.api_key_env = p.api_key_env.clone();
+            self.base_model = model.to_string();
+            return;
+        }
+        // No provider prefix — just set the model
+        self.base_model = spec.to_string();
+    }
+
+    /// Return all providers that have valid API keys available in the environment.
+    #[must_use]
+    pub fn detected_providers(&self) -> Vec<DetectedProvider> {
+        let mut detected = Vec::new();
+        for &(name, env_var) in KNOWN_PROVIDER_ENV_VARS {
+            let available = std::env::var(env_var).is_ok();
+            let configured = self.providers.contains_key(name);
+            let is_active = self.provider == name;
+            if available || configured {
+                detected.push(DetectedProvider {
+                    name: name.to_string(),
+                    env_var: env_var.to_string(),
+                    key_available: available,
+                    configured,
+                    active: is_active,
+                    models: self
+                        .providers
+                        .get(name)
+                        .map(|p| p.models.clone())
+                        .unwrap_or(ProviderModels {
+                            chat: String::new(),
+                            reasoner: None,
+                        }),
+                });
+            }
+        }
+        detected
+    }
+}
+
+/// A detected provider with its availability status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedProvider {
+    pub name: String,
+    pub env_var: String,
+    pub key_available: bool,
+    pub configured: bool,
+    pub active: bool,
+    pub models: ProviderModels,
 }
 
 impl Default for LlmConfig {

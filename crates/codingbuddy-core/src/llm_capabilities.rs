@@ -57,6 +57,23 @@ impl ModelFamily {
     }
 }
 
+/// How a model supports extended reasoning/thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThinkingCapability {
+    /// Model does not support thinking/reasoning mode.
+    #[default]
+    None,
+    /// Native reasoning (DeepSeek-R1 style): model always thinks, no config needed.
+    /// ThinkingConfig must NOT be sent; strip temperature/top_p/tool_choice.
+    NativeReasoning,
+    /// Configurable extended thinking (Anthropic style): send ThinkingConfig with budget.
+    ExtendedThinking,
+    /// Implicit reasoning (OpenAI o1/o3 style): model reasons internally,
+    /// use max_completion_tokens instead of max_tokens.
+    ImplicitReasoning,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PreferredEditTool {
@@ -65,7 +82,7 @@ pub enum PreferredEditTool {
     PatchDirect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelCapabilities {
     pub provider: ProviderKind,
     pub family: ModelFamily,
@@ -94,6 +111,14 @@ pub struct ModelCapabilities {
     pub uses_options_num_predict: bool,
     /// Whether Mistral-style message sequence repair is needed (insert assistant between tool→user).
     pub requires_message_sequence_repair: bool,
+    /// Context window size in tokens (0 = unknown/use config default).
+    pub context_window_tokens: u64,
+    /// Cost per million input tokens in USD (0.0 = unknown/free).
+    pub cost_per_mtok_input: f64,
+    /// Cost per million output tokens in USD (0.0 = unknown/free).
+    pub cost_per_mtok_output: f64,
+    /// Thinking capability for this model.
+    pub thinking_capability: ThinkingCapability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -188,7 +213,7 @@ pub struct CapabilityRegistryOverrides {
     pub models: BTreeMap<String, CapabilityOverride>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CapabilityResolution {
     pub capabilities: ModelCapabilities,
     pub applied_rules: Vec<String>,
@@ -318,6 +343,14 @@ fn base_capabilities(
                 downgrades_tool_choice_required: false,
                 uses_options_num_predict: false,
                 requires_message_sequence_repair: false,
+                context_window_tokens: if is_reasoner { 64_000 } else { 128_000 },
+                cost_per_mtok_input: if is_reasoner { 0.55 } else { 0.27 },
+                cost_per_mtok_output: if is_reasoner { 2.19 } else { 1.10 },
+                thinking_capability: if is_reasoner {
+                    ThinkingCapability::NativeReasoning
+                } else {
+                    ThinkingCapability::ExtendedThinking
+                },
             }
         }
         ProviderKind::OpenAiCompatible => {
@@ -348,6 +381,14 @@ fn base_capabilities(
                 downgrades_tool_choice_required: family == ModelFamily::Gemini,
                 uses_options_num_predict: false,
                 requires_message_sequence_repair: family == ModelFamily::Mistral,
+                context_window_tokens: 128_000,
+                cost_per_mtok_input: 0.0,
+                cost_per_mtok_output: 0.0,
+                thinking_capability: if is_reasoning {
+                    ThinkingCapability::ImplicitReasoning
+                } else {
+                    ThinkingCapability::None
+                },
             }
         }
         ProviderKind::Anthropic => ModelCapabilities {
@@ -370,6 +411,10 @@ fn base_capabilities(
             downgrades_tool_choice_required: false,
             uses_options_num_predict: false,
             requires_message_sequence_repair: false,
+            context_window_tokens: 200_000,
+            cost_per_mtok_input: 3.0,
+            cost_per_mtok_output: 15.0,
+            thinking_capability: ThinkingCapability::ExtendedThinking,
         },
         ProviderKind::Google => ModelCapabilities {
             provider,
@@ -391,6 +436,10 @@ fn base_capabilities(
             downgrades_tool_choice_required: true,
             uses_options_num_predict: false,
             requires_message_sequence_repair: false,
+            context_window_tokens: 1_000_000,
+            cost_per_mtok_input: 1.25,
+            cost_per_mtok_output: 10.0,
+            thinking_capability: ThinkingCapability::None,
         },
         ProviderKind::Groq => ModelCapabilities {
             provider,
@@ -412,6 +461,10 @@ fn base_capabilities(
             downgrades_tool_choice_required: false,
             uses_options_num_predict: false,
             requires_message_sequence_repair: false,
+            context_window_tokens: 128_000,
+            cost_per_mtok_input: 0.0,
+            cost_per_mtok_output: 0.0,
+            thinking_capability: ThinkingCapability::None,
         },
         ProviderKind::OpenRouter => ModelCapabilities {
             provider,
@@ -433,6 +486,10 @@ fn base_capabilities(
             downgrades_tool_choice_required: false,
             uses_options_num_predict: false,
             requires_message_sequence_repair: false,
+            context_window_tokens: 128_000,
+            cost_per_mtok_input: 0.0,
+            cost_per_mtok_output: 0.0,
+            thinking_capability: ThinkingCapability::None,
         },
         ProviderKind::Ollama => ModelCapabilities {
             provider,
@@ -454,6 +511,10 @@ fn base_capabilities(
             downgrades_tool_choice_required: true,
             uses_options_num_predict: true,
             requires_message_sequence_repair: family == ModelFamily::Mistral,
+            context_window_tokens: 32_000,
+            cost_per_mtok_input: 0.0,
+            cost_per_mtok_output: 0.0,
+            thinking_capability: ThinkingCapability::None,
         },
     }
 }
