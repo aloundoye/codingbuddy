@@ -1124,6 +1124,67 @@ impl LocalToolHost {
                 let result = self.lsp_manager.symbols(Path::new(path))?;
                 Ok(json!({ "symbols": result }))
             }
+            "github.create_pr" | "github_create_pr" => {
+                let title = call
+                    .args
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing required parameter 'title'"))?;
+                let body = call.args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                let base = call.args.get("base").and_then(|v| v.as_str());
+                let draft = call
+                    .args
+                    .get("draft")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut cmd = format!(
+                    "gh pr create --title {} --body {}",
+                    shell_quote(title),
+                    shell_quote(body),
+                );
+                if let Some(b) = base {
+                    cmd.push_str(&format!(" --base {}", shell_quote(b)));
+                }
+                if draft {
+                    cmd.push_str(" --draft");
+                }
+                self.run_cmd(&cmd, 30)
+            }
+            "github.list_issues" | "github_list_issues" => {
+                let label = call.args.get("label").and_then(|v| v.as_str());
+                let state = call
+                    .args
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("open");
+                let limit = call
+                    .args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20);
+                let mut cmd = format!(
+                    "gh issue list --state {} --limit {limit} --json number,title,labels,assignees",
+                    shell_quote(state),
+                );
+                if let Some(l) = label {
+                    cmd.push_str(&format!(" --label {}", shell_quote(l)));
+                }
+                self.run_cmd(&cmd, 15)
+            }
+            "github.view_pr" | "github_view_pr" => {
+                let pr = call
+                    .args
+                    .get("pr")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("missing required parameter 'pr'"))?;
+                self.run_cmd(
+                    &format!(
+                        "gh pr view {} --json title,body,state,reviews,statusCheckRollup,additions,deletions,changedFiles",
+                        shell_quote(pr),
+                    ),
+                    15,
+                )
+            }
             name if name.starts_with("plugin__") => self.run_plugin_tool(name, &call.args),
             name if name.starts_with("mcp__") => {
                 let rest = &name[5..]; // skip "mcp__"

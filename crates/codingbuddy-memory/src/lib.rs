@@ -1,3 +1,5 @@
+pub mod auto_extract;
+
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use codingbuddy_core::runtime_dir;

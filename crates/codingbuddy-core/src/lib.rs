@@ -264,6 +264,9 @@ pub enum ToolName {
     LspDefinition,
     LspReferences,
     LspSymbols,
+    GithubCreatePr,
+    GithubListIssues,
+    GithubViewPr,
 }
 
 impl ToolName {
@@ -316,6 +319,9 @@ impl ToolName {
             "lsp_definition" => Self::LspDefinition,
             "lsp_references" => Self::LspReferences,
             "lsp_symbols" => Self::LspSymbols,
+            "github_create_pr" => Self::GithubCreatePr,
+            "github_list_issues" => Self::GithubListIssues,
+            "github_view_pr" => Self::GithubViewPr,
             _ => return None,
         })
     }
@@ -369,6 +375,9 @@ impl ToolName {
             "lsp.definition" | "lsp_definition" => Self::LspDefinition,
             "lsp.references" | "lsp_references" => Self::LspReferences,
             "lsp.symbols" | "lsp_symbols" => Self::LspSymbols,
+            "github.create_pr" | "github_create_pr" => Self::GithubCreatePr,
+            "github.list_issues" | "github_list_issues" => Self::GithubListIssues,
+            "github.view_pr" | "github_view_pr" => Self::GithubViewPr,
             _ => return None,
         })
     }
@@ -421,6 +430,9 @@ impl ToolName {
             Self::LspDefinition => "lsp.definition",
             Self::LspReferences => "lsp.references",
             Self::LspSymbols => "lsp.symbols",
+            Self::GithubCreatePr => "github.create_pr",
+            Self::GithubListIssues => "github.list_issues",
+            Self::GithubViewPr => "github.view_pr",
         }
     }
 
@@ -472,6 +484,9 @@ impl ToolName {
             Self::LspDefinition => "lsp_definition",
             Self::LspReferences => "lsp_references",
             Self::LspSymbols => "lsp_symbols",
+            Self::GithubCreatePr => "github_create_pr",
+            Self::GithubListIssues => "github_list_issues",
+            Self::GithubViewPr => "github_view_pr",
         }
     }
 
@@ -539,6 +554,9 @@ impl ToolName {
         Self::LspDefinition,
         Self::LspReferences,
         Self::LspSymbols,
+        Self::GithubCreatePr,
+        Self::GithubListIssues,
+        Self::GithubViewPr,
     ];
 }
 

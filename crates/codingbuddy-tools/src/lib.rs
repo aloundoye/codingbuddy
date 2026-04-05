@@ -29,6 +29,7 @@ use codingbuddy_memory::MemoryManager;
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
 pub(crate) use command_guard::detect_container_environment;
+pub(crate) use command_guard::shell_quote;
 use ignore::WalkBuilder;
 pub use plugins::{
     CatalogPlugin, PluginCommandPrompt, PluginInfo, PluginManager, PluginVerifyResult,
