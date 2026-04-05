@@ -8,7 +8,7 @@ const os = require("os");
 const path = require("path");
 
 const VERSION = require("./package.json").version;
-const REPO = "alassanendoye/codingbuddy";
+const REPO = "aloundoye/codingbuddy";
 
 function getPlatformTarget() {
   const platform = os.platform();
@@ -33,9 +33,9 @@ function getPlatformTarget() {
 
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
-    const follow = (url) => {
+    const follow = (location) => {
       https
-        .get(url, (res) => {
+        .get(location, (res) => {
           if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             follow(res.headers.location);
             return;
@@ -60,7 +60,8 @@ function downloadFile(url, dest) {
 async function main() {
   const target = getPlatformTarget();
   const ext = os.platform() === "win32" ? ".zip" : ".tar.gz";
-  const asset = `codingbuddy-v${VERSION}-${target}${ext}`;
+  // CI produces: codingbuddy-{target}.{ext} (no version in filename)
+  const asset = `codingbuddy-${target}${ext}`;
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${asset}`;
 
   const binDir = path.join(__dirname, "bin");
@@ -83,14 +84,14 @@ async function main() {
   const binName = os.platform() === "win32" ? "codingbuddy.exe" : "codingbuddy";
   const binPath = path.join(binDir, binName);
 
+  // Archives contain the binary at the top level (no subdirectory)
   if (ext === ".tar.gz") {
-    execSync(`tar xzf "${tmpFile}" -C "${binDir}" --strip-components=1`, {
-      stdio: "inherit",
-    });
+    execSync(`tar xzf "${tmpFile}" -C "${binDir}"`, { stdio: "inherit" });
   } else {
-    execSync(`powershell -Command "Expand-Archive -Path '${tmpFile}' -DestinationPath '${binDir}'"`, {
-      stdio: "inherit",
-    });
+    execSync(
+      `powershell -Command "Expand-Archive -Path '${tmpFile}' -DestinationPath '${binDir}' -Force"`,
+      { stdio: "inherit" },
+    );
   }
 
   if (os.platform() !== "win32") {

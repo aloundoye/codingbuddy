@@ -12,17 +12,80 @@ Connect any LLM — DeepSeek, OpenAI, Anthropic, Google, Groq, Ollama, OpenRoute
 - **Smart.** 7-strategy fuzzy editing, coordinator mode for parallel agents, per-turn RAG, doom loop detection.
 - **Extensible.** MCP servers, 12 lifecycle hooks, custom skills with model/effort metadata, SendMessage for inter-agent communication.
 
+## Installation
+
+### One-liner (recommended)
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.ps1 | iex
+```
+
+The installer downloads the correct binary for your platform, verifies the SHA-256 checksum, and adds it to your PATH.
+
+### Other methods
+
+**npm** (any platform with Node.js):
+```bash
+npm install -g codingbuddy
+```
+
+**Homebrew** (macOS / Linux):
+```bash
+brew install aloundoye/tap/codingbuddy
+```
+
+**From source** (requires Rust 1.94.1+):
+```bash
+cargo build --release --bin codingbuddy
+# Binary at target/release/codingbuddy — move it to a directory in your PATH
+```
+
+### Installer options
+
+The install scripts accept flags to customize behavior:
+
+```bash
+# Install a specific version
+curl -fsSL .../install.sh | bash -s -- --version v0.3.0
+
+# Install to a custom directory
+curl -fsSL .../install.sh | bash -s -- --install-dir ~/.local/bin
+
+# Dry run (show what would happen)
+curl -fsSL .../install.sh | bash -s -- --dry-run
+```
+
+On Windows:
+```powershell
+# Custom install directory
+& { irm .../install.ps1 } -InstallDir "C:\tools\codingbuddy\bin"
+```
+
+### Verify installation
+
+```bash
+codingbuddy --version
+codingbuddy doctor    # Check dependencies and config
+```
+
 ## Quickstart
 
 ```bash
-# Install
-cargo build --release --bin codingbuddy
-
 # Configure (pick any provider)
 export DEEPSEEK_API_KEY="sk-..."      # or OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
 
 # Chat
 codingbuddy chat
+
+# Or run the first-time project setup
+codingbuddy chat
+> /init
 ```
 
 Switch providers in `.codingbuddy/settings.json`:
@@ -182,6 +245,32 @@ Settings merge in order (later wins):
     "mode": "auto"
   }
 }
+```
+
+## Web UI
+
+CodingBuddy includes an optional web interface for browser-based access:
+
+```bash
+# Start HTTP server with web UI
+codingbuddy serve --transport http --web
+
+# Open http://127.0.0.1:8199 in your browser
+```
+
+The web frontend connects to the same JSON-RPC backend used by IDE integrations. Build it from the `web/` directory:
+
+```bash
+cd web && npm install && npm run build
+```
+
+For development with hot-reload:
+```bash
+# Terminal 1: start the backend
+codingbuddy serve --transport http
+
+# Terminal 2: start the dev server (proxies /rpc to backend)
+cd web && npm run dev
 ```
 
 ## Development
