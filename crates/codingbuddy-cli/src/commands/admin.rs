@@ -708,6 +708,93 @@ fn preferred_edit_tool_key(tool: codingbuddy_core::PreferredEditTool) -> &'stati
     }
 }
 
+/// Format a doctor payload as a human-readable terminal checklist.
+pub(crate) fn format_doctor_display(payload: &serde_json::Value) -> String {
+    let mut out = String::new();
+    out.push_str("Doctor Diagnostics\n");
+    out.push_str("==================\n");
+
+    let checks = &payload["checks"];
+    let check_items: &[(&str, &str)] = &[
+        ("git", "Git"),
+        ("rg", "Ripgrep"),
+        ("cargo", "Cargo"),
+        ("tsc", "TypeScript"),
+        ("python", "Python"),
+        ("go", "Go"),
+        ("gh", "GitHub CLI"),
+    ];
+    for &(key, label) in check_items {
+        let ok = checks[key].as_bool() == Some(true);
+        let mark = if ok { "\u{2713}" } else { "\u{2717}" };
+        out.push_str(&format!("  {mark} {label:<16}\n"));
+    }
+
+    // API key
+    let api_ok = payload["llm"]["api_key_env_set"].as_bool() == Some(true)
+        || payload["llm"]["api_key_configured"].as_bool() == Some(true);
+    let env_var = payload["llm"]["api_key_env"].as_str().unwrap_or("API_KEY");
+    out.push_str(&format!(
+        "  {} API Key          {}\n",
+        if api_ok { "\u{2713}" } else { "\u{2717}" },
+        if api_ok {
+            format!("{env_var} is set")
+        } else {
+            format!("{env_var} not set")
+        }
+    ));
+
+    // Provider / model
+    let provider = payload["llm"]["provider"].as_str().unwrap_or("unknown");
+    let model = payload["llm"]["base_model"].as_str().unwrap_or("unknown");
+    out.push_str(&format!("  \u{2713} Provider         {provider}\n"));
+    out.push_str(&format!("  \u{2713} Model            {model}\n"));
+
+    // Storage
+    if let Some(count) = payload["storage"]["session_count"].as_u64() {
+        let bytes = payload["storage"]["bytes"].as_u64().unwrap_or(0);
+        let size = if bytes > 1_048_576 {
+            format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+        } else if bytes > 1024 {
+            format!("{:.0} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{bytes} B")
+        };
+        out.push_str(&format!(
+            "  \u{2713} Sessions         {count} sessions, {size}\n"
+        ));
+    }
+
+    // Hooks
+    if let Some(n) = payload["hooks"]["count"].as_u64()
+        && n > 0
+    {
+        out.push_str(&format!("  \u{2713} Hooks            {n} configured\n"));
+    }
+
+    // Local ML
+    let ml_enabled = payload["local_ml"]["enabled"].as_bool() == Some(true);
+    out.push_str(&format!(
+        "  {} Local ML         {}\n",
+        if ml_enabled { "\u{2713}" } else { "\u{2717}" },
+        if ml_enabled { "enabled" } else { "disabled" }
+    ));
+
+    // Warnings
+    if let Some(warnings) = payload["warnings"].as_array()
+        && !warnings.is_empty()
+    {
+        out.push_str("\nWarnings:\n");
+        for w in warnings {
+            if let Some(s) = w.as_str() {
+                out.push_str(&format!("  ! {s}\n"));
+            }
+        }
+    }
+
+    out
+}
+
 pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()> {
     let service = IndexService::new(cwd)?;
     let store = Store::new(cwd)?;

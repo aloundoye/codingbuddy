@@ -793,10 +793,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             let path = AppConfig::keybindings_path().unwrap_or_default();
                             format!("Keybindings: {}", path.display())
                         }
-                        SlashCommand::Doctor => serde_json::to_string_pretty(&doctor_payload(
-                            cwd,
-                            &DoctorArgs::default(),
-                        )?)?,
+                        SlashCommand::Doctor => {
+                            format_doctor_display(&doctor_payload(cwd, &DoctorArgs::default())?)
+                        }
                         SlashCommand::Copy => "Copied last response to clipboard.".to_string(),
                         SlashCommand::Paste => {
                             if let Some(img_bytes) = read_image_from_clipboard() {

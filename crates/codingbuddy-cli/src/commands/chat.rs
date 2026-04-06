@@ -39,9 +39,9 @@ use crate::{
 };
 
 // Commands that chat dispatches to
-use crate::commands::admin::doctor_payload;
 use crate::commands::admin::run_config;
 use crate::commands::admin::run_doctor;
+use crate::commands::admin::{doctor_payload, format_doctor_display};
 use crate::commands::admin::{parse_permissions_cmd, permissions_payload, run_permissions};
 use crate::commands::background::background_payload;
 use crate::commands::background::{parse_background_cmd, run_background};
