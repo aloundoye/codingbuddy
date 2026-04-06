@@ -1464,6 +1464,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::ConfigReloaded { .. } => "ConfigReloaded",
                         codingbuddy_core::StreamChunk::ToolCallReady { .. } => "ToolCallReady",
                         codingbuddy_core::StreamChunk::ToolProgress { .. } => "ToolProgress",
+                        codingbuddy_core::StreamChunk::RateLimited { .. } => "RateLimited",
                         codingbuddy_core::StreamChunk::Done { .. } => "Done",
                     },
                     "payload": match &chunk {
@@ -1481,6 +1482,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::Error { message, recoverable } => serde_json::json!({ "message": message, "recoverable": recoverable }),
                         codingbuddy_core::StreamChunk::ToolProgress { tool_name, data } => serde_json::json!({ "tool_name": tool_name, "data": data }),
                         codingbuddy_core::StreamChunk::ConfigReloaded { path } => serde_json::json!({ "path": path }),
+                        codingbuddy_core::StreamChunk::RateLimited { wait_seconds, attempt, max_attempts, provider } => serde_json::json!({ "wait_seconds": wait_seconds, "attempt": attempt, "max_attempts": max_attempts, "provider": provider }),
                         _ => serde_json::json!({}),
                     }
                 });
@@ -1594,6 +1596,13 @@ pub(crate) fn run_chat(
                     }
                     codingbuddy_core::StreamChunk::ConfigReloaded { path } => {
                         eprintln!("  \x1b[33m\u{27f3}\x1b[0m  Config reloaded: {path}");
+                    }
+                    codingbuddy_core::StreamChunk::RateLimited { wait_seconds, attempt, max_attempts, provider } => {
+                        use std::io::Write as _;
+                        let err = std::io::stderr();
+                        let mut handle = err.lock();
+                        let _ = writeln!(handle, "  \x1b[33m\u{23f3} Rate limited by {provider}. Retrying in {wait_seconds}s (attempt {attempt}/{max_attempts})\x1b[0m");
+                        let _ = handle.flush();
                     }
                     codingbuddy_core::StreamChunk::UsageUpdate { .. } => {}
                     codingbuddy_core::StreamChunk::ClearStreamingText => {}
@@ -1919,6 +1928,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                 }
                 StreamChunk::ConfigReloaded { path } => {
                     eprintln!("  \x1b[33m\u{27f3}\x1b[0m  Config reloaded: {path}");
+                }
+                StreamChunk::RateLimited { wait_seconds, attempt, max_attempts, provider } => {
+                    let _ = writeln!(handle, "[rate limited by {provider}: retrying in {wait_seconds}s ({attempt}/{max_attempts})]");
+                    let _ = handle.flush();
                 }
                 StreamChunk::UsageUpdate { .. } => {}
                 StreamChunk::ClearStreamingText => {

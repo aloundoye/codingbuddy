@@ -1557,6 +1557,13 @@ pub enum StreamChunk {
     ConfigReloaded { path: String },
     /// Live progress data from a running tool (e.g. bash stdout lines).
     ToolProgress { tool_name: String, data: String },
+    /// Rate-limited by the provider; retrying after a delay.
+    RateLimited {
+        wait_seconds: u64,
+        attempt: u8,
+        max_attempts: u8,
+        provider: String,
+    },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -1702,6 +1709,18 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "type": "tool_progress",
             "tool_name": tool_name,
             "data": data,
+        }),
+        StreamChunk::RateLimited {
+            wait_seconds,
+            attempt,
+            max_attempts,
+            provider,
+        } => serde_json::json!({
+            "type": "rate_limited",
+            "wait_seconds": wait_seconds,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "provider": provider,
         }),
         StreamChunk::Done { reason } => {
             let mut obj = serde_json::json!({ "type": "done" });

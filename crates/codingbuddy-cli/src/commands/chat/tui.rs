@@ -1136,6 +1136,12 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 StreamChunk::ConfigReloaded { .. } => {}
                 StreamChunk::SnapshotRecorded { .. } => {}
                 StreamChunk::ToolCallReady { .. } => {}
+                StreamChunk::RateLimited { wait_seconds, provider, attempt, max_attempts } => {
+                    let _ = tx_stream.send(TuiStreamEvent::SystemNotice {
+                        line: format!("\u{23f3} Rate limited by {provider}. Retrying in {wait_seconds}s ({attempt}/{max_attempts})"),
+                        error: false,
+                    });
+                }
                 StreamChunk::ToolProgress { tool_name, data } => {
                     let _ = tx_stream.send(TuiStreamEvent::ToolProgress { tool_name, data });
                 }
@@ -1144,8 +1150,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
 
             let prompt_repo_root_override = repo_root_override.clone();
             thread::spawn(move || {
-                // DEBUG probe — writes to file before any engine call
-                { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "thread_start tools={} ro={} mode={:?}", allow_tools, read_only_for_turn, mode_for_turn)); }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     engine_clone.chat_with_options(
                         &prompt,
@@ -1165,7 +1169,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         },
                     )
                 }));
-                { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "chat_with_options returned: ok={}", result.as_ref().map(|r| r.is_ok()).unwrap_or(false))); }
                 match result {
                     Ok(Ok(output)) => {
                         let _ = tx_done.send(TuiStreamEvent::Done(output));

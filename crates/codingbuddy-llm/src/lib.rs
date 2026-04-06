@@ -1572,7 +1572,16 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        let delay = retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after);
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            cb(StreamChunk::RateLimited {
+                                wait_seconds: delay.as_secs().max(1),
+                                attempt: attempt + 1,
+                                max_attempts: self.cfg.max_retries,
+                                provider: self.cfg.provider.clone(),
+                            });
+                        }
+                        thread::sleep(delay);
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
