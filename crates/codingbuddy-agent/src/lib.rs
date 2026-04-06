@@ -660,6 +660,8 @@ impl AgentEngine {
     /// repo map, manifests) is injected on the first turn so the model starts
     /// with project awareness instead of blind.
     fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
+        fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
+        dlog("tool_loop: START");
         let project_memory = codingbuddy_memory::MemoryManager::new(&self.workspace)
             .ok()
             .and_then(|mm| mm.read_combined_memory().ok());
@@ -789,8 +791,10 @@ impl AgentEngine {
 
         // Gather lightweight bootstrap context so the model starts with project awareness.
         // Budget: ~15% of context window to leave room for conversation.
+        dlog("tool_loop: bootstrap...");
         let initial_context =
             self.build_bootstrap_context(prompt, options, self.cfg.llm.context_window_tokens);
+        dlog(&format!("tool_loop: bootstrap done ({} msgs)", initial_context.len()));
         let initial_phase = match session.status {
             SessionState::Planning | SessionState::AwaitingApproval => Some(TaskPhase::Plan),
             SessionState::ExecutingStep => Some(TaskPhase::Execute),
@@ -1014,7 +1018,9 @@ impl AgentEngine {
             loop_ = loop_.with_history(options.chat_history.clone());
         }
 
+        dlog("tool_loop: calling loop_.run()");
         let result = loop_.run(prompt)?;
+        dlog(&format!("tool_loop: run done turns={} tools={}", result.turns, result.tool_calls_made.len()));
 
         if !result.tool_calls_made.is_empty() {
             self.observer.verbose_log(&format!(
@@ -1084,6 +1090,8 @@ impl AgentEngine {
     }
 
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
+        fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
+        dlog(&format!("chat_with_options START tools={} mode={:?}", options.tools, options.mode));
         // Fire SessionStart hook
         let ws = self.workspace.display().to_string();
         let session_start_input =
@@ -1136,14 +1144,18 @@ impl AgentEngine {
             },
         );
 
+        dlog(&format!("BRANCH tools={} team={}", options.tools, should_run_team_orchestration(self, &prompt_enriched, &options)));
         let result = if !options.tools {
-            // No tools requested → use the analysis path (read-only Q&A)
+            dlog("-> analyze (no tools)");
             self.analyze_with_options(&prompt_enriched, options)
         } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
+            dlog("-> team");
             team::run(self, &prompt_enriched, &options)
         } else {
+            dlog("-> tool_loop");
             self.run_tool_use_loop(&prompt_enriched, &options)
         };
+        dlog(&format!("RESULT ok={}", result.is_ok()));
 
         if let Ok(text) = &result {
             // Record Assistant Turn
@@ -1404,19 +1416,29 @@ fn build_retriever_callback(
     let workspace_path = workspace.to_path_buf();
     let indexed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Kick off index build in background so it doesn't block the first LLM call.
+    {
+        let bg_retriever = retriever.clone();
+        let bg_workspace = workspace_path.clone();
+        let bg_indexed = indexed.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = bg_retriever.lock() {
+                let _ = r.build_index(&bg_workspace);
+                bg_indexed.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+    }
+
     Some(std::sync::Arc::new(
         move |query: &str, max_results: usize| {
-            let mut retriever = retriever
+            // Skip retrieval if index is still building in background
+            if !indexed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(vec![]);
+            }
+
+            let retriever = retriever
                 .lock()
                 .map_err(|e| anyhow!("retriever lock: {e}"))?;
-
-            // Lazy index on first call
-            if !indexed.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Err(e) = retriever.build_index(&workspace_path) {
-                    eprintln!("[codingbuddy] index build failed: {e}");
-                }
-                indexed.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
 
             let filter = codingbuddy_local_ml::SearchFilter {
                 max_results,

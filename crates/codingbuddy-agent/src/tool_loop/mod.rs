@@ -1068,11 +1068,17 @@ impl<'a> ToolUseLoop<'a> {
                 self.config.images.clear();
             }
 
+            { fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
+            dlog(&format!("execute_loop t={} model={} tools={} choice={:?}", turns, request.model, request.tools.len(), request.tool_choice)); }
+
             let response = if let Some(ref cb) = self.stream_cb {
                 self.llm.complete_chat_streaming(&request, cb.clone())?
             } else {
                 self.llm.complete_chat(&request)?
             };
+
+            { fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
+            dlog(&format!("execute_loop t={} response text_len={} tools={} finish={}", turns, response.text.len(), response.tool_calls.len(), response.finish_reason)); }
 
             if let Some(compatibility) = response.compatibility.as_ref()
                 && (!compatibility.transforms.is_empty()
