@@ -2478,9 +2478,16 @@ impl LlmConfig {
 
     #[must_use]
     pub fn capability_resolution_for_model(&self, model: &str) -> Option<CapabilityResolution> {
-        self.active_provider_kind().map(|provider| {
-            resolve_model_capabilities(provider, model, Some(&self.capability_overrides))
-        })
+        // Fall back to OpenAI-compatible for unknown providers so custom
+        // endpoints and new providers don't cause hard failures.
+        let provider = self
+            .active_provider_kind()
+            .unwrap_or(ProviderKind::OpenAiCompatible);
+        Some(resolve_model_capabilities(
+            provider,
+            model,
+            Some(&self.capability_overrides),
+        ))
     }
 
     #[must_use]

@@ -59,8 +59,20 @@ pub struct ChatShell {
     pub thinking_visibility: String,
 }
 
+/// Maximum transcript entries before draining the oldest 20%.
+const TRANSCRIPT_MAX_CAPACITY: usize = 10_000;
+
 impl ChatShell {
+    /// Enforce transcript capacity — when the limit is reached, drain the oldest 20%.
+    fn enforce_transcript_capacity(&mut self) {
+        if self.transcript.len() >= TRANSCRIPT_MAX_CAPACITY {
+            let drain_count = TRANSCRIPT_MAX_CAPACITY / 5;
+            self.transcript.drain(..drain_count);
+        }
+    }
+
     pub fn push_transcript(&mut self, line: impl Into<String>) {
+        self.enforce_transcript_capacity();
         self.transcript.push(TranscriptEntry {
             kind: MessageKind::Assistant,
             text: line.into(),
@@ -68,6 +80,7 @@ impl ChatShell {
     }
 
     pub fn push_user(&mut self, line: impl Into<String>) {
+        self.enforce_transcript_capacity();
         self.transcript.push(TranscriptEntry {
             kind: MessageKind::User,
             text: line.into(),
@@ -75,6 +88,7 @@ impl ChatShell {
     }
 
     pub fn push_system(&mut self, line: impl Into<String>) {
+        self.enforce_transcript_capacity();
         self.transcript.push(TranscriptEntry {
             kind: MessageKind::System,
             text: line.into(),
@@ -82,6 +96,7 @@ impl ChatShell {
     }
 
     pub fn push_error(&mut self, line: impl Into<String>) {
+        self.enforce_transcript_capacity();
         self.transcript.push(TranscriptEntry {
             kind: MessageKind::Error,
             text: line.into(),
@@ -89,6 +104,7 @@ impl ChatShell {
     }
 
     pub fn push_tool_call(&mut self, tool_name: &str, args_summary: &str) {
+        self.enforce_transcript_capacity();
         self.transcript.push(TranscriptEntry {
             kind: MessageKind::ToolCall,
             text: format!("{tool_name} {args_summary}"),
@@ -101,6 +117,7 @@ impl ChatShell {
         } else {
             format!("{duration_ms}ms")
         };
+        self.enforce_transcript_capacity();
         self.transcript.push(TranscriptEntry {
             kind: MessageKind::ToolResult,
             text: format!("{tool_name} ({duration_str}) {summary}"),
@@ -112,6 +129,7 @@ impl ChatShell {
     }
 
     pub fn push_thinking(&mut self, line: impl Into<String>) {
+        self.enforce_transcript_capacity();
         self.transcript.push(TranscriptEntry {
             kind: MessageKind::Thinking,
             text: line.into(),
@@ -723,8 +741,9 @@ impl AutocompleteState {
 pub struct GhostTextState {
     /// The current ghost text suggestion, if any.
     pub suggestion: Option<String>,
-    /// When the last keystroke occurred (for debounce).
-    pub last_keystroke: Instant,
+    /// When the last text edit occurred (for debounce). Only text-changing
+    /// keystrokes update this — cursor movement does not.
+    pub last_edit: Instant,
     /// Whether a completion request is pending (debounce not yet elapsed).
     pub pending: bool,
     /// Debounce duration (default 200ms).
@@ -737,7 +756,7 @@ impl Default for GhostTextState {
     fn default() -> Self {
         Self {
             suggestion: None,
-            last_keystroke: Instant::now(),
+            last_edit: Instant::now(),
             pending: false,
             debounce_ms: 200,
             min_input_len: 3,
@@ -746,10 +765,12 @@ impl Default for GhostTextState {
 }
 
 impl GhostTextState {
-    /// Record a keystroke — clears current suggestion and resets debounce.
+    /// Record a text-editing keystroke — clears current suggestion and resets debounce.
+    /// Call this only for keystrokes that actually change the input text (insertions,
+    /// deletions), not for cursor movement or navigation.
     pub fn on_keystroke(&mut self) {
         self.suggestion = None;
-        self.last_keystroke = Instant::now();
+        self.last_edit = Instant::now();
         self.pending = true;
     }
 
@@ -757,7 +778,7 @@ impl GhostTextState {
     pub fn should_request(&self, input_len: usize) -> bool {
         self.pending
             && input_len >= self.min_input_len
-            && self.last_keystroke.elapsed() >= Duration::from_millis(self.debounce_ms)
+            && self.last_edit.elapsed() >= Duration::from_millis(self.debounce_ms)
     }
 
     /// Set the suggestion from a completion callback result.

@@ -52,9 +52,9 @@ use uuid::Uuid;
 use crate::tool_bridge;
 
 use anti_hallucination::{
-    HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS,
-    SHELL_COMMAND_NUDGE, check_response_consistency, extract_shell_commands,
-    extract_user_directives, has_unverified_file_references,
+    HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS, SHELL_COMMAND_NUDGE,
+    check_response_consistency, extract_shell_commands, extract_user_directives,
+    has_unverified_file_references,
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
@@ -1005,7 +1005,11 @@ impl<'a> ToolUseLoop<'a> {
             let tool_def_tokens: u64 = self
                 .tools
                 .iter()
-                .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
+                // JSON tool schemas tokenize less efficiently than natural language
+                // (~3.5 chars/token vs ~4 chars/token) due to punctuation and field names.
+                .map(|t| {
+                    (serde_json::to_string(t).unwrap_or_default().len() as f64 / 3.5).ceil() as u64
+                })
                 .sum();
             let message_tokens = estimate_message_tokens(&self.messages);
             let estimated_tokens = message_tokens + tool_def_tokens;
@@ -1068,17 +1072,11 @@ impl<'a> ToolUseLoop<'a> {
                 self.config.images.clear();
             }
 
-            { fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
-            dlog(&format!("execute_loop t={} model={} tools={} choice={:?}", turns, request.model, request.tools.len(), request.tool_choice)); }
-
             let response = if let Some(ref cb) = self.stream_cb {
                 self.llm.complete_chat_streaming(&request, cb.clone())?
             } else {
                 self.llm.complete_chat(&request)?
             };
-
-            { fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
-            dlog(&format!("execute_loop t={} response text_len={} tools={} finish={}", turns, response.text.len(), response.tool_calls.len(), response.finish_reason)); }
 
             if let Some(compatibility) = response.compatibility.as_ref()
                 && (!compatibility.transforms.is_empty()
@@ -1930,7 +1928,33 @@ impl<'a> ToolUseLoop<'a> {
             let approved = if hook_approved {
                 true
             } else if let Some(ref cb) = self.approval_cb {
-                cb(&proposal.call)?
+                match cb(&proposal.call) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Push a Tool message so the conversation chain stays valid
+                        // (prevents HTTP 400 "insufficient tool messages" from the API)
+                        let err_msg = format!("Approval error: {e}");
+                        self.messages
+                            .push(tool_bridge::tool_error_to_message(&llm_call.id, &err_msg));
+                        let duration = start.elapsed().as_millis() as u64;
+                        self.emit(StreamChunk::ToolCallEnd {
+                            tool_name: llm_call.name.clone(),
+                            duration_ms: duration,
+                            success: false,
+                            summary: err_msg,
+                        });
+                        records.push(ToolCallRecord {
+                            tool_name: llm_call.name.clone(),
+                            tool_call_id: llm_call.id.clone(),
+                            args_summary,
+                            success: false,
+                            duration_ms: duration,
+                            args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
+                            result_preview: None,
+                        });
+                        return Ok(records);
+                    }
+                }
             } else {
                 false
             };
@@ -2673,7 +2697,7 @@ impl<'a> ToolUseLoop<'a> {
                 "--- {}:{}-{} (score: {:.3}) ---\n{}\n",
                 r.file_path, r.start_line, r.end_line, r.score, r.content,
             );
-            let chunk_tokens = (chunk_text.len() as u64) / 4;
+            let chunk_tokens = (chunk_text.len() as f64 / 3.5).ceil() as u64;
             if token_estimate + chunk_tokens > budget_tokens {
                 break;
             }

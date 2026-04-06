@@ -117,6 +117,12 @@ impl ApiClient {
         self.api_key = None;
     }
 
+    /// Re-resolve the API key from env/config. Called after a 401 response
+    /// in case the key was rotated or refreshed since construction.
+    pub fn refresh_api_key(&mut self) {
+        self.api_key = resolve_key_from_config(&self.cfg);
+    }
+
     /// Attach a cancellation token that will be checked during streaming.
     pub fn set_cancel_token(&mut self, token: CancellationToken) {
         self.cancel_token = Some(token);

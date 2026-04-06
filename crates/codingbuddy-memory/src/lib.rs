@@ -6,6 +6,7 @@ use codingbuddy_core::runtime_dir;
 use codingbuddy_store::{CheckpointRecord, Store, TranscriptExportRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1233,8 +1234,19 @@ pub fn load_hierarchical_memory(workspace: &Path) -> Vec<(PathBuf, String)> {
 /// Process @import directives in memory content.
 /// `@path/to/file` includes that file's contents inline.
 /// Relative paths are resolved from the directory containing the source file.
-/// Max recursion depth is 5 to prevent infinite loops.
+/// Max recursion depth is 5 to prevent infinite loops. Circular references
+/// are detected by tracking visited canonical paths.
 pub fn process_imports(content: &str, base_dir: &Path, max_depth: u8) -> String {
+    let mut visited = HashSet::new();
+    process_imports_inner(content, base_dir, max_depth, &mut visited)
+}
+
+fn process_imports_inner(
+    content: &str,
+    base_dir: &Path,
+    max_depth: u8,
+    visited: &mut HashSet<PathBuf>,
+) -> String {
     if max_depth == 0 {
         return content.to_string();
     }
@@ -1250,10 +1262,19 @@ pub fn process_imports(content: &str, base_dir: &Path, max_depth: u8) -> String 
                 continue;
             }
             let resolved = base_dir.join(import_path);
+            let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+            if !visited.insert(canonical.clone()) {
+                result.push_str(&format!(
+                    "<!-- circular import skipped: {} -->\n",
+                    resolved.display()
+                ));
+                continue;
+            }
             if resolved.exists() && resolved.is_file() {
                 if let Ok(imported) = fs::read_to_string(&resolved) {
                     let import_dir = resolved.parent().unwrap_or(base_dir);
-                    let processed = process_imports(&imported, import_dir, max_depth - 1);
+                    let processed =
+                        process_imports_inner(&imported, import_dir, max_depth - 1, visited);
                     result.push_str(&format!("<!-- imported from {} -->\n", resolved.display()));
                     result.push_str(processed.trim());
                     result.push('\n');
