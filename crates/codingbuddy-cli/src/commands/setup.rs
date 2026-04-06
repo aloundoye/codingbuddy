@@ -1,5 +1,5 @@
 use anyhow::Result;
-use codingbuddy_core::AppConfig;
+use codingbuddy_core::{AppConfig, KNOWN_PROVIDER_ENV_VARS};
 use codingbuddy_local_ml::model_registry;
 use codingbuddy_local_ml::{ModelManager, ModelStatus};
 use serde_json::json;
@@ -36,13 +36,23 @@ pub(crate) fn maybe_first_time_setup(cwd: &Path, cfg: &AppConfig) -> Result<bool
         return Ok(false);
     }
 
-    // If everything is already configured, silently write the marker
-    if has_api_key(cfg) && cfg.local_ml.enabled {
+    // If an API key is available (either explicitly configured or auto-detected
+    // from env vars by AppConfig::ensure → auto_detect_provider), show a
+    // one-time confirmation message and write the marker.
+    if has_api_key(cfg) {
+        let provider_name = &cfg.llm.provider;
+        let model = cfg.llm.active_base_model();
+        let env_var = &cfg.llm.active_provider().api_key_env;
         write_setup_marker(&marker)?;
+        eprintln!(
+            "  \x1b[32m\u{2713}\x1b[0m Using \x1b[1m{provider_name}\x1b[0m ({env_var}). Model: \x1b[1m{model}\x1b[0m."
+        );
+        eprintln!("    Run \x1b[1mcodingbuddy setup\x1b[0m to customize or enable local ML.");
+        eprintln!();
         return Ok(false);
     }
 
-    // Only show banner in interactive terminals
+    // No provider detected — show compact listing (interactive terminals only)
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         return Ok(false);
     }
@@ -54,18 +64,13 @@ pub(crate) fn maybe_first_time_setup(cwd: &Path, cfg: &AppConfig) -> Result<bool
         return Ok(false);
     }
 
-    // Show soft, non-blocking banner
-    let missing = if !has_api_key(cfg) {
-        "API key not configured"
-    } else {
-        "local ML not configured"
-    };
-    eprintln!(
-        "  \x1b[33m!\x1b[0m {missing}. Run \x1b[1mcodingbuddy setup\x1b[0m to configure, or \x1b[1m/init\x1b[0m in chat."
-    );
+    eprintln!("  \x1b[33m!\x1b[0m No API key detected. Set one of these environment variables:");
+    for &(name, env_var) in KNOWN_PROVIDER_ENV_VARS {
+        eprintln!("    \x1b[1m{env_var}\x1b[0m  ({name})");
+    }
+    eprintln!("    Or run \x1b[1mcodingbuddy setup\x1b[0m to configure interactively.");
     eprintln!();
 
-    // Increment counter
     write_banner_count(&counter_path, count + 1);
 
     Ok(false)
@@ -835,5 +840,29 @@ mod tests {
         // Existing settings preserved
         assert_eq!(root["local_ml"]["enabled"], true);
         assert_eq!(root["custom"], "preserved");
+    }
+
+    #[test]
+    fn auto_detect_writes_marker_and_shows_provider() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let dir = cwd.join(".codingbuddy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), "{}").unwrap();
+
+        // Set an API key — AppConfig::ensure will auto-detect it
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key") };
+
+        let cfg = AppConfig::ensure(cwd).unwrap();
+        // auto_detect_provider already switched to anthropic
+        assert_eq!(cfg.llm.provider, "anthropic");
+
+        let result = maybe_first_time_setup(cwd, &cfg).unwrap();
+
+        // Returns false (no config reload needed), but marker is written
+        assert!(!result);
+        assert!(dir.join(SETUP_MARKER).exists());
+
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     }
 }

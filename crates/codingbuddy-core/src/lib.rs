@@ -2393,7 +2393,7 @@ pub struct LlmConfig {
 
 /// Known provider names and their corresponding API key environment variables.
 /// Used for auto-detection and provider enumeration.
-const KNOWN_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
+pub const KNOWN_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("anthropic", "ANTHROPIC_API_KEY"),
     ("openai-compatible", "OPENAI_API_KEY"),
     ("deepseek", "DEEPSEEK_API_KEY"),
