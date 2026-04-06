@@ -350,7 +350,7 @@ fn base_capabilities(
                 supports_image_input: !is_reasoner,
                 strict_empty_content_filtering: false,
                 normalize_tool_call_ids: false,
-                max_safe_tool_count: if is_reasoner { 18 } else { 24 },
+                max_safe_tool_count: if is_reasoner { 10 } else { 14 },
                 preferred_edit_tool: PreferredEditTool::FsEdit,
                 prefers_max_completion_tokens: false,
                 requires_schema_sanitization: false,
