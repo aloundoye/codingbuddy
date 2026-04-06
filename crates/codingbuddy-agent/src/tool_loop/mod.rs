@@ -2363,22 +2363,11 @@ impl<'a> ToolUseLoop<'a> {
             tools
         };
 
-        // Force tool use on the first LLM call for each new question so the model
-        // explores the codebase instead of fabricating an answer.
-        let last_user_idx = self
-            .messages
-            .iter()
-            .rposition(|m| matches!(m, ChatMessage::User { .. }))
-            .unwrap_or(0);
-        let llm_turns_this_question = self.messages[last_user_idx..]
-            .iter()
-            .filter(|m| matches!(m, ChatMessage::Assistant { .. }))
-            .count();
-        let tool_choice = if llm_turns_this_question < 1 && !self.config.read_only {
-            ToolChoice::required()
-        } else {
-            ToolChoice::auto()
-        };
+        // Always use tool_choice=auto, like Claude Code does. Forcing
+        // "required" causes some models (e.g. DeepSeek) to hang or timeout.
+        // The system prompt steers tool usage; auto-conversion catches bash
+        // blocks that slip through as text.
+        let tool_choice = ToolChoice::auto();
 
         let (model, thinking, max_tokens) = self.next_request_route();
 

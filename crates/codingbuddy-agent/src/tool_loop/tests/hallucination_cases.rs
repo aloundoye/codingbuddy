@@ -57,25 +57,12 @@ fn hallucination_nudge_skips_short_responses() {
 // ── Batch 6: Anti-hallucination hardening tests ──
 
 #[test]
-fn first_turn_uses_required_tool_choice() {
-    // Build a loop with no tool results in messages (first turn)
-    let llm = ScriptedLlm::new(vec![
-        // Force tool_choice=required will cause the model to call a tool
-        make_tool_response(vec![LlmToolCall {
-            id: "call_1".to_string(),
-            name: "fs_read".to_string(),
-            arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
-        }]),
-        make_text_response("Read the file."),
-    ]);
-    let tool_host = Arc::new(MockToolHost::new(
-        vec![ToolResult {
-            invocation_id: uuid::Uuid::nil(),
-            success: true,
-            output: serde_json::json!({"content": "[package]\nname = \"test\""}),
-        }],
-        true,
-    ));
+fn first_turn_uses_auto_tool_choice() {
+    // tool_choice=auto on all turns — forcing "required" causes some
+    // models (e.g. DeepSeek) to hang. The system prompt and auto-conversion
+    // handle the fallback.
+    let llm = ScriptedLlm::new(vec![]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
 
     let config = ToolLoopConfig::default();
     let loop_ = ToolUseLoop::new(
@@ -86,31 +73,28 @@ fn first_turn_uses_required_tool_choice() {
         default_tools(),
     );
 
-    // The first build_request should use tool_choice=required
     let request = loop_.build_request();
     assert_eq!(
         request.tool_choice,
-        ToolChoice::required(),
-        "first turn should force tool_choice=required"
+        ToolChoice::auto(),
+        "should always use tool_choice=auto"
     );
 }
 
 #[test]
-fn subsequent_turns_use_auto_tool_choice() {
-    // After 1+ Assistant turns since last User message, tool_choice should be auto.
-    // The threshold is based on Assistant messages, not Tool messages.
+fn all_turns_use_auto_tool_choice() {
+    // All turns use auto — even after tool results, even on first turn.
     let llm = ScriptedLlm::new(vec![]);
     let tool_host = Arc::new(MockToolHost::new(vec![], true));
-    let config = ToolLoopConfig::default();
     let mut loop_ = ToolUseLoop::new(
         &llm,
         tool_host,
-        config,
+        ToolLoopConfig::default(),
         "system".to_string(),
         default_tools(),
     );
 
-    // Simulate: User asked → Assistant responded (1 turn) → tool result
+    // After assistant + tool results: still auto
     loop_.messages.push(ChatMessage::Assistant {
         content: Some("I'll read the file.".to_string()),
         tool_calls: vec![LlmToolCall {
@@ -127,33 +111,7 @@ fn subsequent_turns_use_auto_tool_choice() {
     });
 
     let request = loop_.build_request();
-    assert_eq!(
-        request.tool_choice,
-        ToolChoice::auto(),
-        "after 1+ Assistant turns should use tool_choice=auto"
-    );
-
-    // With no Assistant messages (only Tool results), should still force required
-    let llm2 = ScriptedLlm::new(vec![]);
-    let tool_host2 = Arc::new(MockToolHost::new(vec![], true));
-    let mut loop2 = ToolUseLoop::new(
-        &llm2,
-        tool_host2,
-        ToolLoopConfig::default(),
-        "system".to_string(),
-        default_tools(),
-    );
-    loop2.messages.push(ChatMessage::Tool {
-        tool_call_id: "call_1".to_string(),
-        content: "one result".to_string(),
-        tool_name: None,
-    });
-    let request2 = loop2.build_request();
-    assert_eq!(
-        request2.tool_choice,
-        ToolChoice::required(),
-        "with no Assistant turns, should still force required"
-    );
+    assert_eq!(request.tool_choice, ToolChoice::auto());
 }
 
 #[test]
@@ -586,9 +544,8 @@ fn shell_blocks_auto_converted_to_tool_calls() {
 }
 
 #[test]
-fn tool_choice_required_per_new_question() {
-    // In multi-turn, tool_choice=required should reset for each new user question.
-    // The ScriptedLlm lets us verify via the request the loop builds.
+fn multi_turn_tool_use_across_questions() {
+    // Multi-turn: model uses tools in first question, then again in second.
     // We simulate: turn 1 uses a tool, then continue_with asks a new question.
     let llm = ScriptedLlm::new(vec![
         // First run: tool call + response
