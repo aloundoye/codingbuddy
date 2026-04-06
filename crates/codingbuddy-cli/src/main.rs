@@ -449,7 +449,7 @@ struct AskArgs {
     mode: String,
 }
 
-#[derive(Args, Default)]
+#[derive(Args)]
 struct ChatArgs {
     #[arg(
         long,
@@ -466,6 +466,17 @@ struct ChatArgs {
     /// Override the model for this session (e.g. deepseek-reasoner, glm-5).
     #[arg(long)]
     model: Option<String>,
+}
+
+impl Default for ChatArgs {
+    fn default() -> Self {
+        Self {
+            tools: true,
+            json_events: false,
+            tui: false,
+            model: None,
+        }
+    }
 }
 
 #[derive(Args)]
