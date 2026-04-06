@@ -267,7 +267,7 @@ pub(crate) fn extract_shell_commands(text: &str) -> Vec<String> {
 }
 
 /// Strip bash/sh code blocks from text, leaving only the prose content.
-/// Used to extract the non-command parts of a response for the assistant message.
+#[cfg(test)]
 pub(crate) fn strip_shell_blocks(text: &str) -> String {
     shell_block_regex().replace_all(text, "").trim().to_string()
 }

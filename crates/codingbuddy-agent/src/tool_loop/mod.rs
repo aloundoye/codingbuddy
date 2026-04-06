@@ -54,7 +54,7 @@ use crate::tool_bridge;
 use anti_hallucination::{
     HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS,
     SHELL_COMMAND_NUDGE, check_response_consistency, extract_shell_commands,
-    extract_user_directives, has_unverified_file_references, strip_shell_blocks,
+    extract_user_directives, has_unverified_file_references,
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
@@ -933,6 +933,7 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
+        let mut shell_nudge_count: usize = 0;
         let mut truncation_retries: u8 = 0;
 
         let mut verbosity_nudge_count: usize = 0;
@@ -1067,7 +1068,7 @@ impl<'a> ToolUseLoop<'a> {
                 self.config.images.clear();
             }
 
-            let mut response = if let Some(ref cb) = self.stream_cb {
+            let response = if let Some(ref cb) = self.stream_cb {
                 self.llm.complete_chat_streaming(&request, cb.clone())?
             } else {
                 self.llm.complete_chat(&request)?
@@ -1124,60 +1125,36 @@ impl<'a> ToolUseLoop<'a> {
                 return Err(anyhow!("Response blocked by content filter"));
             }
 
-            // Shell command auto-conversion: when the model outputs bash code
-            // blocks as text instead of calling tools, extract the commands and
-            // synthesize bash_run tool calls. This works around models (e.g.
-            // DeepSeek) that ignore tool_choice=required. The synthetic calls
-            // go through the normal permission pipeline.
-            //
-            // MUST run before truncation recovery: long bash scripts often hit
-            // the output token limit (finish_reason="length"), and the truncation
-            // retry `continue` would skip this conversion entirely.
-            if response.tool_calls.is_empty() {
-                let commands = extract_shell_commands(&response.text);
-                if !commands.is_empty() {
-                    // Clear the streamed text from the TUI — the bash blocks
-                    // are being converted to tool calls, not displayed as text.
-                    self.emit(StreamChunk::ClearStreamingText);
-
-                    let prose = strip_shell_blocks(&response.text);
-                    self.emit(StreamChunk::SecurityWarning {
-                        message: format!(
-                            "Auto-converting {} shell block(s) to bash_run tool calls",
-                            commands.len()
-                        ),
+            // Shell command nudge: if the model outputs bash code blocks as
+            // text instead of using the bash_run tool, nudge it to retry with
+            // tools. This runs once before the general hallucination nudge.
+            // Unlike auto-conversion (which clears streamed text and creates
+            // synthetic tool calls that need approval), this just asks the
+            // model to retry — simpler and doesn't break the TUI flow.
+            if response.tool_calls.is_empty()
+                && shell_nudge_count == 0
+                && !extract_shell_commands(&response.text).is_empty()
+            {
+                shell_nudge_count += 1;
+                if let Some(ref cb) = self.event_cb {
+                    cb(EventKind::HallucinationNudgeFired {
+                        nudge_count: 1,
+                        trigger: "shell_command_pattern".to_string(),
                     });
-
-                    response.tool_calls = commands
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, cmd)| LlmToolCall {
-                            id: format!("synthetic_{}", Uuid::new_v4().as_simple()),
-                            name: "bash_run".to_string(),
-                            arguments: serde_json::json!({
-                                "command": cmd,
-                                "description": format!("(auto-converted from text) command {}", i + 1),
-                            })
-                            .to_string(),
-                        })
-                        .collect();
-                    response.text = prose;
-                    // Override finish_reason so truncation recovery doesn't
-                    // re-swallow the now-converted tool calls.
-                    response.finish_reason = "tool_calls".to_string();
-
-                    if let Some(ref cb) = self.event_cb {
-                        cb(EventKind::HallucinationNudgeFired {
-                            nudge_count: response.tool_calls.len() as u64,
-                            trigger: "shell_auto_convert".to_string(),
-                        });
-                    }
                 }
+                self.messages.push(ChatMessage::Assistant {
+                    content: Some(response.text.clone()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                });
+                self.messages.push(ChatMessage::User {
+                    content: SHELL_COMMAND_NUDGE.to_string(),
+                });
+                continue;
             }
 
             // Output token recovery: when the model hits max_output_tokens,
             // ask it to be more concise and retry (up to 3 attempts).
-            // Skipped when shell auto-conversion already extracted tool calls.
             if response.finish_reason == "length" && truncation_retries < MAX_TRUNCATION_RETRIES {
                 truncation_retries += 1;
                 self.messages.push(ChatMessage::System {
