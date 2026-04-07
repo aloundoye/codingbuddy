@@ -933,6 +933,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                                 release_notes_payload(cwd, range, args.get(1).map(|s| s.as_str()))?;
                             serde_json::to_string_pretty(&payload)?
                         }
+                        SlashCommand::Models => format_models_list(cfg),
                         SlashCommand::Login => {
                             let payload = login_payload(cwd)?;
                             serde_json::to_string_pretty(&payload)?

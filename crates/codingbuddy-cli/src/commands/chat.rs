@@ -1344,6 +1344,14 @@ pub(crate) fn run_chat(
                         }
                     }
                 }
+                SlashCommand::Models => {
+                    let output = format_models_list(&cfg);
+                    if json_mode {
+                        print_json(&json!({"models": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
                 SlashCommand::Login => {
                     let payload = login_payload(cwd)?;
                     if json_mode {
@@ -2059,6 +2067,92 @@ pub(crate) fn run_resume_specific(
         None,
         Some(session.session_id),
     )
+}
+
+/// Format a list of known models with pricing and context window info.
+fn format_models_list(cfg: &AppConfig) -> String {
+    use codingbuddy_core::cost::get_pricing;
+
+    let active_model = cfg.llm.active_base_model();
+    let provider = &cfg.llm.provider;
+
+    let mut out = format!("Models for {provider}:\n");
+    out.push_str(&format!(
+        "  {:<28} {:>8} {:>10} {:>10}\n",
+        "Model", "Context", "Input/M", "Output/M"
+    ));
+    out.push_str(&format!("  {}\n", "-".repeat(60)));
+
+    // Collect models from the active provider and common models
+    let mut models: Vec<(&str, u64, f64, f64)> = Vec::new();
+
+    // Add the active model
+    if let Some(resolution) = cfg.llm.capability_resolution_for_model(&active_model) {
+        let caps = &resolution.capabilities;
+        let pricing = get_pricing(&active_model);
+        models.push((
+            "",
+            caps.context_window_tokens,
+            pricing.input_per_million,
+            pricing.output_per_million,
+        ));
+    }
+
+    // Common models by provider
+    let known_models: &[&str] = match provider.as_str() {
+        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
+        "anthropic" => &[
+            "claude-opus-4",
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5-20251001",
+        ],
+        "openai-compatible" => &[
+            "gpt-4o",
+            "gpt-4o-mini",
+            "o4-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+        ],
+        "google" => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+        "groq" => &["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
+        _ => &[],
+    };
+
+    for &model in known_models {
+        let pricing = get_pricing(model);
+        let ctx = cfg
+            .llm
+            .capability_resolution_for_model(model)
+            .map(|r| r.capabilities.context_window_tokens)
+            .unwrap_or(128_000);
+        let marker = if model == active_model { "* " } else { "  " };
+        let ctx_str = if ctx >= 1_000_000 {
+            format!("{}M", ctx / 1_000_000)
+        } else {
+            format!("{}K", ctx / 1000)
+        };
+        out.push_str(&format!(
+            "{marker}{:<28} {:>8} {:>9.2} {:>9.2}\n",
+            model, ctx_str, pricing.input_per_million, pricing.output_per_million
+        ));
+    }
+
+    // If active model wasn't in the known list, show it
+    if !known_models.contains(&active_model.as_str()) {
+        let pricing = get_pricing(&active_model);
+        let ctx = models.first().map(|m| m.1).unwrap_or(128_000);
+        let ctx_str = if ctx >= 1_000_000 {
+            format!("{}M", ctx / 1_000_000)
+        } else {
+            format!("{}K", ctx / 1000)
+        };
+        out.push_str(&format!(
+            "* {:<28} {:>8} {:>9.2} {:>9.2}\n",
+            active_model, ctx_str, pricing.input_per_million, pricing.output_per_million
+        ));
+    }
+
+    out
 }
 
 #[cfg(test)]
