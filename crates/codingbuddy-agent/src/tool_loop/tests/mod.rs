@@ -1,4 +1,4 @@
-use super::anti_hallucination::split_sentences;
+use super::anti_hallucination::{contains_shell_command_pattern, split_sentences};
 use super::compaction::COMPACTION_TEMPLATE;
 use super::safety::DOOM_LOOP_HISTORY_SIZE;
 use super::*;

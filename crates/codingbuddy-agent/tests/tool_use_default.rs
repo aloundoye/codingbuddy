@@ -520,11 +520,11 @@ fn first_turn_tool_choice_required() -> Result<()> {
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
-    // First request should have tool_choice=required
+    // All turns use auto — required causes hangs on some models
     assert_eq!(
         requests[0].tool_choice,
-        codingbuddy_core::ToolChoice::required(),
-        "first turn should force tool_choice=required"
+        codingbuddy_core::ToolChoice::auto(),
+        "first turn should use tool_choice=auto"
     );
     Ok(())
 }
@@ -559,23 +559,14 @@ fn subsequent_turns_tool_choice_auto() -> Result<()> {
 
     let requests = captured.lock().unwrap();
     assert!(requests.len() >= 3, "should have at least 3 LLM calls");
-    // First request (no prior Assistant turns) should use required
-    assert_eq!(
-        requests[0].tool_choice,
-        codingbuddy_core::ToolChoice::required(),
-        "first turn should use tool_choice=required"
-    );
-    // After first Assistant response, switch to auto
-    assert_eq!(
-        requests[1].tool_choice,
-        codingbuddy_core::ToolChoice::auto(),
-        "second turn (1 Assistant turn) should use auto"
-    );
-    assert_eq!(
-        requests[2].tool_choice,
-        codingbuddy_core::ToolChoice::auto(),
-        "third turn should also use auto"
-    );
+    // All turns use auto
+    for (i, req) in requests.iter().enumerate() {
+        assert_eq!(
+            req.tool_choice,
+            codingbuddy_core::ToolChoice::auto(),
+            "turn {} should use tool_choice=auto", i
+        );
+    }
     Ok(())
 }
 

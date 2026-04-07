@@ -1961,7 +1961,7 @@ fn ghost_text_min_input_length() {
         "should not request for short input"
     );
     // Wait past debounce and check with sufficient input
-    ghost.last_keystroke = Instant::now() - Duration::from_millis(300);
+    ghost.last_edit = Instant::now() - Duration::from_millis(300);
     assert!(
         ghost.should_request(5),
         "should request for long input after debounce"

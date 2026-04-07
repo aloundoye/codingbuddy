@@ -21,6 +21,18 @@ fn text_parse_err(
     rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e))
 }
 
+/// Parse a UUID string, logging a warning and returning `Uuid::nil()` on failure.
+/// This prevents silent data corruption by making parse errors observable.
+fn parse_uuid_or_nil(s: &str) -> Uuid {
+    Uuid::parse_str(s).unwrap_or_else(|e| {
+        eprintln!(
+            "codingbuddy-store: warning: corrupt UUID '{}': {e}",
+            &s[..s.len().min(36)]
+        );
+        Uuid::nil()
+    })
+}
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (
         1,
@@ -375,6 +387,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
          );
          CREATE INDEX IF NOT EXISTS idx_session_todos_session_position
             ON session_todos(session_id, position, created_at);",
+    ),
+    (
+        13,
+        "CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+         CREATE INDEX IF NOT EXISTS idx_subagent_runs_session ON subagent_runs(session_id);
+         CREATE INDEX IF NOT EXISTS idx_cost_ledger_session ON cost_ledger(session_id);",
     ),
 ];
 
@@ -1283,10 +1302,8 @@ impl Store {
         if let Some(session_id) = session_id {
             let rows = stmt.query_map([session_id.to_string()], |r| {
                 Ok(ContextCompactionRecord {
-                    summary_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
-                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
+                    summary_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                    session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                     from_turn: r.get::<_, i64>(2)? as u64,
                     to_turn: r.get::<_, i64>(3)? as u64,
                     token_delta_estimate: r.get(4)?,
@@ -1300,10 +1317,8 @@ impl Store {
         } else {
             let rows = stmt.query_map([], |r| {
                 Ok(ContextCompactionRecord {
-                    summary_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
-                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
+                    summary_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                    session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                     from_turn: r.get::<_, i64>(2)? as u64,
                     to_turn: r.get::<_, i64>(3)? as u64,
                     token_delta_estimate: r.get(4)?,
@@ -1361,8 +1376,7 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(CheckpointRecord {
-                checkpoint_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                checkpoint_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
                 reason: r.get(1)?,
                 snapshot_path: r.get(2)?,
                 files_count: r.get::<_, i64>(3)? as u64,
@@ -1674,7 +1688,7 @@ impl Store {
         let mut rows = stmt.query([run_id.to_string()])?;
         if let Some(r) = rows.next()? {
             return Ok(Some(SubagentRunRecord {
-                run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                run_id: parse_uuid_or_nil(&r.get::<_, String>(0)?),
                 session_id: r
                     .get::<_, Option<String>>(1)?
                     .and_then(|value| Uuid::parse_str(&value).ok()),
@@ -1711,7 +1725,7 @@ impl Store {
         let mut rows = stmt.query([task_id.to_string()])?;
         if let Some(r) = rows.next()? {
             return Ok(Some(SubagentRunRecord {
-                run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                run_id: parse_uuid_or_nil(&r.get::<_, String>(0)?),
                 session_id: r
                     .get::<_, Option<String>>(1)?
                     .and_then(|value| Uuid::parse_str(&value).ok()),
@@ -1779,7 +1793,7 @@ impl Store {
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(SubagentRunRecord {
-                    run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                    run_id: parse_uuid_or_nil(&r.get::<_, String>(0)?),
                     session_id: r
                         .get::<_, Option<String>>(1)?
                         .and_then(|value| Uuid::parse_str(&value).ok()),
@@ -1823,7 +1837,7 @@ impl Store {
             )?;
             let rows = stmt.query_map(params![capped_limit], |r| {
                 Ok(SubagentRunRecord {
-                    run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                    run_id: parse_uuid_or_nil(&r.get::<_, String>(0)?),
                     session_id: r
                         .get::<_, Option<String>>(1)?
                         .and_then(|value| Uuid::parse_str(&value).ok()),
@@ -1992,8 +2006,7 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(BackgroundJobRecord {
-                job_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                job_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
                 kind: r.get(1)?,
                 reference: r.get(2)?,
                 status: r.get(3)?,
@@ -2044,10 +2057,8 @@ impl Store {
             )?;
             let rows = stmt.query_map(params![session_id.to_string(), bounded_limit], |r| {
                 Ok(ReplayCassetteRecord {
-                    cassette_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
-                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
+                    cassette_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                    session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                     deterministic: r.get::<_, i64>(2)? != 0,
                     events_count: r.get::<_, i64>(3)? as u64,
                     payload_json: r.get(4)?,
@@ -2068,10 +2079,8 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![bounded_limit], |r| {
             Ok(ReplayCassetteRecord {
-                cassette_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
-                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                cassette_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                 deterministic: r.get::<_, i64>(2)? != 0,
                 events_count: r.get::<_, i64>(3)? as u64,
                 payload_json: r.get(4)?,
@@ -2211,8 +2220,7 @@ impl Store {
         )?;
         let rows = stmt.query_map([limit.max(1) as i64], |r| {
             Ok(VisualArtifactRecord {
-                artifact_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                artifact_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
                 path: r.get(1)?,
                 mime: r.get(2)?,
                 metadata_json: r.get(3)?,
@@ -2251,8 +2259,7 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(RemoteEnvProfileRecord {
-                profile_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                profile_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
                 name: r.get(1)?,
                 endpoint: r.get(2)?,
                 auth_mode: r.get(3)?,
@@ -2419,10 +2426,8 @@ impl Store {
         let mut rows = stmt.query([task_id.to_string()])?;
         if let Some(r) = rows.next()? {
             return Ok(Some(TaskQueueRecord {
-                task_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
-                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                task_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                 title: r.get(2)?,
                 description: r.get(3)?,
                 priority: r.get::<_, i64>(4)? as u32,
@@ -2474,10 +2479,8 @@ impl Store {
             )?;
             let rows = stmt.query_map([sid.to_string()], |r| {
                 Ok(TaskQueueRecord {
-                    task_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
-                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
+                    task_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                    session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                     title: r.get(2)?,
                     description: r.get(3)?,
                     priority: r.get::<_, i64>(4)? as u32,
@@ -2498,10 +2501,8 @@ impl Store {
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(TaskQueueRecord {
-                    task_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
-                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                        .unwrap_or_else(|_| Uuid::nil()),
+                    task_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                    session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                     title: r.get(2)?,
                     description: r.get(3)?,
                     priority: r.get::<_, i64>(4)? as u32,
@@ -2550,10 +2551,8 @@ impl Store {
         )?;
         let rows = stmt.query_map([session_id.to_string()], |r| {
             Ok(SessionTodoRecord {
-                todo_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
-                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                todo_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                 content: r.get(2)?,
                 status: r.get(3)?,
                 position: r.get::<_, i64>(4)? as u32,
@@ -2701,10 +2700,8 @@ impl Store {
         )?;
         let rows = stmt.query_map([session_id.to_string()], |r| {
             Ok(ReviewRunRecord {
-                review_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
-                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                review_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                session_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                 preset: r.get(2)?,
                 target: r.get(3)?,
                 findings_json: r.get(4)?,
@@ -2746,10 +2743,8 @@ impl Store {
         )?;
         let rows = stmt.query_map([task_id.to_string()], |r| {
             Ok(ArtifactRecord {
-                artifact_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
-                task_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                artifact_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                task_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                 artifact_path: r.get(2)?,
                 files_json: r.get(3)?,
                 created_at: r.get(4)?,
@@ -2770,10 +2765,8 @@ impl Store {
         )?;
         let rows = stmt.query_map([limit as i64], |r| {
             Ok(ArtifactRecord {
-                artifact_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
-                task_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
-                    .unwrap_or_else(|_| Uuid::nil()),
+                artifact_id: parse_uuid_or_nil(r.get::<_, String>(0)?.as_str()),
+                task_id: parse_uuid_or_nil(r.get::<_, String>(1)?.as_str()),
                 artifact_path: r.get(2)?,
                 files_json: r.get(3)?,
                 created_at: r.get(4)?,

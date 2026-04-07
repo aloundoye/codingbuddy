@@ -224,7 +224,8 @@ fn build_builtin_secret_patterns() -> Vec<(String, Regex)> {
     let patterns = vec![
         ("api_key_sk", r"sk-[a-zA-Z0-9]{20,}"),
         ("anthropic_key", r"sk-ant-[a-zA-Z0-9\-]{20,}"),
-        ("aws_key", r"AKIA[0-9A-Z]{16}"),
+        // AWS access key ID — require word boundary to avoid matching partial strings
+        ("aws_key", r"\bAKIA[0-9A-Z]{16}\b"),
         ("google_api_key", r"AIza[a-zA-Z0-9_\-]{35}"),
         ("github_token", r"ghp_[a-zA-Z0-9]{36}"),
         ("gitlab_token", r"glpat-[a-zA-Z0-9\-]{20,}"),

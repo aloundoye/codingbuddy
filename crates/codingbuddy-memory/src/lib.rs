@@ -6,6 +6,7 @@ use codingbuddy_core::runtime_dir;
 use codingbuddy_store::{CheckpointRecord, Store, TranscriptExportRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -152,6 +153,7 @@ pub struct RewindResult {
 pub enum ExportFormat {
     Json,
     Markdown,
+    Html,
 }
 
 impl ExportFormat {
@@ -159,6 +161,7 @@ impl ExportFormat {
         match value.trim().to_ascii_lowercase().as_str() {
             "json" => Some(Self::Json),
             "md" | "markdown" => Some(Self::Markdown),
+            "html" => Some(Self::Html),
             _ => None,
         }
     }
@@ -167,6 +170,7 @@ impl ExportFormat {
         match self {
             Self::Json => "json",
             Self::Markdown => "md",
+            Self::Html => "html",
         }
     }
 }
@@ -896,6 +900,7 @@ impl MemoryManager {
                 }
                 md
             }
+            ExportFormat::Html => render_html_export(&projection.transcript, session),
         };
         fs::write(&out_path, body)?;
 
@@ -1233,8 +1238,19 @@ pub fn load_hierarchical_memory(workspace: &Path) -> Vec<(PathBuf, String)> {
 /// Process @import directives in memory content.
 /// `@path/to/file` includes that file's contents inline.
 /// Relative paths are resolved from the directory containing the source file.
-/// Max recursion depth is 5 to prevent infinite loops.
+/// Max recursion depth is 5 to prevent infinite loops. Circular references
+/// are detected by tracking visited canonical paths.
 pub fn process_imports(content: &str, base_dir: &Path, max_depth: u8) -> String {
+    let mut visited = HashSet::new();
+    process_imports_inner(content, base_dir, max_depth, &mut visited)
+}
+
+fn process_imports_inner(
+    content: &str,
+    base_dir: &Path,
+    max_depth: u8,
+    visited: &mut HashSet<PathBuf>,
+) -> String {
     if max_depth == 0 {
         return content.to_string();
     }
@@ -1250,10 +1266,19 @@ pub fn process_imports(content: &str, base_dir: &Path, max_depth: u8) -> String 
                 continue;
             }
             let resolved = base_dir.join(import_path);
+            let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+            if !visited.insert(canonical.clone()) {
+                result.push_str(&format!(
+                    "<!-- circular import skipped: {} -->\n",
+                    resolved.display()
+                ));
+                continue;
+            }
             if resolved.exists() && resolved.is_file() {
                 if let Ok(imported) = fs::read_to_string(&resolved) {
                     let import_dir = resolved.parent().unwrap_or(base_dir);
-                    let processed = process_imports(&imported, import_dir, max_depth - 1);
+                    let processed =
+                        process_imports_inner(&imported, import_dir, max_depth - 1, visited);
                     result.push_str(&format!("<!-- imported from {} -->\n", resolved.display()));
                     result.push_str(processed.trim());
                     result.push('\n');
@@ -1366,6 +1391,75 @@ fn tail_lines(content: &str, max_lines: usize) -> String {
         return content.to_string();
     }
     lines[lines.len().saturating_sub(max_lines)..].join("\n")
+}
+
+/// Render a transcript as self-contained HTML with embedded CSS.
+fn render_html_export(transcript: &[String], session_id: Uuid) -> String {
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    html.push_str(&format!(
+        "<title>CodingBuddy Session {}</title>\n",
+        &session_id.to_string()[..8]
+    ));
+    html.push_str("<style>\n");
+    html.push_str(
+        ":root { --bg: #1e1e2e; --fg: #cdd6f4; --user: #89b4fa; --assistant: #a6e3a1; \
+         --tool: #f9e2af; --border: #45475a; --code-bg: #313244; }\n\
+         @media (prefers-color-scheme: light) { :root { --bg: #eff1f5; --fg: #4c4f69; \
+         --user: #1e66f5; --assistant: #40a02b; --tool: #df8e1d; --border: #ccd0da; \
+         --code-bg: #e6e9ef; } }\n\
+         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; \
+         background: var(--bg); color: var(--fg); max-width: 800px; margin: 0 auto; \
+         padding: 2rem 1rem; line-height: 1.6; }\n\
+         h1 { border-bottom: 2px solid var(--border); padding-bottom: 0.5rem; }\n\
+         .msg { border-left: 3px solid var(--border); padding: 0.5rem 1rem; margin: 1rem 0; \
+         border-radius: 0 4px 4px 0; }\n\
+         .msg.user { border-color: var(--user); }\n\
+         .msg.assistant { border-color: var(--assistant); }\n\
+         .msg.tool { border-color: var(--tool); font-size: 0.9em; }\n\
+         .role { font-weight: 600; font-size: 0.85em; text-transform: uppercase; }\n\
+         .role.user { color: var(--user); }\n\
+         .role.assistant { color: var(--assistant); }\n\
+         .role.tool { color: var(--tool); }\n\
+         pre { background: var(--code-bg); padding: 0.75rem; border-radius: 4px; \
+         overflow-x: auto; font-size: 0.85em; }\n\
+         code { font-family: 'SF Mono', 'Fira Code', monospace; }\n\
+         details { margin: 0.25rem 0; }\n\
+         summary { cursor: pointer; color: var(--tool); }\n",
+    );
+    html.push_str("</style>\n</head>\n<body>\n");
+    html.push_str(&format!(
+        "<h1>CodingBuddy Session <code>{}</code></h1>\n",
+        &session_id.to_string()[..8]
+    ));
+
+    for line in transcript {
+        let (role, content) = if let Some(rest) = line.strip_prefix("[user] ") {
+            ("user", rest)
+        } else if let Some(rest) = line.strip_prefix("[assistant] ") {
+            ("assistant", rest)
+        } else if let Some(rest) = line.strip_prefix("[tool:") {
+            let role_end = rest.find(']').unwrap_or(rest.len());
+            ("tool", &rest[role_end + 1..])
+        } else {
+            ("assistant", line.as_str())
+        };
+
+        let escaped = content
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+
+        html.push_str(&format!(
+            "<div class=\"msg {role}\"><span class=\"role {role}\">{role}</span>\n<p>{escaped}</p></div>\n"
+        ));
+    }
+
+    html.push_str("<footer style=\"text-align:center;color:var(--border);margin-top:2rem;font-size:0.8em\">\n");
+    html.push_str("Generated by CodingBuddy</footer>\n");
+    html.push_str("</body>\n</html>\n");
+    html
 }
 
 #[cfg(test)]

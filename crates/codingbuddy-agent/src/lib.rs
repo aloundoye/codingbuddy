@@ -729,6 +729,18 @@ impl AgentEngine {
             repo_map_summary.as_deref(),
             &active_base_model,
         );
+
+        // Inject output style preference
+        match self.cfg.output_style.as_str() {
+            "concise" => {
+                system_prompt.push_str("\n\nIMPORTANT: Be extremely concise. One-sentence answers preferred. No preamble or trailing summaries.");
+            }
+            "verbose" => {
+                system_prompt.push_str("\n\nExplain your reasoning in detail. Include context, alternatives considered, and trade-offs.");
+            }
+            _ => {} // "normal" or unrecognized — no injection
+        }
+
         if let Some(plan_addendum) = self.active_plan_prompt_addendum(&session)? {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&plan_addendum);
@@ -1137,7 +1149,6 @@ impl AgentEngine {
         );
 
         let result = if !options.tools {
-            // No tools requested → use the analysis path (read-only Q&A)
             self.analyze_with_options(&prompt_enriched, options)
         } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
             team::run(self, &prompt_enriched, &options)
@@ -1404,19 +1415,29 @@ fn build_retriever_callback(
     let workspace_path = workspace.to_path_buf();
     let indexed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Kick off index build in background so it doesn't block the first LLM call.
+    {
+        let bg_retriever = retriever.clone();
+        let bg_workspace = workspace_path.clone();
+        let bg_indexed = indexed.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = bg_retriever.lock() {
+                let _ = r.build_index(&bg_workspace);
+                bg_indexed.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+    }
+
     Some(std::sync::Arc::new(
         move |query: &str, max_results: usize| {
-            let mut retriever = retriever
+            // Skip retrieval if index is still building in background
+            if !indexed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(vec![]);
+            }
+
+            let retriever = retriever
                 .lock()
                 .map_err(|e| anyhow!("retriever lock: {e}"))?;
-
-            // Lazy index on first call
-            if !indexed.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Err(e) = retriever.build_index(&workspace_path) {
-                    eprintln!("[codingbuddy] index build failed: {e}");
-                }
-                indexed.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
 
             let filter = codingbuddy_local_ml::SearchFilter {
                 max_results,
