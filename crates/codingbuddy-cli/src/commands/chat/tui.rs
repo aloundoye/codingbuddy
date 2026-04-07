@@ -894,10 +894,12 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             )
                         }
                         SlashCommand::Theme(t) => {
-                            if let Some(t) = t {
-                                format!("Theme: {t}")
+                            if let Some(ref name) = t {
+                                let theme = codingbuddy_ui::TuiTheme::from_preference(name);
+                                let mode = if theme.is_light { "light" } else { "dark" };
+                                format!("Theme set to: {name} ({mode})")
                             } else {
-                                "Available: default, dark, light".to_string()
+                                "Available themes: dark, light, colorblind, auto\nUsage: /theme <name>".to_string()
                             }
                         }
                         SlashCommand::Usage => {
