@@ -312,11 +312,14 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             AppConfig::project_settings_path(cwd).display()
                         ),
                         SlashCommand::Model(model) => {
-                            if let Some(model) = model {
+                            if let Some(ref model) = model {
                                 force_max_think
-                                    .store(is_max_think_selection(&model), Ordering::Relaxed);
+                                    .store(is_max_think_selection(model), Ordering::Relaxed);
                             }
-                            if force_max_think.load(Ordering::Relaxed) {
+                            if model.is_none() {
+                                // No argument — show model list
+                                format_models_list(cfg)
+                            } else if force_max_think.load(Ordering::Relaxed) {
                                 format!(
                                     "model mode: thinking-enabled ({})",
                                     cfg.llm.active_reasoner_model()
