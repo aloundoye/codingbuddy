@@ -957,6 +957,15 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             serde_json::to_string_pretty(&payload)?
                         }
                         SlashCommand::Models => format_models_list(cfg),
+                        SlashCommand::Share => {
+                            let record = MemoryManager::new(cwd)?.export_transcript(
+                                ExportFormat::Html,
+                                None,
+                                None,
+                            )?;
+                            open_in_browser(&record.output_path);
+                            format!("shared: {}", record.output_path)
+                        }
                         SlashCommand::Login => {
                             let payload = login_payload(cwd)?;
                             serde_json::to_string_pretty(&payload)?

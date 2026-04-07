@@ -1356,6 +1356,19 @@ pub(crate) fn run_chat(
                         println!("{output}");
                     }
                 }
+                SlashCommand::Share => {
+                    let record = codingbuddy_memory::MemoryManager::new(cwd)?.export_transcript(
+                        codingbuddy_memory::ExportFormat::Html,
+                        None,
+                        selected_session_id,
+                    )?;
+                    open_in_browser(&record.output_path);
+                    if json_mode {
+                        print_json(&json!({"shared": record.output_path}))?;
+                    } else {
+                        println!("shared: {}", record.output_path);
+                    }
+                }
                 SlashCommand::Login => {
                     let payload = login_payload(cwd)?;
                     if json_mode {
@@ -2157,6 +2170,18 @@ fn format_models_list(cfg: &AppConfig) -> String {
     }
 
     out
+}
+
+/// Open a file path in the system browser (cross-platform).
+fn open_in_browser(path: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", path])
+        .spawn();
 }
 
 #[cfg(test)]

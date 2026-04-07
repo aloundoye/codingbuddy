@@ -76,6 +76,7 @@ pub enum SlashCommand {
     PrComments(Vec<String>),
     ReleaseNotes(Vec<String>),
     Models,
+    Share,
     Login,
     Logout,
     Unknown { name: String, args: Vec<String> },
@@ -167,6 +168,7 @@ impl SlashCommand {
             "pr_comments" | "pr-comments" => Self::PrComments(args),
             "release-notes" | "release_notes" => Self::ReleaseNotes(args),
             "models" => Self::Models,
+            "share" => Self::Share,
             "login" => Self::Login,
             "logout" => Self::Logout,
             other => Self::Unknown {
@@ -191,6 +193,7 @@ pub const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("config", "Show current configuration"),
     ("model", "Switch or view model"),
     ("models", "List models with pricing and capabilities"),
+    ("share", "Export session as HTML and open in browser"),
     ("provider", "Switch or view provider"),
     ("cost", "Show session cost estimate"),
     ("mcp", "Manage MCP servers"),
