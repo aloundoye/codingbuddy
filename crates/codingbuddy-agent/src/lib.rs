@@ -660,8 +660,6 @@ impl AgentEngine {
     /// repo map, manifests) is injected on the first turn so the model starts
     /// with project awareness instead of blind.
     fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
-        fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
-        dlog("tool_loop: START");
         let project_memory = codingbuddy_memory::MemoryManager::new(&self.workspace)
             .ok()
             .and_then(|mm| mm.read_combined_memory().ok());
@@ -731,6 +729,18 @@ impl AgentEngine {
             repo_map_summary.as_deref(),
             &active_base_model,
         );
+
+        // Inject output style preference
+        match self.cfg.output_style.as_str() {
+            "concise" => {
+                system_prompt.push_str("\n\nIMPORTANT: Be extremely concise. One-sentence answers preferred. No preamble or trailing summaries.");
+            }
+            "verbose" => {
+                system_prompt.push_str("\n\nExplain your reasoning in detail. Include context, alternatives considered, and trade-offs.");
+            }
+            _ => {} // "normal" or unrecognized — no injection
+        }
+
         if let Some(plan_addendum) = self.active_plan_prompt_addendum(&session)? {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&plan_addendum);
@@ -791,10 +801,8 @@ impl AgentEngine {
 
         // Gather lightweight bootstrap context so the model starts with project awareness.
         // Budget: ~15% of context window to leave room for conversation.
-        dlog("tool_loop: bootstrap...");
         let initial_context =
             self.build_bootstrap_context(prompt, options, self.cfg.llm.context_window_tokens);
-        dlog(&format!("tool_loop: bootstrap done ({} msgs)", initial_context.len()));
         let initial_phase = match session.status {
             SessionState::Planning | SessionState::AwaitingApproval => Some(TaskPhase::Plan),
             SessionState::ExecutingStep => Some(TaskPhase::Execute),
@@ -1018,9 +1026,7 @@ impl AgentEngine {
             loop_ = loop_.with_history(options.chat_history.clone());
         }
 
-        dlog("tool_loop: calling loop_.run()");
         let result = loop_.run(prompt)?;
-        dlog(&format!("tool_loop: run done turns={} tools={}", result.turns, result.tool_calls_made.len()));
 
         if !result.tool_calls_made.is_empty() {
             self.observer.verbose_log(&format!(
@@ -1090,8 +1096,6 @@ impl AgentEngine {
     }
 
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
-        fn dlog(msg: &str) { use std::io::Write; let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cb_tui_probe.log").map(|mut f| writeln!(f, "{msg}")); }
-        dlog(&format!("chat_with_options START tools={} mode={:?}", options.tools, options.mode));
         // Fire SessionStart hook
         let ws = self.workspace.display().to_string();
         let session_start_input =
@@ -1144,18 +1148,13 @@ impl AgentEngine {
             },
         );
 
-        dlog(&format!("BRANCH tools={} team={}", options.tools, should_run_team_orchestration(self, &prompt_enriched, &options)));
         let result = if !options.tools {
-            dlog("-> analyze (no tools)");
             self.analyze_with_options(&prompt_enriched, options)
         } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
-            dlog("-> team");
             team::run(self, &prompt_enriched, &options)
         } else {
-            dlog("-> tool_loop");
             self.run_tool_use_loop(&prompt_enriched, &options)
         };
-        dlog(&format!("RESULT ok={}", result.is_ok()));
 
         if let Ok(text) = &result {
             // Record Assistant Turn
