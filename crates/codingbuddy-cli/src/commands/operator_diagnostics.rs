@@ -83,7 +83,15 @@ pub(crate) fn provider_compatibility_diagnostics(
             active.push("gemini-schema-sanitize".to_string());
             active.push("max_output_tokens-alias".to_string());
         }
-        ProviderKind::Groq | ProviderKind::OpenRouter => {}
+        ProviderKind::Groq
+        | ProviderKind::OpenRouter
+        | ProviderKind::Azure
+        | ProviderKind::Bedrock
+        | ProviderKind::Vertex
+        | ProviderKind::MistralApi
+        | ProviderKind::Xai
+        | ProviderKind::Together
+        | ProviderKind::Copilot => {}
         ProviderKind::Deepseek => {}
     }
 

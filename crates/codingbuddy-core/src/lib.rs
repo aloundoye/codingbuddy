@@ -2420,6 +2420,13 @@ pub const KNOWN_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("groq", "GROQ_API_KEY"),
     ("openrouter", "OPENROUTER_API_KEY"),
     ("ollama", "OLLAMA_HOST"),
+    ("azure", "AZURE_OPENAI_API_KEY"),
+    ("bedrock", "AWS_ACCESS_KEY_ID"),
+    ("vertex", "GOOGLE_APPLICATION_CREDENTIALS"),
+    ("mistral", "MISTRAL_API_KEY"),
+    ("xai", "XAI_API_KEY"),
+    ("together", "TOGETHER_API_KEY"),
+    ("copilot", "GITHUB_TOKEN"),
 ];
 
 impl LlmConfig {
@@ -2708,6 +2715,76 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "qwen2.5-coder:7b".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "azure".to_string(),
+        ProviderConfig {
+            kind: "azure".to_string(),
+            base_url: String::new(), // Set via AZURE_OPENAI_ENDPOINT
+            api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "gpt-4o".to_string(),
+                reasoner: Some("o4-mini".to_string()),
+            },
+        },
+    );
+    map.insert(
+        "mistral".to_string(),
+        ProviderConfig {
+            kind: "mistral".to_string(),
+            base_url: "https://api.mistral.ai".to_string(),
+            api_key_env: "MISTRAL_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "mistral-large-latest".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "xai".to_string(),
+        ProviderConfig {
+            kind: "xai".to_string(),
+            base_url: "https://api.x.ai".to_string(),
+            api_key_env: "XAI_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "grok-2".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "together".to_string(),
+        ProviderConfig {
+            kind: "together".to_string(),
+            base_url: "https://api.together.xyz".to_string(),
+            api_key_env: "TOGETHER_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "copilot".to_string(),
+        ProviderConfig {
+            kind: "copilot".to_string(),
+            base_url: "https://api.githubcopilot.com".to_string(),
+            api_key_env: "GITHUB_TOKEN".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "gpt-4o".to_string(),
                 reasoner: None,
             },
         },

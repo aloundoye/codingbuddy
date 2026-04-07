@@ -11,6 +11,13 @@ pub enum ProviderKind {
     Groq,
     OpenRouter,
     Ollama,
+    Azure,
+    Bedrock,
+    Vertex,
+    MistralApi,
+    Xai,
+    Together,
+    Copilot,
 }
 
 impl ProviderKind {
@@ -24,6 +31,13 @@ impl ProviderKind {
             ProviderKind::Groq => "groq",
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Ollama => "ollama",
+            ProviderKind::Azure => "azure",
+            ProviderKind::Bedrock => "bedrock",
+            ProviderKind::Vertex => "vertex",
+            ProviderKind::MistralApi => "mistral",
+            ProviderKind::Xai => "xai",
+            ProviderKind::Together => "together",
+            ProviderKind::Copilot => "copilot",
         }
     }
 }
@@ -245,6 +259,13 @@ pub fn normalize_provider_kind(name: &str) -> Option<ProviderKind> {
         "groq" => Some(ProviderKind::Groq),
         "openrouter" | "open-router" => Some(ProviderKind::OpenRouter),
         "ollama" => Some(ProviderKind::Ollama),
+        "azure" | "azure-openai" | "azure_openai" => Some(ProviderKind::Azure),
+        "bedrock" | "aws-bedrock" | "aws_bedrock" => Some(ProviderKind::Bedrock),
+        "vertex" | "google-vertex" | "vertex-ai" => Some(ProviderKind::Vertex),
+        "mistral" | "mistral-ai" | "mistralai" => Some(ProviderKind::MistralApi),
+        "xai" | "grok" | "x-ai" => Some(ProviderKind::Xai),
+        "together" | "togetherai" | "together-ai" => Some(ProviderKind::Together),
+        "copilot" | "github-copilot" | "github_copilot" => Some(ProviderKind::Copilot),
         _ => None,
     }
 }
@@ -530,6 +551,50 @@ fn base_capabilities(
             cost_per_mtok_output: 0.0,
             thinking_capability: ThinkingCapability::None,
         },
+        // All remaining providers use OpenAI-compatible API with provider-specific defaults
+        ProviderKind::Azure
+        | ProviderKind::Bedrock
+        | ProviderKind::Vertex
+        | ProviderKind::MistralApi
+        | ProviderKind::Xai
+        | ProviderKind::Together
+        | ProviderKind::Copilot => {
+            let (input_cost, output_cost) = match provider {
+                ProviderKind::Azure => (2.50, 10.0),
+                ProviderKind::Bedrock => (3.0, 15.0),
+                ProviderKind::Vertex => (1.25, 10.0),
+                ProviderKind::MistralApi => (2.0, 6.0),
+                ProviderKind::Xai => (2.0, 10.0),
+                ProviderKind::Together => (0.80, 0.80),
+                ProviderKind::Copilot => (0.0, 0.0),
+                _ => (0.0, 0.0),
+            };
+            ModelCapabilities {
+                provider,
+                family,
+                supports_tool_calling: true,
+                supports_tool_choice: true,
+                supports_parallel_tool_calls: true,
+                supports_reasoning_mode: false,
+                supports_thinking_config: false,
+                supports_streaming_tool_deltas: true,
+                supports_fim: false,
+                supports_image_input: true,
+                strict_empty_content_filtering: false,
+                normalize_tool_call_ids: false,
+                max_safe_tool_count: 18,
+                preferred_edit_tool: PreferredEditTool::FsEdit,
+                prefers_max_completion_tokens: false,
+                requires_schema_sanitization: false,
+                downgrades_tool_choice_required: false,
+                uses_options_num_predict: false,
+                requires_message_sequence_repair: false,
+                context_window_tokens: 128_000,
+                cost_per_mtok_input: input_cost,
+                cost_per_mtok_output: output_cost,
+                thinking_capability: ThinkingCapability::None,
+            }
+        }
     }
 }
 

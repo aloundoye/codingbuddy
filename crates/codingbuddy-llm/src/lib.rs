@@ -252,7 +252,14 @@ impl ApiClient {
             ProviderKind::OpenAiCompatible
             | ProviderKind::Groq
             | ProviderKind::OpenRouter
-            | ProviderKind::Ollama => {
+            | ProviderKind::Ollama
+            | ProviderKind::Azure
+            | ProviderKind::Bedrock
+            | ProviderKind::Vertex
+            | ProviderKind::MistralApi
+            | ProviderKind::Xai
+            | ProviderKind::Together
+            | ProviderKind::Copilot => {
                 if is_chat {
                     format!("{prefix}/chat/completions")
                 } else {
@@ -1265,7 +1272,14 @@ impl ApiClient {
             | ProviderKind::Google
             | ProviderKind::Groq
             | ProviderKind::OpenRouter
-            | ProviderKind::Ollama => Ok(trimmed.to_string()),
+            | ProviderKind::Ollama
+            | ProviderKind::Azure
+            | ProviderKind::Bedrock
+            | ProviderKind::Vertex
+            | ProviderKind::MistralApi
+            | ProviderKind::Xai
+            | ProviderKind::Together
+            | ProviderKind::Copilot => Ok(trimmed.to_string()),
         }
     }
 
