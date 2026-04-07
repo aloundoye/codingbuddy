@@ -100,6 +100,10 @@ pub(crate) fn run_chat(
             Err(e) => eprintln!("setup skipped: {e}"),
         }
     }
+    if !json_mode {
+        super::update::show_update_banner(cwd);
+        super::update::check_for_update_background(cwd);
+    }
     ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)
         .context("LLM provider not ready — check your API key and provider settings")?;
     let mut engine = AgentEngine::new(cwd).context("failed to initialize agent engine")?;
