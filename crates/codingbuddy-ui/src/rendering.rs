@@ -693,12 +693,27 @@ pub(crate) fn render_diff_line(line: &str) -> Line<'static> {
         )]);
     }
     if line.starts_with("@@") {
-        return Line::from(vec![Span::styled(
-            line.to_string(),
-            Style::default()
-                .fg(t.diff_hunk)
-                .add_modifier(Modifier::BOLD),
-        )]);
+        // Parse line numbers from @@ -old,count +new,count @@ context
+        let parts: Vec<&str> = line.splitn(4, ' ').collect();
+        let hunk_info = if parts.len() >= 3 {
+            format!("{} {}", parts[1], parts[2])
+        } else {
+            line.to_string()
+        };
+        let context = if parts.len() >= 4 {
+            format!(" {}", parts[3])
+        } else {
+            String::new()
+        };
+        return Line::from(vec![
+            Span::styled(
+                format!("@@ {hunk_info} @@"),
+                Style::default()
+                    .fg(t.diff_hunk)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(context, Style::default().fg(t.muted)),
+        ]);
     }
     if let Some(rest) = line.strip_prefix('+') {
         return Line::from(vec![
