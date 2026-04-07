@@ -396,8 +396,8 @@ fn base_capabilities(
                 uses_options_num_predict: false,
                 requires_message_sequence_repair: family == ModelFamily::Mistral,
                 context_window_tokens: 128_000,
-                cost_per_mtok_input: 0.0,
-                cost_per_mtok_output: 0.0,
+                cost_per_mtok_input: 2.50,
+                cost_per_mtok_output: 10.0,
                 thinking_capability: if is_reasoning {
                     ThinkingCapability::ImplicitReasoning
                 } else {
@@ -476,8 +476,8 @@ fn base_capabilities(
             uses_options_num_predict: false,
             requires_message_sequence_repair: false,
             context_window_tokens: 128_000,
-            cost_per_mtok_input: 0.0,
-            cost_per_mtok_output: 0.0,
+            cost_per_mtok_input: 0.59,
+            cost_per_mtok_output: 0.79,
             thinking_capability: ThinkingCapability::None,
         },
         ProviderKind::OpenRouter => ModelCapabilities {
@@ -501,8 +501,8 @@ fn base_capabilities(
             uses_options_num_predict: false,
             requires_message_sequence_repair: false,
             context_window_tokens: 128_000,
-            cost_per_mtok_input: 0.0,
-            cost_per_mtok_output: 0.0,
+            cost_per_mtok_input: 3.0,
+            cost_per_mtok_output: 15.0,
             thinking_capability: ThinkingCapability::None,
         },
         ProviderKind::Ollama => ModelCapabilities {

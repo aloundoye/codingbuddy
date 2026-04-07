@@ -207,7 +207,8 @@ impl CostTracker {
     }
 
     /// Set pricing from resolved model capabilities. Falls back to the per-model
-    /// pricing table if the capabilities have zero costs (e.g. Ollama, OpenRouter).
+    /// pricing table if the capabilities have zero costs (e.g. Ollama).
+    /// Used when ModelCapabilities are available at the call site.
     #[allow(dead_code)]
     pub fn set_pricing_from_capabilities(
         &mut self,
