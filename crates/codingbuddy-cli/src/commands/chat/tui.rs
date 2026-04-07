@@ -393,12 +393,11 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                                 format!("rewound to checkpoint {}", checkpoint.checkpoint_id)
                             }
                         }
-                        SlashCommand::Export(_) => {
-                            let record = MemoryManager::new(cwd)?.export_transcript(
-                                ExportFormat::Json,
-                                None,
-                                None,
-                            )?;
+                        SlashCommand::Export(ref args) => {
+                            let fmt_str = args.first().map(|s| s.as_str()).unwrap_or("json");
+                            let fmt = ExportFormat::parse(fmt_str).unwrap_or(ExportFormat::Json);
+                            let record =
+                                MemoryManager::new(cwd)?.export_transcript(fmt, None, None)?;
                             format!("exported transcript {}", record.output_path)
                         }
                         SlashCommand::Plan(args) => {
