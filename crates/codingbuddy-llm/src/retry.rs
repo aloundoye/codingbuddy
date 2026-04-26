@@ -96,8 +96,12 @@ pub fn compute_delay(category: RetryCategory, attempt: u8, retry_after: Option<u
     let max = category.max_delay_ms() as f64;
     let exponent = u32::from(attempt);
     let raw = base * 2f64.powi(exponent as i32);
-    // Deterministic jitter (avoids rand dependency)
-    let jitter = 0.5 + ((attempt as f64 * 1.618).fract());
+    // Time-based jitter to avoid thundering herd across multiple clients
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let jitter = 0.5 + (nanos as f64 / u32::MAX as f64) * 0.5;
     let delay = (raw * jitter).min(max).max(base);
     Duration::from_millis(delay as u64)
 }

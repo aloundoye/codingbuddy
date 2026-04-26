@@ -312,11 +312,14 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             AppConfig::project_settings_path(cwd).display()
                         ),
                         SlashCommand::Model(model) => {
-                            if let Some(model) = model {
+                            if let Some(ref model) = model {
                                 force_max_think
-                                    .store(is_max_think_selection(&model), Ordering::Relaxed);
+                                    .store(is_max_think_selection(model), Ordering::Relaxed);
                             }
-                            if force_max_think.load(Ordering::Relaxed) {
+                            if model.is_none() {
+                                // No argument — show model list
+                                format_models_list(cfg)
+                            } else if force_max_think.load(Ordering::Relaxed) {
                                 format!(
                                     "model mode: thinking-enabled ({})",
                                     cfg.llm.active_reasoner_model()
@@ -393,12 +396,11 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                                 format!("rewound to checkpoint {}", checkpoint.checkpoint_id)
                             }
                         }
-                        SlashCommand::Export(_) => {
-                            let record = MemoryManager::new(cwd)?.export_transcript(
-                                ExportFormat::Json,
-                                None,
-                                None,
-                            )?;
+                        SlashCommand::Export(ref args) => {
+                            let fmt_str = args.first().map(|s| s.as_str()).unwrap_or("json");
+                            let fmt = ExportFormat::parse(fmt_str).unwrap_or(ExportFormat::Json);
+                            let record =
+                                MemoryManager::new(cwd)?.export_transcript(fmt, None, None)?;
                             format!("exported transcript {}", record.output_path)
                         }
                         SlashCommand::Plan(args) => {
@@ -793,10 +795,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             let path = AppConfig::keybindings_path().unwrap_or_default();
                             format!("Keybindings: {}", path.display())
                         }
-                        SlashCommand::Doctor => serde_json::to_string_pretty(&doctor_payload(
-                            cwd,
-                            &DoctorArgs::default(),
-                        )?)?,
+                        SlashCommand::Doctor => {
+                            format_doctor_display(&doctor_payload(cwd, &DoctorArgs::default())?)
+                        }
                         SlashCommand::Copy => "Copied last response to clipboard.".to_string(),
                         SlashCommand::Paste => {
                             if let Some(img_bytes) = read_image_from_clipboard() {
@@ -862,13 +863,31 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                                     .unwrap_or("active chat session updated")
                                     .to_string()
                             } else {
+                                // Show session list
+                                let store = Store::new(cwd)?;
+                                let sessions = store.list_sessions()?;
                                 let current = active_session_for_closure
                                     .lock()
                                     .map(|guard| *guard)
                                     .unwrap_or(None);
-                                current
-                                    .map(|session_id| format!("current chat session: {session_id}"))
-                                    .unwrap_or_else(|| "Usage: /resume <session-id>".to_string())
+                                if sessions.is_empty() {
+                                    "No sessions found.".to_string()
+                                } else {
+                                    let mut out = String::from("Recent sessions:\n");
+                                    for s in sessions.iter().take(10) {
+                                        let marker = if current == Some(s.session_id) {
+                                            "*"
+                                        } else {
+                                            " "
+                                        };
+                                        let id_short = &s.session_id.to_string()[..8];
+                                        let status =
+                                            serde_json::to_string(&s.status).unwrap_or_default();
+                                        out.push_str(&format!(" {marker} {id_short}  {status}\n",));
+                                    }
+                                    out.push_str("\nUsage: /resume <session-id-prefix>");
+                                    out
+                                }
                             }
                         }
                         SlashCommand::Stats => {
@@ -896,10 +915,12 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             )
                         }
                         SlashCommand::Theme(t) => {
-                            if let Some(t) = t {
-                                format!("Theme: {t}")
+                            if let Some(ref name) = t {
+                                let theme = codingbuddy_ui::TuiTheme::from_preference(name);
+                                let mode = if theme.is_light { "light" } else { "dark" };
+                                format!("Theme set to: {name} ({mode})")
                             } else {
-                                "Available: default, dark, light".to_string()
+                                "Available themes: dark, light, colorblind, auto\nUsage: /theme <name>".to_string()
                             }
                         }
                         SlashCommand::Usage => {
@@ -934,6 +955,16 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             let payload =
                                 release_notes_payload(cwd, range, args.get(1).map(|s| s.as_str()))?;
                             serde_json::to_string_pretty(&payload)?
+                        }
+                        SlashCommand::Models => format_models_list(cfg),
+                        SlashCommand::Share => {
+                            let record = MemoryManager::new(cwd)?.export_transcript(
+                                ExportFormat::Html,
+                                None,
+                                None,
+                            )?;
+                            open_in_browser(&record.output_path);
+                            format!("shared: {}", record.output_path)
                         }
                         SlashCommand::Login => {
                             let payload = login_payload(cwd)?;
@@ -1136,6 +1167,12 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 StreamChunk::ConfigReloaded { .. } => {}
                 StreamChunk::SnapshotRecorded { .. } => {}
                 StreamChunk::ToolCallReady { .. } => {}
+                StreamChunk::RateLimited { wait_seconds, provider, attempt, max_attempts } => {
+                    let _ = tx_stream.send(TuiStreamEvent::SystemNotice {
+                        line: format!("\u{23f3} Rate limited by {provider}. Retrying in {wait_seconds}s ({attempt}/{max_attempts})"),
+                        error: false,
+                    });
+                }
                 StreamChunk::ToolProgress { tool_name, data } => {
                     let _ = tx_stream.send(TuiStreamEvent::ToolProgress { tool_name, data });
                 }

@@ -317,6 +317,41 @@ pub(crate) fn prepare_chat_tools_with_compatibility(
     applied: &mut AppliedCompatibility,
 ) -> Result<Option<PreparedToolPayload>> {
     let mut tools = serialize_tool_definitions(&req.tools)?;
+
+    // Truncate long tool descriptions for non-Anthropic providers.
+    // Anthropic models handle 200-500 word descriptions well; other models
+    // (DeepSeek, Qwen, Ollama) slow down or hang with large tool payloads.
+    if !matches!(capabilities.provider, ProviderKind::Anthropic) {
+        const MAX_DESCRIPTION_CHARS: usize = 400;
+        for tool in &mut tools {
+            if let Some(desc) = tool
+                .get_mut("function")
+                .and_then(|f| f.get_mut("description"))
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+                && desc.len() > MAX_DESCRIPTION_CHARS
+            {
+                let truncated = format!(
+                    "{}...",
+                    &desc[..desc[..MAX_DESCRIPTION_CHARS]
+                        .rfind('\n')
+                        .unwrap_or(MAX_DESCRIPTION_CHARS)]
+                );
+                tool["function"]["description"] = serde_json::Value::String(truncated);
+            }
+        }
+        if tools.iter().any(|t| {
+            t.get("function")
+                .and_then(|f| f.get("description"))
+                .and_then(|d| d.as_str())
+                .is_some_and(|s| s.ends_with("..."))
+        }) {
+            applied
+                .transforms
+                .push("tool-description-truncate".to_string());
+        }
+    }
+
     if sanitize_tool_definitions_for_provider(&mut tools, capabilities) {
         applied
             .transforms

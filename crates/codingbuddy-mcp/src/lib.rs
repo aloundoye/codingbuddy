@@ -236,18 +236,74 @@ impl McpManager {
         Ok(self.refresh_tools()?.0)
     }
 
+    /// Refresh tools from all MCP servers. Servers whose cached tools are
+    /// younger than `TOOL_CACHE_TTL_SECS` are skipped (use `force_refresh_tools`
+    /// to bypass the TTL).
     pub fn refresh_tools(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
+        self.refresh_tools_inner(false)
+    }
+
+    /// Force-refresh tools for all MCP servers, ignoring cache TTL.
+    pub fn force_refresh_tools(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
+        self.refresh_tools_inner(true)
+    }
+
+    /// MCP tool cache TTL in seconds (5 minutes).
+    const TOOL_CACHE_TTL_SECS: i64 = 300;
+
+    fn refresh_tools_inner(&self, force: bool) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
         let mut tools = Vec::new();
         let mut refreshes = Vec::new();
-        let existing = self.store.list_mcp_tool_cache()?.into_iter().fold(
+        let cached_rows = self.store.list_mcp_tool_cache()?;
+
+        let existing = cached_rows.iter().fold(
             BTreeMap::<String, BTreeSet<String>>::new(),
             |mut acc, row| {
-                acc.entry(row.server_id).or_default().insert(row.tool_name);
+                acc.entry(row.server_id.clone())
+                    .or_default()
+                    .insert(row.tool_name.clone());
                 acc
             },
         );
 
+        // Build a map of server_id -> newest updated_at for TTL checking
+        let newest_by_server: BTreeMap<String, chrono::DateTime<Utc>> = cached_rows
+            .iter()
+            .filter_map(|r| {
+                chrono::DateTime::parse_from_rfc3339(&r.updated_at)
+                    .ok()
+                    .map(|dt| (r.server_id.clone(), dt.with_timezone(&Utc)))
+            })
+            .fold(BTreeMap::new(), |mut acc, (sid, dt)| {
+                acc.entry(sid)
+                    .and_modify(|prev| {
+                        if dt > *prev {
+                            *prev = dt;
+                        }
+                    })
+                    .or_insert(dt);
+                acc
+            });
+
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
+            // Skip re-discovery if cached tools are fresh enough
+            if !force && let Some(newest) = newest_by_server.get(&server.id) {
+                let age = Utc::now().signed_duration_since(*newest).num_seconds();
+                if age < Self::TOOL_CACHE_TTL_SECS {
+                    // Serve from cache
+                    if let Some(cached) = existing.get(&server.id) {
+                        for name in cached {
+                            tools.push(McpTool {
+                                server_id: server.id.clone(),
+                                name: name.clone(),
+                                description: String::new(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+
             let discovered = discover_server_tools(&server)
                 .with_context(|| format!("failed to discover MCP tools for {}", server.id))
                 .unwrap_or_else(|_| {
@@ -295,7 +351,7 @@ impl McpManager {
         &self,
         previous_fingerprint: Option<&str>,
     ) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>, McpToolChangeNotice)> {
-        let (tools, refreshes) = self.refresh_tools()?;
+        let (tools, refreshes) = self.force_refresh_tools()?;
         let fingerprint = tool_fingerprint(&tools)?;
         let changed_servers = if previous_fingerprint.is_some_and(|value| value == fingerprint) {
             Vec::new()

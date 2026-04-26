@@ -269,8 +269,7 @@ impl IndexService {
                 continue;
             }
             if let Some(s) = scope
-                && !path.starts_with(s)
-                && !path.contains(s)
+                && !path_matches_scope(&path, s)
             {
                 continue;
             }
@@ -306,8 +305,7 @@ impl IndexService {
             }
             let rel = rel_path.to_string_lossy().to_string();
             if let Some(s) = scope
-                && !rel.starts_with(s)
-                && !rel.contains(s)
+                && !path_matches_scope(&rel, s)
             {
                 continue;
             }
@@ -425,8 +423,7 @@ impl IndexService {
                 .unwrap_or(0) as usize;
 
             if let Some(s) = scope
-                && !path.starts_with(s)
-                && !path.contains(s)
+                && !path_matches_scope(&path, s)
             {
                 continue;
             }
@@ -505,6 +502,22 @@ fn workspace_file_paths(workspace: &Path, respect_gitignore: bool) -> Vec<PathBu
         out.push(path.to_path_buf());
     }
     out
+}
+
+/// Check if a path matches a scope string using path component boundaries.
+/// Returns true if the path starts with the scope as a path prefix (not just
+/// a string prefix), preventing "src" from matching "unsrc/lib.rs".
+fn path_matches_scope(path: &str, scope: &str) -> bool {
+    if path.starts_with(scope) {
+        // Verify the match is at a path boundary (next char is '/' or end)
+        path.len() == scope.len()
+            || path.as_bytes().get(scope.len()) == Some(&b'/')
+            || scope.ends_with('/')
+    } else {
+        // Also match if scope appears as a path component anywhere
+        let scope_trimmed = scope.trim_end_matches('/');
+        path.split('/').any(|component| component == scope_trimmed)
+    }
 }
 
 fn has_ignored_component(path: &Path) -> bool {

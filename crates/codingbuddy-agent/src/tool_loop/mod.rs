@@ -52,9 +52,9 @@ use uuid::Uuid;
 use crate::tool_bridge;
 
 use anti_hallucination::{
-    HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS,
-    MAX_SHELL_NUDGE_ATTEMPTS, SHELL_COMMAND_NUDGE, check_response_consistency,
-    contains_shell_command_pattern, extract_user_directives, has_unverified_file_references,
+    HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS, SHELL_COMMAND_NUDGE,
+    check_response_consistency, extract_shell_commands, extract_user_directives,
+    has_unverified_file_references,
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
@@ -1005,7 +1005,11 @@ impl<'a> ToolUseLoop<'a> {
             let tool_def_tokens: u64 = self
                 .tools
                 .iter()
-                .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
+                // JSON tool schemas tokenize less efficiently than natural language
+                // (~3.5 chars/token vs ~4 chars/token) due to punctuation and field names.
+                .map(|t| {
+                    (serde_json::to_string(t).unwrap_or_default().len() as f64 / 3.5).ceil() as u64
+                })
                 .sum();
             let message_tokens = estimate_message_tokens(&self.messages);
             let estimated_tokens = message_tokens + tool_def_tokens;
@@ -1125,6 +1129,34 @@ impl<'a> ToolUseLoop<'a> {
                 return Err(anyhow!("Response blocked by content filter"));
             }
 
+            // Shell command nudge: if the model outputs bash code blocks as
+            // text instead of using the bash_run tool, nudge it to retry with
+            // tools. This runs once before the general hallucination nudge.
+            // Unlike auto-conversion (which clears streamed text and creates
+            // synthetic tool calls that need approval), this just asks the
+            // model to retry — simpler and doesn't break the TUI flow.
+            if response.tool_calls.is_empty()
+                && shell_nudge_count == 0
+                && !extract_shell_commands(&response.text).is_empty()
+            {
+                shell_nudge_count += 1;
+                if let Some(ref cb) = self.event_cb {
+                    cb(EventKind::HallucinationNudgeFired {
+                        nudge_count: 1,
+                        trigger: "shell_command_pattern".to_string(),
+                    });
+                }
+                self.messages.push(ChatMessage::Assistant {
+                    content: Some(response.text.clone()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                });
+                self.messages.push(ChatMessage::User {
+                    content: SHELL_COMMAND_NUDGE.to_string(),
+                });
+                continue;
+            }
+
             // Output token recovery: when the model hits max_output_tokens,
             // ask it to be more concise and retry (up to 3 attempts).
             if response.finish_reason == "length" && truncation_retries < MAX_TRUNCATION_RETRIES {
@@ -1151,33 +1183,6 @@ impl<'a> ToolUseLoop<'a> {
             // No tool calls → return the text response (or nudge to use tools)
             if response.tool_calls.is_empty() {
                 let text = response.text.clone();
-
-                // Shell command detection — separate counter and higher limit.
-                // The model should NEVER output bash scripts as text. This check
-                // runs independently from the general hallucination nudge so that
-                // shell commands are always caught even after MAX_NUDGE_ATTEMPTS.
-                let has_shell_cmd =
-                    shell_nudge_count < MAX_SHELL_NUDGE_ATTEMPTS
-                        && contains_shell_command_pattern(&text);
-
-                if has_shell_cmd {
-                    shell_nudge_count += 1;
-                    if let Some(ref cb) = self.event_cb {
-                        cb(EventKind::HallucinationNudgeFired {
-                            nudge_count: shell_nudge_count as u64,
-                            trigger: "shell_command_pattern".to_string(),
-                        });
-                    }
-                    self.messages.push(ChatMessage::Assistant {
-                        content: Some(text),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                    });
-                    self.messages.push(ChatMessage::User {
-                        content: SHELL_COMMAND_NUDGE.to_string(),
-                    });
-                    continue;
-                }
 
                 // Anti-hallucination guard: if the model responds with a long text
                 // without using tools, nudge it to use tools instead of guessing.
@@ -1923,7 +1928,33 @@ impl<'a> ToolUseLoop<'a> {
             let approved = if hook_approved {
                 true
             } else if let Some(ref cb) = self.approval_cb {
-                cb(&proposal.call)?
+                match cb(&proposal.call) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Push a Tool message so the conversation chain stays valid
+                        // (prevents HTTP 400 "insufficient tool messages" from the API)
+                        let err_msg = format!("Approval error: {e}");
+                        self.messages
+                            .push(tool_bridge::tool_error_to_message(&llm_call.id, &err_msg));
+                        let duration = start.elapsed().as_millis() as u64;
+                        self.emit(StreamChunk::ToolCallEnd {
+                            tool_name: llm_call.name.clone(),
+                            duration_ms: duration,
+                            success: false,
+                            summary: err_msg,
+                        });
+                        records.push(ToolCallRecord {
+                            tool_name: llm_call.name.clone(),
+                            tool_call_id: llm_call.id.clone(),
+                            args_summary,
+                            success: false,
+                            duration_ms: duration,
+                            args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
+                            result_preview: None,
+                        });
+                        return Ok(records);
+                    }
+                }
             } else {
                 false
             };
@@ -2339,22 +2370,11 @@ impl<'a> ToolUseLoop<'a> {
             tools
         };
 
-        // Force tool use on the first LLM call for each new question so the model
-        // explores the codebase instead of fabricating an answer.
-        let last_user_idx = self
-            .messages
-            .iter()
-            .rposition(|m| matches!(m, ChatMessage::User { .. }))
-            .unwrap_or(0);
-        let llm_turns_this_question = self.messages[last_user_idx..]
-            .iter()
-            .filter(|m| matches!(m, ChatMessage::Assistant { .. }))
-            .count();
-        let tool_choice = if llm_turns_this_question < 1 && !self.config.read_only {
-            ToolChoice::required()
-        } else {
-            ToolChoice::auto()
-        };
+        // Always use tool_choice=auto, like Claude Code does. Forcing
+        // "required" causes some models (e.g. DeepSeek) to hang or timeout.
+        // The system prompt steers tool usage; auto-conversion catches bash
+        // blocks that slip through as text.
+        let tool_choice = ToolChoice::auto();
 
         let (model, thinking, max_tokens) = self.next_request_route();
 
@@ -2677,7 +2697,7 @@ impl<'a> ToolUseLoop<'a> {
                 "--- {}:{}-{} (score: {:.3}) ---\n{}\n",
                 r.file_path, r.start_line, r.end_line, r.score, r.content,
             );
-            let chunk_tokens = (chunk_text.len() as u64) / 4;
+            let chunk_tokens = (chunk_text.len() as f64 / 3.5).ceil() as u64;
             if token_estimate + chunk_tokens > budget_tokens {
                 break;
             }

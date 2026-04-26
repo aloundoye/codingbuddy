@@ -117,6 +117,12 @@ impl ApiClient {
         self.api_key = None;
     }
 
+    /// Re-resolve the API key from env/config. Called after a 401 response
+    /// in case the key was rotated or refreshed since construction.
+    pub fn refresh_api_key(&mut self) {
+        self.api_key = resolve_key_from_config(&self.cfg);
+    }
+
     /// Attach a cancellation token that will be checked during streaming.
     pub fn set_cancel_token(&mut self, token: CancellationToken) {
         self.cancel_token = Some(token);
@@ -246,7 +252,14 @@ impl ApiClient {
             ProviderKind::OpenAiCompatible
             | ProviderKind::Groq
             | ProviderKind::OpenRouter
-            | ProviderKind::Ollama => {
+            | ProviderKind::Ollama
+            | ProviderKind::Azure
+            | ProviderKind::Bedrock
+            | ProviderKind::Vertex
+            | ProviderKind::MistralApi
+            | ProviderKind::Xai
+            | ProviderKind::Together
+            | ProviderKind::Copilot => {
                 if is_chat {
                     format!("{prefix}/chat/completions")
                 } else {
@@ -1259,7 +1272,14 @@ impl ApiClient {
             | ProviderKind::Google
             | ProviderKind::Groq
             | ProviderKind::OpenRouter
-            | ProviderKind::Ollama => Ok(trimmed.to_string()),
+            | ProviderKind::Ollama
+            | ProviderKind::Azure
+            | ProviderKind::Bedrock
+            | ProviderKind::Vertex
+            | ProviderKind::MistralApi
+            | ProviderKind::Xai
+            | ProviderKind::Together
+            | ProviderKind::Copilot => Ok(trimmed.to_string()),
         }
     }
 
@@ -1566,7 +1586,16 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        let delay = retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after);
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            cb(StreamChunk::RateLimited {
+                                wait_seconds: delay.as_secs().max(1),
+                                attempt: attempt + 1,
+                                max_attempts: self.cfg.max_retries,
+                                provider: self.cfg.provider.clone(),
+                            });
+                        }
+                        thread::sleep(delay);
                         attempt = attempt.saturating_add(1);
                         continue;
                     }

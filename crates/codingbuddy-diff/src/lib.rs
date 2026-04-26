@@ -258,6 +258,10 @@ fn parse_patch_path(raw: &str) -> Option<String> {
     if normalized.is_empty() {
         return None;
     }
+    // Reject path traversal attempts
+    if normalized.contains("../") || normalized.starts_with('/') {
+        return None;
+    }
     Some(normalized.to_string())
 }
 

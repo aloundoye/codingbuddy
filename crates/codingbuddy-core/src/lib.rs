@@ -1557,6 +1557,13 @@ pub enum StreamChunk {
     ConfigReloaded { path: String },
     /// Live progress data from a running tool (e.g. bash stdout lines).
     ToolProgress { tool_name: String, data: String },
+    /// Rate-limited by the provider; retrying after a delay.
+    RateLimited {
+        wait_seconds: u64,
+        attempt: u8,
+        max_attempts: u8,
+        provider: String,
+    },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -1702,6 +1709,18 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "type": "tool_progress",
             "tool_name": tool_name,
             "data": data,
+        }),
+        StreamChunk::RateLimited {
+            wait_seconds,
+            attempt,
+            max_attempts,
+            provider,
+        } => serde_json::json!({
+            "type": "rate_limited",
+            "wait_seconds": wait_seconds,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "provider": provider,
         }),
         StreamChunk::Done { reason } => {
             let mut obj = serde_json::json!({ "type": "done" });
@@ -2393,7 +2412,7 @@ pub struct LlmConfig {
 
 /// Known provider names and their corresponding API key environment variables.
 /// Used for auto-detection and provider enumeration.
-const KNOWN_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
+pub const KNOWN_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("anthropic", "ANTHROPIC_API_KEY"),
     ("openai-compatible", "OPENAI_API_KEY"),
     ("deepseek", "DEEPSEEK_API_KEY"),
@@ -2401,6 +2420,13 @@ const KNOWN_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("groq", "GROQ_API_KEY"),
     ("openrouter", "OPENROUTER_API_KEY"),
     ("ollama", "OLLAMA_HOST"),
+    ("azure", "AZURE_OPENAI_API_KEY"),
+    ("bedrock", "AWS_ACCESS_KEY_ID"),
+    ("vertex", "GOOGLE_APPLICATION_CREDENTIALS"),
+    ("mistral", "MISTRAL_API_KEY"),
+    ("xai", "XAI_API_KEY"),
+    ("together", "TOGETHER_API_KEY"),
+    ("copilot", "GITHUB_TOKEN"),
 ];
 
 impl LlmConfig {
@@ -2478,9 +2504,16 @@ impl LlmConfig {
 
     #[must_use]
     pub fn capability_resolution_for_model(&self, model: &str) -> Option<CapabilityResolution> {
-        self.active_provider_kind().map(|provider| {
-            resolve_model_capabilities(provider, model, Some(&self.capability_overrides))
-        })
+        // Fall back to OpenAI-compatible for unknown providers so custom
+        // endpoints and new providers don't cause hard failures.
+        let provider = self
+            .active_provider_kind()
+            .unwrap_or(ProviderKind::OpenAiCompatible);
+        Some(resolve_model_capabilities(
+            provider,
+            model,
+            Some(&self.capability_overrides),
+        ))
     }
 
     #[must_use]
@@ -2682,6 +2715,76 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "qwen2.5-coder:7b".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "azure".to_string(),
+        ProviderConfig {
+            kind: "azure".to_string(),
+            base_url: String::new(), // Set via AZURE_OPENAI_ENDPOINT
+            api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "gpt-4o".to_string(),
+                reasoner: Some("o4-mini".to_string()),
+            },
+        },
+    );
+    map.insert(
+        "mistral".to_string(),
+        ProviderConfig {
+            kind: "mistral".to_string(),
+            base_url: "https://api.mistral.ai".to_string(),
+            api_key_env: "MISTRAL_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "mistral-large-latest".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "xai".to_string(),
+        ProviderConfig {
+            kind: "xai".to_string(),
+            base_url: "https://api.x.ai".to_string(),
+            api_key_env: "XAI_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "grok-2".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "together".to_string(),
+        ProviderConfig {
+            kind: "together".to_string(),
+            base_url: "https://api.together.xyz".to_string(),
+            api_key_env: "TOGETHER_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo".to_string(),
+                reasoner: None,
+            },
+        },
+    );
+    map.insert(
+        "copilot".to_string(),
+        ProviderConfig {
+            kind: "copilot".to_string(),
+            base_url: "https://api.githubcopilot.com".to_string(),
+            api_key_env: "GITHUB_TOKEN".to_string(),
+            openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
+            models: ProviderModels {
+                chat: "gpt-4o".to_string(),
                 reasoner: None,
             },
         },

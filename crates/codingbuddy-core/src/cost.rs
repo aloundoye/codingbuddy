@@ -44,6 +44,10 @@ pub fn get_pricing(model: &str) -> ModelPricing {
         // Mistral
         m if m.contains("mistral-large") => (2.00, 6.00, 0.0),
         m if m.contains("mistral") || m.contains("codestral") => (0.30, 0.90, 0.0),
+        // xAI / Grok
+        m if m.contains("grok-3") => (3.00, 15.00, 0.0),
+        m if m.contains("grok-2") => (2.00, 10.00, 0.0),
+        m if m.contains("grok") => (5.00, 15.00, 0.0),
         // Default: DeepSeek Chat
         _ => (0.27, 1.10, 0.1),
     };
