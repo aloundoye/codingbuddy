@@ -16,6 +16,7 @@ use std::ops::Deref;
 use std::thread;
 use std::time::Duration;
 
+pub mod model_catalog;
 mod provider_transform;
 pub mod providers;
 pub mod retry;

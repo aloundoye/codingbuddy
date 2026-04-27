@@ -20,8 +20,10 @@ pub use llm_capabilities::{
     resolve_model_capabilities,
 };
 pub use model_catalog::{
-    ModelCatalog, ModelCatalogSource, ModelCost, ModelInfo, ModelLimits, ModelStatus,
-    ProviderCapability,
+    DEFAULT_MODEL_CATALOG_CACHE_TTL_SECONDS, DEFAULT_MODEL_CATALOG_REFRESH_TIMEOUT_SECONDS,
+    DEFAULT_MODELS_DEV_URL, ModelCatalog, ModelCatalogCache, ModelCatalogConfig,
+    ModelCatalogSource, ModelCost, ModelInfo, ModelLimits, ModelModality, ModelStatus,
+    ProviderCapability, ProviderStatus,
 };
 pub use tool_metadata::{
     DynamicToolTrust, InterruptBehavior, RuntimeToolMetadata, ToolAgentRole, ToolMetadata,
@@ -2394,6 +2396,8 @@ pub struct LlmConfig {
     pub providers: std::collections::HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub capability_overrides: CapabilityRegistryOverrides,
+    #[serde(default)]
+    pub model_catalog: ModelCatalogConfig,
     pub profile: String,
     pub context_window_tokens: u64,
     pub temperature: f32,
@@ -2609,6 +2613,7 @@ impl Default for LlmConfig {
             provider: "deepseek".to_string(),
             providers: default_providers(),
             capability_overrides: CapabilityRegistryOverrides::default(),
+            model_catalog: ModelCatalogConfig::default(),
             profile: CODINGBUDDY_PROFILE_V32.to_string(),
             context_window_tokens: 128_000,
             temperature: 0.2,

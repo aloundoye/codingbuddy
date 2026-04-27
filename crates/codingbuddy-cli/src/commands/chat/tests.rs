@@ -7,6 +7,40 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
+fn models_list_uses_catalog_overrides() {
+    let mut cfg = AppConfig {
+        llm: codingbuddy_core::LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.llm
+        .model_catalog
+        .overrides
+        .push(codingbuddy_core::ModelInfo {
+            provider: "openai-compatible".to_string(),
+            id: "custom-agent-model".to_string(),
+            display_name: "Custom Agent Model".to_string(),
+            capability: codingbuddy_core::ProviderCapability {
+                tool_call: true,
+                reasoning: true,
+                ..Default::default()
+            },
+            limits: codingbuddy_core::ModelLimits {
+                context_tokens: 512_000,
+                output_tokens: 16_384,
+            },
+            ..codingbuddy_core::ModelInfo::default()
+        });
+
+    let output = format_models_list(&cfg);
+    assert!(output.contains("custom-agent-model"));
+    assert!(output.contains("512K"));
+    assert!(output.contains("tools,reasoning"));
+}
+
+#[test]
 fn render_web_fetch_markdown_contains_metadata_and_extract_block() {
     let output = serde_json::json!({
         "status": 200,
