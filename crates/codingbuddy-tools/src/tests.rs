@@ -229,6 +229,54 @@ fn fs_glob_grep_and_edit_work() {
 }
 
 #[test]
+fn fs_glob_and_grep_skip_denied_secret_paths() {
+    let (workspace, host) = temp_host();
+    fs::create_dir_all(workspace.join("src")).expect("src");
+    fs::write(workspace.join(".env"), "TOKEN=secret\n").expect("secret");
+    fs::write(
+        workspace.join("src/main.rs"),
+        "const TOKEN: &str = \"public\";\n",
+    )
+    .expect("seed");
+
+    let globbed = host.execute(ApprovedToolCall {
+        invocation_id: Uuid::now_v7(),
+        call: ToolCall {
+            name: "fs.glob".to_string(),
+            args: json!({"pattern":"**/*", "respectGitignore": false}),
+            requires_approval: false,
+        },
+    });
+    assert!(globbed.success);
+    let glob_paths: Vec<_> = globbed.output["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(!glob_paths.contains(&".env"));
+    assert!(glob_paths.contains(&"src/main.rs"));
+
+    let grepped = host.execute(ApprovedToolCall {
+        invocation_id: Uuid::now_v7(),
+        call: ToolCall {
+            name: "fs.grep".to_string(),
+            args: json!({"pattern":"TOKEN", "respectGitignore": false}),
+            requires_approval: false,
+        },
+    });
+    assert!(grepped.success);
+    let grep_paths: Vec<_> = grepped.output["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(!grep_paths.contains(&".env"));
+    assert!(grep_paths.contains(&"src/main.rs"));
+}
+
+#[test]
 fn fs_edit_includes_unified_diff_in_result() {
     let (workspace, host) = temp_host();
     fs::write(workspace.join("demo.rs"), "fn old() {}\n").expect("seed");

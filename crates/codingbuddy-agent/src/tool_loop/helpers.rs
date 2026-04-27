@@ -1,10 +1,10 @@
 //! Small utility functions used across the tool loop.
 
-use codingbuddy_core::is_api_tool_name_read_only;
+use codingbuddy_core::RuntimeToolMetadata;
 
 /// Check if a tool API name is read-only.
 pub(crate) fn is_read_only_api_name(name: &str) -> bool {
-    is_api_tool_name_read_only(name)
+    RuntimeToolMetadata::for_api_name(name).read_only
 }
 
 /// Strip fenced code blocks from text so that word counting applies only to prose.

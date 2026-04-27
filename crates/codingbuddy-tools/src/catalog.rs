@@ -238,11 +238,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "type": "string",
                             "description": "Regex pattern to search for"
                         },
-                        "glob": {
-                            "type": "string",
-                            "description": "Glob pattern to filter which files to search (e.g. '**/*.rs'). Defaults to '**/*'."
-                        },
-                        "limit": {
+	                        "glob": {
+	                            "type": "string",
+	                            "description": "Glob pattern to filter which files to search (e.g. '**/*.rs'). Defaults to '**/*'."
+	                        },
+	                        "base": {
+	                            "type": "string",
+	                            "description": "Base directory to search within. Defaults to the workspace root."
+	                        },
+	                        "limit": {
                             "type": "integer",
                             "description": "Maximum matches to return. Defaults to 200."
                         },

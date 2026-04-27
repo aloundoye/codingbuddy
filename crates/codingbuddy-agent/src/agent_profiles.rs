@@ -5,7 +5,7 @@
 //! Profiles are selected based on `ChatMode` and prompt content.
 
 use codingbuddy_core::complexity::PromptComplexity;
-use codingbuddy_core::{ToolAgentRole, ToolName};
+use codingbuddy_core::{RuntimeToolMetadata, ToolAgentRole};
 
 /// An agent profile constrains tool availability and adds a system prompt addendum.
 #[derive(Debug, Clone)]
@@ -197,8 +197,9 @@ pub fn select_profile(
 
 /// Filter tool definitions by an agent profile.
 ///
-/// The profile's runtime role is resolved against canonical tool metadata.
-/// MCP tools (`mcp__*`) always pass through both filters.
+/// The profile's runtime role is resolved against canonical runtime metadata.
+/// Dynamic tools default to conservative Build/General roles unless a trusted
+/// adapter supplies narrower metadata.
 pub fn filter_by_profile(
     tools: Vec<codingbuddy_core::ToolDefinition>,
     profile: &AgentProfile,
@@ -206,12 +207,8 @@ pub fn filter_by_profile(
     tools
         .into_iter()
         .filter(|t| {
-            if t.function.name.starts_with("mcp__") {
-                return true;
-            }
-            let allowed_by_role = ToolName::from_api_name(&t.function.name)
-                .map(|tool| tool.is_allowed_for_role(profile.role))
-                .unwrap_or(true);
+            let metadata = RuntimeToolMetadata::for_api_name(&t.function.name);
+            let allowed_by_role = metadata.is_allowed_for_role(profile.role);
             let blocked = profile.blocked_tools.iter().any(|b| *b == t.function.name);
             allowed_by_role && !blocked
         })
@@ -386,21 +383,21 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tools_always_pass_through() {
+    fn explore_blocks_untrusted_mcp_tools() {
         let tools = vec![
             make_tool("fs_read"),
             make_tool("mcp__github__search"),
             make_tool("mcp__slack__post"),
         ];
-        // Even explore's allowlist should let MCP tools through
         let filtered = filter_by_profile(tools, &PROFILE_EXPLORE);
         let names: Vec<_> = filtered.iter().map(|t| t.function.name.as_str()).collect();
-        assert!(names.contains(&"mcp__github__search"));
-        assert!(names.contains(&"mcp__slack__post"));
+        assert!(names.contains(&"fs_read"));
+        assert!(!names.contains(&"mcp__github__search"));
+        assert!(!names.contains(&"mcp__slack__post"));
     }
 
     #[test]
-    fn mcp_tools_survive_blocklist() {
+    fn build_profile_keeps_untrusted_mcp_tools_execute_scoped() {
         let tools = vec![make_tool("web_search"), make_tool("mcp__web__fetch")];
         let filtered = filter_by_profile(tools, &PROFILE_BUILD);
         let names: Vec<_> = filtered.iter().map(|t| t.function.name.as_str()).collect();
@@ -410,7 +407,7 @@ mod tests {
         );
         assert!(
             names.contains(&"mcp__web__fetch"),
-            "MCP tools should survive blocklist"
+            "untrusted MCP tools remain available to build/execute profiles"
         );
     }
 

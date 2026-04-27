@@ -86,6 +86,13 @@ const COMPACTION_EXTRA_OVERHEAD_TOKENS: u64 = 512;
 /// Every N tool calls, inject a brief system reminder to keep the model on track.
 const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
 
+struct ParallelPreparedToolCall {
+    effective_call: LlmToolCall,
+    cached: Option<serde_json::Value>,
+    error: Option<String>,
+    proposal: Option<codingbuddy_core::ToolProposal>,
+}
+
 /// Return `Some(args_json)` only for read tools (needed for anti-hallucination
 /// path extraction). Write/agent tools don't need the raw JSON stored.
 /// Transform the content of a `ChatMessage::Tool`, preserving all other fields.
@@ -1320,16 +1327,15 @@ impl<'a> ToolUseLoop<'a> {
             let mut batch_had_failure = false;
             let mut batch_had_success = false;
 
-            // Partition by concurrency_safe metadata: safe tools run in parallel,
-            // everything else runs sequentially.
-            let (parallel_calls, sequential_calls): (Vec<_>, Vec<_>) =
-                response.tool_calls.iter().partition(|c| {
-                    codingbuddy_core::ToolName::from_api_name(&c.name)
-                        .map(|tn| {
-                            let meta = tn.metadata();
-                            meta.concurrency_safe && !meta.agent_level
-                        })
-                        .unwrap_or(false)
+            // Partition by runtime metadata: only read-only, non-agent tools that
+            // are explicitly concurrency-safe can enter the parallel path.
+            let (parallel_calls, mut sequential_calls): (Vec<_>, Vec<_>) =
+                response.tool_calls.iter().cloned().partition(|c| {
+                    let meta = codingbuddy_core::RuntimeToolMetadata::for_api_name(&c.name);
+                    meta.read_only
+                        && meta.concurrency_safe
+                        && !meta.agent_level
+                        && !meta.approval_required
                 });
 
             // Execute independent read-only tools in parallel using thread scope.
@@ -1337,11 +1343,8 @@ impl<'a> ToolUseLoop<'a> {
             if parallel_calls.len() > 1 {
                 // Pre-validate, check circuit breaker, and look up cache BEFORE entering
                 // thread scope (these require &mut self which is not Sync).
-                let mut pre_validated: Vec<(
-                    LlmToolCall,               // repaired call
-                    Option<serde_json::Value>, // cached result (Some = skip execution)
-                    Option<String>,            // validation/breaker error (Some = skip execution)
-                )> = Vec::with_capacity(parallel_calls.len());
+                let mut pre_validated: Vec<ParallelPreparedToolCall> =
+                    Vec::with_capacity(parallel_calls.len());
 
                 for llm_call in &parallel_calls {
                     let repaired = tool_bridge::repair_tool_name(&llm_call.name, &self.tools);
@@ -1364,11 +1367,12 @@ impl<'a> ToolUseLoop<'a> {
                         &parsed_args,
                         &self.tools,
                     ) {
-                        pre_validated.push((
+                        pre_validated.push(ParallelPreparedToolCall {
                             effective_call,
-                            None,
-                            Some(format!("Validation error: {e}")),
-                        ));
+                            cached: None,
+                            error: Some(format!("Validation error: {e}")),
+                            proposal: None,
+                        });
                         continue;
                     }
 
@@ -1381,13 +1385,33 @@ impl<'a> ToolUseLoop<'a> {
                             "Tool '{}' is temporarily disabled due to repeated failures. Try a different approach.",
                             effective_call.name
                         );
-                        pre_validated.push((effective_call, None, Some(err)));
+                        pre_validated.push(ParallelPreparedToolCall {
+                            effective_call,
+                            cached: None,
+                            error: Some(err),
+                            proposal: None,
+                        });
+                        continue;
+                    }
+
+                    // Propose on the main thread before any parallel execution.
+                    // If policy or hooks require approval, fall back to the normal
+                    // sequential path so the standard approval UX is preserved.
+                    let internal = tool_bridge::llm_tool_call_to_internal(&effective_call);
+                    let proposal = self.tool_host.propose(internal);
+                    if !proposal.approved {
+                        sequential_calls.push(effective_call);
                         continue;
                     }
 
                     // Cache lookup
                     let cached = self.tool_cache.lookup(&effective_call.name, &parsed_args);
-                    pre_validated.push((effective_call, cached, None));
+                    pre_validated.push(ParallelPreparedToolCall {
+                        effective_call,
+                        cached,
+                        error: None,
+                        proposal: Some(proposal),
+                    });
                 }
 
                 // Execute in parallel — only calls that passed pre-validation and aren't cached.
@@ -1398,10 +1422,10 @@ impl<'a> ToolUseLoop<'a> {
                     let indexed_handles: Vec<_> = pre_validated
                         .iter()
                         .enumerate()
-                        .map(|(idx, (effective_call, cached, error))| {
+                        .map(|(idx, prepared)| {
                             let handle = s.spawn(move || {
                                 // Return pre-computed error
-                                if let Some(err_msg) = error {
+                                if let Some(err_msg) = &prepared.error {
                                     let error_result = codingbuddy_core::ToolResult {
                                         invocation_id: uuid::Uuid::new_v4(),
                                         success: false,
@@ -1411,9 +1435,13 @@ impl<'a> ToolUseLoop<'a> {
                                 }
 
                                 // Return cached result
-                                if let Some(cached_val) = cached {
+                                if let Some(cached_val) = &prepared.cached {
                                     let result = codingbuddy_core::ToolResult {
-                                        invocation_id: uuid::Uuid::new_v4(),
+                                        invocation_id: prepared
+                                            .proposal
+                                            .as_ref()
+                                            .map(|p| p.invocation_id)
+                                            .unwrap_or_else(uuid::Uuid::new_v4),
                                         success: true,
                                         output: cached_val.clone(),
                                     };
@@ -1422,12 +1450,29 @@ impl<'a> ToolUseLoop<'a> {
 
                                 // Execute the tool
                                 let start = Instant::now();
-                                let internal =
-                                    tool_bridge::llm_tool_call_to_internal(effective_call);
-                                let proposal = tool_host.propose(internal);
+                                let Some(proposal) = &prepared.proposal else {
+                                    let result = codingbuddy_core::ToolResult {
+                                        invocation_id: uuid::Uuid::new_v4(),
+                                        success: false,
+                                        output: serde_json::json!(
+                                            "Internal error: parallel tool execution missing approval proposal"
+                                        ),
+                                    };
+                                    return (idx, result, 0u64);
+                                };
+                                if !proposal.approved {
+                                    let result = codingbuddy_core::ToolResult {
+                                        invocation_id: proposal.invocation_id,
+                                        success: false,
+                                        output: serde_json::json!(
+                                            "Tool requires approval and was not executed in parallel"
+                                        ),
+                                    };
+                                    return (idx, result, 0u64);
+                                }
                                 let approved = ApprovedToolCall {
                                     invocation_id: proposal.invocation_id,
-                                    call: proposal.call,
+                                    call: proposal.call.clone(),
                                 };
                                 let result = tool_host.execute(approved);
                                 let elapsed = start.elapsed().as_millis() as u64;
@@ -1463,7 +1508,7 @@ impl<'a> ToolUseLoop<'a> {
                 // Look up effective_call from pre_validated by index.
                 for (idx, result, par_duration) in &parallel_results {
                     let effective_call = if *idx < pre_validated.len() {
-                        &pre_validated[*idx].0
+                        &pre_validated[*idx].effective_call
                     } else {
                         // Should not happen now that we preserve original_idx,
                         // but keep as safety fallback

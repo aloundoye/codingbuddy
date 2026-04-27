@@ -299,7 +299,14 @@ impl LocalToolHost {
                         continue;
                     }
                     let rel = normalize_rel_path(rel_path);
-                    if compiled.matches(&rel) {
+                    if self.policy.check_path(&rel).is_err() {
+                        continue;
+                    }
+                    let rel_under_base = path
+                        .strip_prefix(&base_path)
+                        .map(normalize_rel_path)
+                        .unwrap_or_else(|_| rel.clone());
+                    if compiled.matches(&rel) || compiled.matches(&rel_under_base) {
                         matches.push(json!({
                             "path": rel,
                             "is_dir": path.is_dir()
@@ -330,6 +337,11 @@ impl LocalToolHost {
                     .get("glob")
                     .and_then(|v| v.as_str())
                     .unwrap_or("**/*");
+                let base = call
+                    .args
+                    .get("base")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
                 let respect_gitignore = call
                     .args
                     .get("respectGitignore")
@@ -346,7 +358,9 @@ impl LocalToolHost {
                     .case_insensitive(!case_sensitive)
                     .build()?;
                 let mut matches = Vec::new();
-                for path in walk_paths(&self.workspace, &self.workspace, respect_gitignore) {
+                self.policy.check_path(base)?;
+                let base_path = self.workspace.join(base);
+                for path in walk_paths(&base_path, &self.workspace, respect_gitignore) {
                     if !path.is_file() {
                         continue;
                     }
@@ -358,7 +372,14 @@ impl LocalToolHost {
                         continue;
                     }
                     let rel = normalize_rel_path(rel_path);
-                    if !compiled_glob.matches(&rel) {
+                    if self.policy.check_path(&rel).is_err() {
+                        continue;
+                    }
+                    let rel_under_base = path
+                        .strip_prefix(&base_path)
+                        .map(normalize_rel_path)
+                        .unwrap_or_else(|_| rel.clone());
+                    if !compiled_glob.matches(&rel) && !compiled_glob.matches(&rel_under_base) {
                         continue;
                     }
                     let bytes = match fs::read(&path) {

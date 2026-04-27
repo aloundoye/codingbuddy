@@ -212,6 +212,45 @@ fn multi_tool_calls_parallel() {
     assert_eq!(result.tool_calls_made.len(), 2);
 }
 
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn parallel_candidates_that_need_approval_fall_back_without_execution() {
+    let llm = ScriptedLlm::new(vec![
+        make_tool_response(vec![
+            LlmToolCall {
+                id: "call_1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"secret-a.rs"}"#.to_string(),
+            },
+            LlmToolCall {
+                id: "call_2".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"secret-b.rs"}"#.to_string(),
+            },
+        ]),
+        make_text_response("I could not read those files."),
+    ]);
+
+    let tool_host = Arc::new(MockToolHost::new(vec![], false));
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host.clone(),
+        ToolLoopConfig::default(),
+        "system".to_string(),
+        default_tools(),
+    );
+
+    let result = loop_.run("Read both files").unwrap();
+    assert_eq!(result.turns, 2);
+    assert_eq!(result.tool_calls_made.len(), 2);
+    assert!(result.tool_calls_made.iter().all(|r| !r.success));
+    assert_eq!(
+        tool_host.executed_count(),
+        0,
+        "tools needing approval must not execute in the parallel branch"
+    );
+}
+
 #[test]
 fn tool_search_caps_promotions_for_weak_models() {
     let llm = ScriptedLlm::new(vec![]);

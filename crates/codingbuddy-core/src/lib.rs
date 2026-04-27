@@ -9,6 +9,7 @@ pub mod complexity;
 pub mod config_watcher;
 pub mod cost;
 mod llm_capabilities;
+mod model_catalog;
 pub mod profiler;
 pub mod prompts;
 mod tool_metadata;
@@ -18,9 +19,13 @@ pub use llm_capabilities::{
     model_capabilities, model_capabilities_with_registry, normalize_provider_kind,
     resolve_model_capabilities,
 };
+pub use model_catalog::{
+    ModelCatalog, ModelCatalogSource, ModelCost, ModelInfo, ModelLimits, ModelStatus,
+    ProviderCapability,
+};
 pub use tool_metadata::{
-    InterruptBehavior, ToolAgentRole, ToolMetadata, ToolPhaseAccess, ToolTier,
-    is_api_tool_name_read_only, is_internal_tool_name_read_only,
+    DynamicToolTrust, InterruptBehavior, RuntimeToolMetadata, ToolAgentRole, ToolMetadata,
+    ToolPhaseAccess, ToolTier, is_api_tool_name_read_only, is_internal_tool_name_read_only,
 };
 
 pub type Result<T> = anyhow::Result<T>;
@@ -2520,6 +2525,11 @@ impl LlmConfig {
     pub fn capabilities_for_model(&self, model: &str) -> Option<ModelCapabilities> {
         self.capability_resolution_for_model(model)
             .map(|resolution| resolution.capabilities)
+    }
+
+    #[must_use]
+    pub fn model_catalog(&self) -> ModelCatalog {
+        ModelCatalog::from_config(self)
     }
 
     /// Parse a `provider/model-id` spec and apply it to this config.

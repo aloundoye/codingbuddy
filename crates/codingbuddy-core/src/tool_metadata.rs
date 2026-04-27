@@ -1,13 +1,18 @@
 use crate::{TaskPhase, ToolName};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum ToolTier {
     Core,
     Contextual,
+    #[default]
     Extended,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ToolAgentRole {
     Build,
     Explore,
@@ -16,7 +21,8 @@ pub enum ToolAgentRole {
     General,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ToolPhaseAccess {
     pub explore: bool,
     pub plan: bool,
@@ -24,12 +30,27 @@ pub struct ToolPhaseAccess {
     pub verify: bool,
 }
 
+impl Default for ToolPhaseAccess {
+    fn default() -> Self {
+        Self {
+            explore: false,
+            plan: false,
+            execute: true,
+            verify: false,
+        }
+    }
+}
+
 /// Behavior when the user interrupts during tool execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum InterruptBehavior {
     /// Abort immediately (default for reads).
     Cancel,
     /// Finish before handling interrupt (default for writes).
+    #[default]
     Block,
 }
 
@@ -51,6 +72,131 @@ pub struct ToolMetadata {
     pub max_result_chars: usize,
     /// What to do when user interrupts during execution.
     pub interrupt_behavior: InterruptBehavior,
+}
+
+/// Runtime-only metadata for any tool visible to the agent.
+///
+/// Built-in tools are derived from [`ToolName::metadata`]. Dynamic tools
+/// (MCP/plugin/custom/unknown) default to a conservative Execute-only,
+/// approval-required profile unless a trusted adapter supplies narrower
+/// metadata in the future.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RuntimeToolMetadata {
+    pub read_only: bool,
+    pub phase_access: ToolPhaseAccess,
+    pub agent_level: bool,
+    pub review_blocked: bool,
+    pub tier: ToolTier,
+    pub allowed_roles: Vec<ToolAgentRole>,
+    pub concurrency_safe: bool,
+    pub destructive: bool,
+    pub deferred: bool,
+    pub max_result_chars: usize,
+    pub interrupt_behavior: InterruptBehavior,
+    pub approval_required: bool,
+    pub dynamic: bool,
+    pub trust_level: DynamicToolTrust,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DynamicToolTrust {
+    BuiltIn,
+    TrustedReadOnly,
+    #[default]
+    Untrusted,
+}
+
+impl Default for RuntimeToolMetadata {
+    fn default() -> Self {
+        Self::restricted_dynamic()
+    }
+}
+
+impl From<ToolMetadata> for RuntimeToolMetadata {
+    fn from(metadata: ToolMetadata) -> Self {
+        Self {
+            read_only: metadata.read_only,
+            phase_access: metadata.phase_access,
+            agent_level: metadata.agent_level,
+            review_blocked: metadata.review_blocked,
+            tier: metadata.tier,
+            allowed_roles: metadata.allowed_roles.to_vec(),
+            concurrency_safe: metadata.concurrency_safe,
+            destructive: metadata.destructive,
+            deferred: metadata.deferred,
+            max_result_chars: metadata.max_result_chars,
+            interrupt_behavior: metadata.interrupt_behavior,
+            approval_required: !metadata.read_only || metadata.review_blocked,
+            dynamic: false,
+            trust_level: DynamicToolTrust::BuiltIn,
+        }
+    }
+}
+
+impl RuntimeToolMetadata {
+    #[must_use]
+    pub fn restricted_dynamic() -> Self {
+        Self {
+            read_only: false,
+            phase_access: ToolPhaseAccess::default(),
+            agent_level: false,
+            review_blocked: true,
+            tier: ToolTier::Extended,
+            allowed_roles: vec![ToolAgentRole::Build, ToolAgentRole::General],
+            concurrency_safe: false,
+            destructive: true,
+            deferred: false,
+            max_result_chars: 30_000,
+            interrupt_behavior: InterruptBehavior::Block,
+            approval_required: true,
+            dynamic: true,
+            trust_level: DynamicToolTrust::Untrusted,
+        }
+    }
+
+    #[must_use]
+    pub fn trusted_read_only_dynamic() -> Self {
+        Self {
+            read_only: true,
+            phase_access: READ_ALL_PHASES,
+            agent_level: false,
+            review_blocked: false,
+            tier: ToolTier::Extended,
+            allowed_roles: ALL_ROLES.to_vec(),
+            concurrency_safe: true,
+            destructive: false,
+            deferred: false,
+            max_result_chars: 30_000,
+            interrupt_behavior: InterruptBehavior::Cancel,
+            approval_required: false,
+            dynamic: true,
+            trust_level: DynamicToolTrust::TrustedReadOnly,
+        }
+    }
+
+    #[must_use]
+    pub fn for_api_name(name: &str) -> Self {
+        ToolName::from_api_name(name)
+            .map(|tool| tool.metadata().into())
+            .unwrap_or_else(Self::restricted_dynamic)
+    }
+
+    #[must_use]
+    pub fn is_allowed_for_role(&self, role: ToolAgentRole) -> bool {
+        self.allowed_roles.contains(&role)
+    }
+
+    #[must_use]
+    pub fn is_allowed_in_phase(&self, phase: TaskPhase) -> bool {
+        match phase {
+            TaskPhase::Explore => self.phase_access.explore,
+            TaskPhase::Plan => self.phase_access.plan,
+            TaskPhase::Execute => self.phase_access.execute,
+            TaskPhase::Verify => self.phase_access.verify,
+        }
+    }
 }
 
 const ALL_ROLES: &[ToolAgentRole] = &[
@@ -402,4 +548,29 @@ pub fn is_internal_tool_name_read_only(name: &str) -> bool {
     ToolName::from_internal_name(name)
         .map(|tool| tool.is_read_only())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_metadata_restricts_unknown_dynamic_tools() {
+        let metadata = RuntimeToolMetadata::for_api_name("mcp__github__create_issue");
+        assert!(metadata.dynamic);
+        assert!(!metadata.read_only);
+        assert!(!metadata.concurrency_safe);
+        assert!(metadata.approval_required);
+        assert!(!metadata.is_allowed_in_phase(TaskPhase::Explore));
+        assert!(metadata.is_allowed_in_phase(TaskPhase::Execute));
+    }
+
+    #[test]
+    fn runtime_metadata_keeps_builtin_read_only_parallel_safe() {
+        let metadata = RuntimeToolMetadata::for_api_name("fs_read");
+        assert!(!metadata.dynamic);
+        assert!(metadata.read_only);
+        assert!(metadata.concurrency_safe);
+        assert!(metadata.is_allowed_in_phase(TaskPhase::Explore));
+    }
 }

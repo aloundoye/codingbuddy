@@ -3,22 +3,12 @@
 //! Implements the Explore→Plan→Execute→Verify workflow with tool filtering
 //! per phase. Simple/Medium tasks bypass phases entirely.
 
-use codingbuddy_core::{TaskPhase, ToolName};
-
-fn is_mcp_tool(tool_name: &str) -> bool {
-    tool_name.starts_with("mcp__")
-}
+use codingbuddy_core::{RuntimeToolMetadata, TaskPhase};
 
 /// Check if a tool is allowed in the given phase.
 /// Returns true if the tool should be included in the request.
 pub fn is_tool_allowed_in_phase(tool_name: &str, phase: TaskPhase) -> bool {
-    if is_mcp_tool(tool_name) {
-        return true;
-    }
-
-    ToolName::from_api_name(tool_name)
-        .map(|tool| tool.is_allowed_in_phase(phase))
-        .unwrap_or(phase == TaskPhase::Execute)
+    RuntimeToolMetadata::for_api_name(tool_name).is_allowed_in_phase(phase)
 }
 
 /// Determine if a phase transition should occur based on the current state.
@@ -119,10 +109,14 @@ mod tests {
     }
 
     #[test]
-    fn explore_allows_mcp() {
-        assert!(is_tool_allowed_in_phase(
+    fn explore_blocks_unknown_dynamic_tools() {
+        assert!(!is_tool_allowed_in_phase(
             "mcp__server__tool",
             TaskPhase::Explore
+        ));
+        assert!(is_tool_allowed_in_phase(
+            "mcp__server__tool",
+            TaskPhase::Execute
         ));
     }
 
