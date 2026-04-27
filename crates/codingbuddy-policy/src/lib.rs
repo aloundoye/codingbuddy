@@ -82,6 +82,122 @@ pub struct PermissionRule {
     pub decision: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolPolicyTargets {
+    pub paths: Vec<String>,
+    pub command: Option<String>,
+    pub url: Option<String>,
+    pub agent: Option<String>,
+    pub broad_file_scan: bool,
+}
+
+impl ToolPolicyTargets {
+    #[must_use]
+    pub fn from_call(call: &ToolCall) -> Self {
+        let mut targets = Self::default();
+        match call.name.as_str() {
+            "bash.run" => {
+                targets.command = call
+                    .args
+                    .get("cmd")
+                    .or_else(|| call.args.get("command"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            "fs.read" | "fs.edit" | "fs.write" => {
+                push_string_arg(&mut targets.paths, &call.args, "path");
+                push_string_arg(&mut targets.paths, &call.args, "file_path");
+            }
+            "fs.glob" => {
+                let base = call
+                    .args
+                    .get("base")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let pattern = call
+                    .args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("**/*");
+                add_scan_targets(&mut targets, base, pattern);
+            }
+            "fs.grep" => {
+                let base = call
+                    .args
+                    .get("base")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let glob = call
+                    .args
+                    .get("glob")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("**/*");
+                add_scan_targets(&mut targets, base, glob);
+            }
+            "web.fetch" => {
+                targets.url = call
+                    .args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            "spawn_task" => {
+                targets.agent = call
+                    .args
+                    .get("subagent_type")
+                    .or_else(|| call.args.get("role"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+        targets.paths.sort();
+        targets.paths.dedup();
+        targets
+    }
+
+    fn matches_path_specifier(&self, specifier: &str) -> bool {
+        if specifier == "*" {
+            return true;
+        }
+        if self
+            .paths
+            .iter()
+            .any(|target| permission_path_matches(specifier, target))
+        {
+            return true;
+        }
+        self.broad_file_scan && is_sensitive_or_specific_path_rule(specifier)
+    }
+}
+
+fn push_string_arg(paths: &mut Vec<String>, args: &serde_json::Value, key: &str) {
+    if let Some(path) = args.get(key).and_then(|v| v.as_str())
+        && !path.trim().is_empty()
+    {
+        paths.push(path.to_string());
+    }
+}
+
+fn add_scan_targets(targets: &mut ToolPolicyTargets, base: &str, pattern: &str) {
+    let base = if base.trim().is_empty() { "." } else { base };
+    let pattern = if pattern.trim().is_empty() {
+        "**/*"
+    } else {
+        pattern
+    };
+    targets.paths.push(base.to_string());
+    targets.paths.push(pattern.to_string());
+    if base == "." {
+        targets.paths.push(pattern.to_string());
+    } else {
+        targets
+            .paths
+            .push(format!("{}/{}", base.trim_end_matches('/'), pattern));
+    }
+    targets.broad_file_scan = matches!(pattern, "*" | "**" | "**/*" | "./**/*");
+}
+
 impl PermissionRule {
     /// Parse a rule and check if it matches a tool call.
     /// Returns `Some(decision)` if matched, `None` otherwise.
@@ -130,10 +246,12 @@ impl PermissionRule {
             return None;
         }
 
+        let targets = ToolPolicyTargets::from_call(call);
+
         // Check specifier match.
         match tool_name {
             "bash.run" => {
-                let cmd = call.args.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                let cmd = targets.command.as_deref().unwrap_or("");
                 if glob_command_matches(&specifier, cmd) {
                     Some(&self.decision)
                 } else {
@@ -141,21 +259,13 @@ impl PermissionRule {
                 }
             }
             "fs.read" | "fs.edit" | "fs.write" | "fs.glob" | "fs.grep" => {
-                let path = call
-                    .args
-                    .get("path")
-                    .or_else(|| call.args.get("file_path"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Ok(pattern) = Pattern::new(&specifier)
-                    && (pattern.matches(path) || pattern.matches_path(Path::new(path)))
-                {
+                if targets.matches_path_specifier(&specifier) {
                     return Some(&self.decision);
                 }
                 None
             }
             "web.fetch" => {
-                let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let url = targets.url.as_deref().unwrap_or("");
                 if let Some(domain) = specifier.strip_prefix("domain:") {
                     if url.contains(domain) {
                         return Some(&self.decision);
@@ -166,12 +276,7 @@ impl PermissionRule {
                 None
             }
             "spawn_task" => {
-                let agent = call
-                    .args
-                    .get("subagent_type")
-                    .or_else(|| call.args.get("role"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let agent = targets.agent.as_deref().unwrap_or("");
                 if agent == specifier || specifier == "*" {
                     Some(&self.decision)
                 } else {
@@ -181,6 +286,42 @@ impl PermissionRule {
             _ => None,
         }
     }
+}
+
+fn permission_path_matches(specifier: &str, target: &str) -> bool {
+    let specifier = normalize_policy_path(specifier);
+    let target = normalize_policy_path(target);
+    if specifier == "*" || target == specifier {
+        return true;
+    }
+    if let Ok(pattern) = Pattern::new(&specifier)
+        && (pattern.matches(&target) || pattern.matches_path(Path::new(&target)))
+    {
+        return true;
+    }
+    if let Some(file_name) = Path::new(&target).file_name().and_then(|v| v.to_str())
+        && let Ok(pattern) = Pattern::new(&specifier)
+        && pattern.matches(file_name)
+    {
+        return true;
+    }
+    !is_glob_pattern(&specifier) && target.ends_with(&specifier)
+}
+
+fn normalize_policy_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn is_sensitive_or_specific_path_rule(specifier: &str) -> bool {
+    let specifier = normalize_policy_path(specifier);
+    specifier.contains(".env")
+        || specifier.contains("secret")
+        || specifier.contains(".ssh")
+        || specifier.contains(".aws")
+        || specifier.contains("id_*")
 }
 
 /// Parse "Tool(specifier)" syntax. Returns (tool, specifier).
@@ -1924,6 +2065,54 @@ mod tests {
         };
         assert_eq!(rule.matches(&matching), Some("allow"));
         assert_eq!(rule.matches(&non_matching), None);
+    }
+
+    #[test]
+    fn permission_rule_matches_glob_base_and_pattern() {
+        let rule = PermissionRule {
+            rule: "Glob(src/**/*.rs)".to_string(),
+            decision: "ask".to_string(),
+        };
+        let matching = ToolCall {
+            name: "fs.glob".to_string(),
+            args: json!({"base": "src", "pattern": "**/*.rs"}),
+            requires_approval: false,
+        };
+        let non_matching = ToolCall {
+            name: "fs.glob".to_string(),
+            args: json!({"base": "docs", "pattern": "**/*.md"}),
+            requires_approval: false,
+        };
+        assert_eq!(rule.matches(&matching), Some("ask"));
+        assert_eq!(rule.matches(&non_matching), None);
+    }
+
+    #[test]
+    fn permission_rule_matches_grep_glob_target() {
+        let rule = PermissionRule {
+            rule: "Grep(src/**/*.rs)".to_string(),
+            decision: "ask".to_string(),
+        };
+        let matching = ToolCall {
+            name: "fs.grep".to_string(),
+            args: json!({"pattern": "secret", "base": "src", "glob": "**/*.rs"}),
+            requires_approval: false,
+        };
+        assert_eq!(rule.matches(&matching), Some("ask"));
+    }
+
+    #[test]
+    fn permission_rule_matches_sensitive_broad_grep_scan() {
+        let rule = PermissionRule {
+            rule: "Grep(.env*)".to_string(),
+            decision: "ask".to_string(),
+        };
+        let matching = ToolCall {
+            name: "fs.grep".to_string(),
+            args: json!({"pattern": "TOKEN"}),
+            requires_approval: false,
+        };
+        assert_eq!(rule.matches(&matching), Some("ask"));
     }
 
     #[test]

@@ -188,7 +188,7 @@ fn relativize_workspace_paths(tool_name: &str, args: &mut Value, workspace: &Pat
         "fs.list" => {
             relativize_path_field(obj, "dir", &workspace_roots);
         }
-        "fs.glob" => {
+        "fs.glob" | "fs.grep" => {
             relativize_path_field(obj, "base", &workspace_roots);
         }
         "multi_edit" => {
