@@ -442,9 +442,7 @@ fn shell_command_pattern_detected() {
         "multi-line sh block should trigger"
     );
     assert!(
-        contains_shell_command_pattern(
-            "```bash\ngit add .\ngit commit -m \"bump version\"\n```"
-        ),
+        contains_shell_command_pattern("```bash\ngit add .\ngit commit -m \"bump version\"\n```"),
         "git commands in bash block should trigger"
     );
     assert!(

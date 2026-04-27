@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-agent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-diff"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-hooks"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-index"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "codingbuddy-core",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-jsonrpc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-llm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-local-ml"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-lsp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-memory"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-policy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "codingbuddy-core",
  "glob",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-subagent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-testkit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "codingbuddy-agent",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-tools"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "codingbuddy-ui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

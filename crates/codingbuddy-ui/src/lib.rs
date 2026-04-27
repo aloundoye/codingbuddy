@@ -475,7 +475,7 @@ where
                     ("ACTION", if approval_flash_on { Color::LightCyan } else { Color::Cyan })
                 };
                 let prompt = format!(
-                    " [{severity}] `{tool_name}` {compact_args} | Y=approve A=always any=deny "
+                    " [{severity}] {tool_name}  {compact_args}  [y] Allow  [a] Always  [n] Deny "
                 );
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![Span::styled(

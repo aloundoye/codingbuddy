@@ -112,7 +112,14 @@ pub(crate) fn handle_stream_event(
             summary,
             success,
         } => {
-            let marker = if success { "✓" } else { "✗" };
+            let is_denied = summary.contains("denied");
+            let marker = if success {
+                "✓"
+            } else if is_denied {
+                "⊘"
+            } else {
+                "✗"
+            };
             state
                 .shell
                 .push_tool_result(&format!("{marker} {tool_name}"), duration_ms, &summary);
@@ -263,11 +270,10 @@ pub(crate) fn handle_stream_event(
             if let Some(diff) = &diff_preview {
                 state.shell.push_system(diff.clone());
             }
-            *state.info_line = format!(
-                "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
-            );
+            *state.info_line =
+                format!("{tool_name}  {compact_args}  [y] Allow  [a] Always  [n] Deny");
             state.shell.push_system(format!(
-                "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
+                "Allow {tool_name} {compact_args}?  [y] Allow once  [a] Always allow  [n] Deny"
             ));
             use std::io::Write as _;
             let _ = write!(io::stdout(), "\x07");

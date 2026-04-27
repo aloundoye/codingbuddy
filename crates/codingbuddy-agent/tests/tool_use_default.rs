@@ -564,7 +564,8 @@ fn subsequent_turns_tool_choice_auto() -> Result<()> {
         assert_eq!(
             req.tool_choice,
             codingbuddy_core::ToolChoice::auto(),
-            "turn {} should use tool_choice=auto", i
+            "turn {} should use tool_choice=auto",
+            i
         );
     }
     Ok(())

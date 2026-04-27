@@ -215,9 +215,7 @@ pub(crate) fn contains_shell_command_pattern(text: &str) -> bool {
     // Layer 1: bash/shell code block with substantial content (2+ non-empty lines).
     // This catches ALL shell scripts regardless of which commands they use.
     static SHELL_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?ms)^```(?:bash|sh|shell|zsh)\s*\n(.*?)```"
-        ).expect("valid regex")
+        regex::Regex::new(r"(?ms)^```(?:bash|sh|shell|zsh)\s*\n(.*?)```").expect("valid regex")
     });
 
     if let Some(cap) = SHELL_BLOCK.captures(text) {
