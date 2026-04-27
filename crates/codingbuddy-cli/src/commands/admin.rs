@@ -643,6 +643,11 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             json!(runtime_diagnostics.highlights),
         );
     }
+    let model_catalog = cfg.llm.model_catalog();
+    let provider_model_count = model_catalog.for_provider(&cfg.llm.provider).len();
+    let active_catalog_entry = model_catalog
+        .find(&cfg.llm.provider, &cfg.llm.active_base_model())
+        .is_some();
 
     let payload = json!({
         "os": std::env::consts::OS,
@@ -675,6 +680,18 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "active_provider_kind": active_provider_kind.map(codingbuddy_core::ProviderKind::as_key),
             "capability_profiles": capability_profiles,
             "last_applied_compatibility": last_applied_compatibility,
+            "model_catalog": {
+                "enabled": cfg.llm.model_catalog.enabled,
+                "source": model_catalog.source,
+                "remote_url": cfg.llm.model_catalog.remote_url,
+                "cache_ttl_seconds": cfg.llm.model_catalog.cache_ttl_seconds,
+                "refresh_timeout_seconds": cfg.llm.model_catalog.refresh_timeout_seconds,
+                "offline": cfg.llm.model_catalog.offline,
+                "total_models": model_catalog.models.len(),
+                "provider_models": provider_model_count,
+                "inline_overrides": cfg.llm.model_catalog.overrides.len(),
+                "active_model_found": active_catalog_entry,
+            },
         },
         "plugins": {
             "installed": plugins.len(),
@@ -1379,6 +1396,11 @@ mod tests {
         assert!(local_ml["runtime"]["scheduler"]["max_concurrent_requests"].is_number());
         assert!(local_ml["runtime"]["scheduler"]["max_queue_depth"].is_number());
         assert!(local_ml["runtime"]["scheduler"]["max_queue_wait_ms"].is_number());
+        assert!(
+            payload["llm"]["model_catalog"].is_object(),
+            "doctor payload must include model catalog diagnostics"
+        );
+        assert!(payload["llm"]["model_catalog"]["total_models"].is_number());
     }
 
     #[test]

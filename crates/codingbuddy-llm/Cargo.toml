@@ -12,3 +12,6 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

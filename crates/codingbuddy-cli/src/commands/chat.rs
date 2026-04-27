@@ -2086,90 +2086,132 @@ pub(crate) fn run_resume_specific(
     )
 }
 
-/// Format a list of known models with pricing and context window info.
+/// Format a catalog-backed list of models with pricing, limits, and provider capabilities.
 fn format_models_list(cfg: &AppConfig) -> String {
-    use codingbuddy_core::cost::get_pricing;
-
     let active_model = cfg.llm.active_base_model();
     let provider = &cfg.llm.provider;
+    let catalog = cfg.llm.model_catalog();
+    let models = catalog.for_provider(provider);
 
-    let mut out = format!("Models for {provider}:\n");
+    let mut out = format!(
+        "Models for {provider} (catalog: {:?}, {} total):\n",
+        catalog.source,
+        catalog.models.len()
+    );
     out.push_str(&format!(
-        "  {:<28} {:>8} {:>10} {:>10}\n",
-        "Model", "Context", "Input/M", "Output/M"
+        "  {:<34} {:>8} {:>8} {:>15}  {}\n",
+        "Model", "Context", "Output", "$/M in/out", "Capabilities"
     ));
-    out.push_str(&format!("  {}\n", "-".repeat(60)));
+    out.push_str(&format!("  {}\n", "-".repeat(94)));
 
-    // Collect models from the active provider and common models
-    let mut models: Vec<(&str, u64, f64, f64)> = Vec::new();
-
-    // Add the active model
-    if let Some(resolution) = cfg.llm.capability_resolution_for_model(&active_model) {
-        let caps = &resolution.capabilities;
-        let pricing = get_pricing(&active_model);
-        models.push((
-            "",
-            caps.context_window_tokens,
-            pricing.input_per_million,
-            pricing.output_per_million,
+    let mut active_listed = false;
+    for model in models {
+        let marker = if model.id == active_model {
+            active_listed = true;
+            "* "
+        } else {
+            "  "
+        };
+        out.push_str(&format!(
+            "{marker}{:<34} {:>8} {:>8} {:>15}  {}\n",
+            model.id,
+            format_token_limit(model.limits.context_tokens),
+            format_output_limit(model.limits.output_tokens),
+            format_model_cost(model.cost),
+            format_model_capabilities(model)
         ));
     }
 
-    // Common models by provider
-    let known_models: &[&str] = match provider.as_str() {
-        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
-        "anthropic" => &[
-            "claude-opus-4",
-            "claude-sonnet-4-20250514",
-            "claude-haiku-4-5-20251001",
-        ],
-        "openai-compatible" => &[
-            "gpt-4o",
-            "gpt-4o-mini",
-            "o4-mini",
-            "gpt-4.1",
-            "gpt-4.1-mini",
-        ],
-        "google" => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
-        "groq" => &["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
-        _ => &[],
-    };
-
-    for &model in known_models {
-        let pricing = get_pricing(model);
-        let ctx = cfg
-            .llm
-            .capability_resolution_for_model(model)
-            .map(|r| r.capabilities.context_window_tokens)
-            .unwrap_or(128_000);
-        let marker = if model == active_model { "* " } else { "  " };
-        let ctx_str = if ctx >= 1_000_000 {
-            format!("{}M", ctx / 1_000_000)
-        } else {
-            format!("{}K", ctx / 1000)
-        };
+    if !active_listed {
+        let active = codingbuddy_core::ModelInfo::from_capabilities(
+            provider,
+            &active_model,
+            Some(cfg.llm.active_provider().kind.as_str()),
+            &cfg.llm.capability_overrides,
+        );
         out.push_str(&format!(
-            "{marker}{:<28} {:>8} {:>9.2} {:>9.2}\n",
-            model, ctx_str, pricing.input_per_million, pricing.output_per_million
-        ));
-    }
-
-    // If active model wasn't in the known list, show it
-    if !known_models.contains(&active_model.as_str()) {
-        let pricing = get_pricing(&active_model);
-        let ctx = models.first().map(|m| m.1).unwrap_or(128_000);
-        let ctx_str = if ctx >= 1_000_000 {
-            format!("{}M", ctx / 1_000_000)
-        } else {
-            format!("{}K", ctx / 1000)
-        };
-        out.push_str(&format!(
-            "* {:<28} {:>8} {:>9.2} {:>9.2}\n",
-            active_model, ctx_str, pricing.input_per_million, pricing.output_per_million
+            "* {:<34} {:>8} {:>8} {:>15}  {}\n",
+            active.id,
+            format_token_limit(active.limits.context_tokens),
+            format_output_limit(active.limits.output_tokens),
+            format_model_cost(active.cost),
+            format_model_capabilities(&active)
         ));
     }
 
     out
+}
+
+fn format_token_limit(tokens: u64) -> String {
+    if tokens == 0 {
+        "?".to_string()
+    } else if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else {
+        format!("{}K", tokens / 1_000)
+    }
+}
+
+fn format_output_limit(tokens: u32) -> String {
+    if tokens == 0 {
+        "?".to_string()
+    } else {
+        format_token_limit(u64::from(tokens))
+    }
+}
+
+fn format_model_cost(cost: codingbuddy_core::ModelCost) -> String {
+    if cost.input_per_mtok_usd == 0.0 && cost.output_per_mtok_usd == 0.0 {
+        "local/free".to_string()
+    } else {
+        format!(
+            "{:.2}/{:.2}",
+            cost.input_per_mtok_usd, cost.output_per_mtok_usd
+        )
+    }
+}
+
+fn format_model_capabilities(model: &codingbuddy_core::ModelInfo) -> String {
+    let mut caps = Vec::new();
+    if model.capability.tool_call {
+        caps.push("tools");
+    }
+    if model.capability.parallel_tool_call {
+        caps.push("parallel");
+    }
+    if model.capability.reasoning {
+        caps.push("reasoning");
+    }
+    if model.capability.thinking_config {
+        caps.push("thinking");
+    }
+    if model.capability.image_input
+        || model
+            .modalities
+            .contains(&codingbuddy_core::ModelModality::Image)
+    {
+        caps.push("vision");
+    }
+    if model.capability.fim {
+        caps.push("fim");
+    }
+    match model.status {
+        codingbuddy_core::ModelStatus::Preview => caps.push("preview"),
+        codingbuddy_core::ModelStatus::Deprecated => caps.push("deprecated"),
+        codingbuddy_core::ModelStatus::Unknown => caps.push("unknown"),
+        codingbuddy_core::ModelStatus::Stable => {}
+    }
+    match model.provider_status {
+        codingbuddy_core::ProviderStatus::Degraded => caps.push("provider-degraded"),
+        codingbuddy_core::ProviderStatus::Unavailable => caps.push("provider-down"),
+        codingbuddy_core::ProviderStatus::Unknown => caps.push("provider-unknown"),
+        codingbuddy_core::ProviderStatus::Available => {}
+    }
+    if caps.is_empty() {
+        "text".to_string()
+    } else {
+        caps.join(",")
+    }
 }
 
 /// Open a file path in the system browser (cross-platform).
