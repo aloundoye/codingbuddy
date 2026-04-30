@@ -24,8 +24,9 @@ pub fn has_local_ml_feature() -> bool {
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use codingbuddy_core::{
-    AppConfig, ChatMessage, ChatRequest, EventEnvelope, EventKind, Session, SessionBudgets,
-    SessionState, StreamChunk, TaskPhase, ToolCall, ToolChoice, UserQuestionHandler,
+    AppConfig, ChatMessage, ChatRequest, DynamicToolTrust, EventEnvelope, EventKind,
+    RuntimeToolMetadata, Session, SessionBudgets, SessionState, StreamChunk, TaskPhase, ToolCall,
+    ToolChoice, ToolPermissionMatcher, ToolResultSizePolicy, UserQuestionHandler,
 };
 use codingbuddy_hooks::{HookRuntime, HooksConfig};
 use codingbuddy_llm::{ApiClient, LlmClient};
@@ -39,6 +40,7 @@ use codingbuddy_tools::{
     tool_definitions, tool_search_definition,
 };
 use observe::Observer;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -859,6 +861,7 @@ impl AgentEngine {
         let signals = detect_signals(prompt, &self.workspace);
         let (tiered_tools, mut discoverable_tools) =
             tiered_tool_definitions(builtin_tools, &signals);
+        let mut runtime_tool_metadata = HashMap::new();
 
         // Move deferred tools to discoverable (discovered via tool_search, not sent by default)
         let mut tools = Vec::with_capacity(tiered_tools.len());
@@ -872,24 +875,20 @@ impl AgentEngine {
                 tools.push(tool);
             }
         }
+        register_tool_definitions_metadata(&mut runtime_tool_metadata, &tools);
+        register_tool_definitions_metadata(&mut runtime_tool_metadata, &discoverable_tools);
         if let Some(ref mcp) = self.mcp
             && let Ok(mcp_tools) = mcp.discover_tools()
         {
             for mt in mcp_tools {
+                let tool_name = format!("mcp__{}__{}", mt.server_id, mt.name);
+                runtime_tool_metadata.insert(tool_name.clone(), mcp_tool_metadata(&tool_name, &mt));
                 tools.push(codingbuddy_core::ToolDefinition {
                     tool_type: "function".to_string(),
                     function: codingbuddy_core::FunctionDefinition {
-                        name: format!("mcp__{}__{}", mt.server_id, mt.name),
+                        name: tool_name,
                         description: truncate_mcp_description(&mt.description),
-                        parameters: serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "arguments": {
-                                    "type": "object",
-                                    "description": "Arguments to pass to the MCP tool"
-                                }
-                            }
-                        }),
+                        parameters: mcp_tool_parameters(&mt.input_schema),
                         strict: None,
                     },
                 });
@@ -898,8 +897,13 @@ impl AgentEngine {
 
         // Apply agent profile tool filtering
         if let Some(p) = profile {
-            tools = agent_profiles::filter_by_profile(tools, p);
-            discoverable_tools = agent_profiles::filter_by_profile(discoverable_tools, p);
+            tools =
+                agent_profiles::filter_by_profile_with_metadata(tools, p, &runtime_tool_metadata);
+            discoverable_tools = agent_profiles::filter_by_profile_with_metadata(
+                discoverable_tools,
+                p,
+                &runtime_tool_metadata,
+            );
         }
         if let Some(capabilities) = self.cfg.llm.capabilities_for_model(&active_base_model) {
             (tools, discoverable_tools) =
@@ -907,7 +911,12 @@ impl AgentEngine {
         }
 
         if !discoverable_tools.is_empty() {
-            tools.push(tool_search_definition());
+            let tool_search = tool_search_definition();
+            runtime_tool_metadata.insert(
+                tool_search.function.name.clone(),
+                RuntimeToolMetadata::for_api_name(&tool_search.function.name),
+            );
+            tools.push(tool_search);
         }
 
         let mut loop_ = tool_loop::ToolUseLoop::new(
@@ -918,6 +927,7 @@ impl AgentEngine {
             tools,
         );
         loop_.set_discoverable_tools(discoverable_tools);
+        loop_.extend_tool_metadata(runtime_tool_metadata);
 
         // Wire stream callback
         {
@@ -1271,6 +1281,72 @@ fn prompt_grants_plan_approval(prompt: &str) -> bool {
 /// Cap MCP tool descriptions to prevent OpenAPI-bloated descriptions from
 /// eating the context window (2048-char cap, inspired by Claude Code).
 const MCP_DESCRIPTION_MAX_CHARS: usize = 2048;
+
+fn register_tool_definitions_metadata(
+    metadata: &mut HashMap<String, RuntimeToolMetadata>,
+    tools: &[codingbuddy_core::ToolDefinition],
+) {
+    for tool in tools {
+        metadata.insert(
+            tool.function.name.clone(),
+            RuntimeToolMetadata::for_api_name(&tool.function.name),
+        );
+    }
+}
+
+fn mcp_tool_parameters(input_schema: &serde_json::Value) -> serde_json::Value {
+    let argument_schema = if input_schema.is_object() {
+        input_schema.clone()
+    } else {
+        serde_json::json!({
+            "type": "object",
+            "description": "Arguments to pass to the MCP tool"
+        })
+    };
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "arguments": argument_schema
+        }
+    })
+}
+
+fn mcp_tool_metadata(tool_name: &str, tool: &codingbuddy_mcp::McpTool) -> RuntimeToolMetadata {
+    let display_name = format!("MCP {}: {}", tool.server_id, tool.name);
+    let search_text = format!(
+        "mcp server {} tool {} {}",
+        tool.server_id, tool.name, tool.description
+    );
+    let mut metadata = if mcp_annotations_read_only(&tool.annotations)
+        && !mcp_annotations_destructive(&tool.annotations)
+    {
+        RuntimeToolMetadata::trusted_read_only_dynamic()
+    } else {
+        RuntimeToolMetadata::restricted_dynamic()
+    }
+    .with_display_text(display_name, search_text);
+    metadata.permission_matcher = ToolPermissionMatcher::Mcp;
+    metadata.max_result_chars = 30_000;
+    metadata.result_size_policy = ToolResultSizePolicy::PersistAndTruncate { max_chars: 30_000 };
+    if metadata.read_only {
+        metadata.trust_level = DynamicToolTrust::TrustedReadOnly;
+    }
+    metadata.search_text = format!("{} api-name {}", metadata.search_text, tool_name);
+    metadata
+}
+
+fn mcp_annotations_read_only(annotations: &serde_json::Value) -> bool {
+    annotation_bool(annotations, &["readOnlyHint", "read_only", "readOnly"]).unwrap_or(false)
+}
+
+fn mcp_annotations_destructive(annotations: &serde_json::Value) -> bool {
+    annotation_bool(annotations, &["destructiveHint", "destructive"]).unwrap_or(false)
+}
+
+fn annotation_bool(annotations: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| annotations.get(*key).and_then(serde_json::Value::as_bool))
+}
 
 fn truncate_mcp_description(desc: &str) -> String {
     if desc.len() <= MCP_DESCRIPTION_MAX_CHARS {
@@ -1667,6 +1743,40 @@ mod tests {
         let result = truncate_to_token_budget(text, 4);
         assert!(result.contains("truncated"));
         assert!(result.len() < text.len() + 40); // truncated + marker
+    }
+
+    #[test]
+    fn mcp_metadata_trusts_declared_read_only_tools() {
+        let tool = codingbuddy_mcp::McpTool {
+            server_id: "github".to_string(),
+            name: "search".to_string(),
+            description: "Search issues".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+            annotations: serde_json::json!({"readOnlyHint": true}),
+        };
+        let metadata = mcp_tool_metadata("mcp__github__search", &tool);
+        assert!(metadata.read_only);
+        assert!(!metadata.approval_required);
+        assert_eq!(metadata.trust_level, DynamicToolTrust::TrustedReadOnly);
+        assert_eq!(metadata.permission_matcher, ToolPermissionMatcher::Mcp);
+        assert!(metadata.is_allowed_in_phase(TaskPhase::Explore));
+    }
+
+    #[test]
+    fn mcp_metadata_restricts_unknown_or_destructive_tools() {
+        let tool = codingbuddy_mcp::McpTool {
+            server_id: "slack".to_string(),
+            name: "post".to_string(),
+            description: "Post a message".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+            annotations: serde_json::json!({"readOnlyHint": true, "destructiveHint": true}),
+        };
+        let metadata = mcp_tool_metadata("mcp__slack__post", &tool);
+        assert!(!metadata.read_only);
+        assert!(metadata.approval_required);
+        assert_eq!(metadata.trust_level, DynamicToolTrust::Untrusted);
+        assert!(!metadata.is_allowed_in_phase(TaskPhase::Explore));
+        assert!(metadata.is_allowed_in_phase(TaskPhase::Execute));
     }
 
     #[test]

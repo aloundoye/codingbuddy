@@ -5,7 +5,8 @@
 //! back into `ChatMessage::Tool` for feeding to the next LLM turn.
 
 use codingbuddy_core::{
-    ChatMessage, LlmToolCall, ToolCall, ToolDefinition, ToolName, ToolResult, repair_tool_api_name,
+    ChatMessage, LlmToolCall, RuntimeToolMetadata, ToolCall, ToolDefinition, ToolName, ToolResult,
+    repair_tool_api_name,
 };
 use codingbuddy_policy::output_scanner::{InjectionWarning, OutputScanner};
 
@@ -41,6 +42,21 @@ pub fn llm_tool_call_to_internal(call: &LlmToolCall) -> ToolCall {
         args,
         requires_approval,
     }
+}
+
+/// Convert an LLM tool call using runtime metadata supplied by the active tool surface.
+///
+/// Dynamic tools such as MCP/plugin/custom tools may be explicitly validated as
+/// trusted read-only at runtime. This variant keeps the same name translation as
+/// [`llm_tool_call_to_internal`] while deriving approval behavior from the
+/// runtime contract instead of from the static built-in enum alone.
+pub fn llm_tool_call_to_internal_with_metadata(
+    call: &LlmToolCall,
+    metadata: &RuntimeToolMetadata,
+) -> ToolCall {
+    let mut tool_call = llm_tool_call_to_internal(call);
+    tool_call.requires_approval = metadata.approval_required;
+    tool_call
 }
 
 /// Attempt to repair a misnamed tool call by fuzzy-matching against available tools.
@@ -81,14 +97,24 @@ pub fn tool_result_to_message(
     result: &ToolResult,
     scanner: Option<&OutputScanner>,
 ) -> (ChatMessage, Vec<InjectionWarning>) {
-    let raw = format_tool_output(&result.output, result.success);
-
     // Use higher limit for MCP tools
     let max_chars = if tool_name.starts_with("mcp__") {
         MCP_MAX_OUTPUT_CHARS
     } else {
         MAX_TOOL_OUTPUT_CHARS
     };
+    tool_result_to_message_with_limit(tool_call_id, tool_name, result, scanner, max_chars)
+}
+
+/// Convert a `ToolResult` into a tool message using a metadata-provided size limit.
+pub fn tool_result_to_message_with_limit(
+    tool_call_id: &str,
+    tool_name: &str,
+    result: &ToolResult,
+    scanner: Option<&OutputScanner>,
+    max_chars: usize,
+) -> (ChatMessage, Vec<InjectionWarning>) {
+    let raw = format_tool_output(&result.output, result.success);
     let mut content = truncate_output(&raw, max_chars);
 
     // Apply security scanning if available
@@ -292,6 +318,19 @@ mod tests {
         let tc = llm_tool_call_to_internal(&llm_call);
         assert_eq!(tc.name, "mcp__github__search", "MCP tools keep API name");
         assert!(tc.requires_approval, "unknown tools require approval");
+    }
+
+    #[test]
+    fn trusted_dynamic_metadata_can_clear_approval() {
+        let llm_call = LlmToolCall {
+            id: "call_3".to_string(),
+            name: "mcp__github__search".to_string(),
+            arguments: r#"{"query":"test"}"#.to_string(),
+        };
+        let metadata = RuntimeToolMetadata::trusted_read_only_dynamic();
+        let tc = llm_tool_call_to_internal_with_metadata(&llm_call, &metadata);
+        assert_eq!(tc.name, "mcp__github__search");
+        assert!(!tc.requires_approval);
     }
 
     #[test]

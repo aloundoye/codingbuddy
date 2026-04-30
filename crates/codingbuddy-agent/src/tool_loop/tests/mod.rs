@@ -3,8 +3,8 @@ use super::compaction::COMPACTION_TEMPLATE;
 use super::safety::DOOM_LOOP_HISTORY_SIZE;
 use super::*;
 use codingbuddy_core::{
-    LlmResponse, Plan, PlanStep, Session, SessionBudgets, SessionState, TaskPhase, ToolCall,
-    ToolProposal, ToolResult,
+    ApprovedToolCall, LlmResponse, Plan, PlanStep, Session, SessionBudgets, SessionState,
+    TaskPhase, ToolCall, ToolProposal, ToolResult,
 };
 use codingbuddy_store::{SessionTodoRecord, Store, TaskQueueRecord};
 use std::collections::VecDeque;

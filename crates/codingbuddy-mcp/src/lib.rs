@@ -66,6 +66,10 @@ pub struct McpTool {
     pub server_id: String,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub annotations: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,12 +295,20 @@ impl McpManager {
                 let age = Utc::now().signed_duration_since(*newest).num_seconds();
                 if age < Self::TOOL_CACHE_TTL_SECS {
                     // Serve from cache
-                    if let Some(cached) = existing.get(&server.id) {
-                        for name in cached {
+                    let cached_rows_for_server = cached_rows
+                        .iter()
+                        .filter(|row| row.server_id == server.id)
+                        .collect::<Vec<_>>();
+                    if !cached_rows_for_server.is_empty() {
+                        for row in cached_rows_for_server {
+                            let (input_schema, annotations) =
+                                decode_cached_tool_metadata(&row.schema_json);
                             tools.push(McpTool {
                                 server_id: server.id.clone(),
-                                name: name.clone(),
-                                description: String::new(),
+                                name: row.tool_name.clone(),
+                                description: row.description.clone(),
+                                input_schema,
+                                annotations,
                             });
                         }
                     }
@@ -311,6 +323,8 @@ impl McpManager {
                         server_id: server.id.clone(),
                         name: format!("{}.tool", server.id),
                         description: "fallback tool".to_string(),
+                        input_schema: serde_json::Value::Null,
+                        annotations: serde_json::Value::Null,
                     }]
                 });
             let previous = existing.get(&server.id).cloned().unwrap_or_default();
@@ -322,7 +336,7 @@ impl McpManager {
                     server_id: tool.server_id.clone(),
                     tool_name: tool.name.clone(),
                     description: tool.description.clone(),
-                    schema_json: "{}".to_string(),
+                    schema_json: encode_cached_tool_metadata(&tool),
                     updated_at: Utc::now().to_rfc3339(),
                 });
                 tools.push(tool);
@@ -784,6 +798,36 @@ impl McpManager {
     }
 }
 
+fn encode_cached_tool_metadata(tool: &McpTool) -> String {
+    serde_json::to_string(&json!({
+        "input_schema": tool.input_schema.clone(),
+        "annotations": tool.annotations.clone(),
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn decode_cached_tool_metadata(schema_json: &str) -> (serde_json::Value, serde_json::Value) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(schema_json) else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let input_schema = value
+        .get("input_schema")
+        .or_else(|| value.get("inputSchema"))
+        .cloned()
+        .unwrap_or_else(|| {
+            if value.is_object() && value.get("annotations").is_none() {
+                value.clone()
+            } else {
+                serde_json::Value::Null
+            }
+        });
+    let annotations = value
+        .get("annotations")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    (input_schema, annotations)
+}
+
 fn tool_fingerprint(tools: &[McpTool]) -> Result<String> {
     let serialized = serde_json::to_vec(tools)?;
     Ok(format!("{:x}", Sha256::digest(serialized)))
@@ -1075,22 +1119,7 @@ pub fn enforce_mcp_token_limit(output: &str, limits: &McpTokenLimits) -> (String
 
 fn discover_server_tools(server: &McpServer) -> Result<Vec<McpTool>> {
     if let Some(list) = server.metadata.get("tools").and_then(|v| v.as_array()) {
-        let tools = list
-            .iter()
-            .filter_map(|entry| {
-                let name = entry.get("name")?.as_str()?.to_string();
-                let description = entry
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                Some(McpTool {
-                    server_id: server.id.clone(),
-                    name,
-                    description,
-                })
-            })
-            .collect::<Vec<_>>();
+        let tools = parse_tools_array(&server.id, list);
         if !tools.is_empty() {
             return Ok(tools);
         }
@@ -1121,24 +1150,7 @@ fn discover_server_tools(server: &McpServer) -> Result<Vec<McpTool>> {
             let tools = value
                 .get("tools")
                 .and_then(|v| v.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|entry| {
-                            let name = entry.get("name")?.as_str()?.to_string();
-                            let description = entry
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            Some(McpTool {
-                                server_id: server.id.clone(),
-                                name,
-                                description,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .map(|items| parse_tools_array(&server.id, items))
                 .unwrap_or_default();
             Ok(tools)
         }
@@ -2312,6 +2324,15 @@ fn parse_tools_array(server_id: &str, tools: &[serde_json::Value]) -> Vec<McpToo
                 server_id: server_id.to_string(),
                 name,
                 description,
+                input_schema: entry
+                    .get("inputSchema")
+                    .or_else(|| entry.get("input_schema"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                annotations: entry
+                    .get("annotations")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
             })
         })
         .collect()
@@ -2425,7 +2446,12 @@ mod tests {
             "id": 2,
             "result": {
                 "tools": [
-                    {"name": "search", "description": "Search tool"},
+                    {
+                        "name": "search",
+                        "description": "Search tool",
+                        "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                        "annotations": {"readOnlyHint": true}
+                    },
                     {"name": "read"}
                 ]
             }
@@ -2434,6 +2460,22 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].server_id, "srv");
         assert_eq!(tools[0].name, "search");
+        assert_eq!(
+            tools[0]
+                .input_schema
+                .get("properties")
+                .and_then(|props| props.get("query"))
+                .and_then(|query| query.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            tools[0]
+                .annotations
+                .get("readOnlyHint")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
         assert_eq!(tools[1].name, "read");
     }
 
