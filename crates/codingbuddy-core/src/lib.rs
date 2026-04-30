@@ -27,7 +27,8 @@ pub use model_catalog::{
 };
 pub use tool_metadata::{
     DynamicToolTrust, InterruptBehavior, RuntimeToolMetadata, ToolAgentRole, ToolMetadata,
-    ToolPhaseAccess, ToolTier, is_api_tool_name_read_only, is_internal_tool_name_read_only,
+    ToolPermissionMatcher, ToolPhaseAccess, ToolResultSizePolicy, ToolTier,
+    is_api_tool_name_read_only, is_internal_tool_name_read_only,
 };
 
 pub type Result<T> = anyhow::Result<T>;

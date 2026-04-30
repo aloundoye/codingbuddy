@@ -1,5 +1,5 @@
 use super::*;
-use codingbuddy_core::{ToolName, ToolTier};
+use codingbuddy_core::{RuntimeToolMetadata, ToolDefinition, ToolName, ToolTier};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -125,6 +125,32 @@ pub(super) fn handle_tool_search(
     }
 
     let mut matches = search_extended_tools(query, &tool_loop.discoverable_tools);
+    let mut seen = matches
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<HashSet<_>>();
+    for tool in &tool_loop.discoverable_tools {
+        if seen.contains(&tool.function.name) {
+            continue;
+        }
+        let metadata = tool_loop.runtime_metadata_for_tool(&tool.function.name);
+        if query_matches_tool_metadata(query, tool, &metadata) {
+            seen.insert(tool.function.name.clone());
+            matches.push(tool.clone());
+        }
+    }
+
+    let mut restricted_matches = 0usize;
+    let mut restricted_reasons = HashSet::new();
+    matches.retain(|tool| {
+        if let Some(reason) = tool_loop.tool_visibility_error(&tool.function.name) {
+            restricted_matches += 1;
+            restricted_reasons.insert(reason);
+            false
+        } else {
+            true
+        }
+    });
     matches.sort_by_key(|tool| tool_search_priority(&tool.function.name));
 
     let weak_model = is_weak_model_for_tool_search(&tool_loop.config.model);
@@ -151,6 +177,8 @@ pub(super) fn handle_tool_search(
             continue;
         }
         if newly_enabled < promotion_cap {
+            let metadata = tool_loop.runtime_metadata_for_tool(&tool.function.name);
+            tool_loop.register_tool_metadata(tool.function.name.clone(), metadata);
             tool_loop.tools.push(tool.clone());
             newly_enabled += 1;
         } else {
@@ -190,7 +218,36 @@ pub(super) fn handle_tool_search(
             "\nDeferred {deferred} match(es). Narrow your query to promote more tools."
         ));
     }
+    if restricted_matches > 0 {
+        let mut reasons = restricted_reasons.into_iter().collect::<Vec<_>>();
+        reasons.sort();
+        result.push_str(&format!(
+            "\nFiltered {restricted_matches} match(es) hidden by {}.",
+            reasons.join(", ")
+        ));
+    }
     result
+}
+
+fn query_matches_tool_metadata(
+    query: &str,
+    tool: &ToolDefinition,
+    metadata: &RuntimeToolMetadata,
+) -> bool {
+    let query_lower = query.to_ascii_lowercase();
+    let keywords = query_lower
+        .split_whitespace()
+        .filter(|kw| !kw.is_empty())
+        .collect::<Vec<_>>();
+    if keywords.is_empty() {
+        return false;
+    }
+    let haystack = format!(
+        "{} {} {} {}",
+        tool.function.name, tool.function.description, metadata.display_name, metadata.search_text
+    )
+    .to_ascii_lowercase();
+    keywords.iter().any(|kw| haystack.contains(kw))
 }
 
 fn is_weak_model_for_tool_search(model: &str) -> bool {

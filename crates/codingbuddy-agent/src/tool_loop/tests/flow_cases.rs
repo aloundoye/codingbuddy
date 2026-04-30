@@ -315,6 +315,97 @@ fn tool_search_caps_promotions_for_weak_models() {
 }
 
 #[test]
+fn tool_search_respects_phase_visibility() {
+    let llm = ScriptedLlm::new(vec![]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host,
+        ToolLoopConfig::default(),
+        "system".to_string(),
+        vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: codingbuddy_core::FunctionDefinition {
+                name: "fs_read".to_string(),
+                description: "read".to_string(),
+                strict: None,
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }],
+    );
+    loop_.phase = Some(TaskPhase::Explore);
+    loop_.set_discoverable_tools(vec![ToolDefinition {
+        tool_type: "function".to_string(),
+        function: codingbuddy_core::FunctionDefinition {
+            name: "fs_edit".to_string(),
+            description: "edit files".to_string(),
+            strict: None,
+            parameters: serde_json::json!({"type":"object"}),
+        },
+    }]);
+
+    let baseline = loop_.tools.len();
+    let output =
+        super::agent_tools::handle_tool_search(&mut loop_, &serde_json::json!({"query":"edit"}));
+
+    assert_eq!(loop_.tools.len(), baseline);
+    assert!(
+        !loop_
+            .tools
+            .iter()
+            .any(|tool| tool.function.name == "fs_edit")
+    );
+    assert!(output.contains("Filtered 1 match"));
+}
+
+#[test]
+fn tool_search_promotes_trusted_read_only_mcp_in_explore() {
+    let llm = ScriptedLlm::new(vec![]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host,
+        ToolLoopConfig::default(),
+        "system".to_string(),
+        vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: codingbuddy_core::FunctionDefinition {
+                name: "fs_read".to_string(),
+                description: "read".to_string(),
+                strict: None,
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }],
+    );
+    loop_.phase = Some(TaskPhase::Explore);
+    loop_.set_discoverable_tools(vec![ToolDefinition {
+        tool_type: "function".to_string(),
+        function: codingbuddy_core::FunctionDefinition {
+            name: "mcp__github__search".to_string(),
+            description: "Search GitHub issues".to_string(),
+            strict: None,
+            parameters: serde_json::json!({"type":"object"}),
+        },
+    }]);
+    loop_.register_tool_metadata(
+        "mcp__github__search",
+        codingbuddy_core::RuntimeToolMetadata::trusted_read_only_dynamic()
+            .with_display_text("MCP GitHub search", "github issue search read only"),
+    );
+
+    let output =
+        super::agent_tools::handle_tool_search(&mut loop_, &serde_json::json!({"query":"github"}));
+
+    assert!(
+        loop_
+            .tools
+            .iter()
+            .any(|tool| tool.function.name == "mcp__github__search")
+    );
+    assert!(output.contains("Enabled 1 matching tool"));
+}
+
+#[test]
 fn tool_chain_multiple_turns() {
     let llm = ScriptedLlm::new(vec![
         // Turn 1: grep

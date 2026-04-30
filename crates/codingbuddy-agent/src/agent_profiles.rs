@@ -6,6 +6,7 @@
 
 use codingbuddy_core::complexity::PromptComplexity;
 use codingbuddy_core::{RuntimeToolMetadata, ToolAgentRole};
+use std::collections::HashMap;
 
 /// An agent profile constrains tool availability and adds a system prompt addendum.
 #[derive(Debug, Clone)]
@@ -204,10 +205,23 @@ pub fn filter_by_profile(
     tools: Vec<codingbuddy_core::ToolDefinition>,
     profile: &AgentProfile,
 ) -> Vec<codingbuddy_core::ToolDefinition> {
+    filter_by_profile_with_metadata(tools, profile, &HashMap::new())
+}
+
+/// Filter tool definitions by an agent profile using runtime metadata supplied
+/// by dynamic adapters such as MCP.
+pub fn filter_by_profile_with_metadata(
+    tools: Vec<codingbuddy_core::ToolDefinition>,
+    profile: &AgentProfile,
+    metadata_by_name: &HashMap<String, RuntimeToolMetadata>,
+) -> Vec<codingbuddy_core::ToolDefinition> {
     tools
         .into_iter()
         .filter(|t| {
-            let metadata = RuntimeToolMetadata::for_api_name(&t.function.name);
+            let metadata = metadata_by_name
+                .get(&t.function.name)
+                .cloned()
+                .unwrap_or_else(|| RuntimeToolMetadata::for_api_name(&t.function.name));
             let allowed_by_role = metadata.is_allowed_for_role(profile.role);
             let blocked = profile.blocked_tools.iter().any(|b| *b == t.function.name);
             allowed_by_role && !blocked
@@ -394,6 +408,20 @@ mod tests {
         assert!(names.contains(&"fs_read"));
         assert!(!names.contains(&"mcp__github__search"));
         assert!(!names.contains(&"mcp__slack__post"));
+    }
+
+    #[test]
+    fn explore_keeps_trusted_read_only_mcp_tools() {
+        let tools = vec![make_tool("fs_read"), make_tool("mcp__github__search")];
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "mcp__github__search".to_string(),
+            RuntimeToolMetadata::trusted_read_only_dynamic(),
+        );
+        let filtered = filter_by_profile_with_metadata(tools, &PROFILE_EXPLORE, &metadata);
+        let names: Vec<_> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(names.contains(&"fs_read"));
+        assert!(names.contains(&"mcp__github__search"));
     }
 
     #[test]

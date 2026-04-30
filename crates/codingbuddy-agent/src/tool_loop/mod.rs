@@ -27,16 +27,21 @@ pub(crate) mod cache;
 mod compaction;
 mod event_emission;
 mod helpers;
+mod model_routing;
+mod permission_execution;
 pub mod phases;
+mod request_building;
+mod result_handling;
 mod safety;
 pub mod streaming_executor;
+mod verification;
 
 // Re-export public API from submodules
 pub use types::*;
 
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
-    ApprovedToolCall, ChatMessage, ChatRequest, EventKind, LlmToolCall, Plan, PlanStep, Session,
+    ChatMessage, ChatRequest, EventKind, LlmToolCall, Plan, PlanStep, RuntimeToolMetadata, Session,
     SessionState, StreamCallback, StreamChunk, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
     ToolHost, UserQuestion, estimate_message_tokens, strip_prior_reasoning_content,
 };
@@ -61,7 +66,7 @@ use compaction::{
     build_compaction_summary_with_llm, extract_memory_observations, extract_tool_path,
     truncate_line,
 };
-use helpers::{is_read_only_api_name, summarize_args};
+use helpers::summarize_args;
 use safety::{
     CIRCUIT_BREAKER_COOLDOWN_TURNS, CIRCUIT_BREAKER_THRESHOLD, CircuitBreakerState, CostTracker,
     DOOM_LOOP_GUIDANCE, DOOM_LOOP_THRESHOLD, DoomLoopTracker, ERROR_RECOVERY_GUIDANCE,
@@ -141,6 +146,7 @@ pub struct ToolUseLoop<'a> {
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
     discoverable_tools: Vec<ToolDefinition>,
+    tool_metadata: HashMap<String, RuntimeToolMetadata>,
     stream_cb: Option<StreamCallback>,
     approval_cb: Option<ApprovalCallback>,
     user_question_cb: Option<UserQuestionCallback>,
@@ -238,6 +244,14 @@ impl<'a> ToolUseLoop<'a> {
             None
         };
 
+        let mut tool_metadata = HashMap::new();
+        for tool in &tools {
+            tool_metadata.insert(
+                tool.function.name.clone(),
+                Self::metadata_for_definition(tool),
+            );
+        }
+
         Self {
             llm,
             tool_host,
@@ -245,6 +259,7 @@ impl<'a> ToolUseLoop<'a> {
             messages,
             tools,
             discoverable_tools: Vec::new(),
+            tool_metadata,
             stream_cb: None,
             approval_cb: None,
             user_question_cb: None,
@@ -279,7 +294,55 @@ impl<'a> ToolUseLoop<'a> {
 
     /// Install tools that can be revealed on demand via `tool_search`.
     pub fn set_discoverable_tools(&mut self, tools: Vec<ToolDefinition>) {
+        for tool in &tools {
+            self.tool_metadata.insert(
+                tool.function.name.clone(),
+                Self::metadata_for_definition(tool),
+            );
+        }
         self.discoverable_tools = tools;
+    }
+
+    /// Install explicit runtime metadata supplied by dynamic adapters.
+    pub fn extend_tool_metadata(&mut self, metadata: HashMap<String, RuntimeToolMetadata>) {
+        self.tool_metadata.extend(metadata);
+    }
+
+    pub(super) fn register_tool_metadata(
+        &mut self,
+        tool_name: impl Into<String>,
+        metadata: RuntimeToolMetadata,
+    ) {
+        self.tool_metadata.insert(tool_name.into(), metadata);
+    }
+
+    pub(super) fn runtime_metadata_for_tool(&self, name: &str) -> RuntimeToolMetadata {
+        self.tool_metadata
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| RuntimeToolMetadata::for_api_name(name))
+    }
+
+    pub(super) fn tool_visibility_error(&self, name: &str) -> Option<String> {
+        let metadata = self.runtime_metadata_for_tool(name);
+        if self.config.read_only && !metadata.read_only {
+            return Some("read-only session".to_string());
+        }
+        if let Some(phase) = self.phase
+            && !metadata.is_allowed_in_phase(phase)
+        {
+            return Some(format!("{} phase", phase.as_str()));
+        }
+        None
+    }
+
+    fn metadata_for_definition(tool: &ToolDefinition) -> RuntimeToolMetadata {
+        let mut metadata = RuntimeToolMetadata::for_api_name(&tool.function.name);
+        if metadata.dynamic {
+            metadata.display_name = tool.function.name.clone();
+            metadata.search_text = format!("{} {}", tool.function.name, tool.function.description);
+        }
+        metadata
     }
 
     fn workspace_store(&self) -> Result<Store> {
@@ -446,16 +509,7 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     fn next_request_route(&self) -> (String, Option<codingbuddy_core::ThinkingConfig>, u32) {
-        // Always use the user-configured model. No mid-session model switching.
-        // Thinking budget escalates based on evidence (compile errors, test failures).
-        let thinking = self.config.thinking.as_ref().map(|base| {
-            if self.escalation.should_escalate() {
-                codingbuddy_core::ThinkingConfig::enabled(self.escalation.budget())
-            } else {
-                base.clone()
-            }
-        });
-        (self.config.model.clone(), thinking, self.config.max_tokens)
+        model_routing::next_request_route(&self.config, &self.escalation)
     }
 
     fn compaction_budget_for_next_turn(&self, tool_def_tokens: u64) -> (u64, u64, u64) {
@@ -1331,7 +1385,7 @@ impl<'a> ToolUseLoop<'a> {
             // are explicitly concurrency-safe can enter the parallel path.
             let (parallel_calls, mut sequential_calls): (Vec<_>, Vec<_>) =
                 response.tool_calls.iter().cloned().partition(|c| {
-                    let meta = codingbuddy_core::RuntimeToolMetadata::for_api_name(&c.name);
+                    let meta = self.runtime_metadata_for_tool(&c.name);
                     meta.read_only
                         && meta.concurrency_safe
                         && !meta.agent_level
@@ -1397,7 +1451,11 @@ impl<'a> ToolUseLoop<'a> {
                     // Propose on the main thread before any parallel execution.
                     // If policy or hooks require approval, fall back to the normal
                     // sequential path so the standard approval UX is preserved.
-                    let internal = tool_bridge::llm_tool_call_to_internal(&effective_call);
+                    let metadata = self.runtime_metadata_for_tool(&effective_call.name);
+                    let internal = tool_bridge::llm_tool_call_to_internal_with_metadata(
+                        &effective_call,
+                        &metadata,
+                    );
                     let proposal = self.tool_host.propose(internal);
                     if !proposal.approved {
                         sequential_calls.push(effective_call);
@@ -1470,9 +1528,17 @@ impl<'a> ToolUseLoop<'a> {
                                     };
                                     return (idx, result, 0u64);
                                 }
-                                let approved = ApprovedToolCall {
-                                    invocation_id: proposal.invocation_id,
-                                    call: proposal.call.clone(),
+                                let Some(approved) =
+                                    permission_execution::approved_call_from_proposal(proposal)
+                                else {
+                                    let result = codingbuddy_core::ToolResult {
+                                        invocation_id: proposal.invocation_id,
+                                        success: false,
+                                        output: serde_json::json!(
+                                            "Tool requires approval and was not executed in parallel"
+                                        ),
+                                    };
+                                    return (idx, result, 0u64);
                                 };
                                 let result = tool_host.execute(approved);
                                 let elapsed = start.elapsed().as_millis() as u64;
@@ -1543,11 +1609,13 @@ impl<'a> ToolUseLoop<'a> {
                         }
                     }
 
-                    let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
+                    let (msg, injection_warnings) = tool_bridge::tool_result_to_message_with_limit(
                         &effective_call.id,
                         &effective_call.name,
                         result,
                         Some(&self.output_scanner),
+                        self.runtime_metadata_for_tool(&effective_call.name)
+                            .max_result_chars(),
                     );
                     let msg = self.apply_privacy_to_message(msg);
 
@@ -1754,7 +1822,7 @@ impl<'a> ToolUseLoop<'a> {
                 // Count read-only vs write tool calls in this batch
                 let prev_edit_calls = self.phase_edit_calls;
                 for tc in &response.tool_calls {
-                    if helpers::is_read_only_api_name(&tc.name) {
+                    if self.runtime_metadata_for_tool(&tc.name).read_only {
                         self.phase_read_only_calls += 1;
                     } else {
                         self.phase_edit_calls += 1;
@@ -1846,7 +1914,9 @@ impl<'a> ToolUseLoop<'a> {
         };
 
         // Convert LLM call to internal format
-        let mut tool_call = tool_bridge::llm_tool_call_to_internal(&llm_call);
+        let metadata = self.runtime_metadata_for_tool(&llm_call.name);
+        let mut tool_call =
+            tool_bridge::llm_tool_call_to_internal_with_metadata(&llm_call, &metadata);
         // Save parsed args before tool_call is moved into propose()
         let mut parsed_args = tool_call.args.clone();
 
@@ -2056,11 +2126,13 @@ impl<'a> ToolUseLoop<'a> {
                 success: true,
                 output: cached_result,
             };
-            let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
+            let (msg, injection_warnings) = tool_bridge::tool_result_to_message_with_limit(
                 &llm_call.id,
                 &llm_call.name,
                 &result,
                 Some(&self.output_scanner),
+                self.runtime_metadata_for_tool(&llm_call.name)
+                    .max_result_chars(),
             );
             self.messages.push(msg);
             self.emit_injection_warnings(&injection_warnings);
@@ -2097,10 +2169,7 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         // Execute the approved tool
-        let approved_call = ApprovedToolCall {
-            invocation_id: proposal.invocation_id,
-            call: proposal.call,
-        };
+        let approved_call = permission_execution::approved_call_after_permission(proposal);
         let mut result = self.tool_host.execute(approved_call);
 
         let duration = start.elapsed().as_millis() as u64;
@@ -2164,32 +2233,14 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
 
-        // Run LSP diagnostics once per language (not per file) to avoid
-        // redundant workspace-wide checks like `cargo check`.
-        let mut lsp_diagnostics_text = String::new();
-        if success
-            && !modified_paths.is_empty()
-            && let Some(ref validator) = self.config.edit_validator
-        {
-            let mut checked_extensions = std::collections::HashSet::new();
-            for path in &modified_paths {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !checked_extensions.insert(ext) {
-                    continue;
-                }
-                if let Ok(diags) = validator.check_file(path)
-                    && !diags.is_empty()
-                {
-                    lsp_diagnostics_text
-                        .push_str(&codingbuddy_lsp::EditValidator::format_for_llm(&diags));
-                    lsp_diagnostics_text.push('\n');
-                }
-            }
-        }
+        let lsp_diagnostics_text = if success && !modified_paths.is_empty() {
+            verification::post_edit_diagnostics(
+                self.config.edit_validator.as_ref(),
+                &modified_paths,
+            )
+        } else {
+            String::new()
+        };
 
         // Scan tool output for evidence-driven budget escalation signals
         if let Some(output_str) = result.output.as_str() {
@@ -2271,28 +2322,18 @@ impl<'a> ToolUseLoop<'a> {
             .and_then(|s| self.persist_large_output(&llm_call.name, s));
 
         // Per-tool output truncation using metadata-driven max_result_chars
-        let max_chars = codingbuddy_core::ToolName::from_api_name(&llm_call.name)
-            .map(|tn| tn.metadata().max_result_chars)
-            .unwrap_or(50_000);
-        if let Some(text) = result.output.as_str()
-            && text.len() > max_chars
-        {
-            let truncated = &text[..text.floor_char_boundary(max_chars)];
-            let footer = format!(
-                "\n\n[Output truncated. Showing first {} of {} characters. \
-                 Use more specific queries to narrow results.]",
-                max_chars,
-                text.len()
-            );
-            result.output = serde_json::Value::String(format!("{truncated}{footer}"));
-        }
+        let max_chars = self
+            .runtime_metadata_for_tool(&llm_call.name)
+            .max_result_chars();
+        result_handling::truncate_result_output(&mut result, max_chars);
 
         // Convert result to ChatMessage::Tool and append, scanning for security issues
-        let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
+        let (msg, injection_warnings) = tool_bridge::tool_result_to_message_with_limit(
             &llm_call.id,
             &llm_call.name,
             &result,
             Some(&self.output_scanner),
+            max_chars,
         );
         // Append file persistence hint to the truncated message content.
         let msg = if let Some(hint) = file_hint {
@@ -2395,64 +2436,26 @@ impl<'a> ToolUseLoop<'a> {
     /// Applies dynamic thinking budget escalation based on evidence.
     /// Uses model capabilities to decide tool_choice and temperature handling.
     fn build_request(&self) -> ChatRequest {
-        let tools = if self.config.read_only {
-            self.tools
-                .iter()
-                .filter(|t| is_read_only_api_name(&t.function.name))
-                .cloned()
-                .collect()
-        } else {
-            self.tools.clone()
-        };
-
-        // Phase-based tool filtering (only when phase loop is enabled)
-        let tools = if let Some(phase) = self.phase {
-            tools
-                .into_iter()
-                .filter(|t| phases::is_tool_allowed_in_phase(&t.function.name, phase))
-                .collect()
-        } else {
-            tools
-        };
-
-        // Always use tool_choice=auto, like Claude Code does. Forcing
-        // "required" causes some models (e.g. DeepSeek) to hang or timeout.
-        // The system prompt steers tool usage; auto-conversion catches bash
-        // blocks that slip through as text.
-        let tool_choice = ToolChoice::auto();
-
         let (model, thinking, max_tokens) = self.next_request_route();
+        let tools = request_building::filter_tools_for_request(
+            &self.tools,
+            self.config.read_only,
+            self.phase,
+            |name| self.runtime_metadata_for_tool(name),
+        );
 
-        // Use model capabilities to decide what to strip
-        let caps = codingbuddy_core::model_capabilities(self.config.provider_kind, &model);
-        let temperature = if caps.supports_reasoning_mode {
-            None // Reasoner models don't support temperature
-        } else {
-            self.config.temperature
-        };
-        let tool_choice = if !caps.supports_tool_choice {
-            ToolChoice::auto()
-        } else {
-            tool_choice
-        };
-
-        ChatRequest {
-            model,
-            messages: self.messages.clone(),
+        request_building::build_chat_request(
+            self.messages.clone(),
             tools,
-            tool_choice,
-            max_tokens,
-            temperature,
-            top_p: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logprobs: None,
-            top_logprobs: None,
-            thinking,
-            images: self.config.images.clone(),
-            provider_options: Default::default(),
-            response_format: None,
-        }
+            request_building::RequestRoute {
+                model,
+                thinking,
+                max_tokens,
+            },
+            self.config.provider_kind,
+            self.config.temperature,
+            self.config.images.clone(),
+        )
     }
 
     /// Track an error message for stuck detection.
