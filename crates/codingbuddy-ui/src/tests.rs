@@ -1665,25 +1665,25 @@ fn image_fallback_text_paste() {
 fn model_picker_navigation() {
     let mut picker = ModelPickerState::new();
     assert_eq!(picker.selected, 0);
-    assert_eq!(picker.confirm(), "deepseek-chat");
+    assert_eq!(picker.confirm(), "deepseek/deepseek-chat");
 
     picker.down();
     assert_eq!(picker.selected, 1);
-    assert_eq!(picker.confirm(), "deepseek-reasoner");
+    assert_eq!(picker.confirm(), "deepseek/deepseek-reasoner");
 
     // Navigate to last item
-    for _ in 0..20 {
+    for _ in 0..40 {
         picker.down();
     }
-    let last_idx = MODEL_CHOICES.len() - 1;
+    let last_idx = picker.count() - 1;
     assert_eq!(picker.selected, last_idx, "should clamp at bottom");
 
     // Back to top
-    for _ in 0..MODEL_CHOICES.len() + 5 {
+    for _ in 0..picker.count() + 5 {
         picker.up();
     }
     assert_eq!(picker.selected, 0, "should clamp at top");
-    assert_eq!(picker.confirm(), "deepseek-chat");
+    assert_eq!(picker.confirm(), "deepseek/deepseek-chat");
 
     // Display lines should be bounded
     let lines = picker.display_lines();

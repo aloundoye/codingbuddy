@@ -99,6 +99,8 @@ pub struct ChatOptions {
     pub session_id: Option<Uuid>,
     /// Manual profile override from `/agent <name>`. When set, overrides auto-selection.
     pub profile_override: Option<String>,
+    /// Optional `provider/model` selector applied to this turn without mutating persisted config.
+    pub model_spec: Option<String>,
 }
 
 pub struct AgentEngine {
@@ -270,6 +272,30 @@ impl AgentEngine {
     /// Apply a `provider/model-id` spec (e.g. `"anthropic/claude-sonnet-4-6-20250514"`).
     pub fn apply_model_spec(&mut self, spec: &str) {
         self.cfg.llm.apply_model_spec(spec);
+    }
+
+    fn effective_config(&self, options: &ChatOptions) -> AppConfig {
+        let mut cfg = self.cfg.clone();
+        if let Some(spec) = options.model_spec.as_deref() {
+            cfg.llm.apply_model_spec(spec);
+        }
+        cfg
+    }
+
+    fn routed_llm_for_options(
+        &self,
+        cfg: &AppConfig,
+        options: &ChatOptions,
+    ) -> Result<Option<ApiClient>> {
+        if options
+            .model_spec
+            .as_deref()
+            .is_some_and(|spec| !spec.trim().is_empty())
+        {
+            Ok(Some(ApiClient::new(cfg.llm.clone())?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn validate_api_key(&self) -> Result<()> {
@@ -590,6 +616,12 @@ impl AgentEngine {
     }
 
     pub fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        let cfg = self.effective_config(&options);
+        let routed_llm = self.routed_llm_for_options(&cfg, &options)?;
+        let llm = match routed_llm.as_ref() {
+            Some(client) => client as &(dyn LlmClient + Send + Sync),
+            None => self.llm.as_ref(),
+        };
         // Grab a clone of the stream callback (if any) to pass to analyze().
         // complete_chat_streaming will fire ContentDelta per-token in real-time.
         let stream_cb = self
@@ -599,8 +631,8 @@ impl AgentEngine {
             .and_then(|guard| guard.as_ref().cloned());
 
         let response = analysis::analyze(
-            self.llm.as_ref(),
-            &self.cfg,
+            llm,
+            &cfg,
             &self.workspace,
             prompt,
             &options,
@@ -614,9 +646,9 @@ impl AgentEngine {
                 options.session_id,
                 EventKind::ProviderCompatibilityApplied {
                     model: if options.force_max_think {
-                        self.cfg.llm.active_reasoner_model()
+                        cfg.llm.active_reasoner_model()
                     } else {
-                        self.cfg.llm.active_base_model()
+                        cfg.llm.active_base_model()
                     },
                     provider: compatibility.provider.clone(),
                     transforms: compatibility.transforms.clone(),
@@ -662,6 +694,12 @@ impl AgentEngine {
     /// repo map, manifests) is injected on the first turn so the model starts
     /// with project awareness instead of blind.
     fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
+        let cfg = self.effective_config(options);
+        let routed_llm = self.routed_llm_for_options(&cfg, options)?;
+        let llm = match routed_llm.as_ref() {
+            Some(client) => client as &(dyn LlmClient + Send + Sync),
+            None => self.llm.as_ref(),
+        };
         let project_memory = codingbuddy_memory::MemoryManager::new(&self.workspace)
             .ok()
             .and_then(|mm| mm.read_combined_memory().ok());
@@ -703,8 +741,8 @@ impl AgentEngine {
             .and_then(agent_profiles::profile_by_name)
             .or_else(|| agent_profiles::select_profile(options.mode, prompt, complexity));
 
-        let active_base_model = self.cfg.llm.active_base_model();
-        let active_reasoner_model = self.cfg.llm.active_reasoner_model();
+        let active_base_model = cfg.llm.active_base_model();
+        let active_reasoner_model = cfg.llm.active_reasoner_model();
         let mut session = self.ensure_session_record_for(options.session_id)?;
         if session.status == SessionState::AwaitingApproval && prompt_grants_plan_approval(prompt) {
             session.status = SessionState::ExecutingStep;
@@ -733,7 +771,7 @@ impl AgentEngine {
         );
 
         // Inject output style preference
-        match self.cfg.output_style.as_str() {
+        match cfg.output_style.as_str() {
             "concise" => {
                 system_prompt.push_str("\n\nIMPORTANT: Be extremely concise. One-sentence answers preferred. No preamble or trailing summaries.");
             }
@@ -754,7 +792,7 @@ impl AgentEngine {
 
         // Append skill catalog with when_to_use hints so the LLM knows available skills
         if let Ok(skill_mgr) = crate::skills::SkillManager::new(&self.workspace)
-            && let Ok(skills) = skill_mgr.list(&self.cfg.skills.paths)
+            && let Ok(skills) = skill_mgr.list(&cfg.skills.paths)
         {
             let prompt_lower = prompt.to_lowercase();
             let mut recommended: Vec<String> = Vec::new();
@@ -804,7 +842,7 @@ impl AgentEngine {
         // Gather lightweight bootstrap context so the model starts with project awareness.
         // Budget: ~15% of context window to leave room for conversation.
         let initial_context =
-            self.build_bootstrap_context(prompt, options, self.cfg.llm.context_window_tokens);
+            self.build_bootstrap_context(prompt, options, cfg.llm.context_window_tokens);
         let initial_phase = match session.status {
             SessionState::Planning | SessionState::AwaitingApproval => Some(TaskPhase::Plan),
             SessionState::ExecutingStep => Some(TaskPhase::Execute),
@@ -815,18 +853,15 @@ impl AgentEngine {
         let config = tool_loop::ToolLoopConfig {
             model: active_base_model.clone(),
             max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
-            provider_kind: self
-                .cfg
+            provider_kind: cfg
                 .llm
                 .active_provider_kind()
                 .unwrap_or(codingbuddy_core::ProviderKind::Deepseek),
             temperature: None, // Incompatible with thinking mode
-            context_window_tokens: self.cfg.llm.context_window_tokens,
-            reserved_overhead_tokens: self.cfg.context.reserved_overhead_tokens,
-            response_budget_tokens: self.cfg.context.response_budget_tokens,
-            max_turns: self
-                .max_turns
-                .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns) as usize,
+            context_window_tokens: cfg.llm.context_window_tokens,
+            reserved_overhead_tokens: cfg.context.reserved_overhead_tokens,
+            response_budget_tokens: cfg.context.response_budget_tokens,
+            max_turns: self.max_turns.unwrap_or(cfg.agent_loop.tool_loop_max_turns) as usize,
             read_only,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(think_budget)),
             extended_thinking_model: active_reasoner_model,
@@ -834,21 +869,21 @@ impl AgentEngine {
             subagent_worker: self.build_subagent_worker(),
             skill_runner: self.build_skill_runner(),
             workspace: Some(self.workspace.clone()),
-            retriever: build_retriever_callback(&self.workspace, &self.cfg),
-            privacy_router: build_privacy_router(&self.cfg),
+            retriever: build_retriever_callback(&self.workspace, &cfg),
+            privacy_router: build_privacy_router(&cfg),
             images: options.images.clone(),
             initial_context,
             profile_name: profile.map(|p| p.name.to_string()),
-            phase_loop_enabled: self.cfg.agent_loop.phase_loop_enabled,
+            phase_loop_enabled: cfg.agent_loop.phase_loop_enabled,
             initial_phase,
             session_id: Some(session.session_id),
-            edit_validator: if self.cfg.lsp.enabled {
+            edit_validator: if cfg.lsp.enabled {
                 Some(std::sync::Arc::new(codingbuddy_lsp::EditValidator::new(
                     self.workspace.clone(),
                     codingbuddy_lsp::LspConfig {
-                        enabled: self.cfg.lsp.enabled,
-                        languages: self.cfg.lsp.languages.clone(),
-                        timeout_seconds: self.cfg.lsp.timeout_seconds,
+                        enabled: cfg.lsp.enabled,
+                        languages: cfg.lsp.languages.clone(),
+                        timeout_seconds: cfg.lsp.timeout_seconds,
                     },
                 )))
             } else {
@@ -905,7 +940,7 @@ impl AgentEngine {
                 &runtime_tool_metadata,
             );
         }
-        if let Some(capabilities) = self.cfg.llm.capabilities_for_model(&active_base_model) {
+        if let Some(capabilities) = cfg.llm.capabilities_for_model(&active_base_model) {
             (tools, discoverable_tools) =
                 shape_tool_surface(tools, discoverable_tools, capabilities);
         }
@@ -919,13 +954,8 @@ impl AgentEngine {
             tools.push(tool_search);
         }
 
-        let mut loop_ = tool_loop::ToolUseLoop::new(
-            self.llm.as_ref(),
-            self.tool_host.clone(),
-            config,
-            system_prompt,
-            tools,
-        );
+        let mut loop_ =
+            tool_loop::ToolUseLoop::new(llm, self.tool_host.clone(), config, system_prompt, tools);
         loop_.set_discoverable_tools(discoverable_tools);
         loop_.extend_tool_metadata(runtime_tool_metadata);
 
@@ -1144,6 +1174,24 @@ impl AgentEngine {
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
         let session = self.ensure_session_record_for(options.session_id)?;
         options.session_id = Some(session.session_id);
+        if options
+            .model_spec
+            .as_deref()
+            .is_some_and(|spec| !spec.trim().is_empty())
+        {
+            let effective = self.effective_config(&options);
+            let model = effective.llm.active_base_model();
+            self.stream(StreamChunk::ModelChanged {
+                model: model.clone(),
+            });
+            self.append_event_best_effort_for_session(
+                Some(session.session_id),
+                EventKind::ProviderSelected {
+                    provider: effective.llm.provider.clone(),
+                    model,
+                },
+            );
+        }
 
         if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
             options.chat_history = projection.chat_messages;

@@ -919,6 +919,77 @@ impl IdeRpcHandler {
         }))
     }
 
+    fn handle_session_timeline(&self, params: Value) -> Result<Value> {
+        let session_id = require_uuid(&params, "session_id")?;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as i64;
+        let limit = limit.clamp(1, 500);
+
+        let conn = self.store.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT seq_no, at, kind, payload
+             FROM events
+             WHERE session_id = ?1
+             ORDER BY seq_no DESC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query([session_id.to_string(), limit.to_string()])?;
+        let mut timeline = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind = row.get::<_, String>(2)?;
+            let payload_raw = row.get::<_, String>(3)?;
+            let payload = serde_json::from_str::<Value>(&payload_raw).unwrap_or(Value::Null);
+            timeline.push(serde_json::json!({
+                "seq_no": row.get::<_, i64>(0)?.max(0) as u64,
+                "at": row.get::<_, String>(1)?,
+                "kind": kind,
+                "category": timeline_category(&kind),
+                "summary": timeline_summary(&kind, &payload),
+                "payload": payload,
+            }));
+        }
+        timeline.reverse();
+
+        let projection = self.store.rebuild_from_events(session_id)?;
+        let tasks = self.store.list_tasks(Some(session_id))?;
+        let background_jobs = self.store.list_background_jobs()?;
+
+        Ok(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "timeline": timeline,
+            "patches": {
+                "staged": projection.staged_patches.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "applied": projection.applied_patches.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            },
+            "steps": projection.step_status.iter().map(|(step_id, done, note)| {
+                serde_json::json!({
+                    "step_id": step_id.to_string(),
+                    "done": done,
+                    "note": note,
+                })
+            }).collect::<Vec<_>>(),
+            "tasks": tasks.iter().map(|task| {
+                serde_json::json!({
+                    "task_id": task.task_id.to_string(),
+                    "title": &task.title,
+                    "status": &task.status,
+                    "priority": task.priority,
+                    "outcome": &task.outcome,
+                })
+            }).collect::<Vec<_>>(),
+            "background_jobs": background_jobs.iter().take(25).map(|job| {
+                serde_json::json!({
+                    "job_id": job.job_id.to_string(),
+                    "kind": &job.kind,
+                    "reference": &job.reference,
+                    "status": &job.status,
+                    "metadata": serde_json::from_str::<Value>(&job.metadata_json).unwrap_or(Value::Null),
+                    "started_at": &job.started_at,
+                    "updated_at": &job.updated_at,
+                })
+            }).collect::<Vec<_>>(),
+        }))
+    }
+
     // -- Tool approval methods --
 
     fn handle_tool_approve(&self, params: Value) -> Result<Value> {
@@ -1287,41 +1358,13 @@ impl IdeRpcHandler {
 
     fn handle_model_list(&self, _params: Value) -> Result<Value> {
         let cfg = AppConfig::load(self.workspace_path()).unwrap_or_default();
-        let active = &cfg.llm.base_model;
-        let provider = &cfg.llm.provider;
-
-        let mut models = Vec::new();
-        for (name, pcfg) in &cfg.llm.providers {
-            models.push(serde_json::json!({
-                "id": pcfg.models.chat,
-                "provider": name,
-                "role": "chat",
-                "active": pcfg.models.chat == *active && name == provider,
-            }));
-            if let Some(ref reasoner) = pcfg.models.reasoner {
-                models.push(serde_json::json!({
-                    "id": reasoner,
-                    "provider": name,
-                    "role": "reasoner",
-                    "active": reasoner == active && name == provider,
-                }));
-            }
-        }
-
-        // If the active model isn't listed in any provider, include it
-        if !models.iter().any(|m| m["active"] == true) {
-            models.push(serde_json::json!({
-                "id": active,
-                "provider": provider,
-                "role": "chat",
-                "active": true,
-            }));
-        }
+        let catalog = cfg.llm.model_catalog();
 
         Ok(serde_json::json!({
-            "models": models,
-            "active_model": active,
-            "active_provider": provider,
+            "models": catalog.selector_items(&cfg.llm),
+            "active_model": cfg.llm.active_base_model(),
+            "active_provider": cfg.llm.provider,
+            "catalog_source": catalog.source,
         }))
     }
 
@@ -1459,7 +1502,7 @@ impl RpcHandler for IdeRpcHandler {
                 "version": env!("CARGO_PKG_VERSION"),
                 "partial_messages_enabled": self.include_partial_messages,
                 "capabilities": [
-                    "session/open", "session/resume", "session/fork", "session/list",
+                    "session/open", "session/resume", "session/fork", "session/list", "session/timeline",
                     "session/remote_resume", "session/handoff_export", "session/handoff_import",
                     "session/handoff_link_create", "session/handoff_link_consume",
                     "prompt/execute", "prompt/stream_next", "stream/chunk",
@@ -1484,6 +1527,7 @@ impl RpcHandler for IdeRpcHandler {
             "session/resume" => self.handle_session_resume(params),
             "session/fork" => self.handle_session_fork(params),
             "session/list" => self.handle_session_list(params),
+            "session/timeline" => self.handle_session_timeline(params),
             "session/remote_resume" => self.handle_session_remote_resume(params),
             "session/handoff_export" => self.handle_session_handoff_export(params),
             "session/handoff_import" => self.handle_session_handoff_import(params),
@@ -1528,6 +1572,108 @@ impl RpcHandler for IdeRpcHandler {
             _ => Err(anyhow!("method not found: {method}")),
         }
     }
+}
+
+fn timeline_category(kind: &str) -> &'static str {
+    if kind.contains("Patch") || kind.contains("Snapshot") {
+        "patch"
+    } else if kind.contains("Tool") {
+        "tool"
+    } else if kind.contains("Background") || kind.contains("Subagent") || kind.contains("Run") {
+        "background"
+    } else if kind.contains("Task") || kind.contains("Step") || kind.contains("Plan") {
+        "plan"
+    } else if kind.contains("Model") || kind.contains("Provider") {
+        "model"
+    } else if kind.contains("Session") || kind.contains("Phase") {
+        "session"
+    } else if kind.contains("Error") || kind.contains("Warning") {
+        "diagnostic"
+    } else {
+        "message"
+    }
+}
+
+fn timeline_summary(kind: &str, payload: &Value) -> String {
+    let kind = kind.split('@').next().unwrap_or(kind);
+    let body = payload.get("payload").unwrap_or(payload);
+    match kind {
+        "ChatTurn" => body
+            .get("message")
+            .map(chat_turn_summary)
+            .unwrap_or_else(|| "chat turn".to_string()),
+        "ToolProposed" => body
+            .pointer("/proposal/call/name")
+            .and_then(Value::as_str)
+            .map(|name| format!("tool proposed: {name}"))
+            .unwrap_or_else(|| "tool proposed".to_string()),
+        "ToolApproved" => body
+            .get("invocation_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("tool approved: {id}"))
+            .unwrap_or_else(|| "tool approved".to_string()),
+        "ToolResult" => body
+            .pointer("/result/name")
+            .and_then(Value::as_str)
+            .map(|name| format!("tool result: {name}"))
+            .unwrap_or_else(|| "tool result".to_string()),
+        "PatchStaged" => body
+            .get("patch_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("patch staged: {id}"))
+            .unwrap_or_else(|| "patch staged".to_string()),
+        "PatchApplied" => {
+            let applied = body
+                .get("applied")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            body.get("patch_id")
+                .and_then(Value::as_str)
+                .map(|id| format!("patch applied={applied}: {id}"))
+                .unwrap_or_else(|| format!("patch applied={applied}"))
+        }
+        "ModelChanged" => body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(|model| format!("model changed: {model}"))
+            .unwrap_or_else(|| "model changed".to_string()),
+        "ProviderSelected" => {
+            let provider = body.get("provider").and_then(Value::as_str).unwrap_or("");
+            let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+            format!("model selected: {provider}/{model}")
+        }
+        "PhaseTransition" => {
+            let from = body.get("from").and_then(Value::as_str).unwrap_or("");
+            let to = body.get("to").and_then(Value::as_str).unwrap_or("");
+            format!("phase: {from} -> {to}")
+        }
+        "SessionStateChanged" => {
+            let from = body.get("from").and_then(Value::as_str).unwrap_or("");
+            let to = body.get("to").and_then(Value::as_str).unwrap_or("");
+            format!("session state: {from} -> {to}")
+        }
+        _ => kind.to_string(),
+    }
+}
+
+fn chat_turn_summary(message: &Value) -> String {
+    if let Some(content) = message.get("content").and_then(Value::as_str) {
+        return format!("message: {}", truncate_timeline(content));
+    }
+    if message.get("tool_calls").is_some() {
+        return "assistant tool call turn".to_string();
+    }
+    "chat turn".to_string()
+}
+
+fn truncate_timeline(value: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    if value.chars().count() <= MAX_CHARS {
+        return value.replace('\n', " ");
+    }
+    let mut out: String = value.chars().take(MAX_CHARS - 1).collect();
+    out.push('…');
+    out.replace('\n', " ")
 }
 
 fn handoff_dir(store_root: &Path) -> PathBuf {

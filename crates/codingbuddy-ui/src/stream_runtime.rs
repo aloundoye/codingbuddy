@@ -265,15 +265,15 @@ pub(crate) fn handle_stream_event(
             response_tx,
         } => {
             let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
+            let explanation = approval_explanation(&tool_name, &args_summary);
             // Show diff preview for file edit/write operations
             let diff_preview = build_approval_diff_preview(&tool_name, &args_summary);
             if let Some(diff) = &diff_preview {
                 state.shell.push_system(diff.clone());
             }
-            *state.info_line =
-                format!("{tool_name}  {compact_args}  [y] Allow  [a] Always  [n] Deny");
+            *state.info_line = format!("{explanation}  [y] Allow  [a] Always  [n] Deny");
             state.shell.push_system(format!(
-                "Allow {tool_name} {compact_args}?  [y] Allow once  [a] Always allow  [n] Deny"
+                "Allow {tool_name} {compact_args}?\n{explanation}\n[y] Allow once  [a] Always allow  [n] Deny"
             ));
             use std::io::Write as _;
             let _ = write!(io::stdout(), "\x07");
@@ -303,6 +303,51 @@ pub(crate) fn handle_stream_event(
         }
         TuiStreamEvent::Done(output) => StreamEventResult::Done(output),
     }
+}
+
+pub(crate) fn approval_explanation(tool_name: &str, args_json: &str) -> String {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
+    match tool_name {
+        "bash.run" | "bash_run" => {
+            let cmd = args
+                .get("cmd")
+                .or_else(|| args.get("command"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("<command>");
+            format!(
+                "Runs shell command `{}`; approval protects filesystem, process, and network effects.",
+                truncate_inline(cmd, 96)
+            )
+        }
+        "fs.edit" | "fs_edit" => {
+            let path = approval_path(&args).unwrap_or("<unknown path>");
+            format!("Edits `{path}`; review the preview before allowing.")
+        }
+        "fs.write" | "fs_write" => {
+            let path = approval_path(&args).unwrap_or("<unknown path>");
+            format!("Writes or overwrites `{path}`; review the preview before allowing.")
+        }
+        name if name.starts_with("mcp__") => {
+            let mut parts = name.splitn(3, "__");
+            let _ = parts.next();
+            let server = parts.next().unwrap_or("unknown");
+            let tool = parts.next().unwrap_or("tool");
+            format!(
+                "Runs MCP tool `{tool}` from server `{server}`; untrusted or mutating MCP tools need approval."
+            )
+        }
+        _ => format!(
+            "Runs `{tool_name}` with `{}`.",
+            truncate_inline(args_json, 96)
+        ),
+    }
+}
+
+fn approval_path(args: &serde_json::Value) -> Option<&str> {
+    args.get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(|value| value.as_str())
 }
 
 /// Build a diff preview for edit/write approval prompts so users can see

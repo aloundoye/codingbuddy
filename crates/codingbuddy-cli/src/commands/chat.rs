@@ -117,6 +117,9 @@ pub(crate) fn run_chat(
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
         .unwrap_or(false);
+    let mut active_model_spec = cli
+        .and_then(|v| v.model.clone())
+        .filter(|model| !is_max_think_selection(model));
     let teammate_mode = cli.and_then(|v| v.teammate_mode.clone());
     let repo_root_override = cli.and_then(|v| v.repo.clone());
     let watch_files_enabled = cli.map(|value| value.watch_files).unwrap_or(false);
@@ -137,6 +140,7 @@ pub(crate) fn run_chat(
             allow_tools,
             cfg: &cfg,
             initial_force_max_think: force_max_think,
+            initial_model_spec: active_model_spec.clone(),
             teammate_mode: teammate_mode.clone(),
             repo_root_override: repo_root_override.clone(),
             debug_context,
@@ -349,27 +353,28 @@ pub(crate) fn run_chat(
                 SlashCommand::Model(model) => {
                     if let Some(model) = model {
                         force_max_think = is_max_think_selection(&model);
+                        if force_max_think {
+                            active_model_spec = None;
+                        } else {
+                            active_model_spec = Some(model);
+                        }
                     }
+                    let active_model = active_model_for_display(
+                        &cfg,
+                        active_model_spec.as_deref(),
+                        force_max_think,
+                    );
                     if json_mode {
                         print_json(&json!({
                             "force_max_think": force_max_think,
-                            "model": if force_max_think {
-                                cfg.llm.active_reasoner_model()
-                            } else {
-                                cfg.llm.active_base_model()
-                            },
+                            "model": active_model,
+                            "model_spec": active_model_spec.as_deref(),
                             "thinking_enabled": force_max_think,
                         }))?;
                     } else if force_max_think {
-                        println!(
-                            "model mode: thinking-enabled ({})",
-                            cfg.llm.active_reasoner_model()
-                        );
+                        println!("model mode: thinking-enabled ({})", active_model);
                     } else {
-                        println!(
-                            "model mode: auto ({} thinking=on-demand)",
-                            cfg.llm.active_base_model()
-                        );
+                        println!("model mode: auto ({} thinking=on-demand)", active_model);
                     }
                 }
                 SlashCommand::Provider(provider) => {
@@ -1351,7 +1356,11 @@ pub(crate) fn run_chat(
                 SlashCommand::Models => {
                     let output = format_models_list(&cfg);
                     if json_mode {
-                        print_json(&json!({"models": output}))?;
+                        let mut payload = model_selector_items_json(&cfg);
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert("display".to_string(), json!(output));
+                        }
+                        print_json(&payload)?;
                     } else {
                         println!("{output}");
                     }
@@ -1443,6 +1452,7 @@ pub(crate) fn run_chat(
                                     watch_files: watch_files_enabled,
                                     session_id: selected_session_id,
                                     profile_override: active_profile_override.clone(),
+                                    model_spec: active_model_spec.clone(),
                                     ..Default::default()
                                 },
                             )?;
@@ -1652,7 +1662,10 @@ pub(crate) fn run_chat(
 
         let images_for_turn = std::mem::take(&mut pending_images);
         if !json_mode && !json_events {
-            crate::md_render::print_role_header("assistant", &cfg.llm.active_base_model());
+            crate::md_render::print_role_header(
+                "assistant",
+                &active_model_for_display(&cfg, active_model_spec.as_deref(), force_max_think),
+            );
         }
         let output = engine.chat_with_options(
             prompt,
@@ -1669,6 +1682,7 @@ pub(crate) fn run_chat(
                 images: images_for_turn,
                 session_id: selected_session_id,
                 profile_override: active_profile_override.clone(),
+                model_spec: active_model_spec.clone(),
                 ..Default::default()
             },
         )?;
@@ -1744,6 +1758,7 @@ pub(crate) fn run_chat(
                             watch_files: true,
                             session_id: selected_session_id,
                             profile_override: active_profile_override.clone(),
+                            model_spec: active_model_spec.clone(),
                             ..Default::default()
                         },
                     )?;
@@ -2088,54 +2103,32 @@ pub(crate) fn run_resume_specific(
 
 /// Format a catalog-backed list of models with pricing, limits, and provider capabilities.
 fn format_models_list(cfg: &AppConfig) -> String {
-    let active_model = cfg.llm.active_base_model();
-    let provider = &cfg.llm.provider;
     let catalog = cfg.llm.model_catalog();
-    let models = catalog.for_provider(provider);
+    let items = catalog.selector_items(&cfg.llm);
 
     let mut out = format!(
-        "Models for {provider} (catalog: {:?}, {} total):\n",
+        "Models (catalog: {:?}, {} total). Use `/model provider/model` to switch:\n",
         catalog.source,
         catalog.models.len()
     );
     out.push_str(&format!(
-        "  {:<34} {:>8} {:>8} {:>15}  {}\n",
-        "Model", "Context", "Output", "$/M in/out", "Capabilities"
+        "  {:<18} {:<36} {:>8} {:>8} {:>15} {:<7}  {}\n",
+        "Provider", "Model", "Context", "Output", "$/M in/out", "Where", "Capabilities"
     ));
-    out.push_str(&format!("  {}\n", "-".repeat(94)));
+    out.push_str(&format!("  {}\n", "-".repeat(116)));
 
-    let mut active_listed = false;
-    for model in models {
-        let marker = if model.id == active_model {
-            active_listed = true;
-            "* "
-        } else {
-            "  "
-        };
+    for item in items {
+        let marker = if item.active { "* " } else { "  " };
+        let place = if item.local { "local" } else { "cloud" };
         out.push_str(&format!(
-            "{marker}{:<34} {:>8} {:>8} {:>15}  {}\n",
-            model.id,
-            format_token_limit(model.limits.context_tokens),
-            format_output_limit(model.limits.output_tokens),
-            format_model_cost(model.cost),
-            format_model_capabilities(model)
-        ));
-    }
-
-    if !active_listed {
-        let active = codingbuddy_core::ModelInfo::from_capabilities(
-            provider,
-            &active_model,
-            Some(cfg.llm.active_provider().kind.as_str()),
-            &cfg.llm.capability_overrides,
-        );
-        out.push_str(&format!(
-            "* {:<34} {:>8} {:>8} {:>15}  {}\n",
-            active.id,
-            format_token_limit(active.limits.context_tokens),
-            format_output_limit(active.limits.output_tokens),
-            format_model_cost(active.cost),
-            format_model_capabilities(&active)
+            "{marker}{:<18} {:<36} {:>8} {:>8} {:>15} {:<7}  {}\n",
+            item.provider,
+            truncate_inline(&item.id, 36),
+            format_token_limit(item.context_tokens),
+            format_output_limit(item.output_tokens),
+            format_model_cost(item.cost),
+            place,
+            format_selector_capabilities(&item)
         ));
     }
 
@@ -2171,37 +2164,37 @@ fn format_model_cost(cost: codingbuddy_core::ModelCost) -> String {
     }
 }
 
-fn format_model_capabilities(model: &codingbuddy_core::ModelInfo) -> String {
+fn format_selector_capabilities(item: &codingbuddy_core::ModelSelectorItem) -> String {
     let mut caps = Vec::new();
-    if model.capability.tool_call {
+    if item.capability.tool_call {
         caps.push("tools");
     }
-    if model.capability.parallel_tool_call {
+    if item.capability.parallel_tool_call {
         caps.push("parallel");
     }
-    if model.capability.reasoning {
+    if item.capability.reasoning {
         caps.push("reasoning");
     }
-    if model.capability.thinking_config {
+    if item.capability.thinking_config {
         caps.push("thinking");
     }
-    if model.capability.image_input
-        || model
+    if item.capability.image_input
+        || item
             .modalities
             .contains(&codingbuddy_core::ModelModality::Image)
     {
         caps.push("vision");
     }
-    if model.capability.fim {
+    if item.capability.fim {
         caps.push("fim");
     }
-    match model.status {
+    match item.status {
         codingbuddy_core::ModelStatus::Preview => caps.push("preview"),
         codingbuddy_core::ModelStatus::Deprecated => caps.push("deprecated"),
         codingbuddy_core::ModelStatus::Unknown => caps.push("unknown"),
         codingbuddy_core::ModelStatus::Stable => {}
     }
-    match model.provider_status {
+    match item.provider_status {
         codingbuddy_core::ProviderStatus::Degraded => caps.push("provider-degraded"),
         codingbuddy_core::ProviderStatus::Unavailable => caps.push("provider-down"),
         codingbuddy_core::ProviderStatus::Unknown => caps.push("provider-unknown"),
@@ -2211,6 +2204,32 @@ fn format_model_capabilities(model: &codingbuddy_core::ModelInfo) -> String {
         "text".to_string()
     } else {
         caps.join(",")
+    }
+}
+
+fn model_selector_items_json(cfg: &AppConfig) -> serde_json::Value {
+    let catalog = cfg.llm.model_catalog();
+    serde_json::json!({
+        "catalog_source": catalog.source,
+        "active_provider": cfg.llm.provider,
+        "active_model": cfg.llm.active_base_model(),
+        "models": catalog.selector_items(&cfg.llm),
+    })
+}
+
+fn active_model_for_display(
+    cfg: &AppConfig,
+    model_spec: Option<&str>,
+    force_max_think: bool,
+) -> String {
+    let mut effective = cfg.clone();
+    if let Some(spec) = model_spec {
+        effective.llm.apply_model_spec(spec);
+    }
+    if force_max_think {
+        effective.llm.active_reasoner_model()
+    } else {
+        effective.llm.active_base_model()
     }
 }
 

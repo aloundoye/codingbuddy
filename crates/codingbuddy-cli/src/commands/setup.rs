@@ -19,8 +19,8 @@ const BANNER_COUNTER: &str = ".banner_count";
 /// Maximum number of times to show the soft onboarding banner before auto-dismissing.
 const MAX_BANNER_SHOWS: u32 = 4;
 
-/// Called from `run_chat` on first run. Shows a soft, non-blocking banner
-/// suggesting the user run `codingbuddy setup` or `/init`. Never blocks.
+/// Called from `run_chat` on first run. Interactive terminals may launch the
+/// setup wizard; non-interactive sessions receive a compact banner only.
 ///
 /// Returns `true` if config was potentially modified (only when fully configured
 /// and marker is auto-written).
@@ -64,7 +64,17 @@ pub(crate) fn maybe_first_time_setup(cwd: &Path, cfg: &AppConfig) -> Result<bool
         return Ok(false);
     }
 
-    eprintln!("  \x1b[33m!\x1b[0m No API key detected. Set one of these environment variables:");
+    eprintln!("  \x1b[33m!\x1b[0m No API key detected.");
+    eprintln!(
+        "    CodingBuddy can set up a model provider now: DeepSeek, OpenAI, Anthropic, Gemini, OpenRouter, Ollama, and more."
+    );
+    if prompt_yes_no("    Run interactive setup now? [Y/n]: ")? {
+        run_wizard_steps(cwd, cfg)?;
+        write_setup_marker(&marker)?;
+        return Ok(true);
+    }
+
+    eprintln!("    Set one of these environment variables when you are ready:");
     for &(name, env_var) in KNOWN_PROVIDER_ENV_VARS {
         eprintln!("    \x1b[1m{env_var}\x1b[0m  ({name})");
     }
@@ -100,7 +110,9 @@ fn write_setup_marker(marker: &Path) -> Result<()> {
 
 /// Collected wizard choices — written atomically after all steps complete.
 struct WizardState {
-    /// Custom provider info (only set if user chose option 2).
+    /// Built-in provider/model selection.
+    model_selection: Option<ModelSelectionChoice>,
+    /// Custom provider info.
     custom_provider: Option<CustomProviderChoice>,
     /// Whether to enable local ML.
     enable_ml: bool,
@@ -110,6 +122,12 @@ struct WizardState {
     recommended_model: Option<&'static str>,
     /// Whether to enable privacy scanning.
     enable_privacy: bool,
+}
+
+struct ModelSelectionChoice {
+    provider: String,
+    model: String,
+    api_key_env: Option<String>,
 }
 
 struct CustomProviderChoice {
@@ -123,15 +141,29 @@ struct CustomProviderChoice {
 /// All choices are collected into `WizardState` and written atomically at the end,
 /// so partial config is never persisted if the user cancels mid-wizard.
 fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
-    // Step 1: Provider selection
-    println!("[1/4] Model Provider");
-    println!("  1. DeepSeek API (default)");
-    println!("  2. OpenAI-compatible (GLM-5, Qwen, Ollama, OpenRouter, custom endpoint)");
+    // Step 1: Model selection
+    println!("[1/4] Model");
+    let model_choices = setup_model_choices(cfg);
+    for (idx, item) in model_choices.iter().enumerate() {
+        println!(
+            "  {}. {:<18} {:<32} {}",
+            idx + 1,
+            item.provider,
+            item.id,
+            setup_model_summary(item)
+        );
+    }
+    let custom_choice = model_choices.len() + 1;
+    println!("  {custom_choice}. Custom OpenAI-compatible endpoint");
     println!();
 
-    let provider_choice = prompt_choice("  Select [1-2]: ", 1, 2)?;
+    let provider_choice = prompt_choice(
+        &format!("  Select [1-{custom_choice}]: "),
+        1,
+        custom_choice as u32,
+    )? as usize;
 
-    let custom_provider = if provider_choice == 2 {
+    let (model_selection, custom_provider) = if provider_choice == custom_choice {
         let base_url = loop {
             print!("  API base URL: ");
             std::io::stdout().flush()?;
@@ -157,30 +189,49 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
         let api_key_env = api_key_env.trim().to_string();
 
         println!("  Provider noted.\n");
-        Some(CustomProviderChoice {
-            base_url,
-            model_name,
-            api_key_env: if api_key_env.is_empty() {
-                None
-            } else {
-                Some(api_key_env)
-            },
-        })
+        (
+            None,
+            Some(CustomProviderChoice {
+                base_url,
+                model_name,
+                api_key_env: if api_key_env.is_empty() {
+                    None
+                } else {
+                    Some(api_key_env)
+                },
+            }),
+        )
     } else {
-        println!("  Using DeepSeek API.\n");
-        None
+        let item = model_choices
+            .get(provider_choice.saturating_sub(1))
+            .expect("prompt choice clamped");
+        println!("  Using {} / {}.\n", item.provider, item.id);
+        (
+            Some(ModelSelectionChoice {
+                provider: item.provider.clone(),
+                model: item.id.clone(),
+                api_key_env: item.requires_api_key.then(|| item.api_key_env.clone()),
+            }),
+            None,
+        )
     };
 
     // Step 2: API Key
     println!("[2/4] API Key");
-    let env_var = if provider_choice == 2 {
-        "OPENAI_API_KEY".to_string()
-    } else {
-        cfg.llm.active_provider().api_key_env.clone()
-    };
-    if has_api_key(cfg) {
+    let api_key_env = custom_provider
+        .as_ref()
+        .and_then(|provider| provider.api_key_env.clone())
+        .or_else(|| {
+            model_selection
+                .as_ref()
+                .and_then(|selection| selection.api_key_env.clone())
+        });
+    if api_key_env.as_deref().is_none_or(str::is_empty) {
+        println!("  No API key required for this selection.\n");
+    } else if provider_api_key_present(cfg, api_key_env.as_deref()) {
         println!("  API key is set.\n");
     } else {
+        let env_var = api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
         println!(
             "  Set {} in your environment, or run `codingbuddy setup` to reconfigure.\n",
             env_var
@@ -241,6 +292,7 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
 
     // All choices collected — now write atomically.
     let state = WizardState {
+        model_selection,
         custom_provider,
         enable_ml,
         detected_device,
@@ -262,6 +314,14 @@ fn apply_wizard_state(cwd: &Path, cfg: &AppConfig, state: &WizardState) -> Resul
             &cp.model_name,
             cp.api_key_env.as_deref(),
         )?;
+    } else if let Some(ref selection) = state.model_selection {
+        merge_model_selection(
+            cwd,
+            cfg,
+            &selection.provider,
+            &selection.model,
+            selection.api_key_env.as_deref(),
+        )?;
     }
 
     if state.enable_ml || state.enable_privacy {
@@ -279,6 +339,70 @@ fn apply_wizard_state(cwd: &Path, cfg: &AppConfig, state: &WizardState) -> Resul
     }
 
     Ok(())
+}
+
+fn setup_model_choices(cfg: &AppConfig) -> Vec<codingbuddy_core::ModelSelectorItem> {
+    let catalog = cfg.llm.model_catalog();
+    let mut choices: Vec<_> = catalog
+        .selector_items(&cfg.llm)
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.provider.as_str(),
+                "deepseek"
+                    | "openai-compatible"
+                    | "anthropic"
+                    | "google"
+                    | "openrouter"
+                    | "ollama"
+                    | "mistral"
+                    | "groq"
+                    | "xai"
+                    | "together"
+            )
+        })
+        .collect();
+    choices.truncate(12);
+    choices
+}
+
+fn setup_model_summary(item: &codingbuddy_core::ModelSelectorItem) -> String {
+    let place = if item.local { "local" } else { "cloud" };
+    let auth = if item.requires_api_key {
+        format!("env {}", item.api_key_env)
+    } else {
+        "no key".to_string()
+    };
+    let mut caps = Vec::new();
+    if item.capability.tool_call {
+        caps.push("tools");
+    }
+    if item.capability.reasoning {
+        caps.push("reasoning");
+    }
+    if item.capability.image_input {
+        caps.push("vision");
+    }
+    if caps.is_empty() {
+        caps.push("chat");
+    }
+    format!(
+        "{} ctx, {}, {}, {}",
+        setup_token_limit(item.context_tokens),
+        place,
+        caps.join("/"),
+        auth
+    )
+}
+
+fn setup_token_limit(tokens: u64) -> String {
+    if tokens == 0 {
+        "?".to_string()
+    } else if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else {
+        format!("{}K", tokens / 1_000)
+    }
 }
 
 /// Run the setup wizard, `--local-ml` shortcut, or `--status` display.
@@ -589,6 +713,88 @@ fn merge_provider_config(
     Ok(())
 }
 
+/// Persist a catalog-backed built-in provider/model selection.
+fn merge_model_selection(
+    cwd: &Path,
+    cfg: &AppConfig,
+    provider_name: &str,
+    model: &str,
+    api_key_env: Option<&str>,
+) -> Result<()> {
+    let path = settings_path(cwd);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut root = if path.exists() {
+        let raw = fs::read_to_string(&path)?;
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+
+    let provider_cfg = cfg.llm.providers.get(provider_name);
+    let base_url = provider_cfg
+        .map(|provider| provider.base_url.as_str())
+        .unwrap_or("");
+    let provider_kind = provider_cfg
+        .map(|provider| provider.kind.as_str())
+        .unwrap_or(provider_name);
+    let openai_compat_prefix = provider_cfg
+        .map(|provider| provider.openai_compat_prefix)
+        .unwrap_or(true);
+    let resolved_api_key_env = api_key_env
+        .or_else(|| provider_cfg.map(|provider| provider.api_key_env.as_str()))
+        .unwrap_or("");
+    let reasoner = provider_cfg.and_then(|provider| provider.models.reasoner.as_deref());
+
+    let map = root.as_object_mut().expect("root is object");
+    let llm = map.entry("llm".to_string()).or_insert_with(|| json!({}));
+    if !llm.is_object() {
+        *llm = json!({});
+    }
+    if let Some(llm_obj) = llm.as_object_mut() {
+        llm_obj.insert("provider".to_string(), json!(provider_name));
+        llm_obj.insert("base_model".to_string(), json!(model));
+        llm_obj.insert("base_url".to_string(), json!(base_url));
+        llm_obj.insert(
+            "openai_compat_prefix".to_string(),
+            json!(openai_compat_prefix),
+        );
+        llm_obj.insert("api_key_env".to_string(), json!(resolved_api_key_env));
+
+        let providers = llm_obj
+            .entry("providers".to_string())
+            .or_insert_with(|| json!({}));
+        if !providers.is_object() {
+            *providers = json!({});
+        }
+        if let Some(p) = providers.as_object_mut() {
+            let mut models = serde_json::Map::new();
+            models.insert("chat".to_string(), json!(model));
+            if let Some(reasoner) = reasoner {
+                models.insert("reasoner".to_string(), json!(reasoner));
+            }
+            p.insert(
+                provider_name.to_string(),
+                json!({
+                    "kind": provider_kind,
+                    "base_url": base_url,
+                    "api_key_env": resolved_api_key_env,
+                    "openai_compat_prefix": openai_compat_prefix,
+                    "models": models,
+                }),
+            );
+        }
+    }
+
+    fs::write(&path, serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
 /// Merge local_ml keys into `.codingbuddy/settings.json` without clobbering other settings.
 ///
 /// `device` and `model_id` are optional — when `Some`, they're written to the config
@@ -670,6 +876,20 @@ fn has_api_key(cfg: &AppConfig) -> bool {
         .map(str::trim)
         .is_some_and(|v| !v.is_empty());
     env_set || config_set
+}
+
+fn provider_api_key_present(cfg: &AppConfig, env_var: Option<&str>) -> bool {
+    let env_set = env_var
+        .filter(|name| !name.trim().is_empty())
+        .and_then(|name| std::env::var(name).ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    env_set
+        || cfg
+            .llm
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -807,6 +1027,39 @@ mod tests {
         assert_eq!(
             root["llm"]["providers"]["openai-compat"]["models"]["chat"],
             "llama3"
+        );
+    }
+
+    #[test]
+    fn merge_model_selection_writes_builtin_provider_settings() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let dir = cwd.join(".codingbuddy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), "{}").unwrap();
+
+        let cfg = AppConfig::default();
+        merge_model_selection(
+            cwd,
+            &cfg,
+            "openai-compatible",
+            "gpt-4o-mini",
+            Some("OPENAI_API_KEY"),
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(dir.join("settings.json")).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(root["llm"]["provider"], "openai-compatible");
+        assert_eq!(root["llm"]["base_model"], "gpt-4o-mini");
+        assert_eq!(root["llm"]["api_key_env"], "OPENAI_API_KEY");
+        assert_eq!(
+            root["llm"]["providers"]["openai-compatible"]["models"]["chat"],
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            root["llm"]["providers"]["openai-compatible"]["openai_compat_prefix"],
+            true
         );
     }
 

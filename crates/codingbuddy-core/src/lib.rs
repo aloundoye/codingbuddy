@@ -22,8 +22,8 @@ pub use llm_capabilities::{
 pub use model_catalog::{
     DEFAULT_MODEL_CATALOG_CACHE_TTL_SECONDS, DEFAULT_MODEL_CATALOG_REFRESH_TIMEOUT_SECONDS,
     DEFAULT_MODELS_DEV_URL, ModelCatalog, ModelCatalogCache, ModelCatalogConfig,
-    ModelCatalogSource, ModelCost, ModelInfo, ModelLimits, ModelModality, ModelStatus,
-    ProviderCapability, ProviderStatus,
+    ModelCatalogSource, ModelCost, ModelInfo, ModelLimits, ModelModality, ModelSelectorItem,
+    ModelStatus, ProviderCapability, ProviderStatus,
 };
 pub use tool_metadata::{
     DynamicToolTrust, InterruptBehavior, RuntimeToolMetadata, ToolAgentRole, ToolMetadata,
@@ -2555,6 +2555,9 @@ impl LlmConfig {
             && self.providers.contains_key(maybe_provider)
         {
             self.provider = maybe_provider.to_string();
+            if let Some(provider) = self.providers.get_mut(maybe_provider) {
+                provider.models.chat = model.to_string();
+            }
             let p = self.active_provider();
             self.base_url = p.base_url.clone();
             self.api_key_env = p.api_key_env.clone();
@@ -2563,6 +2566,9 @@ impl LlmConfig {
         }
         // No provider prefix — just set the model
         self.base_model = spec.to_string();
+        if let Some(provider) = self.providers.get_mut(&self.provider) {
+            provider.models.chat = spec.to_string();
+        }
     }
 
     /// Return all providers that have valid API keys available in the environment.
@@ -4705,6 +4711,20 @@ mod tests {
         assert_eq!(provider.api_key_env, "OLLAMA_KEY");
         assert_eq!(provider.models.chat, "llama3");
         assert!(provider.models.reasoner.is_none());
+    }
+
+    #[test]
+    fn apply_model_spec_updates_active_provider_model() {
+        let mut cfg = LlmConfig::default();
+        cfg.apply_model_spec("openrouter/anthropic/claude-sonnet-4");
+
+        assert_eq!(cfg.provider, "openrouter");
+        assert_eq!(cfg.base_model, "anthropic/claude-sonnet-4");
+        assert_eq!(cfg.active_base_model(), "anthropic/claude-sonnet-4");
+        assert_eq!(
+            cfg.providers["openrouter"].models.chat,
+            "anthropic/claude-sonnet-4"
+        );
     }
 
     #[test]

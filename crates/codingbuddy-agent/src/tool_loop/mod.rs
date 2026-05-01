@@ -2087,12 +2087,14 @@ impl<'a> ToolUseLoop<'a> {
                 let threshold_hit = self.denial_tracker.record_denial(&llm_call.name);
                 let denial_msg = if threshold_hit && !self.denial_tracker.guidance_injected {
                     self.denial_tracker.guidance_injected = true;
-                    safety::DENIAL_GUIDANCE
+                    safety::DENIAL_GUIDANCE.to_string()
                 } else {
-                    "Tool call denied by user. Try a different approach or ask the user for guidance."
+                    permission_execution::denial_guidance_for_tool(&llm_call.name)
                 };
-                self.messages
-                    .push(tool_bridge::tool_error_to_message(&llm_call.id, denial_msg));
+                self.messages.push(tool_bridge::tool_error_to_message(
+                    &llm_call.id,
+                    &denial_msg,
+                ));
 
                 records.push(ToolCallRecord {
                     tool_name: llm_call.name.clone(),
