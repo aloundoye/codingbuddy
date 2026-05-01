@@ -5,6 +5,7 @@ pub(crate) struct ChatTuiArgs<'a> {
     pub(crate) allow_tools: bool,
     pub(crate) cfg: &'a AppConfig,
     pub(crate) initial_force_max_think: bool,
+    pub(crate) initial_model_spec: Option<String>,
     pub(crate) teammate_mode: Option<String>,
     pub(crate) repo_root_override: Option<PathBuf>,
     pub(crate) debug_context: bool,
@@ -19,6 +20,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         allow_tools,
         cfg,
         initial_force_max_think,
+        initial_model_spec,
         teammate_mode,
         repo_root_override,
         debug_context,
@@ -36,6 +38,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         eprintln!("[debug] agent engine ready");
     }
     let force_max_think = Arc::new(AtomicBool::new(initial_force_max_think));
+    let active_model_spec = Arc::new(std::sync::Mutex::new(initial_model_spec));
     let additional_dirs = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
     let read_only_mode = Arc::new(AtomicBool::new(false));
     let active_chat_mode = Arc::new(std::sync::Mutex::new(ChatMode::Code));
@@ -79,6 +82,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         _ => TuiTheme::from_preference("auto"),
     };
     let fmt_refresh = Arc::clone(&force_max_think);
+    let active_model_spec_for_closure = Arc::clone(&active_model_spec);
     let additional_dirs_for_closure = Arc::clone(&additional_dirs);
     let read_only_for_closure = Arc::clone(&read_only_mode);
     let active_mode_for_closure = Arc::clone(&active_chat_mode);
@@ -313,8 +317,15 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         ),
                         SlashCommand::Model(model) => {
                             if let Some(ref model) = model {
-                                force_max_think
-                                    .store(is_max_think_selection(model), Ordering::Relaxed);
+                                let thinking = is_max_think_selection(model);
+                                force_max_think.store(thinking, Ordering::Relaxed);
+                                if let Ok(mut guard) = active_model_spec_for_closure.lock() {
+                                    if thinking {
+                                        *guard = None;
+                                    } else {
+                                        *guard = Some(model.clone());
+                                    }
+                                }
                             }
                             if model.is_none() {
                                 // No argument — show model list
@@ -325,10 +336,13 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                                     cfg.llm.active_reasoner_model()
                                 )
                             } else {
-                                format!(
-                                    "model mode: auto ({} thinking=on-demand)",
-                                    cfg.llm.active_base_model()
-                                )
+                                let active_model = active_model_spec_for_closure
+                                    .lock()
+                                    .ok()
+                                    .and_then(|guard| guard.clone())
+                                    .map(|spec| active_model_for_display(cfg, Some(&spec), false))
+                                    .unwrap_or_else(|| cfg.llm.active_base_model());
+                                format!("model mode: auto ({} thinking=on-demand)", active_model)
                             }
                         }
                         SlashCommand::Provider(provider) => format_provider_info(cfg, provider),
@@ -1058,6 +1072,10 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 .lock()
                 .map(|guard| *guard)
                 .unwrap_or(None);
+            let model_spec_for_turn = active_model_spec_for_closure
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
 
             engine.set_stream_callback(std::sync::Arc::new(move |chunk| match chunk {
                 StreamChunk::ContentDelta(s) => {
@@ -1196,6 +1214,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             watch_files: watch_files_enabled,
                             images: images_for_turn,
                             session_id: session_id_for_turn,
+                            model_spec: model_spec_for_turn.clone(),
                             ..Default::default()
                         },
                     )

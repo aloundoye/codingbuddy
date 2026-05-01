@@ -451,177 +451,81 @@ pub(crate) const AGENT_PROFILE_NAMES: &[&str] = &["build", "explore", "plan", "b
 // ─── Model Picker ───────────────────────────────────────────────────────────
 
 /// A model choice with provider tag for filtering.
+#[derive(Debug, Clone)]
 pub(crate) struct ModelChoice {
-    pub id: &'static str,
-    pub description: &'static str,
-    pub provider: &'static str,
+    pub id: String,
+    pub description: String,
+    pub provider: String,
+    pub selection_spec: String,
+    pub active: bool,
 }
 
-/// Available model choices for the interactive `/model` picker.
-pub(crate) const MODEL_CHOICES: &[ModelChoice] = &[
-    // ── DeepSeek ──
-    ModelChoice {
-        id: "deepseek-chat",
-        description: "DeepSeek V3 — fast, tool-capable (default)",
-        provider: "deepseek",
-    },
-    ModelChoice {
-        id: "deepseek-reasoner",
-        description: "DeepSeek R1 — deep reasoning + tools",
-        provider: "deepseek",
-    },
-    // ── OpenAI ──
-    ModelChoice {
-        id: "gpt-4.1",
-        description: "GPT-4.1 — latest, strong coding",
-        provider: "openai-compatible",
-    },
-    ModelChoice {
-        id: "gpt-4.1-mini",
-        description: "GPT-4.1 Mini — fast, affordable",
-        provider: "openai-compatible",
-    },
-    ModelChoice {
-        id: "gpt-4.1-nano",
-        description: "GPT-4.1 Nano — ultra-fast",
-        provider: "openai-compatible",
-    },
-    ModelChoice {
-        id: "gpt-4o",
-        description: "GPT-4o — multimodal all-rounder",
-        provider: "openai-compatible",
-    },
-    ModelChoice {
-        id: "gpt-4o-mini",
-        description: "GPT-4o Mini — cheap, fast",
-        provider: "openai-compatible",
-    },
-    ModelChoice {
-        id: "o3",
-        description: "o3 — strongest reasoning",
-        provider: "openai-compatible",
-    },
-    ModelChoice {
-        id: "o3-mini",
-        description: "o3-mini — fast reasoning",
-        provider: "openai-compatible",
-    },
-    ModelChoice {
-        id: "o4-mini",
-        description: "o4-mini — latest reasoning",
-        provider: "openai-compatible",
-    },
-    // ── Anthropic ──
-    ModelChoice {
-        id: "claude-opus-4-20250514",
-        description: "Claude Opus 4 — most capable",
-        provider: "anthropic",
-    },
-    ModelChoice {
-        id: "claude-sonnet-4-20250514",
-        description: "Claude Sonnet 4 — best coding value",
-        provider: "anthropic",
-    },
-    ModelChoice {
-        id: "claude-haiku-4-5-20251001",
-        description: "Claude Haiku 4.5 — fast + cheap",
-        provider: "anthropic",
-    },
-    // ── Google ──
-    ModelChoice {
-        id: "gemini-2.5-pro",
-        description: "Gemini 2.5 Pro — thorough, large context",
-        provider: "google",
-    },
-    ModelChoice {
-        id: "gemini-2.5-flash",
-        description: "Gemini 2.5 Flash — fast, cheap",
-        provider: "google",
-    },
-    // ── Groq ──
-    ModelChoice {
-        id: "llama-3.3-70b-versatile",
-        description: "Llama 3.3 70B — fast via Groq",
-        provider: "groq",
-    },
-    ModelChoice {
-        id: "llama-3.1-8b-instant",
-        description: "Llama 3.1 8B — ultra-fast via Groq",
-        provider: "groq",
-    },
-    // ── Qwen / Ollama ──
-    ModelChoice {
-        id: "qwen2.5-coder:32b",
-        description: "Qwen 2.5 Coder 32B — local, strong",
-        provider: "ollama",
-    },
-    ModelChoice {
-        id: "qwen2.5-coder:7b",
-        description: "Qwen 2.5 Coder 7B — local, light",
-        provider: "ollama",
-    },
-    // ── OpenRouter ──
-    ModelChoice {
-        id: "anthropic/claude-sonnet-4",
-        description: "Claude Sonnet 4 via OpenRouter",
-        provider: "openrouter",
-    },
-    ModelChoice {
-        id: "deepseek/deepseek-r1",
-        description: "DeepSeek R1 via OpenRouter",
-        provider: "openrouter",
-    },
-    ModelChoice {
-        id: "google/gemini-2.5-pro",
-        description: "Gemini 2.5 Pro via OpenRouter",
-        provider: "openrouter",
-    },
-];
-
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelPickerState {
     pub selected: usize,
     pub viewport_offset: usize,
-    /// Filtered indices into MODEL_CHOICES. Empty = show all.
+    choices: Vec<ModelChoice>,
+    /// Filtered indices into choices. Empty = show all.
     filtered_indices: Vec<usize>,
 }
 
 const MODEL_PICKER_VISIBLE: usize = 8;
+
+impl Default for ModelPickerState {
+    fn default() -> Self {
+        Self::from_config(&codingbuddy_core::AppConfig::default())
+    }
+}
 
 impl ModelPickerState {
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub fn from_config(cfg: &codingbuddy_core::AppConfig) -> Self {
+        let catalog = cfg.llm.model_catalog();
+        let choices = catalog
+            .selector_items(&cfg.llm)
+            .into_iter()
+            .map(model_choice_from_selector)
+            .collect();
+        Self {
+            selected: 0,
+            viewport_offset: 0,
+            choices,
+            filtered_indices: Vec::new(),
+        }
+    }
+
     /// Create a picker filtered to a specific provider.
     pub fn with_provider_filter(provider: &str) -> Self {
-        let filtered: Vec<usize> = MODEL_CHOICES
+        let mut state = Self::new();
+        state.filtered_indices = state
+            .choices
             .iter()
             .enumerate()
             .filter(|(_, m)| m.provider == provider)
             .map(|(i, _)| i)
             .collect();
-        Self {
-            selected: 0,
-            viewport_offset: 0,
-            filtered_indices: filtered,
-        }
+        state.selected = 0;
+        state.viewport_offset = 0;
+        state
     }
 
-    fn visible_choices(&self) -> Vec<(usize, &'static ModelChoice)> {
+    fn visible_choices(&self) -> Vec<(usize, &ModelChoice)> {
         if self.filtered_indices.is_empty() {
-            MODEL_CHOICES.iter().enumerate().collect()
+            self.choices.iter().enumerate().collect()
         } else {
             self.filtered_indices
                 .iter()
-                .map(|&i| (i, &MODEL_CHOICES[i]))
+                .filter_map(|&i| self.choices.get(i).map(|choice| (i, choice)))
                 .collect()
         }
     }
 
     pub fn count(&self) -> usize {
         if self.filtered_indices.is_empty() {
-            MODEL_CHOICES.len()
+            self.choices.len()
         } else {
             self.filtered_indices.len()
         }
@@ -641,12 +545,14 @@ impl ModelPickerState {
         }
     }
 
-    pub fn confirm(&self) -> &'static str {
+    pub fn confirm(&self) -> String {
         let choices = self.visible_choices();
         if self.selected < choices.len() {
-            choices[self.selected].1.id
+            choices[self.selected].1.selection_spec.clone()
+        } else if let Some(choice) = self.choices.first() {
+            choice.selection_spec.clone()
         } else {
-            MODEL_CHOICES[0].id
+            String::new()
         }
     }
 
@@ -661,10 +567,77 @@ impl ModelPickerState {
             .map(|(i, (_, m))| {
                 let idx = start + i;
                 let marker = if idx == self.selected { ">" } else { " " };
-                format!(" {marker} {}  {}", m.id, m.description)
+                let active = if m.active { "*" } else { " " };
+                format!(
+                    " {marker}{active} {:<13} {:<28} {}",
+                    m.provider,
+                    truncate_display(&m.id, 28),
+                    m.description
+                )
             })
             .collect()
     }
+}
+
+fn model_choice_from_selector(item: codingbuddy_core::ModelSelectorItem) -> ModelChoice {
+    let where_label = if item.local { "local" } else { "cloud" };
+    let mut caps = Vec::new();
+    if item.capability.tool_call {
+        caps.push("tools");
+    }
+    if item.capability.reasoning {
+        caps.push("reasoning");
+    }
+    if item.capability.image_input {
+        caps.push("vision");
+    }
+    if caps.is_empty() {
+        caps.push("chat");
+    }
+    ModelChoice {
+        id: item.id,
+        description: format!(
+            "{} ctx, {}, {}, {}",
+            compact_tokens(item.context_tokens),
+            compact_cost(item.cost),
+            where_label,
+            caps.join("/")
+        ),
+        provider: item.provider,
+        selection_spec: item.selection_spec,
+        active: item.active,
+    }
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens == 0 {
+        "?".to_string()
+    } else if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else {
+        format!("{}K", tokens / 1_000)
+    }
+}
+
+fn compact_cost(cost: codingbuddy_core::ModelCost) -> String {
+    if cost.input_per_mtok_usd == 0.0 && cost.output_per_mtok_usd == 0.0 {
+        "free/unknown".to_string()
+    } else {
+        format!(
+            "${:.2}/${:.2} per M",
+            cost.input_per_mtok_usd, cost.output_per_mtok_usd
+        )
+    }
+}
+
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = value.chars().take(keep).collect();
+    out.push('…');
+    out
 }
 
 // ─── Autocomplete Dropdown ───────────────────────────────────────────────────

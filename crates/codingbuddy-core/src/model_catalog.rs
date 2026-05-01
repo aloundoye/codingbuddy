@@ -48,6 +48,29 @@ pub struct ModelInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ModelSelectorItem {
+    pub provider: String,
+    pub id: String,
+    pub display_name: String,
+    pub selection_spec: String,
+    pub context_tokens: u64,
+    pub output_tokens: u32,
+    pub cost: ModelCost,
+    pub capability: ProviderCapability,
+    pub modalities: Vec<ModelModality>,
+    pub status: ModelStatus,
+    pub provider_status: ProviderStatus,
+    pub local: bool,
+    pub cloud: bool,
+    pub configured: bool,
+    pub active: bool,
+    pub api_key_env: String,
+    pub requires_api_key: bool,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelCatalogConfig {
     pub enabled: bool,
     pub remote_url: String,
@@ -167,6 +190,31 @@ impl Default for ModelInfo {
             modalities: vec![ModelModality::Text],
             status: ModelStatus::Unknown,
             provider_status: ProviderStatus::Unknown,
+        }
+    }
+}
+
+impl Default for ModelSelectorItem {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            id: String::new(),
+            display_name: String::new(),
+            selection_spec: String::new(),
+            context_tokens: 0,
+            output_tokens: 0,
+            cost: ModelCost::default(),
+            capability: ProviderCapability::default(),
+            modalities: vec![ModelModality::Text],
+            status: ModelStatus::Unknown,
+            provider_status: ProviderStatus::Unknown,
+            local: false,
+            cloud: true,
+            configured: false,
+            active: false,
+            api_key_env: String::new(),
+            requires_api_key: true,
+            tags: Vec::new(),
         }
     }
 }
@@ -417,10 +465,142 @@ impl ModelCatalog {
         }
     }
 
+    #[must_use]
+    pub fn selector_items(&self, config: &LlmConfig) -> Vec<ModelSelectorItem> {
+        let mut catalog = self.clone();
+        catalog.merge_from(&Self::configured(config));
+
+        let active_provider = config.provider.clone();
+        let active_model = config.active_base_model();
+        if catalog.find(&active_provider, &active_model).is_none() {
+            let provider = config.active_provider();
+            catalog.upsert(ModelInfo::from_capabilities(
+                &active_provider,
+                &active_model,
+                Some(provider.kind.as_str()),
+                &config.capability_overrides,
+            ));
+        }
+
+        let mut items: Vec<_> = catalog
+            .models
+            .iter()
+            .map(|model| selector_item_for_model(model, config, &active_provider, &active_model))
+            .collect();
+        items.sort_by(|a, b| {
+            b.active
+                .cmp(&a.active)
+                .then_with(|| provider_rank(&a.provider).cmp(&provider_rank(&b.provider)))
+                .then_with(|| a.provider.cmp(&b.provider))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        items
+    }
+
     fn sort_models(&mut self) {
         self.models
             .sort_by(|a, b| a.provider.cmp(&b.provider).then_with(|| a.id.cmp(&b.id)));
     }
+}
+
+fn selector_item_for_model(
+    model: &ModelInfo,
+    config: &LlmConfig,
+    active_provider: &str,
+    active_model: &str,
+) -> ModelSelectorItem {
+    let provider_config = config.providers.get(&model.provider);
+    let provider_kind = provider_config
+        .and_then(|provider| normalize_provider_kind(provider.kind.as_str()))
+        .or_else(|| normalize_provider_kind(&model.provider));
+    let local = matches!(provider_kind, Some(ProviderKind::Ollama))
+        || model.provider.contains("ollama")
+        || model.provider.contains("local");
+    let configured = provider_config.is_some();
+    let api_key_env = provider_config
+        .map(|provider| provider.api_key_env.clone())
+        .unwrap_or_default();
+    let active = model.provider == active_provider && model.id == active_model;
+    let mut tags = Vec::new();
+    if active {
+        tags.push("active".to_string());
+    }
+    tags.push(if local { "local" } else { "cloud" }.to_string());
+    tags.push(if model.capability.tool_call {
+        "tools".to_string()
+    } else {
+        "no-tools".to_string()
+    });
+    if model.capability.parallel_tool_call {
+        tags.push("parallel".to_string());
+    }
+    if model.capability.reasoning {
+        tags.push("reasoning".to_string());
+    }
+    if model.capability.thinking_config {
+        tags.push("thinking-config".to_string());
+    }
+    if model.capability.image_input || model.modalities.contains(&ModelModality::Image) {
+        tags.push("vision".to_string());
+    }
+    if model.capability.fim {
+        tags.push("fim".to_string());
+    }
+    match model.status {
+        ModelStatus::Stable => {}
+        ModelStatus::Preview => tags.push("preview".to_string()),
+        ModelStatus::Deprecated => tags.push("deprecated".to_string()),
+        ModelStatus::Unknown => tags.push("unknown-status".to_string()),
+    }
+    match model.provider_status {
+        ProviderStatus::Available => {}
+        ProviderStatus::Degraded => tags.push("provider-degraded".to_string()),
+        ProviderStatus::Unavailable => tags.push("provider-unavailable".to_string()),
+        ProviderStatus::Unknown => tags.push("provider-unknown".to_string()),
+    }
+
+    ModelSelectorItem {
+        provider: model.provider.clone(),
+        id: model.id.clone(),
+        display_name: model.display_name.clone(),
+        selection_spec: format!("{}/{}", model.provider, model.id),
+        context_tokens: model.limits.context_tokens,
+        output_tokens: model.limits.output_tokens,
+        cost: model.cost,
+        capability: model.capability.clone(),
+        modalities: model.modalities.clone(),
+        status: model.status,
+        provider_status: model.provider_status,
+        local,
+        cloud: !local,
+        configured,
+        active,
+        requires_api_key: !api_key_env.is_empty(),
+        api_key_env,
+        tags,
+    }
+}
+
+fn provider_rank(provider: &str) -> usize {
+    [
+        "deepseek",
+        "openai-compatible",
+        "anthropic",
+        "google",
+        "openrouter",
+        "ollama",
+        "mistral",
+        "groq",
+        "xai",
+        "together",
+        "azure",
+        "bedrock",
+        "vertex",
+        "copilot",
+    ]
+    .iter()
+    .position(|candidate| *candidate == provider)
+    .unwrap_or(usize::MAX)
 }
 
 impl ModelInfo {
@@ -771,6 +951,35 @@ mod tests {
             .expect("override model");
         assert_eq!(model.display_name, "Custom Mini");
         assert_eq!(model.cost.input_per_mtok_usd, 0.01);
+    }
+
+    #[test]
+    fn selector_items_mark_active_and_provider_specs() {
+        let mut config = LlmConfig {
+            provider: "openrouter".to_string(),
+            ..Default::default()
+        };
+        config
+            .providers
+            .get_mut("openrouter")
+            .expect("openrouter provider")
+            .models
+            .chat = "anthropic/claude-sonnet-4".to_string();
+        let catalog = ModelCatalog::from_config(&config);
+
+        let items = catalog.selector_items(&config);
+        let active = items
+            .iter()
+            .find(|item| item.active)
+            .expect("active selector item");
+        assert_eq!(active.provider, "openrouter");
+        assert_eq!(active.id, "anthropic/claude-sonnet-4");
+        assert_eq!(
+            active.selection_spec,
+            "openrouter/anthropic/claude-sonnet-4"
+        );
+        assert!(active.cloud);
+        assert!(active.tags.iter().any(|tag| tag == "active"));
     }
 
     #[test]

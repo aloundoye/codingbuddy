@@ -40,16 +40,17 @@ use slash_commands::{
     SLASH_COMMAND_CATALOG, slash_command_suggestions, slash_suggestion_to_command,
 };
 pub use slash_commands::{SlashCommand, slash_command_catalog_entries};
+use state::VimMode;
 pub use state::{
     AutocompleteState, ChatShell, GhostTextState, MessageKind, MlCompletionCallback,
     ModelPickerState, REWIND_ACTIONS, RewindPickerPhase, RewindPickerState, TranscriptEntry,
     format_relative_time,
 };
-use state::{MODEL_CHOICES, VimMode};
 use statusline::render_statusline_spans;
 pub use statusline::{UiStatus, render_statusline};
 use stream_runtime::{
-    StreamEventResult, StreamRuntimeState, filter_stream_event, handle_stream_event,
+    StreamEventResult, StreamRuntimeState, approval_explanation, filter_stream_event,
+    handle_stream_event,
 };
 pub use theme::TuiTheme;
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
@@ -166,9 +167,8 @@ where
         workspace_path.to_string_lossy().as_bytes().hash(&mut h);
         format!("{:x}", h.finish())
     };
-    let ui_cfg = codingbuddy_core::AppConfig::load(&workspace_path)
-        .unwrap_or_default()
-        .ui;
+    let app_cfg = codingbuddy_core::AppConfig::load(&workspace_path).unwrap_or_default();
+    let ui_cfg = app_cfg.ui.clone();
     let thinking_visibility = if ui_cfg.thinking_visibility.trim().is_empty() {
         "concise".to_string()
     } else {
@@ -337,7 +337,8 @@ where
                 let before = &input[..cursor_pos.min(input.len())];
                 wrapped_text_rows(&format!("{prompt_str}{before}{cursor_ch}"), width)
             };
-            let (stream_height, input_height) = compute_inline_heights(area.height, desired_input_rows);
+            let (stream_height, input_height) =
+                compute_inline_heights(area.height, desired_input_rows);
             let stream_area = Rect::new(area.x, area.y, width, stream_height);
             let sep_area = Rect::new(area.x, area.y + stream_height, width, 1);
             let input_area = Rect::new(area.x, sep_area.y + 1, width, input_height);
@@ -346,9 +347,10 @@ where
 
             // Row 0..A: current streaming partial line(s) (or blank when idle)
             if let Some((tool_name, args_summary, _)) = pending_approval.as_ref() {
-                let compact_args = truncate_inline(&args_summary.replace('\n', " "), 72);
+                let explanation = approval_explanation(tool_name, args_summary);
                 let banner = format!(
-                    " !!! APPROVAL REQUIRED !!! {tool_name} {compact_args} | PRESS Y TO APPROVE | ANY KEY DENIES "
+                    " !!! APPROVAL REQUIRED !!! {tool_name} | {} | Y approve | A always | N deny ",
+                    truncate_inline(&explanation, 90)
                 );
                 let bg = if approval_flash_on {
                     Color::LightYellow
@@ -453,7 +455,7 @@ where
 
             // Row A+2..B: input prompt
             if let Some((tool_name, args_summary, _)) = pending_approval.as_ref() {
-                let compact_args = truncate_inline(&args_summary.replace('\n', " "), 56);
+                let explanation = approval_explanation(tool_name, args_summary);
                 // Graduated severity: dangerous commands get red, edits get yellow, reads get dim
                 let (severity, bg) = if tool_name.starts_with("bash") {
                     if approval_flash_on {
@@ -472,10 +474,18 @@ where
                         ("EDIT", Color::Yellow)
                     }
                 } else {
-                    ("ACTION", if approval_flash_on { Color::LightCyan } else { Color::Cyan })
+                    (
+                        "ACTION",
+                        if approval_flash_on {
+                            Color::LightCyan
+                        } else {
+                            Color::Cyan
+                        },
+                    )
                 };
                 let prompt = format!(
-                    " [{severity}] {tool_name}  {compact_args}  [y] Allow  [a] Always  [n] Deny "
+                    " [{severity}] {tool_name}  {}  [y] Allow  [a] Always  [n] Deny ",
+                    truncate_inline(&explanation, 72)
                 );
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![Span::styled(
@@ -567,9 +577,7 @@ where
             let summary_area = Rect::new(area.x, sep2_y, width, 1);
             let operator_summary = operator_summary_line(&status);
             let operator_style = if status.failed_tasks > 0 || status.failed_subagents > 0 {
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else if approval_alert_active {
                 Style::default()
                     .fg(Color::Yellow)
@@ -579,7 +587,10 @@ where
             };
             frame.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
-                    format!(" {}", truncate_inline(&operator_summary, width.saturating_sub(1) as usize)),
+                    format!(
+                        " {}",
+                        truncate_inline(&operator_summary, width.saturating_sub(1) as usize)
+                    ),
                     operator_style,
                 )])),
                 summary_area,
@@ -741,9 +752,10 @@ where
 
         // Handle pending approval prompts via keyboard
         if let Some((ref tool_name, ref args_summary, _)) = pending_approval {
-            let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
+            let explanation = approval_explanation(tool_name, args_summary);
             info_line = format!(
-                "ACTION REQUIRED: `{tool_name}` {compact_args} [Y=approve / A=always allow / any=deny]"
+                "ACTION REQUIRED: `{tool_name}` {} [Y=approve / A=always allow / N=deny]",
+                truncate_inline(&explanation, 96)
             );
         }
 
@@ -808,21 +820,13 @@ where
                 KeyCode::Up => {
                     mp.up();
                     let lines = mp.display_lines();
-                    info_line = format!(
-                        "Select model ({}): {}",
-                        MODEL_CHOICES.len(),
-                        lines.join(" | ")
-                    );
+                    info_line = format!("Select model ({}): {}", mp.count(), lines.join(" | "));
                     continue;
                 }
                 KeyCode::Down => {
                     mp.down();
                     let lines = mp.display_lines();
-                    info_line = format!(
-                        "Select model ({}): {}",
-                        MODEL_CHOICES.len(),
-                        lines.join(" | ")
-                    );
+                    info_line = format!("Select model ({}): {}", mp.count(), lines.join(" | "));
                     continue;
                 }
                 KeyCode::Enter => {
@@ -985,7 +989,7 @@ where
                         })
                         .is_ok();
                     info_line = if persisted {
-                        format!("always allowed `{tool_name}` ({pattern})")
+                        format!("remembered approval for `{tool_name}` as `{pattern}`")
                     } else {
                         format!("approved `{tool_name}` (could not persist)")
                     };
@@ -1862,7 +1866,7 @@ where
             }
             // /model (no args) — open interactive model picker
             if prompt == "/model" {
-                model_picker = Some(ModelPickerState::new());
+                model_picker = Some(ModelPickerState::from_config(&app_cfg));
                 info_line =
                     "Select model: Up/Down to move, Enter to confirm, Esc to cancel".to_string();
                 input.clear();

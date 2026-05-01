@@ -216,6 +216,10 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         .model
         .as_deref()
         .is_some_and(super::commands::chat::is_max_think_selection);
+    let model_spec = cli
+        .model
+        .clone()
+        .filter(|model| !super::commands::chat::is_max_think_selection(model.as_str()));
     ChatOptions {
         tools,
         force_max_think,
@@ -241,6 +245,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         chat_history: vec![],
         session_id: None,
         profile_override: None,
+        model_spec,
     }
 }
 
