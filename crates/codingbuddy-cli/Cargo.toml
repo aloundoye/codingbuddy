@@ -29,6 +29,7 @@ codingbuddy-agent = { path = "../codingbuddy-agent" }
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-diff = { path = "../codingbuddy-diff" }
 codingbuddy-index = { path = "../codingbuddy-index" }
+codingbuddy-llm = { path = "../codingbuddy-llm" }
 codingbuddy-policy = { path = "../codingbuddy-policy" }
 codingbuddy-store = { path = "../codingbuddy-store" }
 codingbuddy-tools = { path = "../codingbuddy-tools" }
