@@ -34,7 +34,8 @@ fn models_list_uses_catalog_overrides() {
             ..codingbuddy_core::ModelInfo::default()
         });
 
-    let output = format_models_list(&cfg);
+    let dir = tempdir().expect("tempdir");
+    let output = format_models_list(dir.path(), &cfg);
     assert!(output.contains("custom-agent-model"));
     assert!(output.contains("512K"));
     assert!(output.contains("tools,reasoning"));

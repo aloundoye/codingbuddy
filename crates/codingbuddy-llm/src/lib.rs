@@ -17,6 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 pub mod model_catalog;
+pub mod protocol;
 mod provider_transform;
 pub mod providers;
 pub mod retry;
@@ -486,10 +487,11 @@ impl ApiClient {
                 self.cfg.provider
             )
         })?;
+        let chat_protocol = protocol::select_chat_protocol(&provider, capabilities.provider);
 
         // Native providers: build their own payload format
-        match capabilities.provider {
-            ProviderKind::Anthropic => {
+        match chat_protocol {
+            protocol::ChatProtocol::AnthropicMessages => {
                 let max_cap = max_output_tokens_for_model(
                     capabilities.provider,
                     &req.model,
@@ -504,12 +506,15 @@ impl ApiClient {
                     compatibility: AppliedCompatibility {
                         provider: "anthropic".to_string(),
                         family: capabilities.family.as_key().to_string(),
-                        transforms: vec!["native_anthropic_messages_api".to_string()],
+                        transforms: vec![
+                            "protocol:anthropic-messages".to_string(),
+                            "native_anthropic_messages_api".to_string(),
+                        ],
                         degraded_inputs: vec![],
                     },
                 });
             }
-            ProviderKind::Google => {
+            protocol::ChatProtocol::GeminiGenerateContent => {
                 let max_cap = max_output_tokens_for_model(capabilities.provider, &req.model, false);
                 let payload = providers::google::build_payload(req, req.max_tokens.min(max_cap))?;
                 return Ok(PreparedPayload {
@@ -517,7 +522,10 @@ impl ApiClient {
                     compatibility: AppliedCompatibility {
                         provider: "google".to_string(),
                         family: capabilities.family.as_key().to_string(),
-                        transforms: vec!["native_gemini_generate_content_api".to_string()],
+                        transforms: vec![
+                            "protocol:gemini-generate-content".to_string(),
+                            "native_gemini_generate_content_api".to_string(),
+                        ],
                         degraded_inputs: vec![],
                     },
                 });
@@ -537,6 +545,9 @@ impl ApiClient {
             transforms: prepared_messages.transforms,
             degraded_inputs: prepared_messages.degraded_inputs,
         };
+        compatibility
+            .transforms
+            .push(format!("protocol:{}", chat_protocol.as_key()));
 
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
@@ -652,11 +663,12 @@ impl ApiClient {
                 self.cfg.provider
             )
         })?;
+        let provider = self.provider_config();
+        let chat_protocol = protocol::select_chat_protocol(&provider, capabilities.provider);
 
         // Build provider-specific endpoint
-        let endpoint = match capabilities.provider {
-            ProviderKind::Google => {
-                let provider = self.provider_config();
+        let endpoint = match chat_protocol {
+            protocol::ChatProtocol::GeminiGenerateContent => {
                 let base = provider.base_url.trim_end_matches('/');
                 let url = providers::google::endpoint(base, &req.model, false);
                 if let Some(key) = api_key {
@@ -671,8 +683,8 @@ impl ApiClient {
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
-            let builder = match capabilities.provider {
-                ProviderKind::Google => {
+            let builder = match chat_protocol {
+                protocol::ChatProtocol::GeminiGenerateContent => {
                     // Google uses API key in URL, no auth header
                     self.client.post(&endpoint).json(&prepared.payload)
                 }
@@ -689,9 +701,13 @@ impl ApiClient {
                     let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
-                        let response = match capabilities.provider {
-                            ProviderKind::Anthropic => providers::anthropic::parse_response(&body)?,
-                            ProviderKind::Google => providers::google::parse_response(&body)?,
+                        let response = match chat_protocol {
+                            protocol::ChatProtocol::AnthropicMessages => {
+                                providers::anthropic::parse_response(&body)?
+                            }
+                            protocol::ChatProtocol::GeminiGenerateContent => {
+                                providers::google::parse_response(&body)?
+                            }
                             _ => {
                                 let r = parse_non_streaming_payload(&body)?;
                                 provider_transform::postprocess_chat_response_with_compatibility(
@@ -926,23 +942,21 @@ impl ApiClient {
                 self.cfg.provider
             )
         })?;
+        let provider = self.provider_config();
+        let chat_protocol = protocol::select_chat_protocol(&provider, capabilities.provider);
         // Native providers handle streaming differently
-        let is_native = matches!(
-            capabilities.provider,
-            ProviderKind::Anthropic | ProviderKind::Google
-        );
+        let is_native = chat_protocol.is_native();
         if !is_native {
             prepared.payload["stream"] = json!(true);
             prepared.payload["stream_options"] = json!({"include_usage": true});
-        } else if capabilities.provider == ProviderKind::Anthropic {
+        } else if chat_protocol == protocol::ChatProtocol::AnthropicMessages {
             prepared.payload["stream"] = json!(true);
         }
         // Google uses ?alt=sse in the URL for streaming, no body flag needed
 
         // Build provider-specific endpoint for streaming
-        let stream_endpoint = match capabilities.provider {
-            ProviderKind::Google => {
-                let provider = self.provider_config();
+        let stream_endpoint = match chat_protocol {
+            protocol::ChatProtocol::GeminiGenerateContent => {
                 let base = provider.base_url.trim_end_matches('/');
                 let url = providers::google::endpoint(base, &req.model, true);
                 if let Some(key) = api_key {
@@ -957,8 +971,10 @@ impl ApiClient {
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
-            let builder = match capabilities.provider {
-                ProviderKind::Google => self.client.post(&stream_endpoint).json(&prepared.payload),
+            let builder = match chat_protocol {
+                protocol::ChatProtocol::GeminiGenerateContent => {
+                    self.client.post(&stream_endpoint).json(&prepared.payload)
+                }
                 _ => self
                     .apply_auth(self.client.post(&stream_endpoint), api_key)
                     .json(&prepared.payload),
@@ -1025,7 +1041,7 @@ impl ApiClient {
                             };
 
                             // ── Native Anthropic streaming ──
-                            if capabilities.provider == ProviderKind::Anthropic {
+                            if chat_protocol == protocol::ChatProtocol::AnthropicMessages {
                                 let evt_type = if anthropic_event_type.is_empty() {
                                     value.get("type").and_then(|v| v.as_str()).unwrap_or("")
                                 } else {
@@ -1043,7 +1059,7 @@ impl ApiClient {
                             }
 
                             // ── Native Google streaming ──
-                            if capabilities.provider == ProviderKind::Google {
+                            if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent {
                                 let raw = providers::google::parse_streaming_chunk(&value);
                                 let events = providers::from_google_event(raw);
                                 let mut done = false;
@@ -1198,7 +1214,7 @@ impl ApiClient {
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
-                            compatibility: None,
+                            compatibility: Some(prepared.compatibility.clone()),
                         };
                         // Native providers handle their own format; OpenAI-compat needs postprocessing
                         if is_native {

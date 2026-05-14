@@ -619,6 +619,7 @@ dependencies = [
  "codingbuddy-diff",
  "codingbuddy-index",
  "codingbuddy-jsonrpc",
+ "codingbuddy-llm",
  "codingbuddy-local-ml",
  "codingbuddy-mcp",
  "codingbuddy-memory",

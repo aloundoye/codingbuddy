@@ -104,6 +104,7 @@ pub(crate) fn run_chat(
         super::update::show_update_banner(cwd);
         super::update::check_for_update_background(cwd);
     }
+    refresh_model_catalog_background(cwd, &cfg);
     ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)
         .context("LLM provider not ready — check your API key and provider settings")?;
     let mut engine = AgentEngine::new(cwd).context("failed to initialize agent engine")?;
@@ -1354,9 +1355,9 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Models => {
-                    let output = format_models_list(&cfg);
+                    let output = format_models_list(cwd, &cfg);
                     if json_mode {
-                        let mut payload = model_selector_items_json(&cfg);
+                        let mut payload = model_selector_items_json(cwd, &cfg);
                         if let Some(obj) = payload.as_object_mut() {
                             obj.insert("display".to_string(), json!(output));
                         }
@@ -2101,38 +2102,96 @@ pub(crate) fn run_resume_specific(
     )
 }
 
+#[derive(Debug)]
+struct CatalogDisplayResolution {
+    catalog: codingbuddy_core::ModelCatalog,
+    source: String,
+    cache_path: PathBuf,
+    cache_fresh: bool,
+    refresh_error: Option<String>,
+}
+
+fn refresh_model_catalog_background(cwd: &Path, cfg: &AppConfig) {
+    if !cfg.llm.model_catalog.enabled || cfg.llm.model_catalog.offline {
+        return;
+    }
+    let llm = cfg.llm.clone();
+    let runtime = runtime_dir(cwd);
+    thread::spawn(move || {
+        let _ = codingbuddy_llm::model_catalog::resolve_model_catalog(&llm, &runtime);
+    });
+}
+
+fn resolve_catalog_for_display(cwd: &Path, cfg: &AppConfig) -> CatalogDisplayResolution {
+    let runtime = runtime_dir(cwd);
+    match codingbuddy_llm::model_catalog::resolve_model_catalog(&cfg.llm, &runtime) {
+        Ok(resolution) => CatalogDisplayResolution {
+            catalog: resolution.catalog,
+            source: format!("{:?}", resolution.source),
+            cache_path: resolution.cache_path,
+            cache_fresh: resolution.cache_fresh,
+            refresh_error: resolution.refresh_error,
+        },
+        Err(error) => CatalogDisplayResolution {
+            catalog: cfg.llm.model_catalog_for_runtime(&runtime),
+            source: "RuntimeCacheFallback".to_string(),
+            cache_path: cfg.llm.model_catalog.cache_path_for(&runtime),
+            cache_fresh: false,
+            refresh_error: Some(error.to_string()),
+        },
+    }
+}
+
 /// Format a catalog-backed list of models with pricing, limits, and provider capabilities.
-fn format_models_list(cfg: &AppConfig) -> String {
-    let catalog = cfg.llm.model_catalog();
+fn format_models_list(cwd: &Path, cfg: &AppConfig) -> String {
+    let resolution = resolve_catalog_for_display(cwd, cfg);
+    let catalog = resolution.catalog;
     let items = catalog.selector_items(&cfg.llm);
 
     let mut out = format!(
-        "Models (catalog: {:?}, {} total). Use `/model provider/model` to switch:\n",
-        catalog.source,
-        catalog.models.len()
+        "Models (catalog: {}, {} total, cache: {}, fresh: {}). Use `/model provider/model` to switch:\n",
+        resolution.source,
+        catalog.models.len(),
+        resolution.cache_path.display(),
+        resolution.cache_fresh
     );
+    if let Some(error) = resolution.refresh_error {
+        out.push_str(&format!("Catalog refresh warning: {error}\n"));
+    }
     out.push_str(&format!(
-        "  {:<18} {:<36} {:>8} {:>8} {:>15} {:<7}  {}\n",
-        "Provider", "Model", "Context", "Output", "$/M in/out", "Where", "Capabilities"
+        "  {:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14}  {}\n",
+        "Provider", "Model", "Context", "Output", "$/M in/out", "Where", "Auth", "Capabilities"
     ));
-    out.push_str(&format!("  {}\n", "-".repeat(116)));
+    out.push_str(&format!("  {}\n", "-".repeat(132)));
 
     for item in items {
         let marker = if item.active { "* " } else { "  " };
         let place = if item.local { "local" } else { "cloud" };
+        let auth = format_model_auth(&item);
         out.push_str(&format!(
-            "{marker}{:<18} {:<36} {:>8} {:>8} {:>15} {:<7}  {}\n",
+            "{marker}{:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14}  {}\n",
             item.provider,
             truncate_inline(&item.id, 36),
             format_token_limit(item.context_tokens),
             format_output_limit(item.output_tokens),
             format_model_cost(item.cost),
             place,
+            auth,
             format_selector_capabilities(&item)
         ));
     }
 
     out
+}
+
+fn format_model_auth(item: &codingbuddy_core::ModelSelectorItem) -> String {
+    if !item.requires_api_key {
+        "none".to_string()
+    } else if item.api_key_available {
+        "ready".to_string()
+    } else {
+        truncate_inline(&format!("missing:{}", item.api_key_env), 14)
+    }
 }
 
 fn format_token_limit(tokens: u64) -> String {
@@ -2207,10 +2266,14 @@ fn format_selector_capabilities(item: &codingbuddy_core::ModelSelectorItem) -> S
     }
 }
 
-fn model_selector_items_json(cfg: &AppConfig) -> serde_json::Value {
-    let catalog = cfg.llm.model_catalog();
+fn model_selector_items_json(cwd: &Path, cfg: &AppConfig) -> serde_json::Value {
+    let resolution = resolve_catalog_for_display(cwd, cfg);
+    let catalog = resolution.catalog;
     serde_json::json!({
-        "catalog_source": catalog.source,
+        "catalog_source": resolution.source,
+        "catalog_cache_path": resolution.cache_path,
+        "catalog_cache_fresh": resolution.cache_fresh,
+        "catalog_refresh_error": resolution.refresh_error,
         "active_provider": cfg.llm.provider,
         "active_model": cfg.llm.active_base_model(),
         "models": catalog.selector_items(&cfg.llm),

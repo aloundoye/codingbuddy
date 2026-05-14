@@ -2537,6 +2537,11 @@ impl LlmConfig {
         ModelCatalog::from_config(self)
     }
 
+    #[must_use]
+    pub fn model_catalog_for_runtime(&self, runtime_dir: &Path) -> ModelCatalog {
+        ModelCatalog::from_runtime_cache(self, runtime_dir)
+    }
+
     /// Parse a `provider/model-id` spec and apply it to this config.
     ///
     /// Accepts:

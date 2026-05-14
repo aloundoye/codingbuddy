@@ -66,6 +66,7 @@ pub struct ModelSelectorItem {
     pub active: bool,
     pub api_key_env: String,
     pub requires_api_key: bool,
+    pub api_key_available: bool,
     pub tags: Vec<String>,
 }
 
@@ -214,6 +215,7 @@ impl Default for ModelSelectorItem {
             active: false,
             api_key_env: String::new(),
             requires_api_key: true,
+            api_key_available: false,
             tags: Vec::new(),
         }
     }
@@ -372,6 +374,29 @@ impl ModelCatalog {
     }
 
     #[must_use]
+    pub fn from_runtime_cache(config: &LlmConfig, runtime_dir: &Path) -> Self {
+        let mut base = if config.model_catalog.enabled {
+            Self::bundled()
+        } else {
+            Self::empty(ModelCatalogSource::Merged)
+        };
+        if config.model_catalog.enabled
+            && let Ok(cache) =
+                ModelCatalogCache::load(config.model_catalog.cache_path_for(runtime_dir))
+        {
+            base.merge_from(&cache.catalog);
+        }
+
+        let mut catalog = Self::from_config_with_base(config, base);
+        if let Some(path) = config.model_catalog.overrides_path_for(runtime_dir)
+            && let Ok(overrides) = Self::load_overrides(path)
+        {
+            catalog.merge_from(&overrides);
+        }
+        catalog
+    }
+
+    #[must_use]
     pub fn from_config_with_base(config: &LlmConfig, mut base: Self) -> Self {
         base.merge_from(&Self::configured(config));
         base.merge_from(&Self::inline_overrides(config));
@@ -520,12 +545,33 @@ fn selector_item_for_model(
     let api_key_env = provider_config
         .map(|provider| provider.api_key_env.clone())
         .unwrap_or_default();
+    let requires_api_key = !api_key_env.is_empty();
+    let explicit_key_for_active_provider = model.provider == active_provider
+        && config
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let api_key_available = !requires_api_key
+        || explicit_key_for_active_provider
+        || std::env::var(&api_key_env)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
     let active = model.provider == active_provider && model.id == active_model;
     let mut tags = Vec::new();
     if active {
         tags.push("active".to_string());
     }
+    if configured {
+        tags.push("configured".to_string());
+    }
     tags.push(if local { "local" } else { "cloud" }.to_string());
+    if requires_api_key {
+        tags.push(if api_key_available {
+            "auth-ok".to_string()
+        } else {
+            "auth-missing".to_string()
+        });
+    }
     tags.push(if model.capability.tool_call {
         "tools".to_string()
     } else {
@@ -575,7 +621,8 @@ fn selector_item_for_model(
         cloud: !local,
         configured,
         active,
-        requires_api_key: !api_key_env.is_empty(),
+        requires_api_key,
+        api_key_available,
         api_key_env,
         tags,
     }
@@ -868,7 +915,9 @@ const BUNDLED_MODELS: &[(&str, &[&str])] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ProviderConfig, ProviderModels};
     use serde_json::json;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     #[test]
@@ -980,6 +1029,70 @@ mod tests {
         );
         assert!(active.cloud);
         assert!(active.tags.iter().any(|tag| tag == "active"));
+    }
+
+    #[test]
+    fn selector_items_expose_auth_availability() {
+        unsafe {
+            std::env::remove_var("CODINGBUDDY_TEST_AUTH_MISSING");
+        }
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test-provider".to_string(),
+            ProviderConfig {
+                kind: "openai-compatible".to_string(),
+                base_url: "https://example.invalid".to_string(),
+                api_key_env: "CODINGBUDDY_TEST_AUTH_MISSING".to_string(),
+                openai_compat_prefix: true,
+                payload_options: serde_json::Value::Null,
+                models: ProviderModels {
+                    chat: "test-model".to_string(),
+                    reasoner: None,
+                },
+            },
+        );
+        let config = LlmConfig {
+            provider: "test-provider".to_string(),
+            providers,
+            ..Default::default()
+        };
+
+        let catalog = ModelCatalog::from_config(&config);
+        let active = catalog
+            .selector_items(&config)
+            .into_iter()
+            .find(|item| item.active)
+            .expect("active selector item");
+        assert!(active.requires_api_key);
+        assert!(!active.api_key_available);
+        assert!(active.tags.iter().any(|tag| tag == "auth-missing"));
+    }
+
+    #[test]
+    fn runtime_cache_is_used_for_selector_catalogs() {
+        let dir = tempdir().expect("tempdir");
+        let cache_path = dir.path().join("model_catalog.json");
+        let mut remote = ModelCatalog::empty(ModelCatalogSource::Remote);
+        remote.upsert(ModelInfo {
+            provider: "openrouter".to_string(),
+            id: "cached/model".to_string(),
+            display_name: "Cached Model".to_string(),
+            modalities: vec![ModelModality::Text],
+            ..ModelInfo::default()
+        });
+        ModelCatalogCache::new(remote, "https://example.invalid", 100)
+            .save(&cache_path)
+            .expect("save cache");
+        let config = LlmConfig {
+            model_catalog: ModelCatalogConfig {
+                cache_path: Some(cache_path.display().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let catalog = ModelCatalog::from_runtime_cache(&config, dir.path());
+        assert!(catalog.find("openrouter", "cached/model").is_some());
     }
 
     #[test]

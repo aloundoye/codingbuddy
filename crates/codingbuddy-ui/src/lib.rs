@@ -1866,7 +1866,10 @@ where
             }
             // /model (no args) — open interactive model picker
             if prompt == "/model" {
-                model_picker = Some(ModelPickerState::from_config(&app_cfg));
+                model_picker = Some(ModelPickerState::from_config_for_workspace(
+                    &app_cfg,
+                    &workspace_path,
+                ));
                 info_line =
                     "Select model: Up/Down to move, Enter to confirm, Esc to cancel".to_string();
                 input.clear();

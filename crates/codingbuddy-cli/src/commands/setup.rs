@@ -369,7 +369,11 @@ fn setup_model_choices(cfg: &AppConfig) -> Vec<codingbuddy_core::ModelSelectorIt
 fn setup_model_summary(item: &codingbuddy_core::ModelSelectorItem) -> String {
     let place = if item.local { "local" } else { "cloud" };
     let auth = if item.requires_api_key {
-        format!("env {}", item.api_key_env)
+        if item.api_key_available {
+            format!("env {} ready", item.api_key_env)
+        } else {
+            format!("env {} missing", item.api_key_env)
+        }
     } else {
         "no key".to_string()
     };

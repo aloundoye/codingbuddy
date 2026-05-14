@@ -484,6 +484,23 @@ impl ModelPickerState {
 
     pub fn from_config(cfg: &codingbuddy_core::AppConfig) -> Self {
         let catalog = cfg.llm.model_catalog();
+        Self::from_catalog(cfg, catalog)
+    }
+
+    pub fn from_config_for_workspace(
+        cfg: &codingbuddy_core::AppConfig,
+        workspace: &std::path::Path,
+    ) -> Self {
+        let catalog = cfg
+            .llm
+            .model_catalog_for_runtime(&codingbuddy_core::runtime_dir(workspace));
+        Self::from_catalog(cfg, catalog)
+    }
+
+    fn from_catalog(
+        cfg: &codingbuddy_core::AppConfig,
+        catalog: codingbuddy_core::ModelCatalog,
+    ) -> Self {
         let choices = catalog
             .selector_items(&cfg.llm)
             .into_iter()
@@ -593,6 +610,9 @@ fn model_choice_from_selector(item: codingbuddy_core::ModelSelectorItem) -> Mode
     }
     if caps.is_empty() {
         caps.push("chat");
+    }
+    if item.requires_api_key && !item.api_key_available {
+        caps.push("auth-missing");
     }
     ModelChoice {
         id: item.id,
