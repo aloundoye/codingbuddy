@@ -770,6 +770,55 @@ pub enum EventKind {
     ToolApproved { invocation_id: Uuid },
     #[serde(alias = "ToolResultV1")]
     ToolResult { result: ToolResult },
+    #[serde(alias = "AgentStepStartedV1")]
+    AgentStepStarted {
+        step_id: Uuid,
+        run_id: Option<Uuid>,
+        provider: String,
+        model: String,
+        phase: Option<String>,
+    },
+    #[serde(alias = "AgentStepEndedV1")]
+    AgentStepEnded {
+        step_id: Uuid,
+        success: bool,
+        finish_reason: String,
+        duration_ms: u64,
+    },
+    #[serde(alias = "ToolInputStartedV1")]
+    ToolInputStarted {
+        invocation_id: Uuid,
+        tool_name: String,
+    },
+    #[serde(alias = "ToolInputEndedV1")]
+    ToolInputEnded {
+        invocation_id: Uuid,
+        tool_name: String,
+        input_bytes: u64,
+        validation_status: String,
+    },
+    #[serde(alias = "ToolExecutionStartedV1")]
+    ToolExecutionStarted {
+        invocation_id: Uuid,
+        tool_name: String,
+    },
+    #[serde(alias = "ToolExecutionEndedV1")]
+    ToolExecutionEnded {
+        invocation_id: Uuid,
+        tool_name: String,
+        success: bool,
+        error: Option<String>,
+        output_bytes: u64,
+        truncated: bool,
+        duration_ms: u64,
+    },
+    #[serde(alias = "ToolRetryScheduledV1")]
+    ToolRetryScheduled {
+        invocation_id: Uuid,
+        tool_name: String,
+        attempt: u64,
+        reason: String,
+    },
     #[serde(alias = "PatchStagedV1")]
     PatchStaged { patch_id: Uuid, base_sha256: String },
     #[serde(alias = "PatchAppliedV1")]
@@ -1050,6 +1099,22 @@ pub enum EventKind {
         tool_name: String,
         reason: String,
     },
+    #[serde(alias = "PermissionDecisionRecordedV1")]
+    PermissionDecisionRecorded {
+        invocation_id: Uuid,
+        tool_name: String,
+        decision: String,
+        reason: String,
+        remembered_approval_source: Option<String>,
+        managed_setting_lock_source: Option<String>,
+        high_risk_category: Option<String>,
+    },
+    #[serde(alias = "AgentInterruptedV1")]
+    AgentInterrupted {
+        reason: String,
+        partial_output_chars: u64,
+        last_consistent_event_id: Option<Uuid>,
+    },
     #[serde(alias = "NotebookEditedV1")]
     NotebookEdited {
         path: String,
@@ -1147,6 +1212,13 @@ pub enum EventKind {
         messages_before: u64,
         messages_after: u64,
     },
+    #[serde(alias = "CompactionSnapshotLinkedV1")]
+    CompactionSnapshotLinked {
+        summary_id: Uuid,
+        snapshot_id: String,
+        active_files: Vec<String>,
+        directives_preserved: u64,
+    },
     /// Doom loop detected — model repeated identical tool calls.
     #[serde(alias = "DoomLoopDetectedV1")]
     DoomLoopDetected {
@@ -1205,6 +1277,7 @@ impl EventKind {
             | Self::ChatTurn { .. }
             | Self::TurnReverted { .. }
             | Self::ContextCompacted { .. }
+            | Self::AgentInterrupted { .. }
             | Self::EffortChanged { .. }
             | Self::PermissionModeChanged { .. }
             | Self::TurnLimitExceeded { .. }
@@ -1214,7 +1287,13 @@ impl EventKind {
             Self::ToolProposed { .. }
             | Self::ToolApproved { .. }
             | Self::ToolResult { .. }
-            | Self::ToolDenied { .. } => "tool",
+            | Self::ToolDenied { .. }
+            | Self::PermissionDecisionRecorded { .. }
+            | Self::ToolInputStarted { .. }
+            | Self::ToolInputEnded { .. }
+            | Self::ToolExecutionStarted { .. }
+            | Self::ToolExecutionEnded { .. }
+            | Self::ToolRetryScheduled { .. } => "tool",
 
             // Plans
             Self::PlanCreated { .. }
@@ -1346,6 +1425,9 @@ impl EventKind {
 
             // Tool loop intelligence
             Self::CompactionTriggered { .. }
+            | Self::CompactionSnapshotLinked { .. }
+            | Self::AgentStepStarted { .. }
+            | Self::AgentStepEnded { .. }
             | Self::DoomLoopDetected { .. }
             | Self::CircuitBreakerTripped { .. }
             | Self::HallucinationNudgeFired { .. }
@@ -2374,9 +2456,45 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     #[serde(default)]
     pub openai_compat_prefix: bool,
+    /// Explicit chat protocol override. Kept outside payload_options so model
+    /// selection, doctor/status, and adapter dispatch can inspect it without
+    /// knowing provider-specific payload knobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_protocol: Option<String>,
+    /// Explicit auth strategy override (`bearer`, `x-api-key`, `query-api-key`,
+    /// `none`, `aws-sigv4`). Defaults are derived from provider kind/protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_strategy: Option<String>,
+    /// Extra request headers to attach to provider calls after built-in headers.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub discovery: ProviderDiscoveryConfig,
     #[serde(default)]
     pub payload_options: serde_json::Value,
     pub models: ProviderModels,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderDiscoveryConfig {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    pub refresh_on_startup: bool,
+}
+
+impl Default for ProviderDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            models_endpoint: None,
+            strategy: None,
+            refresh_on_startup: false,
+        }
+    }
 }
 
 /// Models available for a given provider.
@@ -2452,6 +2570,10 @@ impl LlmConfig {
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
             openai_compat_prefix: self.openai_compat_prefix,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: self.base_model.clone(),
@@ -2655,6 +2777,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.deepseek.com".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             openai_compat_prefix: false,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: CODINGBUDDY_V32_CHAT_MODEL.to_string(),
@@ -2669,6 +2795,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.openai.com".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "gpt-4o-mini".to_string(),
@@ -2683,6 +2813,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.anthropic.com".to_string(),
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "claude-sonnet-4-20250514".to_string(),
@@ -2697,6 +2831,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://generativelanguage.googleapis.com".to_string(),
             api_key_env: "GOOGLE_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "gemini-2.5-flash".to_string(),
@@ -2711,6 +2849,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.groq.com/openai".to_string(),
             api_key_env: "GROQ_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "llama-3.3-70b-versatile".to_string(),
@@ -2725,6 +2867,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://openrouter.ai/api".to_string(),
             api_key_env: "OPENROUTER_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "anthropic/claude-sonnet-4".to_string(),
@@ -2739,6 +2885,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "http://localhost:11434".to_string(),
             api_key_env: String::new(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "qwen2.5-coder:7b".to_string(),
@@ -2753,6 +2903,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: String::new(), // Set via AZURE_OPENAI_ENDPOINT
             api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "gpt-4o".to_string(),
@@ -2767,6 +2921,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.mistral.ai".to_string(),
             api_key_env: "MISTRAL_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "mistral-large-latest".to_string(),
@@ -2781,6 +2939,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.x.ai".to_string(),
             api_key_env: "XAI_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "grok-2".to_string(),
@@ -2795,6 +2957,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.together.xyz".to_string(),
             api_key_env: "TOGETHER_API_KEY".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo".to_string(),
@@ -2809,6 +2975,10 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.githubcopilot.com".to_string(),
             api_key_env: "GITHUB_TOKEN".to_string(),
             openai_compat_prefix: true,
+            chat_protocol: None,
+            auth_strategy: None,
+            headers: std::collections::BTreeMap::new(),
+            discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "gpt-4o".to_string(),
@@ -4699,6 +4869,10 @@ mod tests {
                 base_url: "http://localhost:11434/v1".to_string(),
                 api_key_env: "OLLAMA_KEY".to_string(),
                 openai_compat_prefix: true,
+                chat_protocol: None,
+                auth_strategy: None,
+                headers: std::collections::BTreeMap::new(),
+                discovery: ProviderDiscoveryConfig::default(),
                 payload_options: serde_json::Value::Null,
                 models: ProviderModels {
                     chat: "llama3".to_string(),

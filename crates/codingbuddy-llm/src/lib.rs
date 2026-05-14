@@ -7,7 +7,7 @@ use codingbuddy_core::{
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use reqwest::header::RETRY_AFTER;
+use reqwest::header::{HeaderName, HeaderValue, RETRY_AFTER};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
@@ -181,26 +181,62 @@ impl ApiClient {
         builder: reqwest::blocking::RequestBuilder,
         api_key: Option<&str>,
     ) -> reqwest::blocking::RequestBuilder {
+        self.apply_auth_for_protocol(builder, api_key, protocol::ChatProtocol::OpenAiChat)
+    }
+
+    fn apply_auth_for_protocol(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+        api_key: Option<&str>,
+        chat_protocol: protocol::ChatProtocol,
+    ) -> reqwest::blocking::RequestBuilder {
+        let provider_config = self.provider_config();
         let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
-        match provider {
-            ProviderKind::Anthropic => {
-                let builder = builder
-                    .header("anthropic-version", providers::anthropic::ANTHROPIC_VERSION)
-                    .header(
-                        "anthropic-beta",
-                        "prompt-caching-2024-07-31,output-128k-2025-02-19",
-                    )
-                    .header("content-type", "application/json");
-                match api_key {
-                    Some(key) if !key.trim().is_empty() => builder.header("x-api-key", key),
-                    _ => builder,
-                }
-            }
-            _ => match api_key {
+        let auth_strategy =
+            protocol::select_auth_strategy(&provider_config, provider, chat_protocol);
+        let mut builder = if provider == ProviderKind::Anthropic
+            || chat_protocol == protocol::ChatProtocol::AnthropicMessages
+        {
+            builder
+                .header("anthropic-version", providers::anthropic::ANTHROPIC_VERSION)
+                .header(
+                    "anthropic-beta",
+                    "prompt-caching-2024-07-31,output-128k-2025-02-19",
+                )
+                .header("content-type", "application/json")
+        } else {
+            builder
+        };
+        builder = match auth_strategy {
+            protocol::AuthStrategy::Bearer => match api_key {
                 Some(key) if !key.trim().is_empty() => builder.bearer_auth(key),
                 _ => builder,
             },
+            protocol::AuthStrategy::XApiKey => match api_key {
+                Some(key) if !key.trim().is_empty() => builder.header("x-api-key", key),
+                _ => builder,
+            },
+            protocol::AuthStrategy::QueryApiKey
+            | protocol::AuthStrategy::AwsSigV4
+            | protocol::AuthStrategy::None => builder,
+        };
+        self.apply_custom_provider_headers(builder, &provider_config)
+    }
+
+    fn apply_custom_provider_headers(
+        &self,
+        mut builder: reqwest::blocking::RequestBuilder,
+        provider: &codingbuddy_core::ProviderConfig,
+    ) -> reqwest::blocking::RequestBuilder {
+        for (name, value) in &provider.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                builder = builder.header(name, value);
+            }
         }
+        builder
     }
 
     fn resolve_request_api_key(&self) -> Result<Option<String>> {
@@ -491,6 +527,14 @@ impl ApiClient {
 
         // Native providers: build their own payload format
         match chat_protocol {
+            protocol::ChatProtocol::OpenAiResponses | protocol::ChatProtocol::BedrockConverse => {
+                let adapter = protocol::adapters::adapter_for(chat_protocol);
+                return Err(anyhow!(
+                    "chat protocol '{}' is registered ({:?}) but not enabled in the runtime execution path yet; set provider.chat_protocol='openai-chat' or use a provider with native support for this protocol",
+                    chat_protocol.as_key(),
+                    adapter.payload_shape
+                ));
+            }
             protocol::ChatProtocol::AnthropicMessages => {
                 let max_cap = max_output_tokens_for_model(
                     capabilities.provider,
@@ -683,15 +727,9 @@ impl ApiClient {
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
-            let builder = match chat_protocol {
-                protocol::ChatProtocol::GeminiGenerateContent => {
-                    // Google uses API key in URL, no auth header
-                    self.client.post(&endpoint).json(&prepared.payload)
-                }
-                _ => self
-                    .apply_auth(self.client.post(&endpoint), api_key)
-                    .json(&prepared.payload),
-            };
+            let builder = self
+                .apply_auth_for_protocol(self.client.post(&endpoint), api_key, chat_protocol)
+                .json(&prepared.payload);
             let response = builder.send();
 
             match response {
@@ -971,14 +1009,9 @@ impl ApiClient {
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
-            let builder = match chat_protocol {
-                protocol::ChatProtocol::GeminiGenerateContent => {
-                    self.client.post(&stream_endpoint).json(&prepared.payload)
-                }
-                _ => self
-                    .apply_auth(self.client.post(&stream_endpoint), api_key)
-                    .json(&prepared.payload),
-            };
+            let builder = self
+                .apply_auth_for_protocol(self.client.post(&stream_endpoint), api_key, chat_protocol)
+                .json(&prepared.payload);
             let response = builder.send();
 
             match response {

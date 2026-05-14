@@ -318,31 +318,53 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         SlashCommand::Model(model) => {
                             if let Some(ref model) = model {
                                 let thinking = is_max_think_selection(model);
-                                force_max_think.store(thinking, Ordering::Relaxed);
-                                if let Ok(mut guard) = active_model_spec_for_closure.lock() {
-                                    if thinking {
-                                        *guard = None;
+                                let active_mode = active_mode_for_closure
+                                    .lock()
+                                    .map(|guard| *guard)
+                                    .unwrap_or(ChatMode::Code);
+                                if !thinking
+                                    && let Some(warning) = model_switch_safety_message(
+                                        cwd,
+                                        cfg,
+                                        model,
+                                        allow_tools,
+                                        read_only_for_closure.load(Ordering::Relaxed),
+                                        active_mode,
+                                    )
+                                {
+                                    warning
+                                } else {
+                                    force_max_think.store(thinking, Ordering::Relaxed);
+                                    if let Ok(mut guard) = active_model_spec_for_closure.lock() {
+                                        if thinking {
+                                            *guard = None;
+                                        } else {
+                                            *guard = Some(model.clone());
+                                        }
+                                    }
+                                    if force_max_think.load(Ordering::Relaxed) {
+                                        format!(
+                                            "model mode: thinking-enabled ({})",
+                                            cfg.llm.active_reasoner_model()
+                                        )
                                     } else {
-                                        *guard = Some(model.clone());
+                                        let active_model = active_model_spec_for_closure
+                                            .lock()
+                                            .ok()
+                                            .and_then(|guard| guard.clone())
+                                            .map(|spec| {
+                                                active_model_for_display(cfg, Some(&spec), false)
+                                            })
+                                            .unwrap_or_else(|| cfg.llm.active_base_model());
+                                        format!(
+                                            "model mode: auto ({} thinking=on-demand)",
+                                            active_model
+                                        )
                                     }
                                 }
-                            }
-                            if model.is_none() {
+                            } else {
                                 // No argument — show model list
                                 format_models_list(cwd, cfg)
-                            } else if force_max_think.load(Ordering::Relaxed) {
-                                format!(
-                                    "model mode: thinking-enabled ({})",
-                                    cfg.llm.active_reasoner_model()
-                                )
-                            } else {
-                                let active_model = active_model_spec_for_closure
-                                    .lock()
-                                    .ok()
-                                    .and_then(|guard| guard.clone())
-                                    .map(|spec| active_model_for_display(cfg, Some(&spec), false))
-                                    .unwrap_or_else(|| cfg.llm.active_base_model());
-                                format!("model mode: auto ({} thinking=on-demand)", active_model)
                             }
                         }
                         SlashCommand::Provider(provider) => format_provider_info(cfg, provider),

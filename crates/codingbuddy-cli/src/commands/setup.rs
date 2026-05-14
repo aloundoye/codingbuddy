@@ -390,12 +390,25 @@ fn setup_model_summary(item: &codingbuddy_core::ModelSelectorItem) -> String {
     if caps.is_empty() {
         caps.push("chat");
     }
+    let status = if item.provider_status == codingbuddy_core::ProviderStatus::Degraded {
+        "provider degraded"
+    } else if item.provider_status == codingbuddy_core::ProviderStatus::Unavailable {
+        "provider unavailable"
+    } else if item.status == codingbuddy_core::ModelStatus::Deprecated {
+        "deprecated"
+    } else if item.status == codingbuddy_core::ModelStatus::Preview {
+        "preview"
+    } else {
+        "ready"
+    };
     format!(
-        "{} ctx, {}, {}, {}",
+        "{} ctx, {}, {}, {}, {}, {}",
         setup_token_limit(item.context_tokens),
         place,
         caps.join("/"),
-        auth
+        item.chat_protocol,
+        auth,
+        status
     )
 }
 
@@ -434,6 +447,9 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
             "base_url": provider.base_url,
             "chat_model": provider.models.chat,
             "reasoner_model": provider.models.reasoner,
+            "chat_protocol": provider.chat_protocol,
+            "auth_strategy": provider.auth_strategy,
+            "discovery": provider.discovery,
             "api_key": if api_key_set { "configured" } else { "missing" },
             "hardware": {
                 "device": hw.device.to_string(),
@@ -453,6 +469,20 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
         println!("provider: {}", cfg.llm.provider);
         println!("base_url: {}", provider.base_url);
         println!("chat_model: {}", provider.models.chat);
+        println!(
+            "chat_protocol: {}",
+            provider
+                .chat_protocol
+                .as_deref()
+                .unwrap_or("auto (see /models)")
+        );
+        println!(
+            "auth_strategy: {}",
+            provider
+                .auth_strategy
+                .as_deref()
+                .unwrap_or("auto (provider default)")
+        );
         if let Some(ref reasoner) = provider.models.reasoner {
             println!("reasoner_model: {reasoner}");
         }

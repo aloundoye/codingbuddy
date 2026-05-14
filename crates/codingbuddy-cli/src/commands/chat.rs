@@ -125,6 +125,12 @@ pub(crate) fn run_chat(
     let repo_root_override = cli.and_then(|v| v.repo.clone());
     let watch_files_enabled = cli.map(|value| value.watch_files).unwrap_or(false);
     let detect_urls = cli.map(|value| value.detect_urls).unwrap_or(false);
+    if let Some(spec) = active_model_spec.as_deref()
+        && let Some(warning) =
+            model_switch_safety_message(cwd, &cfg, spec, allow_tools, false, ChatMode::Code)
+    {
+        return Err(anyhow!(warning));
+    }
     let debug_context = cli.map(|v| v.debug_context).unwrap_or(false)
         || std::env::var("CODINGBUDDY_DEBUG_CONTEXT")
             .map(|value| {
@@ -353,8 +359,26 @@ pub(crate) fn run_chat(
                 }
                 SlashCommand::Model(model) => {
                     if let Some(model) = model {
-                        force_max_think = is_max_think_selection(&model);
-                        if force_max_think {
+                        let next_force_max_think = is_max_think_selection(&model);
+                        if !next_force_max_think
+                            && let Some(warning) = model_switch_safety_message(
+                                cwd,
+                                &cfg,
+                                &model,
+                                allow_tools,
+                                read_only_mode,
+                                active_chat_mode,
+                            )
+                        {
+                            if json_mode {
+                                print_json(&json!({"error": warning, "model_spec": model}))?;
+                            } else {
+                                println!("{warning}");
+                            }
+                            continue;
+                        }
+                        force_max_think = next_force_max_think;
+                        if next_force_max_think {
                             active_model_spec = None;
                         } else {
                             active_model_spec = Some(model);
@@ -2159,17 +2183,26 @@ fn format_models_list(cwd: &Path, cfg: &AppConfig) -> String {
         out.push_str(&format!("Catalog refresh warning: {error}\n"));
     }
     out.push_str(&format!(
-        "  {:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14}  {}\n",
-        "Provider", "Model", "Context", "Output", "$/M in/out", "Where", "Auth", "Capabilities"
+        "  {:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14} {:<20} {:<18}  {}\n",
+        "Provider",
+        "Model",
+        "Context",
+        "Output",
+        "$/M in/out",
+        "Where",
+        "Auth",
+        "Protocol",
+        "Status",
+        "Capabilities"
     ));
-    out.push_str(&format!("  {}\n", "-".repeat(132)));
+    out.push_str(&format!("  {}\n", "-".repeat(176)));
 
     for item in items {
         let marker = if item.active { "* " } else { "  " };
         let place = if item.local { "local" } else { "cloud" };
         let auth = format_model_auth(&item);
         out.push_str(&format!(
-            "{marker}{:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14}  {}\n",
+            "{marker}{:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14} {:<20} {:<18}  {}\n",
             item.provider,
             truncate_inline(&item.id, 36),
             format_token_limit(item.context_tokens),
@@ -2177,6 +2210,8 @@ fn format_models_list(cwd: &Path, cfg: &AppConfig) -> String {
             format_model_cost(item.cost),
             place,
             auth,
+            truncate_inline(&item.chat_protocol, 20),
+            format_model_status(&item),
             format_selector_capabilities(&item)
         ));
     }
@@ -2191,6 +2226,27 @@ fn format_model_auth(item: &codingbuddy_core::ModelSelectorItem) -> String {
         "ready".to_string()
     } else {
         truncate_inline(&format!("missing:{}", item.api_key_env), 14)
+    }
+}
+
+fn format_model_status(item: &codingbuddy_core::ModelSelectorItem) -> String {
+    let mut parts = Vec::new();
+    match item.status {
+        codingbuddy_core::ModelStatus::Stable => {}
+        codingbuddy_core::ModelStatus::Preview => parts.push("preview"),
+        codingbuddy_core::ModelStatus::Deprecated => parts.push("deprecated"),
+        codingbuddy_core::ModelStatus::Unknown => parts.push("unknown"),
+    }
+    match item.provider_status {
+        codingbuddy_core::ProviderStatus::Available => {}
+        codingbuddy_core::ProviderStatus::Degraded => parts.push("provider-degraded"),
+        codingbuddy_core::ProviderStatus::Unavailable => parts.push("provider-down"),
+        codingbuddy_core::ProviderStatus::Unknown => parts.push("provider-unknown"),
+    }
+    if parts.is_empty() {
+        "ok".to_string()
+    } else {
+        truncate_inline(&parts.join(","), 18)
     }
 }
 
@@ -2247,6 +2303,18 @@ fn format_selector_capabilities(item: &codingbuddy_core::ModelSelectorItem) -> S
     if item.capability.fim {
         caps.push("fim");
     }
+    if item
+        .modalities
+        .contains(&codingbuddy_core::ModelModality::Audio)
+    {
+        caps.push("audio");
+    }
+    if item
+        .modalities
+        .contains(&codingbuddy_core::ModelModality::Video)
+    {
+        caps.push("video");
+    }
     match item.status {
         codingbuddy_core::ModelStatus::Preview => caps.push("preview"),
         codingbuddy_core::ModelStatus::Deprecated => caps.push("deprecated"),
@@ -2260,8 +2328,15 @@ fn format_selector_capabilities(item: &codingbuddy_core::ModelSelectorItem) -> S
         codingbuddy_core::ProviderStatus::Available => {}
     }
     if caps.is_empty() {
-        "text".to_string()
+        if item.capability.tool_call {
+            "text".to_string()
+        } else {
+            "text,no-tools".to_string()
+        }
     } else {
+        if !item.capability.tool_call {
+            caps.push("no-tools");
+        }
         caps.join(",")
     }
 }
@@ -2294,6 +2369,49 @@ fn active_model_for_display(
     } else {
         effective.llm.active_base_model()
     }
+}
+
+fn model_switch_safety_message(
+    cwd: &Path,
+    cfg: &AppConfig,
+    model_spec: &str,
+    allow_tools: bool,
+    read_only_mode: bool,
+    active_chat_mode: ChatMode,
+) -> Option<String> {
+    if !allow_tools || read_only_mode || active_chat_mode != ChatMode::Code {
+        return None;
+    }
+    let mut effective = cfg.clone();
+    effective.llm.apply_model_spec(model_spec);
+    let provider = effective.llm.provider.clone();
+    let model = effective.llm.active_base_model();
+    let resolution = resolve_catalog_for_display(cwd, &effective);
+    let item = resolution
+        .catalog
+        .selector_items(&effective.llm)
+        .into_iter()
+        .find(|item| item.provider == provider && item.id == model);
+    let supports_tools = item
+        .as_ref()
+        .map(|item| item.capability.tool_call)
+        .or_else(|| {
+            effective
+                .llm
+                .capabilities_for_model(&model)
+                .map(|capabilities| capabilities.supports_tool_calling)
+        })
+        .unwrap_or(true);
+    if supports_tools {
+        return None;
+    }
+    let spec = item
+        .as_ref()
+        .map(|item| item.selection_spec.clone())
+        .unwrap_or_else(|| format!("{provider}/{model}"));
+    Some(format!(
+        "model switch blocked: {spec} is marked no-tools. Use /ask, /context, or /read-only on before switching, or choose a tool-capable model from /models."
+    ))
 }
 
 /// Open a file path in the system browser (cross-platform).

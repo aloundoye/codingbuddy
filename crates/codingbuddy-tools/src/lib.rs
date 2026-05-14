@@ -3,6 +3,7 @@ mod command_guard;
 pub mod custom_tools;
 mod fuzzy_edit;
 mod plugins;
+mod registry;
 mod sandbox;
 mod shell;
 pub mod tool_tiers;
@@ -36,6 +37,10 @@ pub use plugins::{
     plugin_tool_definitions,
 };
 use plugins::{plugin_command_lookup_name, plugin_tool_api_name};
+pub use registry::{
+    RegisteredTool, ToolExecutor, ToolPermissionTarget, ToolRegistry, ToolTruncationPolicy,
+    ToolValidator,
+};
 use serde_json::json;
 use sha2::Digest;
 pub use shell::{

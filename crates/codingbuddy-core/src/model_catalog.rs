@@ -60,6 +60,8 @@ pub struct ModelSelectorItem {
     pub modalities: Vec<ModelModality>,
     pub status: ModelStatus,
     pub provider_status: ProviderStatus,
+    pub chat_protocol: String,
+    pub auth_strategy: String,
     pub local: bool,
     pub cloud: bool,
     pub configured: bool,
@@ -209,6 +211,8 @@ impl Default for ModelSelectorItem {
             modalities: vec![ModelModality::Text],
             status: ModelStatus::Unknown,
             provider_status: ProviderStatus::Unknown,
+            chat_protocol: "openai-chat".to_string(),
+            auth_strategy: "bearer".to_string(),
             local: false,
             cloud: true,
             configured: false,
@@ -546,6 +550,8 @@ fn selector_item_for_model(
         .map(|provider| provider.api_key_env.clone())
         .unwrap_or_default();
     let requires_api_key = !api_key_env.is_empty();
+    let chat_protocol = selector_chat_protocol(provider_config, provider_kind);
+    let auth_strategy = selector_auth_strategy(provider_config, provider_kind, &chat_protocol);
     let explicit_key_for_active_provider = model.provider == active_provider
         && config
             .api_key
@@ -564,6 +570,8 @@ fn selector_item_for_model(
     if configured {
         tags.push("configured".to_string());
     }
+    tags.push(format!("protocol:{chat_protocol}"));
+    tags.push(format!("auth:{auth_strategy}"));
     tags.push(if local { "local" } else { "cloud" }.to_string());
     if requires_api_key {
         tags.push(if api_key_available {
@@ -617,6 +625,8 @@ fn selector_item_for_model(
         modalities: model.modalities.clone(),
         status: model.status,
         provider_status: model.provider_status,
+        chat_protocol,
+        auth_strategy,
         local,
         cloud: !local,
         configured,
@@ -625,6 +635,73 @@ fn selector_item_for_model(
         api_key_available,
         api_key_env,
         tags,
+    }
+}
+
+fn selector_chat_protocol(
+    provider_config: Option<&crate::ProviderConfig>,
+    provider_kind: Option<ProviderKind>,
+) -> String {
+    provider_config
+        .and_then(|provider| provider.chat_protocol.as_deref())
+        .or_else(|| {
+            provider_config.and_then(|provider| {
+                provider
+                    .payload_options
+                    .get("chat_protocol")
+                    .or_else(|| provider.payload_options.get("protocol"))
+                    .and_then(|value| value.as_str())
+            })
+        })
+        .map(normalize_protocol_key)
+        .unwrap_or_else(|| match provider_kind {
+            Some(ProviderKind::Anthropic) => "anthropic-messages".to_string(),
+            Some(ProviderKind::Google) => "gemini-generate-content".to_string(),
+            Some(ProviderKind::Bedrock) => "openai-chat".to_string(),
+            _ => "openai-chat".to_string(),
+        })
+}
+
+fn selector_auth_strategy(
+    provider_config: Option<&crate::ProviderConfig>,
+    provider_kind: Option<ProviderKind>,
+    chat_protocol: &str,
+) -> String {
+    provider_config
+        .and_then(|provider| provider.auth_strategy.as_deref())
+        .map(normalize_auth_key)
+        .unwrap_or_else(|| match (provider_kind, chat_protocol) {
+            (_, "gemini-generate-content") => "query-api-key".to_string(),
+            (_, "bedrock-converse") | (Some(ProviderKind::Bedrock), _) => "aws-sigv4".to_string(),
+            (Some(ProviderKind::Anthropic), _) | (_, "anthropic-messages") => {
+                "x-api-key".to_string()
+            }
+            (Some(ProviderKind::Ollama), _) => "none".to_string(),
+            _ => "bearer".to_string(),
+        })
+}
+
+fn normalize_protocol_key(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "openai" | "chat-completions" | "openai-chat-completions" => "openai-chat".to_string(),
+        "responses" => "openai-responses".to_string(),
+        "anthropic" | "messages" => "anthropic-messages".to_string(),
+        "google" | "gemini" | "generate-content" => "gemini-generate-content".to_string(),
+        "bedrock" | "converse" => "bedrock-converse".to_string(),
+        "" => "openai-chat".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_auth_key(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "bearer-token" | "authorization-bearer" => "bearer".to_string(),
+        "api-key" | "api_key" | "header-api-key" => "x-api-key".to_string(),
+        "query" | "url-api-key" | "gemini-key" => "query-api-key".to_string(),
+        "sigv4" | "aws" => "aws-sigv4".to_string(),
+        "no-auth" | "anonymous" => "none".to_string(),
+        "" => "bearer".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -1044,6 +1121,10 @@ mod tests {
                 base_url: "https://example.invalid".to_string(),
                 api_key_env: "CODINGBUDDY_TEST_AUTH_MISSING".to_string(),
                 openai_compat_prefix: true,
+                chat_protocol: None,
+                auth_strategy: None,
+                headers: std::collections::BTreeMap::new(),
+                discovery: crate::ProviderDiscoveryConfig::default(),
                 payload_options: serde_json::Value::Null,
                 models: ProviderModels {
                     chat: "test-model".to_string(),
@@ -1065,7 +1146,48 @@ mod tests {
             .expect("active selector item");
         assert!(active.requires_api_key);
         assert!(!active.api_key_available);
+        assert_eq!(active.chat_protocol, "openai-chat");
+        assert_eq!(active.auth_strategy, "bearer");
         assert!(active.tags.iter().any(|tag| tag == "auth-missing"));
+        assert!(active.tags.iter().any(|tag| tag == "protocol:openai-chat"));
+        assert!(active.tags.iter().any(|tag| tag == "auth:bearer"));
+    }
+
+    #[test]
+    fn selector_items_expose_explicit_protocol_and_auth() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test-provider".to_string(),
+            ProviderConfig {
+                kind: "openai-compatible".to_string(),
+                base_url: "https://example.invalid".to_string(),
+                api_key_env: "CODINGBUDDY_TEST_AUTH_MISSING".to_string(),
+                openai_compat_prefix: true,
+                chat_protocol: Some("responses".to_string()),
+                auth_strategy: Some("api-key".to_string()),
+                headers: std::collections::BTreeMap::new(),
+                discovery: crate::ProviderDiscoveryConfig::default(),
+                payload_options: serde_json::Value::Null,
+                models: ProviderModels {
+                    chat: "test-model".to_string(),
+                    reasoner: None,
+                },
+            },
+        );
+        let config = LlmConfig {
+            provider: "test-provider".to_string(),
+            providers,
+            ..Default::default()
+        };
+
+        let catalog = ModelCatalog::from_config(&config);
+        let active = catalog
+            .selector_items(&config)
+            .into_iter()
+            .find(|item| item.active)
+            .expect("active selector item");
+        assert_eq!(active.chat_protocol, "openai-responses");
+        assert_eq!(active.auth_strategy, "x-api-key");
     }
 
     #[test]

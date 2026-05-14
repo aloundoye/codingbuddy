@@ -614,13 +614,17 @@ fn model_choice_from_selector(item: codingbuddy_core::ModelSelectorItem) -> Mode
     if item.requires_api_key && !item.api_key_available {
         caps.push("auth-missing");
     }
+    if !item.capability.tool_call {
+        caps.push("no-tools");
+    }
     ModelChoice {
         id: item.id,
         description: format!(
-            "{} ctx, {}, {}, {}",
+            "{} ctx, {}, {}, {}, {}",
             compact_tokens(item.context_tokens),
             compact_cost(item.cost),
             where_label,
+            item.chat_protocol,
             caps.join("/")
         ),
         provider: item.provider,

@@ -287,6 +287,84 @@ pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+pub struct AgenticBenchmarkFixture {
+    pub case_id: String,
+    pub category: String,
+    pub prompt: String,
+    pub expected_tools: Vec<String>,
+    pub denied_tools: Vec<String>,
+    pub provider_protocol: String,
+    pub requires_compaction: bool,
+    pub requires_snapshot: bool,
+    pub requires_subagent: bool,
+    pub terminal_workflow: Vec<String>,
+}
+
+/// Core fixtures for terminal-agent regression suites.
+///
+/// The fixtures describe required behavior without coupling tests to a specific
+/// provider implementation. Test crates can turn these into scripted LLM,
+/// provider payload, permission, compaction, snapshot, and TUI sessions.
+#[must_use]
+pub fn terminal_agent_benchmark_fixtures() -> Vec<AgenticBenchmarkFixture> {
+    vec![
+        AgenticBenchmarkFixture {
+            case_id: "provider-openai-chat-tool-delta".to_string(),
+            category: "provider".to_string(),
+            prompt: "Read src/lib.rs and call one read-only tool before answering.".to_string(),
+            expected_tools: vec!["fs_read".to_string()],
+            provider_protocol: "openai-chat".to_string(),
+            terminal_workflow: vec!["/models".to_string(), "/model deepseek/deepseek-chat".to_string()],
+            ..Default::default()
+        },
+        AgenticBenchmarkFixture {
+            case_id: "multi-file-edit-with-snapshot".to_string(),
+            category: "edit".to_string(),
+            prompt: "Make a two-file Rust edit, run focused tests, and preserve a rewind snapshot."
+                .to_string(),
+            expected_tools: vec![
+                "fs_read".to_string(),
+                "fs_edit".to_string(),
+                "bash_run".to_string(),
+            ],
+            requires_snapshot: true,
+            terminal_workflow: vec!["/diff".to_string(), "/rewind".to_string()],
+            ..Default::default()
+        },
+        AgenticBenchmarkFixture {
+            case_id: "permission-denial-recovery".to_string(),
+            category: "safety".to_string(),
+            prompt: "Attempt a high-risk shell action, handle denial, and choose a safe read-only fallback."
+                .to_string(),
+            expected_tools: vec!["bash_run".to_string(), "fs_read".to_string()],
+            denied_tools: vec!["bash_run".to_string()],
+            terminal_workflow: vec!["approval:deny".to_string()],
+            ..Default::default()
+        },
+        AgenticBenchmarkFixture {
+            case_id: "context-overflow-compaction".to_string(),
+            category: "compaction".to_string(),
+            prompt: "Continue a long session after context pressure while preserving active files and directives."
+                .to_string(),
+            expected_tools: vec!["fs_grep".to_string(), "fs_read".to_string()],
+            requires_compaction: true,
+            terminal_workflow: vec!["/compact active files".to_string()],
+            ..Default::default()
+        },
+        AgenticBenchmarkFixture {
+            case_id: "subagent-background-verification".to_string(),
+            category: "subagent".to_string(),
+            prompt: "Delegate independent verification while continuing the main implementation.".to_string(),
+            expected_tools: vec!["task".to_string()],
+            requires_subagent: true,
+            terminal_workflow: vec!["/tasks".to_string()],
+            ..Default::default()
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CodingBenchmarkCaseResult {
     pub case_id: String,
     pub category: String,
@@ -1120,6 +1198,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn terminal_agent_benchmark_fixtures_cover_required_surfaces() {
+        let fixtures = terminal_agent_benchmark_fixtures();
+        assert!(fixtures.iter().any(|case| case.category == "provider"));
+        assert!(fixtures.iter().any(|case| case.requires_snapshot));
+        assert!(fixtures.iter().any(|case| case.requires_compaction));
+        assert!(fixtures.iter().any(|case| case.requires_subagent));
+        assert!(
+            fixtures
+                .iter()
+                .any(|case| !case.denied_tools.is_empty() && case.category == "safety")
+        );
+    }
 
     #[test]
     fn replay_smoke() {
