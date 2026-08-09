@@ -1,8 +1,6 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
-use codingbuddy_core::{
-    AppConfig, EventKind, ToolCall, normalize_codingbuddy_profile, runtime_dir,
-};
+use codingbuddy_core::{AppConfig, EventKind, ToolCall, runtime_dir};
 use codingbuddy_index::IndexService;
 use codingbuddy_policy::{PolicyEngine, TeamPolicyLocks, team_policy_locks};
 use codingbuddy_store::Store;
@@ -533,7 +531,6 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         .as_deref()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
-    let _profile = normalize_codingbuddy_profile(&cfg.llm.profile).unwrap_or("invalid");
 
     let checks = json!({
         "git": command_exists("git"),

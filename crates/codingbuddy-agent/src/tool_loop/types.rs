@@ -155,7 +155,11 @@ impl Default for ToolLoopConfig {
     fn default() -> Self {
         Self {
             model: codingbuddy_core::CODINGBUDDY_V32_CHAT_MODEL.to_string(),
-            max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
+            max_tokens: codingbuddy_core::max_output_tokens_for_model(
+                ProviderKind::Deepseek,
+                codingbuddy_core::CODINGBUDDY_V32_CHAT_MODEL,
+                true,
+            ),
             provider_kind: ProviderKind::Deepseek,
             temperature: None,
             context_window_tokens: 128_000,

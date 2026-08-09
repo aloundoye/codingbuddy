@@ -43,10 +43,11 @@ use anyhow::{Result, anyhow};
 use codingbuddy_core::{
     ChatMessage, ChatRequest, EventKind, LlmToolCall, Plan, PlanStep, RuntimeToolMetadata, Session,
     SessionState, StreamCallback, StreamChunk, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
-    ToolHost, UserQuestion, estimate_message_tokens, strip_prior_reasoning_content,
+    ToolHost, UserQuestion, estimate_message_tokens, max_output_tokens_for_model,
+    strip_prior_reasoning_content,
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
-use codingbuddy_llm::{LlmClient, max_output_tokens_for_model};
+use codingbuddy_llm::LlmClient;
 use codingbuddy_store::{SessionTodoRecord, Store, TaskQueueRecord};
 use codingbuddy_tools::{format_tool_search_results, search_extended_tools};
 use std::collections::{HashMap, VecDeque};

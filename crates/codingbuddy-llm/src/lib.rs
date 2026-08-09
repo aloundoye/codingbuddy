@@ -3,7 +3,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
     AppliedCompatibility, CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig,
     LlmRequest, LlmResponse, LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
-    normalize_codingbuddy_model, normalize_codingbuddy_profile,
+    max_output_tokens_for_model,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -255,8 +255,7 @@ impl ApiClient {
     }
 
     fn resolved_endpoint(&self, is_chat: bool, is_fim: bool, is_strict_tools: bool) -> String {
-        let default_ep = "https://api.deepseek.com/chat/completions";
-        if self.cfg.endpoint != default_ep && !self.cfg.endpoint.is_empty() {
+        if !self.cfg.endpoint.is_empty() {
             return self.cfg.endpoint.clone();
         }
         let provider = self.provider_config();
@@ -455,12 +454,8 @@ impl ApiClient {
             }
             messages.push(json!({"role": "user", "content": parts}));
         }
-        // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
-        let model = if capabilities.provider == ProviderKind::Deepseek {
-            normalize_codingbuddy_model(&req.model).unwrap_or(req.model.as_str())
-        } else {
-            req.model.as_str()
-        };
+        // Model names pass through as-is for all providers.
+        let model = req.model.as_str();
 
         let mut payload = json!({
             "model": model,
@@ -486,13 +481,8 @@ impl ApiClient {
     }
 
     fn build_fim_payload(&self, req: &FimRequest) -> Value {
-        let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
         let mut payload = json!({
-            "model": if provider == ProviderKind::Deepseek {
-                normalize_codingbuddy_model(&req.model).unwrap_or(&req.model)
-            } else {
-                &req.model
-            },
+            "model": &req.model,
             "prompt": req.prompt,
             "max_tokens": req.max_tokens.min(8192),
             "stream": false
@@ -598,11 +588,7 @@ impl ApiClient {
         let max_cap =
             max_output_tokens_for_model(capabilities.provider, &req.model, thinking_enabled);
         let mut payload = json!({
-            "model": if capabilities.provider == ProviderKind::Deepseek {
-                normalize_codingbuddy_model(&req.model).unwrap_or(&req.model)
-            } else {
-                &req.model
-            },
+            "model": &req.model,
             "messages": prepared_messages.messages,
             "max_tokens": req.max_tokens.min(max_cap),
             "stream": false
@@ -1307,30 +1293,7 @@ impl ApiClient {
         if trimmed.is_empty() {
             return Err(anyhow!("llm model must not be empty"));
         }
-        match self.provider_kind()? {
-            ProviderKind::Deepseek => {
-                let normalized = normalize_codingbuddy_model(trimmed).ok_or_else(|| {
-                    anyhow!(
-                        "unsupported model '{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
-                        requested
-                    )
-                })?;
-                Ok(normalized.to_string())
-            }
-            ProviderKind::OpenAiCompatible
-            | ProviderKind::Anthropic
-            | ProviderKind::Google
-            | ProviderKind::Groq
-            | ProviderKind::OpenRouter
-            | ProviderKind::Ollama
-            | ProviderKind::Azure
-            | ProviderKind::Bedrock
-            | ProviderKind::Vertex
-            | ProviderKind::MistralApi
-            | ProviderKind::Xai
-            | ProviderKind::Together
-            | ProviderKind::Copilot => Ok(trimmed.to_string()),
-        }
+        Ok(trimmed.to_string())
     }
 
     /// Validate parameters that are incompatible with provider-managed thinking modes.
@@ -1673,67 +1636,25 @@ impl ApiClient {
 // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 // annotate_cache_control / apply_cache_annotations / payload_rejects_cache_control removed in P9.
 
-/// Returns the maximum output token limit for the given model.
-///
-/// Thinking-aware: `deepseek-chat` with thinking enabled can output up to 32K tokens,
-/// compared to 8K without thinking. `deepseek-reasoner` always outputs up to 64K.
-pub fn max_output_tokens_for_model(
-    provider: ProviderKind,
-    model: &str,
-    thinking_enabled: bool,
-) -> u32 {
-    if provider == ProviderKind::Deepseek && codingbuddy_core::is_reasoner_model(model) {
-        codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS // 65536
-    } else if provider == ProviderKind::Deepseek && thinking_enabled {
-        codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS // 32768
-    } else {
-        codingbuddy_core::CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS // 8192
-    }
-}
-
 impl LlmClient for ApiClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        let provider = self.provider_kind()?;
+        let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
-        if provider == ProviderKind::Deepseek {
-            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-                anyhow!(
-                    "unsupported llm.profile='{}' (supported: v3_2)",
-                    self.cfg.profile
-                )
-            })?;
-        }
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.complete_inner(&normalized_req, key.as_deref())
     }
 
     fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        let provider = self.provider_kind()?;
+        let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
-        if provider == ProviderKind::Deepseek {
-            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-                anyhow!(
-                    "unsupported llm.profile='{}' (supported: v3_2)",
-                    self.cfg.profile
-                )
-            })?;
-        }
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.complete_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
     fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        let provider = self.provider_kind()?;
-        if provider == ProviderKind::Deepseek {
-            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-                anyhow!(
-                    "unsupported llm.profile='{}' (supported: v3_2)",
-                    self.cfg.profile
-                )
-            })?;
-        }
+        let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
@@ -1747,15 +1668,7 @@ impl LlmClient for ApiClient {
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let provider = self.provider_kind()?;
-        if provider == ProviderKind::Deepseek {
-            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-                anyhow!(
-                    "unsupported llm.profile='{}' (supported: v3_2)",
-                    self.cfg.profile
-                )
-            })?;
-        }
+        let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
@@ -1765,15 +1678,7 @@ impl LlmClient for ApiClient {
     }
 
     fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
-        let provider = self.provider_kind()?;
-        if provider == ProviderKind::Deepseek {
-            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-                anyhow!(
-                    "unsupported llm.profile='{}' (supported: v3_2)",
-                    self.cfg.profile
-                )
-            })?;
-        }
+        let _provider = self.provider_kind()?;
         let resolution = self
             .cfg
             .capability_resolution_for_model(&req.model)
@@ -1797,22 +1702,12 @@ impl LlmClient for ApiClient {
         }
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
-        if provider == ProviderKind::Deepseek {
-            normalized_req.model = self.resolve_request_model(&req.model)?;
-        }
+        normalized_req.model = self.resolve_request_model(&req.model)?;
         self.complete_fim_inner(&normalized_req, key.as_deref())
     }
 
     fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        let provider = self.provider_kind()?;
-        if provider == ProviderKind::Deepseek {
-            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-                anyhow!(
-                    "unsupported llm.profile='{}' (supported: v3_2)",
-                    self.cfg.profile
-                )
-            })?;
-        }
+        let _provider = self.provider_kind()?;
         let resolution = self
             .cfg
             .capability_resolution_for_model(&req.model)
@@ -1836,9 +1731,7 @@ impl LlmClient for ApiClient {
         }
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
-        if provider == ProviderKind::Deepseek {
-            normalized_req.model = self.resolve_request_model(&req.model)?;
-        }
+        normalized_req.model = self.resolve_request_model(&req.model)?;
         self.complete_fim_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
@@ -2416,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    fn model_alias_is_normalized_in_payload() {
+    fn model_name_passes_through_unmodified_in_payload() {
         let client = ApiClient::new(LlmConfig::default()).expect("client");
         let payload = client.build_payload(&LlmRequest {
             unit: codingbuddy_core::LlmUnit::Planner,
@@ -2427,7 +2320,7 @@ mod tests {
             images: vec![],
             provider_options: Default::default(),
         });
-        assert_eq!(payload["model"], "deepseek-chat");
+        assert_eq!(payload["model"], "codingbuddy-v3.2");
     }
 
     #[test]
@@ -2450,49 +2343,6 @@ mod tests {
             })
             .expect_err("truly unsupported provider should fail");
         assert!(err.to_string().contains("unsupported llm.provider"));
-    }
-
-    #[test]
-    fn unsupported_profile_is_rejected() {
-        let cfg = LlmConfig {
-            profile: "unknown".to_string(),
-            api_key: Some("test-key".to_string()),
-            ..LlmConfig::default()
-        };
-        let client = ApiClient::new(cfg).expect("client");
-        let err = client
-            .complete(&LlmRequest {
-                unit: codingbuddy_core::LlmUnit::Planner,
-                prompt: "hello".to_string(),
-                model: "deepseek-chat".to_string(),
-                max_tokens: 128,
-                non_urgent: false,
-                images: vec![],
-                provider_options: Default::default(),
-            })
-            .expect_err("unsupported profile should fail");
-        assert!(err.to_string().contains("unsupported llm.profile"));
-    }
-
-    #[test]
-    fn unsupported_model_is_rejected_before_network_call() {
-        let cfg = LlmConfig {
-            api_key: Some("test-key".to_string()),
-            ..LlmConfig::default()
-        };
-        let client = ApiClient::new(cfg).expect("client");
-        let err = client
-            .complete(&LlmRequest {
-                unit: codingbuddy_core::LlmUnit::Planner,
-                prompt: "hello".to_string(),
-                model: "not-a-codingbuddy-model".to_string(),
-                max_tokens: 128,
-                non_urgent: false,
-                images: vec![],
-                provider_options: Default::default(),
-            })
-            .expect_err("unsupported model should fail");
-        assert!(err.to_string().contains("unsupported model"));
     }
 
     #[test]
@@ -4121,10 +3971,6 @@ mod tests {
     fn model_max_output_tokens_reasoner() {
         assert_eq!(
             max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
-            codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS
-        );
-        assert_eq!(
-            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
             65536
         );
         // Reasoner always returns 64K regardless of thinking flag
@@ -4138,20 +3984,12 @@ mod tests {
     fn model_max_output_tokens_chat() {
         assert_eq!(
             max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", false),
-            codingbuddy_core::CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS
-        );
-        assert_eq!(
-            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", false),
             8192
         );
     }
 
     #[test]
     fn max_output_tokens_thinking_chat_32k() {
-        assert_eq!(
-            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", true),
-            codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS
-        );
         assert_eq!(
             max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", true),
             32768

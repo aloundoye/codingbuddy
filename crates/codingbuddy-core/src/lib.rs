@@ -37,40 +37,19 @@ pub type ProviderOptions = BTreeMap<String, serde_json::Value>;
 // DeepSeek API model constants.
 pub const CODINGBUDDY_V32_CHAT_MODEL: &str = "deepseek-chat";
 pub const CODINGBUDDY_V32_REASONER_MODEL: &str = "deepseek-reasoner";
-pub const CODINGBUDDY_PROFILE_V32: &str = "v3_2";
 
-/// Maximum output tokens for deepseek-chat (V3 non-thinking).
-pub const CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS: u32 = 8192;
-/// Maximum output tokens for deepseek-chat with thinking enabled.
-pub const CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS: u32 = 32_768;
-/// Maximum output tokens for deepseek-reasoner (thinking/R1).
-pub const CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS: u32 = 65536;
-
-pub fn normalize_codingbuddy_model(model: &str) -> Option<&'static str> {
-    let normalized = model.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "deepseek-chat" | "codingbuddy-v3.2" | "codingbuddy-v3.2-chat" | "v3.2" | "v3_2" => {
-            Some(CODINGBUDDY_V32_CHAT_MODEL)
-        }
-        "deepseek-reasoner"
-        | "codingbuddy-v3.2-reasoner"
-        | "reasoner"
-        | "v3.2-reasoner"
-        | "v3_2_reasoner" => Some(CODINGBUDDY_V32_REASONER_MODEL),
-        _ => None,
-    }
-}
-
-/// Returns true if the model name refers to the deepseek-reasoner (or any alias).
-pub fn is_reasoner_model(model: &str) -> bool {
-    normalize_codingbuddy_model(model) == Some(CODINGBUDDY_V32_REASONER_MODEL)
-}
-
-pub fn normalize_codingbuddy_profile(profile: &str) -> Option<&'static str> {
-    let normalized = profile.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "" | "v3_2" | "v3.2" | "v32" | "codingbuddy-v3.2" => Some(CODINGBUDDY_PROFILE_V32),
-        _ => None,
+/// Maximum output tokens for a model, looked up from the capability registry.
+/// Falls back to 8192 if no capability data is available.
+pub fn max_output_tokens_for_model(
+    provider: ProviderKind,
+    model: &str,
+    thinking_enabled: bool,
+) -> u32 {
+    let caps = model_capabilities(provider, model);
+    match caps.thinking_capability {
+        ThinkingCapability::NativeReasoning => 65536,
+        ThinkingCapability::ExtendedThinking if thinking_enabled => 32768,
+        _ => 8192,
     }
 }
 
@@ -2748,7 +2727,7 @@ impl Default for LlmConfig {
             providers: default_providers(),
             capability_overrides: CapabilityRegistryOverrides::default(),
             model_catalog: ModelCatalogConfig::default(),
-            profile: CODINGBUDDY_PROFILE_V32.to_string(),
+            profile: "v3_2".to_string(),
             context_window_tokens: 128_000,
             temperature: 0.2,
             base_url: "https://api.deepseek.com".to_string(),
@@ -4077,18 +4056,6 @@ mod tests {
         }
     }
 
-    fn model_alias_strategy() -> impl Strategy<Value = &'static str> {
-        prop_oneof![
-            Just("deepseek-chat"),
-            Just("codingbuddy-v3.2"),
-            Just("v3.2"),
-            Just("v3_2"),
-            Just("deepseek-reasoner"),
-            Just("codingbuddy-v3.2-reasoner"),
-            Just("reasoner"),
-        ]
-    }
-
     fn session_state_strategy() -> impl Strategy<Value = SessionState> {
         prop_oneof![
             Just(SessionState::Idle),
@@ -4103,22 +4070,6 @@ mod tests {
     }
 
     proptest! {
-        #[test]
-        fn codingbuddy_model_normalization_is_case_and_whitespace_tolerant(
-            alias in model_alias_strategy(),
-            left_ws in 0usize..3,
-            right_ws in 0usize..3,
-            upper in any::<bool>(),
-        ) {
-            let source = if upper {
-                alias.to_ascii_uppercase()
-            } else {
-                alias.to_string()
-            };
-            let candidate = format!("{}{}{}", " ".repeat(left_ws), source, " ".repeat(right_ws));
-            prop_assert!(normalize_codingbuddy_model(&candidate).is_some());
-        }
-
         #[test]
         fn merge_json_value_is_idempotent_for_flat_objects(
             base in prop::collection::btree_map("[a-z]{1,8}", any::<i64>(), 0..12),

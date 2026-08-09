@@ -1,8 +1,6 @@
 use crate::{
-    CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS, CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
-    CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS, CapabilityRegistryOverrides, LlmConfig,
-    ModelCapabilities, ModelFamily, ProviderKind, detect_model_family, is_reasoner_model,
-    normalize_provider_kind, resolve_model_capabilities,
+    CapabilityRegistryOverrides, LlmConfig, ModelCapabilities, ModelFamily, ProviderKind,
+    detect_model_family, normalize_provider_kind, resolve_model_capabilities,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -819,16 +817,7 @@ fn default_modalities(capabilities: &ModelCapabilities) -> Vec<ModelModality> {
 }
 
 fn default_output_tokens(capabilities: &ModelCapabilities, model: &str) -> u32 {
-    if capabilities.provider == ProviderKind::Deepseek && is_reasoner_model(model) {
-        CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS
-    } else if capabilities.provider == ProviderKind::Deepseek
-        && capabilities.supports_thinking_config
-        && capabilities.thinking_capability.has_reasoning()
-    {
-        CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS
-    } else {
-        CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS
-    }
+    crate::max_output_tokens_for_model(capabilities.provider, model, true)
 }
 
 fn parse_modalities(
@@ -1004,10 +993,7 @@ mod tests {
         let reasoner = catalog
             .find("deepseek", "deepseek-reasoner")
             .expect("reasoner");
-        assert_eq!(
-            reasoner.limits.output_tokens,
-            CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS
-        );
+        assert_eq!(reasoner.limits.output_tokens, 65536);
     }
 
     #[test]

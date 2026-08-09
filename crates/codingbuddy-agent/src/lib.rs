@@ -850,13 +850,18 @@ impl AgentEngine {
             _ => None,
         };
 
+        let provider_kind = cfg
+            .llm
+            .active_provider_kind()
+            .unwrap_or(codingbuddy_core::ProviderKind::Deepseek);
         let config = tool_loop::ToolLoopConfig {
             model: active_base_model.clone(),
-            max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
-            provider_kind: cfg
-                .llm
-                .active_provider_kind()
-                .unwrap_or(codingbuddy_core::ProviderKind::Deepseek),
+            max_tokens: codingbuddy_core::max_output_tokens_for_model(
+                provider_kind,
+                &active_base_model,
+                true,
+            ),
+            provider_kind,
             temperature: None, // Incompatible with thinking mode
             context_window_tokens: cfg.llm.context_window_tokens,
             reserved_overhead_tokens: cfg.context.reserved_overhead_tokens,

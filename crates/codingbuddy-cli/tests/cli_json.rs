@@ -79,38 +79,6 @@ fn ask_json_uses_workspace_local_api_key_when_env_missing() {
 }
 
 #[test]
-fn ask_json_rejects_invalid_codingbuddy_profile() {
-    let workspace = TempDir::new().expect("workspace");
-    let mock = start_mock_llm_server();
-    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
-    fs::write(
-        workspace.path().join(".codingbuddy/settings.local.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "llm": {
-                "provider": "deepseek",
-                "profile": "invalid_profile",
-                "endpoint": mock.endpoint,
-                "api_key_env": "DEEPSEEK_API_KEY"
-            }
-        }))
-        .expect("serialize settings"),
-    )
-    .expect("settings");
-
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
-        .current_dir(workspace.path())
-        .env("DEEPSEEK_API_KEY", "test-api-key")
-        .args(["--json", "ask", "hello"])
-        .assert()
-        .failure()
-        .get_output()
-        .stderr
-        .clone();
-    let stderr = String::from_utf8_lossy(&output);
-    assert!(stderr.contains("llm.profile"));
-}
-
-#[test]
 fn config_show_redacts_api_key_in_json_and_text_modes() {
     let workspace = TempDir::new().expect("workspace");
     let runtime = workspace.path().join(".codingbuddy");

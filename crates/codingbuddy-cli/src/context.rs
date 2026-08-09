@@ -1,8 +1,7 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
-    AppConfig, EventEnvelope, EventKind, Session, SessionBudgets, SessionState,
-    normalize_codingbuddy_model, normalize_codingbuddy_profile, runtime_dir,
+    AppConfig, EventEnvelope, EventKind, Session, SessionBudgets, SessionState, runtime_dir,
 };
 use codingbuddy_store::Store;
 use serde_json::json;
@@ -261,34 +260,12 @@ pub(crate) fn ensure_llm_ready_with_cfg(
 ) -> Result<()> {
     use std::io::IsTerminal;
 
-    let provider_kind = cfg.llm.active_provider_kind().ok_or_else(|| {
+    let _provider_kind = cfg.llm.active_provider_kind().ok_or_else(|| {
         anyhow!(
             "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
             cfg.llm.provider
         )
     })?;
-    if provider_kind == codingbuddy_core::ProviderKind::Deepseek {
-        let _profile = normalize_codingbuddy_profile(&cfg.llm.profile).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.profile='{}' (supported: v3_2)",
-                cfg.llm.profile
-            )
-        })?;
-        let active_base_model = cfg.llm.active_base_model();
-        if normalize_codingbuddy_model(&active_base_model).is_none() {
-            return Err(anyhow!(
-                "unsupported active chat model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
-                active_base_model
-            ));
-        }
-        let active_reasoner_model = cfg.llm.active_reasoner_model();
-        if normalize_codingbuddy_model(&active_reasoner_model).is_none() {
-            return Err(anyhow!(
-                "unsupported active reasoner model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
-                active_reasoner_model
-            ));
-        }
-    }
 
     let provider = cfg.llm.active_provider();
     let env_key = provider.api_key_env.trim();

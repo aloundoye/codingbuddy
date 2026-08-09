@@ -54,11 +54,11 @@ pub fn analyze(
 
     let (model, is_reasoner) = if options.force_max_think {
         let m = cfg.llm.active_reasoner_model();
-        let r = codingbuddy_core::is_reasoner_model(&m);
+        let r = m.to_ascii_lowercase().contains("reasoner");
         (m, r)
     } else {
         let m = cfg.llm.active_base_model();
-        let r = codingbuddy_core::is_reasoner_model(&m);
+        let r = m.to_ascii_lowercase().contains("reasoner");
         (m, r)
     };
 
@@ -74,11 +74,13 @@ pub fn analyze(
             messages: messages.clone(),
             tools: vec![],
             tool_choice: ToolChoice::none(),
-            max_tokens: if is_reasoner {
-                codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS
-            } else {
-                8192
-            },
+            max_tokens: codingbuddy_core::max_output_tokens_for_model(
+                cfg.llm
+                    .active_provider_kind()
+                    .unwrap_or(codingbuddy_core::ProviderKind::Deepseek),
+                &model,
+                false,
+            ),
             // Reasoner rejects temperature; deepseek-chat needs 0.0 for determinism
             temperature: if is_reasoner { None } else { Some(0.0) },
             top_p: None,

@@ -1,4 +1,3 @@
-use crate::{CODINGBUDDY_V32_CHAT_MODEL, CODINGBUDDY_V32_REASONER_MODEL};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -278,8 +277,8 @@ pub fn detect_model_family(model: &str) -> ModelFamily {
     } else if lower.contains("gemini") {
         ModelFamily::Gemini
     } else if lower.contains("deepseek")
-        || lower == CODINGBUDDY_V32_CHAT_MODEL
-        || lower == CODINGBUDDY_V32_REASONER_MODEL
+        || lower == crate::CODINGBUDDY_V32_CHAT_MODEL
+        || lower == crate::CODINGBUDDY_V32_REASONER_MODEL
     {
         ModelFamily::Deepseek
     } else if lower.starts_with("gpt-")
@@ -357,7 +356,7 @@ fn base_capabilities(
 ) -> ModelCapabilities {
     match provider {
         ProviderKind::Deepseek => {
-            let is_reasoner = crate::is_reasoner_model(model);
+            let is_reasoner = model.trim().to_ascii_lowercase().contains("reasoner");
             ModelCapabilities {
                 provider,
                 family,

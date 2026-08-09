@@ -252,7 +252,7 @@ fn query_matches_tool_metadata(
 
 fn is_weak_model_for_tool_search(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    !codingbuddy_core::is_reasoner_model(model)
+    !lower.contains("reasoner")
         && (lower.contains("deepseek")
             || lower.contains("qwen")
             || lower.contains("phi")
@@ -299,7 +299,11 @@ pub(super) fn handle_extended_thinking(
         ],
         tools: tool_loop.tools.clone(),
         tool_choice: ToolChoice::auto(),
-        max_tokens: codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS,
+        max_tokens: codingbuddy_core::max_output_tokens_for_model(
+            tool_loop.config.provider_kind,
+            &tool_loop.config.extended_thinking_model,
+            false,
+        ),
         temperature: None,
         top_p: None,
         presence_penalty: None,
