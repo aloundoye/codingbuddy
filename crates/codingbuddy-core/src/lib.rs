@@ -2731,7 +2731,7 @@ impl Default for LlmConfig {
             context_window_tokens: 128_000,
             temperature: 0.2,
             base_url: "https://api.deepseek.com".to_string(),
-            endpoint: "https://api.deepseek.com/chat/completions".to_string(),
+            endpoint: String::new(),
             api_key: None,
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             fast_mode: false,
