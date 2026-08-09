@@ -3,7 +3,6 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
     AppliedCompatibility, CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig,
     LlmRequest, LlmResponse, LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
-    max_output_tokens_for_model,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -12,29 +11,15 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::io::BufRead;
-use std::ops::Deref;
 use std::thread;
 use std::time::Duration;
 
 pub mod model_catalog;
+pub mod payload;
 pub mod protocol;
 mod provider_transform;
 pub mod providers;
 pub mod retry;
-
-#[derive(Debug, Clone)]
-struct PreparedPayload {
-    payload: Value,
-    compatibility: AppliedCompatibility,
-}
-
-impl Deref for PreparedPayload {
-    type Target = Value;
-
-    fn deref(&self) -> &Self::Target {
-        &self.payload
-    }
-}
 
 /// Base delay for network/transport error retries (1s, 2s, 4s exponential backoff).
 const NETWORK_RETRY_BASE_MS: u64 = 1000;
@@ -308,7 +293,7 @@ impl ApiClient {
     }
 
     fn complete_inner(&self, req: &LlmRequest, api_key: Option<&str>) -> Result<LlmResponse> {
-        let prepared = self.build_payload(req);
+        let prepared = payload::build_simple_payload(req, &self.cfg);
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -371,322 +356,8 @@ impl ApiClient {
         Err(last_err.unwrap_or_else(|| anyhow!("deepseek request failed without detailed error")))
     }
 
-    fn build_payload(&self, req: &LlmRequest) -> PreparedPayload {
-        let provider = self.provider_config();
-        let capabilities = self
-            .cfg
-            .capabilities_for_model(&req.model)
-            .unwrap_or_else(|| {
-                codingbuddy_core::model_capabilities(
-                    self.provider_kind().unwrap_or(ProviderKind::Deepseek),
-                    &req.model,
-                )
-            });
-        let fast_mode = self.cfg.fast_mode;
-        let max_cap = max_output_tokens_for_model(capabilities.provider, &req.model, false);
-        if req.max_tokens > max_cap {
-            eprintln!(
-                "warning: requested max_tokens ({}) exceeds model limit for {} ({}); capping",
-                req.max_tokens, req.model, max_cap
-            );
-        }
-        let max_tokens = if fast_mode {
-            req.max_tokens.min(2048)
-        } else {
-            req.max_tokens.min(max_cap)
-        };
-        let temperature = if fast_mode {
-            self.cfg.temperature.min(0.2)
-        } else {
-            self.cfg.temperature
-        };
-        let mut messages = Vec::new();
-        if !self.cfg.language.trim().is_empty() && !self.cfg.language.eq_ignore_ascii_case("en") {
-            messages.push(json!({
-                "role": "system",
-                "content": format!(
-                    "Respond in {} unless the user explicitly asks for another language.",
-                    self.cfg.language
-                )
-            }));
-        }
-        let mut compatibility = AppliedCompatibility {
-            provider: capabilities.provider.as_key().to_string(),
-            family: capabilities.family.as_key().to_string(),
-            ..AppliedCompatibility::default()
-        };
-
-        if req.images.is_empty() {
-            messages.push(json!({"role": "user", "content": req.prompt}));
-        } else {
-            let mut parts = vec![json!({"type": "text", "text": req.prompt})];
-            for img in &req.images {
-                if img.mime.trim().is_empty() {
-                    parts.push(json!({
-                        "type": "text",
-                        "text": "ERROR: A provided image input is malformed (missing mime type). Explain this limitation to the user.",
-                    }));
-                    compatibility
-                        .degraded_inputs
-                        .push("malformed image input".to_string());
-                    continue;
-                }
-                if !capabilities.supports_image_input || img.base64_data.trim().is_empty() {
-                    let reason = if img.base64_data.trim().is_empty() {
-                        format!("empty {} input", img.mime)
-                    } else {
-                        format!("unsupported {} input", img.mime)
-                    };
-                    compatibility.degraded_inputs.push(reason);
-                    parts.push(json!({
-                        "type": "text",
-                        "text": format!(
-                            "ERROR: The current model cannot consume the provided {} input. Explain this limitation to the user and continue without reading the image.",
-                            img.mime
-                        ),
-                    }));
-                    continue;
-                }
-                parts.push(json!({
-                    "type": "image_url",
-                    "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
-                }));
-            }
-            messages.push(json!({"role": "user", "content": parts}));
-        }
-        // Model names pass through as-is for all providers.
-        let model = req.model.as_str();
-
-        let mut payload = json!({
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": self.cfg.stream,
-            "max_tokens": max_tokens
-        });
-        provider_transform::apply_provider_payload_options_map(
-            &mut payload,
-            &req.provider_options,
-            &req.model,
-            &provider,
-            &capabilities,
-            &mut compatibility,
-        );
-        compatibility.transforms.sort();
-        compatibility.transforms.dedup();
-        PreparedPayload {
-            payload,
-            compatibility,
-        }
-    }
-
-    fn build_fim_payload(&self, req: &FimRequest) -> Value {
-        let mut payload = json!({
-            "model": &req.model,
-            "prompt": req.prompt,
-            "max_tokens": req.max_tokens.min(8192),
-            "stream": false
-        });
-        if let Some(s) = &req.suffix {
-            payload["suffix"] = json!(s);
-        }
-        if let Some(temp) = req.temperature {
-            payload["temperature"] = json!(temp);
-        }
-        if let Some(top_p) = req.top_p {
-            payload["top_p"] = json!(top_p);
-        }
-        if let Some(pp) = req.presence_penalty {
-            payload["presence_penalty"] = json!(pp);
-        }
-        if let Some(fp) = req.frequency_penalty {
-            payload["frequency_penalty"] = json!(fp);
-        }
-        payload
-    }
-
-    fn build_chat_payload(&self, req: &ChatRequest) -> Result<PreparedPayload> {
-        let provider = self.provider_config();
-        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
-                self.cfg.provider
-            )
-        })?;
-        let chat_protocol = protocol::select_chat_protocol(&provider, capabilities.provider);
-
-        // Native providers: build their own payload format
-        match chat_protocol {
-            protocol::ChatProtocol::OpenAiResponses | protocol::ChatProtocol::BedrockConverse => {
-                let adapter = protocol::adapters::adapter_for(chat_protocol);
-                return Err(anyhow!(
-                    "chat protocol '{}' is registered ({:?}) but not enabled in the runtime execution path yet; set provider.chat_protocol='openai-chat' or use a provider with native support for this protocol",
-                    chat_protocol.as_key(),
-                    adapter.payload_shape
-                ));
-            }
-            protocol::ChatProtocol::AnthropicMessages => {
-                let max_cap = max_output_tokens_for_model(
-                    capabilities.provider,
-                    &req.model,
-                    req.thinking
-                        .as_ref()
-                        .is_some_and(|t| t.thinking_type == "enabled"),
-                );
-                let payload =
-                    providers::anthropic::build_payload(req, req.max_tokens.min(max_cap))?;
-                return Ok(PreparedPayload {
-                    payload,
-                    compatibility: AppliedCompatibility {
-                        provider: "anthropic".to_string(),
-                        family: capabilities.family.as_key().to_string(),
-                        transforms: vec![
-                            "protocol:anthropic-messages".to_string(),
-                            "native_anthropic_messages_api".to_string(),
-                        ],
-                        degraded_inputs: vec![],
-                    },
-                });
-            }
-            protocol::ChatProtocol::GeminiGenerateContent => {
-                let max_cap = max_output_tokens_for_model(capabilities.provider, &req.model, false);
-                let payload = providers::google::build_payload(req, req.max_tokens.min(max_cap))?;
-                return Ok(PreparedPayload {
-                    payload,
-                    compatibility: AppliedCompatibility {
-                        provider: "google".to_string(),
-                        family: capabilities.family.as_key().to_string(),
-                        transforms: vec![
-                            "protocol:gemini-generate-content".to_string(),
-                            "native_gemini_generate_content_api".to_string(),
-                        ],
-                        degraded_inputs: vec![],
-                    },
-                });
-            }
-            _ => {} // Fall through to OpenAI-compatible path
-        }
-        let requested_thinking = req
-            .thinking
-            .as_ref()
-            .is_some_and(|t| t.thinking_type == "enabled");
-        let thinking_enabled =
-            requested_thinking && capabilities.thinking_capability.accepts_thinking_config();
-        let prepared_messages = provider_transform::preflight_chat_messages(req, &capabilities)?;
-        let mut compatibility = AppliedCompatibility {
-            provider: capabilities.provider.as_key().to_string(),
-            family: capabilities.family.as_key().to_string(),
-            transforms: prepared_messages.transforms,
-            degraded_inputs: prepared_messages.degraded_inputs,
-        };
-        compatibility
-            .transforms
-            .push(format!("protocol:{}", chat_protocol.as_key()));
-
-        // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
-
-        let max_cap =
-            max_output_tokens_for_model(capabilities.provider, &req.model, thinking_enabled);
-        let mut payload = json!({
-            "model": &req.model,
-            "messages": prepared_messages.messages,
-            "max_tokens": req.max_tokens.min(max_cap),
-            "stream": false
-        });
-        // Providers with explicit thinking configs require these sampling
-        // params to be omitted while thinking is enabled.
-        if thinking_enabled {
-            if req.logprobs == Some(true) || req.top_logprobs.is_some() {
-                // Cannot return Err from a non-Result fn; the caller validates via
-                // complete_chat which calls validate_thinking_params. We strip silently
-                // here and let validate_thinking_params catch it early.
-            }
-        } else {
-            if let Some(temp) = req.temperature {
-                payload["temperature"] = json!(temp);
-            }
-            if let Some(top_p) = req.top_p {
-                payload["top_p"] = json!(top_p);
-            }
-            if let Some(pp) = req.presence_penalty {
-                payload["presence_penalty"] = json!(pp);
-            }
-            if let Some(fp) = req.frequency_penalty {
-                payload["frequency_penalty"] = json!(fp);
-            }
-        }
-
-        if let Some(fmt) = &req.response_format {
-            payload["response_format"] = fmt.clone();
-        }
-
-        if let Some(logprobs) = req.logprobs
-            && !thinking_enabled
-        {
-            payload["logprobs"] = json!(logprobs);
-        }
-        if let Some(top_logprobs) = req.top_logprobs
-            && !thinking_enabled
-        {
-            payload["top_logprobs"] = json!(top_logprobs);
-        }
-        // Safety net: deepseek-reasoner thinks natively and rejects both
-        // `thinking` config AND `tool_choice` (HTTP 400). The callers should
-        // already omit these, but guard here as the last line of defense.
-        if capabilities.thinking_capability.accepts_thinking_config()
-            && let Some(ref thinking) = req.thinking
-        {
-            payload["thinking"] = serde_json::to_value(thinking)?;
-        }
-        if capabilities.supports_tool_calling
-            && let Some(prepared_tools) = provider_transform::prepare_chat_tools_with_compatibility(
-                req,
-                &capabilities,
-                &provider.base_url,
-                &self.cfg.endpoint,
-                &mut compatibility,
-            )?
-        {
-            payload["tools"] = json!(prepared_tools.tools);
-            if !prepared_tools.shim_only {
-                if capabilities.supports_parallel_tool_calls
-                    && matches!(
-                        capabilities.provider,
-                        ProviderKind::OpenAiCompatible | ProviderKind::Ollama
-                    )
-                {
-                    // OpenAI-compatible payload knob; omit for providers that do not
-                    // advertise this field to avoid spurious 400s.
-                    payload["parallel_tool_calls"] = json!(true);
-                }
-                if capabilities.supports_tool_choice {
-                    payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
-                }
-            }
-        }
-        provider_transform::apply_provider_payload_options(
-            &mut payload,
-            req,
-            &provider,
-            &capabilities,
-            &mut compatibility,
-        );
-        provider_transform::apply_chat_payload_compatibility_with_tracking(
-            &mut payload,
-            req,
-            &capabilities,
-            &mut compatibility,
-        );
-        compatibility.transforms.sort();
-        compatibility.transforms.dedup();
-        Ok(PreparedPayload {
-            payload,
-            compatibility,
-        })
-    }
-
     fn complete_chat_inner(&self, req: &ChatRequest, api_key: Option<&str>) -> Result<LlmResponse> {
-        let prepared = self.build_chat_payload(req)?;
+        let prepared = payload::build_chat_payload(req, &self.cfg)?;
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
                 "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
@@ -773,7 +444,7 @@ impl ApiClient {
     }
 
     fn complete_fim_inner(&self, req: &FimRequest, api_key: Option<&str>) -> Result<LlmResponse> {
-        let payload = self.build_fim_payload(req);
+        let payload = payload::build_fim_payload(req, &self.cfg);
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
@@ -831,7 +502,7 @@ impl ApiClient {
         api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut payload = self.build_fim_payload(req);
+        let mut payload = payload::build_fim_payload(req, &self.cfg);
         payload["stream"] = json!(true);
         payload["stream_options"] = json!({"include_usage": true});
 
@@ -959,7 +630,7 @@ impl ApiClient {
         api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut prepared = self.build_chat_payload(req)?;
+        let mut prepared = payload::build_chat_payload(req, &self.cfg)?;
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
                 "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
@@ -1432,7 +1103,7 @@ impl ApiClient {
         api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut prepared = self.build_payload(req);
+        let mut prepared = payload::build_simple_payload(req, &self.cfg);
         // Force streaming on for the HTTP request
         prepared.payload["stream"] = json!(true);
         prepared.payload["stream_options"] = json!({"include_usage": true});
@@ -2220,6 +1891,7 @@ fn parse_tool_calls_array(value: &Value) -> Vec<LlmToolCall> {
 mod tests {
     use super::*;
     use codingbuddy_core::ChatMessage;
+    use codingbuddy_core::max_output_tokens_for_model;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2296,30 +1968,36 @@ mod tests {
             ..LlmConfig::default()
         };
         let client = ApiClient::new(cfg).expect("client");
-        let payload = client.build_payload(&LlmRequest {
-            unit: codingbuddy_core::LlmUnit::Planner,
-            prompt: "hello".to_string(),
-            model: "deepseek-chat".to_string(),
-            max_tokens: 16_000,
-            non_urgent: false,
-            images: vec![],
-            provider_options: Default::default(),
-        });
+        let payload = payload::build_simple_payload(
+            &LlmRequest {
+                unit: codingbuddy_core::LlmUnit::Planner,
+                prompt: "hello".to_string(),
+                model: "deepseek-chat".to_string(),
+                max_tokens: 16_000,
+                non_urgent: false,
+                images: vec![],
+                provider_options: Default::default(),
+            },
+            &client.cfg,
+        );
         assert_eq!(payload["max_tokens"], 2048);
     }
 
     #[test]
     fn model_name_passes_through_unmodified_in_payload() {
         let client = ApiClient::new(LlmConfig::default()).expect("client");
-        let payload = client.build_payload(&LlmRequest {
-            unit: codingbuddy_core::LlmUnit::Planner,
-            prompt: "hello".to_string(),
-            model: "codingbuddy-v3.2".to_string(),
-            max_tokens: 256,
-            non_urgent: false,
-            images: vec![],
-            provider_options: Default::default(),
-        });
+        let payload = payload::build_simple_payload(
+            &LlmRequest {
+                unit: codingbuddy_core::LlmUnit::Planner,
+                prompt: "hello".to_string(),
+                model: "codingbuddy-v3.2".to_string(),
+                max_tokens: 256,
+                non_urgent: false,
+                images: vec![],
+                provider_options: Default::default(),
+            },
+            &client.cfg,
+        );
         assert_eq!(payload["model"], "codingbuddy-v3.2");
     }
 
@@ -2624,7 +2302,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         // With thinking enabled, all sampling params must be omitted
         assert!(
             payload.get("temperature").is_none(),
@@ -2669,7 +2347,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert!(
             payload.get("temperature").is_some(),
             "temperature should be present"
@@ -2719,7 +2397,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         // Tools should be present
         assert!(payload.get("tools").is_some(), "tools should be present");
         // tool_choice must be stripped for reasoner (HTTP 400 otherwise)
@@ -2757,7 +2435,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert!(
             payload.get("thinking").is_none(),
             "thinking config must be stripped for deepseek-reasoner (thinks natively)"
@@ -2796,7 +2474,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert!(payload.get("tools").is_some(), "tools should be present");
         assert!(
             payload.get("tool_choice").is_some(),
@@ -2867,7 +2545,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["model"], "gpt-4o-mini");
         assert!(payload.get("thinking").is_none());
         assert_eq!(payload["reasoning_effort"], "medium");
@@ -2906,7 +2584,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["reasoning_effort"], "high");
         assert!(payload.get("temperature").is_none());
         assert!(payload.get("top_p").is_none());
@@ -2942,7 +2620,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["max_tokens"], 256);
         assert_eq!(payload["max_output_tokens"], 256);
     }
@@ -2981,7 +2659,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["tool_choice"], "auto");
     }
 
@@ -3033,7 +2711,7 @@ mod tests {
             response_format: None,
         };
 
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["tools"][0]["function"]["name"], "_noop");
         assert!(payload.get("parallel_tool_calls").is_none());
         assert!(payload.get("tool_choice").is_none());
@@ -3087,7 +2765,7 @@ mod tests {
             response_format: None,
         };
 
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         let schema = &payload["tools"][0]["function"]["parameters"];
         assert_eq!(schema["required"], serde_json::json!(["mode"]));
         assert_eq!(schema["properties"]["mode"]["type"], "string");
@@ -3125,7 +2803,7 @@ mod tests {
             response_format: None,
         };
 
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["max_completion_tokens"], 4096);
         assert!(
             payload.get("max_tokens").is_none(),
@@ -3168,7 +2846,7 @@ mod tests {
             response_format: None,
         };
 
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["parallel_tool_calls"], true);
         assert!(payload.get("tool_choice").is_some());
     }
@@ -3217,7 +2895,7 @@ mod tests {
             response_format: None,
         };
 
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert!(payload.get("parallel_tool_calls").is_none());
         assert!(payload.get("tool_choice").is_none());
         assert!(payload.get("tools").is_some());
@@ -3268,7 +2946,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["tool_choice"], "auto");
     }
 
@@ -3298,7 +2976,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["options"]["num_predict"], 512);
     }
 
@@ -3332,15 +3010,18 @@ mod tests {
             ..LlmConfig::default()
         };
         let client = ApiClient::new(cfg).expect("client");
-        let payload = client.build_payload(&LlmRequest {
-            unit: codingbuddy_core::LlmUnit::Planner,
-            prompt: "hola".to_string(),
-            model: "deepseek-chat".to_string(),
-            max_tokens: 128,
-            non_urgent: false,
-            images: vec![],
-            provider_options: Default::default(),
-        });
+        let payload = payload::build_simple_payload(
+            &LlmRequest {
+                unit: codingbuddy_core::LlmUnit::Planner,
+                prompt: "hola".to_string(),
+                model: "deepseek-chat".to_string(),
+                max_tokens: 128,
+                non_urgent: false,
+                images: vec![],
+                provider_options: Default::default(),
+            },
+            &client.cfg,
+        );
         let messages = payload["messages"].as_array().expect("messages");
         assert_eq!(messages[0]["role"], "system");
         assert!(
@@ -3383,7 +3064,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         let messages = payload["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 2);
         assert!(messages.iter().all(|m| m.get("cache_control").is_none()));
@@ -4025,7 +3706,7 @@ mod tests {
             images: vec![],
             provider_options: Default::default(),
         };
-        let payload = client.build_payload(&req);
+        let payload = payload::build_simple_payload(&req, &client.cfg);
         assert_eq!(payload["max_tokens"], 65536);
     }
 
@@ -4045,7 +3726,7 @@ mod tests {
             images: vec![],
             provider_options: Default::default(),
         };
-        let payload = client.build_payload(&req);
+        let payload = payload::build_simple_payload(&req, &client.cfg);
         assert_eq!(payload["max_tokens"], 8192);
     }
 
@@ -4171,7 +3852,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let result = client.build_chat_payload(&req);
+        let result = payload::build_chat_payload(&req, &client.cfg);
         assert!(
             result.is_ok(),
             "build_chat_payload should return Ok for valid input"
@@ -4241,7 +3922,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         assert_eq!(payload["model"], "claude-sonnet-4-20250514");
         assert!(payload["messages"].is_array());
     }
@@ -4272,7 +3953,7 @@ mod tests {
             provider_options: Default::default(),
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req).expect("build payload");
+        let payload = payload::build_chat_payload(&req, &client.cfg).expect("build payload");
         // Native Gemini format: uses contents array, not messages
         assert!(
             payload["contents"].is_array(),
