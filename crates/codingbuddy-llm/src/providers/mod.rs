@@ -1,11 +1,12 @@
 //! Provider-specific implementations for LLM APIs.
 //!
 //! Each provider handles payload building, response parsing, endpoint routing,
-//! and authentication. Anthropic and Google use native API formats; all others
-//! use the OpenAI-compatible pipeline in `provider_transform.rs`.
+//! and authentication. Anthropic, Google, and OpenAI use native API formats;
+//! all others use the OpenAI-compatible pipeline in `provider_transform.rs`.
 
 pub mod anthropic;
 pub mod google;
+pub mod openai;
 
 use codingbuddy_core::{LlmToolCall, StreamChunk};
 
