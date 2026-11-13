@@ -1125,7 +1125,12 @@ pub enum EventKind {
     #[serde(alias = "ExitPlanModeV1")]
     ExitPlanMode { session_id: Uuid },
     #[serde(alias = "ProviderSelectedV1")]
-    ProviderSelected { provider: String, model: String },
+    ProviderSelected {
+        provider: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
+    },
     #[serde(alias = "ProviderCompatibilityAppliedV1")]
     ProviderCompatibilityApplied {
         model: String,
@@ -2318,13 +2323,25 @@ impl AppConfig {
     }
 
     pub fn load(workspace: &Path) -> Result<Self> {
+        let (mut cfg, explicit) = Self::load_with_provider_origin(workspace)?;
+        if !explicit {
+            cfg.llm.auto_detect_provider();
+        }
+        Ok(cfg)
+    }
+
+    /// Load settings with the provenance needed by interactive provider selection.
+    pub fn load_with_provider_origin(workspace: &Path) -> Result<(Self, bool)> {
+        let mut explicit = false;
         let mut merged = serde_json::to_value(Self::default())?;
 
         let legacy = Self::legacy_toml_path(workspace);
         if legacy.exists() {
             let raw = fs::read_to_string(legacy)?;
-            let legacy_cfg: AppConfig = toml::from_str(&raw)?;
-            merge_json_value(&mut merged, &serde_json::to_value(legacy_cfg)?);
+            let legacy_cfg: toml::Value = toml::from_str(&raw)?;
+            let value = serde_json::to_value(legacy_cfg)?;
+            explicit |= value.pointer("/llm/provider").is_some();
+            merge_llm_settings(&mut merged, &value);
         }
 
         let mut paths = Vec::new();
@@ -2358,31 +2375,23 @@ impl AppConfig {
                     continue;
                 }
             };
-            merge_json_value(&mut merged, &value);
+            explicit |= value.pointer("/llm/provider").is_some();
+            merge_llm_settings(&mut merged, &value);
         }
 
         let mut cfg: Self = serde_json::from_value(merged)?;
-        cfg.llm.auto_detect_provider();
-        Ok(cfg)
+        // Older generated settings wrote the implicit DeepSeek URL for every provider.
+        if cfg.llm.provider != "deepseek"
+            && cfg.llm.endpoint == "https://api.deepseek.com/chat/completions"
+            && cfg.llm.active_provider().base_url != "https://api.deepseek.com"
+        {
+            cfg.llm.endpoint.clear();
+        }
+        Ok((cfg, explicit))
     }
 
     pub fn ensure(workspace: &Path) -> Result<Self> {
-        let path = Self::project_settings_path(workspace);
-        if path.exists()
-            || Self::project_local_settings_path(workspace).exists()
-            || Self::legacy_toml_path(workspace).exists()
-            || Self::user_settings_path().is_some_and(|p| p.exists())
-        {
-            return Self::load(workspace);
-        }
-        fs::create_dir_all(
-            path.parent()
-                .ok_or_else(|| anyhow::anyhow!("invalid config path"))?,
-        )?;
-        let mut cfg = Self::default();
-        cfg.llm.auto_detect_provider();
-        cfg.save(workspace)?;
-        Ok(cfg)
+        Self::load(workspace)
     }
 
     pub fn save(&self, workspace: &Path) -> Result<()> {
@@ -2393,6 +2402,69 @@ impl AppConfig {
         )?;
         fs::write(path, serde_json::to_vec_pretty(self)?)?;
         Ok(())
+    }
+}
+
+// Legacy endpoint and key fields describe the provider selected by their settings layer.
+fn merge_llm_settings(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    let provider = base
+        .pointer("/llm/provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let profile = format!(
+        "/llm/providers/{}",
+        provider.replace('~', "~0").replace('/', "~1")
+    );
+    let changed = overlay
+        .pointer("/llm/provider")
+        .is_some_and(|v| v.as_str() != Some(provider.as_str()))
+        || [
+            "/base_url",
+            "/api_key_env",
+            "/kind",
+            "/chat_protocol",
+            "/auth_strategy",
+        ]
+        .iter()
+        .any(|field| {
+            let path = format!("{profile}{field}");
+            overlay
+                .pointer(&path)
+                .is_some_and(|v| Some(v) != base.pointer(&path))
+        })
+        || ["/llm/base_url", "/llm/endpoint", "/llm/api_key_env"]
+            .iter()
+            .any(|path| {
+                overlay
+                    .pointer(path)
+                    .is_some_and(|v| Some(v) != base.pointer(path))
+            });
+    if changed && let Some(llm) = base.get_mut("llm").and_then(|v| v.as_object_mut()) {
+        llm.remove("api_key");
+        llm.insert("endpoint".into(), serde_json::Value::String(String::new()));
+    }
+    let selected = overlay
+        .pointer("/llm/provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&provider)
+        .to_owned();
+    merge_json_value(base, overlay);
+    let profile = format!(
+        "/llm/providers/{}",
+        selected.replace('~', "~0").replace('/', "~1")
+    );
+    for (old, new) in [
+        ("base_url", "base_url"),
+        ("api_key_env", "api_key_env"),
+        ("base_model", "models/chat"),
+    ] {
+        if let Some(value) = overlay.pointer(&format!("/llm/{old}"))
+            && overlay.pointer(&format!("{profile}/{new}")).is_none()
+            && let Some(slot) = base.pointer_mut(&format!("{profile}/{new}"))
+        {
+            *slot = value.clone();
+        }
     }
 }
 
@@ -2579,8 +2651,11 @@ impl LlmConfig {
 
         // Check providers in priority order (best model quality first)
         for &(provider_name, env_var) in KNOWN_PROVIDER_ENV_VARS {
-            if std::env::var(env_var).is_ok() && self.providers.contains_key(provider_name) {
-                self.provider = provider_name.to_string();
+            if std::env::var(env_var).is_ok_and(|key| !key.trim().is_empty())
+                && self.providers.contains_key(provider_name)
+                && provider_name != "ollama"
+            {
+                self.select_provider(provider_name);
                 let p = self.active_provider();
                 self.base_url = p.base_url.clone();
                 self.api_key_env = p.api_key_env.clone();
@@ -2657,10 +2732,10 @@ impl LlmConfig {
         // Check for provider/model syntax — split on first `/`
         // but only if the part before `/` looks like a provider name
         if let Some((maybe_provider, model)) = spec.split_once('/')
-            && normalize_provider_kind(maybe_provider).is_some()
-            && self.providers.contains_key(maybe_provider)
+            && !model.trim().is_empty()
+            && (self.providers.contains_key(maybe_provider) || maybe_provider == self.provider)
         {
-            self.provider = maybe_provider.to_string();
+            self.select_provider(maybe_provider);
             if let Some(provider) = self.providers.get_mut(maybe_provider) {
                 provider.models.chat = model.to_string();
             }
@@ -2674,6 +2749,39 @@ impl LlmConfig {
         self.base_model = spec.to_string();
         if let Some(provider) = self.providers.get_mut(&self.provider) {
             provider.models.chat = spec.to_string();
+        }
+    }
+
+    /// Stable destination fingerprint for session history and credential scoping.
+    pub fn connection_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let provider = self.active_provider();
+        let mut digest = Sha256::new();
+        for value in [
+            self.provider.as_str(),
+            provider.base_url.trim_end_matches('/'),
+            self.endpoint.as_str(),
+            provider.api_key_env.as_str(),
+            provider.kind.as_str(),
+            provider.chat_protocol.as_deref().unwrap_or_default(),
+            provider.auth_strategy.as_deref().unwrap_or_default(),
+            if provider.openai_compat_prefix {
+                "v1"
+            } else {
+                ""
+            },
+        ] {
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        format!("{:x}", digest.finalize())
+    }
+
+    pub fn select_provider(&mut self, provider: &str) {
+        if self.provider != provider {
+            self.endpoint.clear();
+            self.api_key = None;
+            self.provider = provider.to_owned();
         }
     }
 
@@ -2731,7 +2839,7 @@ impl Default for LlmConfig {
             context_window_tokens: 128_000,
             temperature: 0.2,
             base_url: "https://api.deepseek.com".to_string(),
-            endpoint: "https://api.deepseek.com/chat/completions".to_string(),
+            endpoint: String::new(),
             api_key: None,
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             fast_mode: false,

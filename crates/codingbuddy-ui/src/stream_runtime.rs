@@ -63,6 +63,9 @@ pub(crate) fn handle_stream_event(
     state: &mut StreamRuntimeState<'_>,
 ) -> StreamEventResult {
     match event {
+        TuiStreamEvent::Menu(_) | TuiStreamEvent::ConnectionChanged { .. } => {
+            StreamEventResult::Continue
+        }
         TuiStreamEvent::ContentDelta(text) => {
             if state.shell.is_thinking {
                 state.shell.is_thinking = false;

@@ -3,8 +3,10 @@ use codingbuddy_agent::ChatMode;
 use codingbuddy_core::AppConfig;
 
 pub(crate) fn is_max_think_selection(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("reasoner") || lower.contains("max") || lower.contains("high")
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "reasoner" | "max" | "high"
+    )
 }
 
 /// Format `/provider` info as a plain-text string. Used by both TUI and non-TUI paths.

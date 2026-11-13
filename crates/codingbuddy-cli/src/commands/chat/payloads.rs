@@ -284,113 +284,22 @@ pub(super) fn release_notes_payload(
 }
 
 pub(super) fn login_payload(cwd: &Path) -> Result<serde_json::Value> {
-    let cfg = AppConfig::ensure(cwd)?;
-    let env_key = if cfg.llm.api_key_env.trim().is_empty() {
-        "DEEPSEEK_API_KEY".to_string()
-    } else {
-        cfg.llm.api_key_env.clone()
-    };
-    let token = std::env::var(&env_key).unwrap_or_default();
-    if token.trim().is_empty() {
-        return Err(anyhow!(
-            "missing {}. export the key first, then run /login",
-            env_key
-        ));
-    }
-
-    let runtime_auth = runtime_dir(cwd).join("auth").join("session.json");
-    if let Some(parent) = runtime_auth.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mask = format!(
-        "***{}",
-        token
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>()
-    );
-    let session_payload = json!({
-        "provider": "deepseek",
-        "api_key_env": env_key,
-        "masked": mask,
-        "created_at": Utc::now().to_rfc3339(),
-    });
-    std::fs::write(&runtime_auth, serde_json::to_vec_pretty(&session_payload)?)?;
-
-    let local_path = AppConfig::project_local_settings_path(cwd);
-    if let Some(parent) = local_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut root = if local_path.exists() {
-        let raw = std::fs::read_to_string(&local_path)?;
-        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-    if !root.is_object() {
-        root = json!({});
-    }
-    let map = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("settings.local.json root must be an object"))?;
-    let llm_value = map.entry("llm".to_string()).or_insert_with(|| json!({}));
-    if !llm_value.is_object() {
-        *llm_value = json!({});
-    }
-    if let Some(llm) = llm_value.as_object_mut() {
-        llm.insert("api_key".to_string(), json!(token));
-        llm.insert("api_key_env".to_string(), json!(env_key));
-    }
-    std::fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
-
+    let cfg = AppConfig::load(cwd)?;
+    codingbuddy_llm::check_provider(&cfg.llm)?;
     Ok(json!({
         "schema": "deepseek.auth.v1",
         "logged_in": true,
-        "session_path": runtime_auth.to_string_lossy().to_string(),
-        "settings_path": local_path.to_string_lossy().to_string(),
-        "message": "Login successful. Workspace auth session and settings.local.json updated.",
+        "message": "A credential is available. Use /connect to manage credentials in the terminal UI.",
     }))
 }
 
 pub(super) fn logout_payload(cwd: &Path) -> Result<serde_json::Value> {
-    let _cfg = AppConfig::ensure(cwd)?;
-    let runtime_auth = runtime_dir(cwd).join("auth").join("session.json");
-    let session_removed = if runtime_auth.exists() {
-        std::fs::remove_file(&runtime_auth)?;
-        true
-    } else {
-        false
-    };
-
-    let local_path = AppConfig::project_local_settings_path(cwd);
-    let mut settings_updated = false;
-    if local_path.exists() {
-        let raw = std::fs::read_to_string(&local_path)?;
-        let mut root =
-            serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}));
-        if let Some(llm) = root.get_mut("llm").and_then(|entry| entry.as_object_mut())
-            && llm.remove("api_key").is_some()
-        {
-            settings_updated = true;
-        }
-        std::fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
-    }
-
-    // NOTE: We no longer mutate the process environment (unsafe data race).
-    // The ApiClient caches the key at construction, so clearing the env var
-    // would not affect the running session anyway. The settings file update
-    // above ensures the key is gone on next launch.
-
+    let cfg = AppConfig::load(cwd)?;
+    codingbuddy_llm::remove_provider_key(&cfg.llm)?;
     Ok(json!({
         "schema": "deepseek.auth.v1",
-        "logged_in": false,
-        "session_removed": session_removed,
-        "settings_updated": settings_updated,
-        "message": "Logged out. Restart the session to complete logout.",
+        "logged_in": codingbuddy_llm::check_provider(&cfg.llm).is_ok(),
+        "message": "Saved credential removed. Environment and legacy settings may still supply a key.",
     }))
 }
 

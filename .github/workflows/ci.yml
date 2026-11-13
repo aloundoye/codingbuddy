@@ -19,10 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.94.1
           components: rustfmt, clippy
 
       - name: Rust cache
@@ -52,24 +57,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.94.1
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: tests (workspace split: core)
+      - name: "tests (workspace split: core)"
         run: cargo test --workspace --all-targets --exclude codingbuddy-agent --exclude codingbuddy-cli --exclude codingbuddy-ui
 
-      - name: tests (workspace split: agent)
+      - name: "tests (workspace split: agent)"
         run: cargo test -p codingbuddy-agent --all-targets
 
-      - name: tests (workspace split: cli)
+      - name: "tests (workspace split: cli)"
         run: cargo test -p codingbuddy-cli --all-targets
 
-      - name: tests (workspace split: ui)
+      - name: "tests (workspace split: ui)"
         run: cargo test -p codingbuddy-ui --all-targets
 
       - name: build
@@ -106,7 +117,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.94.1
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2

@@ -207,7 +207,7 @@ pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde
                 return Err(anyhow!("background run-agent prompt is empty"));
             }
             let cfg = AppConfig::ensure(cwd)?;
-            ensure_llm_ready_with_cfg(Some(cwd), &cfg, true)?;
+            codingbuddy_llm::check_provider(&cfg.llm)?;
             let exe = std::env::current_exe()?;
             let mut command = Command::new(exe);
             command.arg("ask").arg(&prompt);

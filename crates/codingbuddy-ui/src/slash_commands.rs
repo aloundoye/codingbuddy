@@ -182,6 +182,9 @@ impl SlashCommand {
 
 /// Slash commands with short descriptions for the autocomplete dropdown.
 pub const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
+    ("connect", "Connect or manage providers"),
+    ("models", "Choose a model for this chat"),
+    ("settings", "Change model defaults and theme"),
     ("help", "Show available commands"),
     ("ask", "Ask a question (read-only)"),
     ("code", "Switch to code mode"),
@@ -192,7 +195,6 @@ pub const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("memory", "Show/edit/sync project memory"),
     ("config", "Show current configuration"),
     ("model", "Switch or view model"),
-    ("models", "List models with pricing and capabilities"),
     ("share", "Export session as HTML and open in browser"),
     ("provider", "Switch or view provider"),
     ("cost", "Show session cost estimate"),
@@ -253,7 +255,6 @@ pub const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("map-refresh", "Refresh repo map cache"),
     ("git", "Run git commands"),
     ("voice", "Voice input mode"),
-    ("settings", "Open settings helpers"),
     ("load", "Load chat profile"),
     ("save", "Save chat profile"),
     ("desktop", "Desktop integration controls"),

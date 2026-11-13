@@ -1,5 +1,4 @@
-use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use anyhow::{Result, anyhow};
 use codingbuddy_agent::context::ContextManager;
 use codingbuddy_agent::skills::SkillManager;
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
@@ -64,6 +63,7 @@ use crate::commands::tasks::handle_tasks_slash;
 mod args;
 #[path = "chat_lifecycle.rs"]
 mod chat_lifecycle;
+mod connections;
 mod payloads;
 mod slash;
 mod tui;
@@ -79,6 +79,27 @@ use tui::{ChatTuiArgs, run_chat_tui};
 use web::fetch_preview_text;
 pub(crate) use web::{render_web_fetch_markdown, render_web_search_markdown};
 
+pub(crate) fn run_setup_menu(cwd: &Path) -> Result<()> {
+    let (cfg, configured) = AppConfig::load_with_provider_origin(cwd)?;
+    let needs_connection = codingbuddy_llm::check_provider(&cfg.llm).is_err();
+    run_chat_tui(ChatTuiArgs {
+        cwd,
+        cfg: &cfg,
+        needs_connection,
+        configured,
+        open_connect: true,
+        cli: None,
+        allow_tools: true,
+        initial_force_max_think: false,
+        teammate_mode: None,
+        repo_root_override: None,
+        debug_context: false,
+        detect_urls: false,
+        watch_files_enabled: false,
+        initial_session_id: None,
+    })
+}
+
 pub(crate) fn run_chat(
     cwd: &Path,
     json_mode: bool,
@@ -90,30 +111,57 @@ pub(crate) fn run_chat(
 ) -> Result<()> {
     use std::io::{IsTerminal, Write, stdin, stdout};
 
-    let mut cfg = AppConfig::ensure(cwd).context("failed to load workspace config")?;
-    if !json_mode {
-        match super::setup::maybe_first_time_setup(cwd, &cfg) {
-            Ok(true) => {
-                cfg = AppConfig::ensure(cwd).context("failed to reload config after setup")?
-            }
-            Ok(false) => {}
-            Err(e) => eprintln!("setup skipped: {e}"),
+    let (mut cfg, configured) = AppConfig::load_with_provider_origin(cwd)?;
+    let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
+    let use_tui = !json_mode && !json_events && (tui || cfg.ui.enable_tui) && interactive_tty;
+    let saved_route = initial_session_id
+        .map(|id| {
+            Store::new(cwd)?
+                .rebuild_from_events(id)
+                .map(|projection| projection.provider_selection)
+        })
+        .transpose()?
+        .flatten();
+    let requested = cli
+        .and_then(|v| v.model.as_deref())
+        .filter(|spec| !is_max_think_selection(spec));
+    let detected = if !configured && requested.is_none() && saved_route.is_none() {
+        connections::detect(&cfg.llm)
+    } else {
+        Vec::new()
+    };
+    if let Some(spec) = requested {
+        cfg.llm.apply_model_spec(spec);
+    } else if let Some((provider, model, _)) = &saved_route {
+        cfg.llm.apply_model_spec(&format!("{provider}/{model}"));
+    } else if let [provider] = detected.as_slice() {
+        cfg.llm.select_provider(provider);
+    }
+    let needs_connection =
+        (!configured && detected.len() > 1) || codingbuddy_llm::check_provider(&cfg.llm).is_err();
+    if !use_tui {
+        if detected.len() > 1 {
+            return Err(anyhow!(
+                "Several providers have credentials. Choose one with --model provider/model."
+            ));
+        }
+        codingbuddy_llm::check_provider(&cfg.llm)?;
+        if let Some((provider, _, destination)) = saved_route.as_ref()
+            && (provider != &cfg.llm.provider
+                || destination
+                    .as_ref()
+                    .is_some_and(|id| id != &cfg.llm.connection_id()))
+        {
+            return Err(anyhow!(
+                "This session used a different provider or endpoint. Resume in a terminal to choose whether to share its history."
+            ));
         }
     }
-    if !json_mode {
+    if interactive_tty && !json_mode && !json_events {
         super::update::show_update_banner(cwd);
         super::update::check_for_update_background(cwd);
     }
     refresh_model_catalog_background(cwd, &cfg);
-    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)
-        .context("LLM provider not ready — check your API key and provider settings")?;
-    let mut engine = AgentEngine::new(cwd).context("failed to initialize agent engine")?;
-    if let Some(cli) = cli {
-        apply_cli_flags(&mut engine, cli);
-    }
-    engine
-        .validate_api_key()
-        .context("API key validation failed — run `codingbuddy init` to configure")?;
     let mut force_max_think = cli
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
@@ -140,14 +188,16 @@ pub(crate) fn run_chat(
                 )
             })
             .unwrap_or(false);
-    let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
-    if !json_mode && (tui || cfg.ui.enable_tui) && interactive_tty {
+    if use_tui {
         return run_chat_tui(ChatTuiArgs {
             cwd,
             allow_tools,
             cfg: &cfg,
             initial_force_max_think: force_max_think,
-            initial_model_spec: active_model_spec.clone(),
+            needs_connection,
+            open_connect: false,
+            configured,
+            cli,
             teammate_mode: teammate_mode.clone(),
             repo_root_override: repo_root_override.clone(),
             debug_context,
@@ -159,6 +209,10 @@ pub(crate) fn run_chat(
     if tui && !interactive_tty {
         return Err(anyhow!("--tui requires an interactive terminal"));
     }
+    let mut engine = AgentEngine::new_with_config(cwd, cfg.clone())?;
+    if let Some(cli) = cli {
+        apply_cli_flags(&mut engine, cli);
+    }
     let mut last_assistant_response: Option<String> = None;
     let mut additional_dirs = cli.map(|value| value.add_dir.clone()).unwrap_or_default();
     let mut read_only_mode = false;
@@ -168,8 +222,8 @@ pub(crate) fn run_chat(
     let mut pending_images: Vec<codingbuddy_core::ImageContent> = vec![];
     let mut selected_session_id = initial_session_id;
     let mut lifecycle_notice_watermarks = HashMap::<Uuid, u64>::new();
-    if !json_mode {
-        println!("deepseek chat (type 'exit' to quit)");
+    if !json_mode && !json_events {
+        println!("CodingBuddy chat (type 'exit' to quit)");
         println!(
             "model: {} thinking=auto approvals: bash={} edits={} tools={}",
             cfg.llm.active_base_model(),
@@ -203,7 +257,7 @@ pub(crate) fn run_chat(
         }
     }
     loop {
-        if !json_mode {
+        if !json_mode && !json_events {
             for notice in poll_session_lifecycle_notices(
                 cwd,
                 selected_session_id,
@@ -215,7 +269,9 @@ pub(crate) fn run_chat(
             stdout().flush()?;
         }
         let mut line = String::new();
-        stdin().read_line(&mut line)?;
+        if stdin().read_line(&mut line)? == 0 {
+            break;
+        }
         let raw_prompt = line.trim();
         if raw_prompt == "exit" {
             break;
@@ -1872,8 +1928,9 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     let json_mode = cli.json || cli.output_format == "json" || cli.output_format == "stream-json";
     let is_stream_json = cli.output_format == "stream-json";
     let is_text = !json_mode;
-    ensure_llm_ready(cwd, json_mode)?;
-    let mut engine = AgentEngine::new(cwd)?;
+    let cfg = selected_config(cwd, cli.model.as_deref())?;
+    codingbuddy_llm::check_provider(&cfg.llm)?;
+    let mut engine = AgentEngine::new_with_config(cwd, cfg)?;
     apply_cli_flags(&mut engine, cli);
     wire_subagent_worker(&engine, cwd);
 
@@ -2075,17 +2132,13 @@ fn print_resume_banner(session: &codingbuddy_core::Session, turn_count: usize) {
     }
 }
 
-pub(crate) fn run_continue_session(
-    cwd: &Path,
-    json_mode: bool,
-    _model: Option<&str>,
-) -> Result<()> {
+pub(crate) fn run_continue_session(cwd: &Path, json_mode: bool, cli: &crate::Cli) -> Result<()> {
     let store = Store::new(cwd)?;
     let session = store
         .load_latest_session()?
         .ok_or_else(|| anyhow!("no previous session to continue"))?;
     let projection = store.rebuild_from_events(session.session_id)?;
-    if !json_mode {
+    if !json_mode && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         print_resume_banner(&session, projection.transcript.len());
     }
     run_chat(
@@ -2094,7 +2147,7 @@ pub(crate) fn run_continue_session(
         false,
         true,
         false,
-        None,
+        Some(cli),
         Some(session.session_id),
     )
 }
@@ -2103,7 +2156,7 @@ pub(crate) fn run_resume_specific(
     cwd: &Path,
     session_id: &str,
     json_mode: bool,
-    _model: Option<&str>,
+    cli: &crate::Cli,
 ) -> Result<()> {
     let store = Store::new(cwd)?;
     let uuid =
@@ -2112,7 +2165,7 @@ pub(crate) fn run_resume_specific(
         .load_session(uuid)?
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
     let projection = store.rebuild_from_events(session.session_id)?;
-    if !json_mode {
+    if !json_mode && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         print_resume_banner(&session, projection.transcript.len());
     }
     run_chat(
@@ -2121,7 +2174,7 @@ pub(crate) fn run_resume_specific(
         false,
         true,
         false,
-        None,
+        Some(cli),
         Some(session.session_id),
     )
 }
@@ -2386,9 +2439,8 @@ fn model_switch_safety_message(
     effective.llm.apply_model_spec(model_spec);
     let provider = effective.llm.provider.clone();
     let model = effective.llm.active_base_model();
-    let resolution = resolve_catalog_for_display(cwd, &effective);
-    let item = resolution
-        .catalog
+    let catalog = effective.llm.model_catalog_for_runtime(&runtime_dir(cwd));
+    let item = catalog
         .selector_items(&effective.llm)
         .into_iter()
         .find(|item| item.provider == provider && item.id == model);

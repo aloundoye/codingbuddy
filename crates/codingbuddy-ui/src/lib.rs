@@ -36,9 +36,9 @@ use panels::{load_artifact_lines, render_mission_control_panel};
 pub(crate) use rendering::truncate_inline;
 use rendering::*;
 pub use rendering::{PROMPT_SUGGESTIONS, TuiStreamEvent, render_prompt_suggestions};
-use slash_commands::{
-    SLASH_COMMAND_CATALOG, slash_command_suggestions, slash_suggestion_to_command,
-};
+#[cfg(test)]
+use slash_commands::slash_command_suggestions;
+use slash_commands::{SLASH_COMMAND_CATALOG, slash_suggestion_to_command};
 pub use slash_commands::{SlashCommand, slash_command_catalog_entries};
 use state::VimMode;
 pub use state::{
@@ -52,6 +52,8 @@ use stream_runtime::{
     StreamEventResult, StreamRuntimeState, approval_explanation, filter_stream_event,
     handle_stream_event,
 };
+mod menu;
+pub use menu::TerminalMenu;
 pub use theme::TuiTheme;
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
 where
@@ -77,7 +79,18 @@ where
         },
         || None,
         None,
+        TerminalControls::default(),
     )
+}
+
+type MenuAction<'a> = dyn FnMut(&str, String) + 'a;
+
+#[derive(Default)]
+pub struct TerminalControls<'a> {
+    pub on_menu: Option<Box<MenuAction<'a>>>,
+    pub needs_connection: bool,
+    pub open_connect: bool,
+    pub cancellation: Option<Arc<std::sync::Mutex<codingbuddy_core::CancellationToken>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -90,6 +103,7 @@ pub fn run_tui_shell_with_bindings<F, S>(
     mut on_submit: F,
     mut refresh_status: S,
     ml_completion: Option<MlCompletionCallback>,
+    mut controls: TerminalControls<'_>,
 ) -> Result<()>
 where
     F: FnMut(&str),
@@ -148,6 +162,7 @@ where
 
     enable_raw_mode()?;
     let _guard = TerminalGuard;
+    crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     // Inline viewport: bottom rows managed by ratatui
@@ -189,7 +204,7 @@ where
     let mut history_cursor: Option<usize> = None;
     let mut saved_input = String::new();
     let mut info_line =
-        String::from(" Ctrl+C exit | Tab autocomplete | Shift+Tab agent | /model models");
+        String::from(" Ctrl+C exit | Tab autocomplete | Shift+Tab agent | / commands");
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
     let mut cursor_visible;
@@ -223,14 +238,122 @@ where
     let mut last_phase_event_at = Instant::now();
     let mut last_phase_heartbeat_at = Instant::now();
     let mut last_mission_refresh_at = Instant::now();
+    let mut menu: Option<TerminalMenu> = None;
+    if controls.open_connect
+        && let Some(action) = controls.on_menu.as_mut()
+    {
+        action("connect", String::new());
+    }
     let mut model_picker: Option<ModelPickerState> = None;
     let mut help_modal: Option<state::HelpModalState> = None;
     let mut active_profile_display: Option<String> = None;
     let mut pending_images: Vec<PathBuf> = Vec::new();
     let mut autocomplete_dropdown: Option<AutocompleteState> = None;
+    let mut slash_dropdown = None;
+    let mut slash_query = None;
     let mut ml_ghost: GhostTextState = GhostTextState::default();
 
     loop {
+        // Drain streaming events from background agent thread.
+        while let Ok(ev) = stream_rx.try_recv() {
+            let ev = match ev {
+                TuiStreamEvent::Menu(next) => {
+                    menu = next;
+                    continue;
+                }
+                TuiStreamEvent::ConnectionChanged { ready, theme } => {
+                    controls.needs_connection = !ready;
+                    if let Some(theme) = theme {
+                        theme::init_theme(TuiTheme::from_preference(&theme));
+                    }
+                    if let Some(updated) = refresh_status() {
+                        status = updated;
+                    }
+                    continue;
+                }
+                other => other,
+            };
+            if cancelled && matches!(ev, TuiStreamEvent::Done(_) | TuiStreamEvent::Error(_)) {
+                is_processing = false;
+                info_line = "Interrupted".into();
+            }
+            let Some(ev) = filter_stream_event(ev, &mut cancelled) else {
+                continue;
+            };
+            let result = {
+                let mut state = StreamRuntimeState {
+                    shell: &mut shell,
+                    streaming_buffer: &mut streaming_buffer,
+                    active_phase: &mut active_phase,
+                    pending_approval: &mut pending_approval,
+                    info_line: &mut info_line,
+                    is_processing: &mut is_processing,
+                    streaming_in_code_block: &mut streaming_in_code_block,
+                    streaming_in_diff_block: &mut streaming_in_diff_block,
+                    streaming_code_block_lang: &mut streaming_code_block_lang,
+                };
+                handle_stream_event(ev, &mut state)
+            };
+            match result {
+                StreamEventResult::Continue => {}
+                StreamEventResult::Done(output) => {
+                    // Flush thinking buffer to transcript as a collapsed summary.
+                    if !shell.thinking_buffer.is_empty() {
+                        let thought = std::mem::take(&mut shell.thinking_buffer);
+                        // Show a single-line summary of the thinking in the transcript.
+                        let summary = truncate_inline(&thought.replace('\n', " "), 120);
+                        shell.push_thinking(summary);
+                    }
+                    shell.is_thinking = false;
+                    // Flush any remaining partial streaming line to scrollback.
+                    if !streaming_buffer.is_empty() {
+                        let remaining = std::mem::take(&mut streaming_buffer);
+                        let logical_lines = if streaming_in_code_block {
+                            vec![remaining]
+                        } else {
+                            split_inline_markdown_blocks(&remaining)
+                        };
+                        let mut styled_lines: Vec<Line<'static>> =
+                            Vec::with_capacity(logical_lines.len().max(1));
+                        for text in logical_lines {
+                            let entry = TranscriptEntry {
+                                kind: MessageKind::Assistant,
+                                text,
+                            };
+                            styled_lines.push(style_transcript_line(
+                                &entry,
+                                streaming_in_code_block,
+                                streaming_in_diff_block,
+                                &streaming_code_block_lang,
+                            ));
+                        }
+                        let _ = insert_wrapped_lines_above(&mut terminal, &styled_lines);
+                    }
+                    shell.finalize_streaming(&output);
+                    // Skip re-printing entries that were already streamed.
+                    last_printed_idx = shell.transcript.len();
+                    streaming_in_code_block = false;
+                    streaming_in_diff_block = false;
+                    streaming_code_block_lang.clear();
+                    active_phase = None;
+                    info_line = "ok".to_string();
+                    is_processing = false;
+                    shell.active_tool = None;
+                    if let Some(new_status) = refresh_status() {
+                        status = new_status;
+                    }
+                }
+            }
+        }
+
+        let next_query = (!is_processing && menu.is_none() && pending_approval.is_none())
+            .then(|| input::slash_query(&input, cursor_pos))
+            .flatten();
+        if next_query != slash_query.as_deref() {
+            slash_dropdown = next_query.and_then(input::slash_dropdown);
+            slash_query = next_query.map(str::to_owned);
+        }
+
         // ML ghost text: check debounce and invoke completion callback
         if ml_ghost.should_request(input.len()) {
             if let Some(ref cb) = ml_completion {
@@ -279,6 +402,10 @@ where
         )?;
 
         terminal.draw(|frame| {
+            if let Some(menu) = &menu {
+                menu.render(frame);
+                return;
+            }
             let area = frame.area();
             if area.width == 0 || area.height < 3 {
                 return;
@@ -326,7 +453,9 @@ where
                 )
             };
             let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
-            let desired_input_rows = if pending_approval.is_some() || reverse_search_active {
+            let desired_input_rows = if pending_approval.is_some() {
+                3
+            } else if reverse_search_active {
                 INPUT_MIN_HEIGHT as usize
             } else if vim_enabled && vim_mode == VimMode::Command {
                 wrapped_text_rows(
@@ -483,18 +612,17 @@ where
                         },
                     )
                 };
-                let prompt = format!(
-                    " [{severity}] {tool_name}  {}  [y] Allow  [a] Always  [n] Deny ",
-                    truncate_inline(&explanation, 72)
-                );
+                let style = Style::default()
+                    .fg(Color::Black)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD);
+                let target = format!(" [{severity}] {explanation}");
+                let target = truncate_inline(&target, usize::from(width).saturating_mul(2));
                 frame.render_widget(
-                    Paragraph::new(Line::from(vec![Span::styled(
-                        truncate_inline(&prompt, width.saturating_sub(1) as usize),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
+                    Paragraph::new(vec![
+                        Line::styled(" [y] Allow  [a] Always  [n] Deny", style),
+                        Line::styled(target, style),
+                    ])
                     .wrap(Wrap { trim: false }),
                     input_area,
                 );
@@ -670,79 +798,26 @@ where
                     Style::default().fg(Color::DarkGray)
                 },
             ));
+            if let Some(dropdown) = &slash_dropdown {
+                frame.render_widget(ratatui::widgets::Clear, stream_area);
+                let rows = dropdown.display_lines(usize::from(stream_area.height));
+                let lines: Vec<_> = rows
+                    .into_iter()
+                    .map(|row| {
+                        if row.starts_with('>') {
+                            Line::styled(row, Style::default().add_modifier(Modifier::REVERSED))
+                        } else {
+                            Line::raw(row)
+                        }
+                    })
+                    .collect();
+                frame.render_widget(Paragraph::new(lines), stream_area);
+                status_spans = vec![Span::raw(
+                    " ↑↓ Select · Enter Run · Tab Complete · Esc Dismiss",
+                )];
+            }
             frame.render_widget(Paragraph::new(Line::from(status_spans)), status_area);
         })?;
-
-        // Drain streaming events from background agent thread.
-        while let Ok(ev) = stream_rx.try_recv() {
-            let Some(ev) = filter_stream_event(ev, &mut cancelled) else {
-                continue;
-            };
-            let result = {
-                let mut state = StreamRuntimeState {
-                    shell: &mut shell,
-                    streaming_buffer: &mut streaming_buffer,
-                    active_phase: &mut active_phase,
-                    pending_approval: &mut pending_approval,
-                    info_line: &mut info_line,
-                    is_processing: &mut is_processing,
-                    streaming_in_code_block: &mut streaming_in_code_block,
-                    streaming_in_diff_block: &mut streaming_in_diff_block,
-                    streaming_code_block_lang: &mut streaming_code_block_lang,
-                };
-                handle_stream_event(ev, &mut state)
-            };
-            match result {
-                StreamEventResult::Continue => {}
-                StreamEventResult::Done(output) => {
-                    // Flush thinking buffer to transcript as a collapsed summary.
-                    if !shell.thinking_buffer.is_empty() {
-                        let thought = std::mem::take(&mut shell.thinking_buffer);
-                        // Show a single-line summary of the thinking in the transcript.
-                        let summary = truncate_inline(&thought.replace('\n', " "), 120);
-                        shell.push_thinking(summary);
-                    }
-                    shell.is_thinking = false;
-                    // Flush any remaining partial streaming line to scrollback.
-                    if !streaming_buffer.is_empty() {
-                        let remaining = std::mem::take(&mut streaming_buffer);
-                        let logical_lines = if streaming_in_code_block {
-                            vec![remaining]
-                        } else {
-                            split_inline_markdown_blocks(&remaining)
-                        };
-                        let mut styled_lines: Vec<Line<'static>> =
-                            Vec::with_capacity(logical_lines.len().max(1));
-                        for text in logical_lines {
-                            let entry = TranscriptEntry {
-                                kind: MessageKind::Assistant,
-                                text,
-                            };
-                            styled_lines.push(style_transcript_line(
-                                &entry,
-                                streaming_in_code_block,
-                                streaming_in_diff_block,
-                                &streaming_code_block_lang,
-                            ));
-                        }
-                        let _ = insert_wrapped_lines_above(&mut terminal, &styled_lines);
-                    }
-                    shell.finalize_streaming(&output);
-                    // Skip re-printing entries that were already streamed.
-                    last_printed_idx = shell.transcript.len();
-                    streaming_in_code_block = false;
-                    streaming_in_diff_block = false;
-                    streaming_code_block_lang.clear();
-                    active_phase = None;
-                    info_line = "ok".to_string();
-                    is_processing = false;
-                    shell.active_tool = None;
-                    if let Some(new_status) = refresh_status() {
-                        status = new_status;
-                    }
-                }
-            }
-        }
 
         // Help modal content displayed in info_line
         if let Some(ref hm) = help_modal {
@@ -762,7 +837,9 @@ where
         // Check for external SIGINT (e.g. `kill -INT`).
         if sigint_flag.swap(false, Ordering::Relaxed) {
             if is_processing {
-                is_processing = false;
+                if let Some(token) = &controls.cancellation {
+                    token.lock().unwrap().cancel();
+                }
                 cancelled = true;
                 streaming_buffer.clear();
                 shell.active_tool = None;
@@ -772,7 +849,7 @@ where
                 if let Some((_, _, response_tx)) = pending_approval.take() {
                     let _ = response_tx.send(false);
                 }
-                info_line = "interrupted — press Ctrl+C again to exit".to_string();
+                info_line = "Stopping the current turn…".to_string();
             } else {
                 break;
             }
@@ -787,6 +864,10 @@ where
                 continue;
             }
             Event::Paste(pasted) => {
+                if let Some(menu) = menu.as_mut() {
+                    menu.paste(&pasted);
+                    continue;
+                }
                 input.insert_str(cursor_pos.min(input.len()), &pasted);
                 cursor_pos = (cursor_pos + pasted.len()).min(input.len());
                 info_line = "pasted input".to_string();
@@ -795,8 +876,24 @@ where
             Event::Key(key) => key,
             _ => continue,
         };
-        // Only handle key press events (ignore release/repeat on platforms that send them)
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if let Some(current) = menu.as_mut() {
+            if key.code == KeyCode::Esc || key == bindings.exit {
+                menu = None;
+                if let Some(action) = controls.on_menu.as_mut() {
+                    action("cancel", String::new());
+                }
+            } else if let Some((id, value)) = current.key(if key == bindings.submit {
+                KeyCode::Enter.into()
+            } else {
+                key
+            }) && let Some(action) = controls.on_menu.as_mut()
+            {
+                action(&id, value);
+            }
             continue;
         }
 
@@ -856,6 +953,38 @@ where
                     continue;
                 }
                 _ => continue,
+            }
+        }
+
+        if let Some(dropdown) = slash_dropdown.as_mut() {
+            match key.code {
+                KeyCode::Up => {
+                    dropdown.up();
+                    continue;
+                }
+                KeyCode::Down => {
+                    dropdown.down();
+                    continue;
+                }
+                KeyCode::Esc => {
+                    slash_dropdown = None;
+                    continue;
+                }
+                KeyCode::Enter | KeyCode::Tab if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(value) = dropdown.selected_value() {
+                        input = slash_suggestion_to_command(value);
+                        if key.code == KeyCode::Tab {
+                            input.push(' ');
+                        }
+                        cursor_pos = input.len();
+                    }
+                    slash_dropdown = None;
+                    if key.code == KeyCode::Tab {
+                        continue;
+                    }
+                    key = bindings.submit;
+                }
+                _ => {}
             }
         }
 
@@ -953,7 +1082,9 @@ where
 
         if key == bindings.exit {
             if is_processing {
-                is_processing = false;
+                if let Some(token) = &controls.cancellation {
+                    token.lock().unwrap().cancel();
+                }
                 cancelled = true;
                 streaming_buffer.clear();
                 shell.active_tool = None;
@@ -962,7 +1093,7 @@ where
                 if let Some((_, _, response_tx)) = pending_approval.take() {
                     let _ = response_tx.send(false);
                 }
-                info_line = "interrupted — press Ctrl+C again to exit".to_string();
+                info_line = "Stopping the current turn…".to_string();
                 continue;
             }
             break;
@@ -1561,6 +1692,9 @@ where
             shell.push_user(&plan_cmd);
             is_processing = true;
             cancelled = false;
+            if let Some(token) = &controls.cancellation {
+                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+            }
             active_phase = None;
             last_phase_event_at = Instant::now();
             last_phase_heartbeat_at = Instant::now();
@@ -1606,6 +1740,9 @@ where
             cursor_pos = 0;
             is_processing = true;
             cancelled = false;
+            if let Some(token) = &controls.cancellation {
+                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+            }
             active_phase = None;
             last_phase_event_at = Instant::now();
             last_phase_heartbeat_at = Instant::now();
@@ -1817,7 +1954,48 @@ where
             }
             let prompt = input.trim().to_string();
             if prompt.is_empty() {
+                if controls.needs_connection
+                    && let Some(action) = controls.on_menu.as_mut()
+                {
+                    action("connect", String::new());
+                }
                 continue;
+            }
+            if let Some(action) = controls.on_menu.as_mut() {
+                let command = match prompt.as_str() {
+                    "/connect" | "/provider" | "/login" => Some("connect"),
+                    "/models" | "/model" => Some("models"),
+                    "/settings" | "/config" => Some("settings"),
+                    "/logout" => Some("remove-key"),
+                    "/" => Some("commands"),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    action(command, String::new());
+                    input.clear();
+                    cursor_pos = 0;
+                    continue;
+                }
+                if !prompt.starts_with('/') && controls.needs_connection {
+                    action("connect", String::new());
+                    continue;
+                }
+                if let Some(spec) = prompt
+                    .strip_prefix("/model ")
+                    .or_else(|| prompt.strip_prefix("/provider "))
+                {
+                    action(
+                        if prompt.starts_with("/model ") {
+                            "model-spec"
+                        } else {
+                            "provider-id"
+                        },
+                        spec.trim().into(),
+                    );
+                    input.clear();
+                    cursor_pos = 0;
+                    continue;
+                }
             }
             if let Some(result) = parse_vim_slash_command(&prompt) {
                 match result {
@@ -1886,6 +2064,9 @@ where
             history_cursor = None;
             is_processing = true;
             cancelled = false;
+            if let Some(token) = &controls.cancellation {
+                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+            }
             active_phase = None;
             last_phase_event_at = Instant::now();
             last_phase_heartbeat_at = Instant::now();
@@ -1959,26 +2140,15 @@ where
             }
             KeyCode::Char(ch) => {
                 input.insert(cursor_pos.min(input.len()), ch);
-                cursor_pos += 1;
+                cursor_pos += ch.len_utf8();
                 ml_ghost.on_keystroke();
-                if autocomplete_dropdown.is_none() {
-                    if ch == '@' {
-                        // Trigger @ file autocomplete dropdown
-                        let trigger = cursor_pos - 1;
-                        let suggestions = autocomplete_at_suggestions("", &workspace_path);
-                        if !suggestions.is_empty() {
-                            let new_ac = AutocompleteState::new(suggestions, trigger);
-                            info_line = new_ac.display_lines(6).join("  ");
-                            autocomplete_dropdown = Some(new_ac);
-                        }
-                    } else if ch == '/' && cursor_pos == 1 && input == "/" {
-                        // Trigger slash command autocomplete at start of input
-                        let suggestions = slash_command_suggestions("", 8);
-                        if !suggestions.is_empty() {
-                            let new_ac = AutocompleteState::new(suggestions, 0);
-                            info_line = new_ac.display_lines(6).join("  ");
-                            autocomplete_dropdown = Some(new_ac);
-                        }
+                if autocomplete_dropdown.is_none() && ch == '@' {
+                    let trigger = cursor_pos - 1;
+                    let suggestions = autocomplete_at_suggestions("", &workspace_path);
+                    if !suggestions.is_empty() {
+                        let new_ac = AutocompleteState::new(suggestions, trigger);
+                        info_line = new_ac.display_lines(6).join("  ");
+                        autocomplete_dropdown = Some(new_ac);
                     }
                 }
             }

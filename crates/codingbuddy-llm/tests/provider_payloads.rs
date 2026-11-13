@@ -243,3 +243,176 @@ fn anthropic_payload_converts_tool_results_to_tool_result_blocks() {
         "fn main() { println!(\"hello\"); }"
     );
 }
+
+#[test]
+fn gemini_round_trips_thought_signature_with_the_function_result() {
+    let response = google::parse_response(
+        &json!({
+            "candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "fs_read", "args": {"path": "main.rs"}},
+                "thoughtSignature": "opaque-provider-signature"
+            }]}}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let id = response.tool_calls[0].id.clone();
+    let request = make_request(
+        "gemini-test",
+        vec![
+            ChatMessage::User {
+                content: "Read main.rs".into(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: response.tool_calls,
+            },
+            ChatMessage::Tool {
+                tool_call_id: id,
+                content: "fn main() {}".into(),
+                tool_name: Some("fs_read".into()),
+            },
+        ],
+        vec![sample_tool()],
+    );
+    let payload = google::build_payload(&request, 1024).unwrap();
+    assert_eq!(
+        payload["contents"][1]["parts"][0]["thoughtSignature"],
+        "opaque-provider-signature"
+    );
+    assert_eq!(
+        payload["contents"][2]["parts"][0]["functionResponse"]["name"],
+        "fs_read"
+    );
+}
+
+#[test]
+fn openai_compatible_presets_stream_from_their_own_endpoint() {
+    use codingbuddy_llm::{ApiClient, LlmClient};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    for (provider, expected_path) in [
+        ("openai-compatible", "/v1/chat/completions"),
+        ("deepseek", "/chat/completions"),
+        ("openrouter", "/v1/chat/completions"),
+        ("ollama", "/v1/chat/completions"),
+        ("custom-fixture", "/chat/completions"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = codingbuddy_core::LlmConfig::default();
+        if provider == "custom-fixture" {
+            let mut profile = cfg.providers["openai-compatible"].clone();
+            profile.openai_compat_prefix = false;
+            cfg.providers.insert(provider.into(), profile);
+        }
+        cfg.select_provider(provider);
+        let profile = cfg.providers.get_mut(provider).unwrap();
+        profile.base_url = format!("http://{}", listener.local_addr().unwrap());
+        if provider != "ollama" {
+            profile.api_key_env = "CODINGBUDDY_FIXTURE_PROVIDER_KEY".into();
+            cfg.api_key = Some("fixture-key".into());
+        }
+        let model = cfg.active_base_model();
+        cfg.timeout_seconds = 3;
+        cfg.max_retries = 0;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut header = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                header.push_str(&line);
+            }
+            assert!(
+                header.starts_with(&format!("POST {expected_path} ")),
+                "{header}"
+            );
+            assert_eq!(header.contains("Bearer fixture-key"), provider != "ollama");
+            let length: usize = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["stream"], true);
+            let events = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ready\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let request = make_request(
+            &model,
+            vec![ChatMessage::User {
+                content: "Say ready".into(),
+            }],
+            vec![],
+        );
+        let response = ApiClient::new(cfg)
+            .unwrap()
+            .complete_chat_streaming(&request, std::sync::Arc::new(|_| {}));
+        server.join().unwrap();
+        assert_eq!(response.unwrap().text, "ready");
+    }
+}
+
+#[test]
+fn cancellation_releases_the_turn_while_waiting_for_response_headers() {
+    use codingbuddy_llm::{ApiClient, LlmClient};
+    use std::{net::TcpListener, sync::mpsc, time::Duration};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = codingbuddy_core::LlmConfig::default();
+    cfg.select_provider("ollama");
+    cfg.providers.get_mut("ollama").unwrap().base_url =
+        format!("http://{}", listener.local_addr().unwrap());
+    cfg.timeout_seconds = 5;
+    let request = make_request(
+        &cfg.active_base_model(),
+        vec![ChatMessage::User {
+            content: "Wait for the mock".into(),
+        }],
+        vec![],
+    );
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (close_tx, close_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        close_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let token = codingbuddy_core::CancellationToken::new();
+    let mut client = ApiClient::new(cfg).unwrap();
+    client.set_cancel_token(token.clone());
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = client.complete_chat_streaming(&request, std::sync::Arc::new(|_| {}));
+        let _ = done_tx.send(result);
+    });
+    accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    token.cancel();
+    let result = done_rx.recv_timeout(Duration::from_secs(1));
+    close_tx.send(()).unwrap();
+    server.join().unwrap();
+    worker.join().unwrap();
+    assert!(
+        result
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted")
+    );
+}

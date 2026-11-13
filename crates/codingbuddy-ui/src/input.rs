@@ -2,6 +2,23 @@ use super::slash_commands::slash_command_suggestions;
 use super::state::{AutocompleteState, VimMode};
 use super::*;
 
+pub(crate) fn slash_query(input: &str, cursor: usize) -> Option<&str> {
+    let query = input.strip_prefix('/')?;
+    (cursor == input.len()
+        && query
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
+    .then_some(query)
+}
+
+pub(crate) fn slash_dropdown(query: &str) -> Option<AutocompleteState> {
+    let mut suggestions = slash_command_suggestions(query, usize::MAX);
+    if !query.is_empty() {
+        suggestions.sort_unstable();
+    }
+    (!suggestions.is_empty()).then(|| AutocompleteState::new(suggestions, 0))
+}
+
 /// Recompute autocomplete suggestions based on current input, returning the
 /// updated dropdown state and info line. Returns `(None, "")` when there are
 /// no matches.

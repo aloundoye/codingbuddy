@@ -79,8 +79,8 @@ pub struct ApiClient {
     api_key: Option<String>,
 }
 
-/// Resolve an API key from env var then config fallback.
-fn resolve_key_from_config(cfg: &LlmConfig) -> Option<String> {
+/// Resolve an explicit credential, an environment key, or a saved key.
+pub fn resolve_key_from_config(cfg: &LlmConfig) -> Option<String> {
     let provider = cfg.active_provider();
     let env_key = provider.api_key_env.trim();
     let env_value = if env_key.is_empty() {
@@ -91,18 +91,159 @@ fn resolve_key_from_config(cfg: &LlmConfig) -> Option<String> {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    env_value.or_else(|| {
-        cfg.api_key
-            .as_ref()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    })
+    cfg.api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .or(env_value)
+        .or_else(|| {
+            (!env_key.is_empty())
+                .then(|| credential_entry(cfg).ok()?.get_password().ok())
+                .flatten()
+        })
+}
+
+fn credential_entry(cfg: &LlmConfig) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(
+        "codingbuddy-provider",
+        &cfg.connection_id(),
+    )?)
+}
+
+pub fn save_provider_key(cfg: &LlmConfig, key: &str) -> Result<()> {
+    Ok(credential_entry(cfg)?.set_password(key)?)
+}
+
+pub fn remove_provider_key(cfg: &LlmConfig) -> Result<()> {
+    match credential_entry(cfg)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn provider_requires_key(cfg: &LlmConfig) -> bool {
+    let provider = cfg.active_provider();
+    let Some(kind) = cfg.active_provider_kind() else {
+        return false;
+    };
+    let protocol = protocol::select_chat_protocol(&provider, kind);
+    !provider.api_key_env.trim().is_empty()
+        && protocol::select_auth_strategy(&provider, kind, protocol) != protocol::AuthStrategy::None
+}
+
+#[derive(Debug)]
+pub enum ConnectionError {
+    UnknownProvider(String),
+    UnsupportedProtocol {
+        provider: String,
+        protocol: &'static str,
+    },
+    MissingCredential {
+        provider: String,
+        variable: String,
+    },
+    RejectedCredential,
+}
+
+impl std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownProvider(provider) => write!(
+                f,
+                "Unknown provider '{provider}'. Use /connect to configure it."
+            ),
+            Self::UnsupportedProtocol { provider, protocol } => write!(
+                f,
+                "{protocol} is unavailable for {provider}. Choose another connection in /connect."
+            ),
+            Self::MissingCredential { provider, variable } => write!(
+                f,
+                "{variable} is required for {provider}. Set it or use /connect."
+            ),
+            Self::RejectedCredential => write!(
+                f,
+                "Invalid or missing API key (HTTP 401). Set the active provider API key environment variable, update llm.api_key, or use /connect."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionError {}
+
+pub fn check_provider(cfg: &LlmConfig) -> Result<()> {
+    let kind = cfg
+        .active_provider_kind()
+        .ok_or_else(|| ConnectionError::UnknownProvider(cfg.provider.clone()))?;
+    let protocol = protocol::select_chat_protocol(&cfg.active_provider(), kind);
+    if matches!(
+        protocol,
+        protocol::ChatProtocol::OpenAiResponses | protocol::ChatProtocol::BedrockConverse
+    ) {
+        return Err(ConnectionError::UnsupportedProtocol {
+            provider: cfg.provider.clone(),
+            protocol: protocol.as_key(),
+        }
+        .into());
+    }
+    if provider_requires_key(cfg) && resolve_key_from_config(cfg).is_none() {
+        return Err(ConnectionError::MissingCredential {
+            provider: cfg.provider.clone(),
+            variable: cfg.active_provider().api_key_env,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+pub fn validate_base_url(value: &str) -> Result<String> {
+    let url =
+        reqwest::Url::parse(value).map_err(|_| anyhow!("Enter a valid HTTP or HTTPS base URL"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "Use an HTTP or HTTPS base URL without credentials, query parameters, or fragments"
+    );
+    Ok(url.as_str().trim_end_matches('/').into())
+}
+
+pub fn probe_provider(cfg: &LlmConfig) -> Result<()> {
+    check_provider(cfg)?;
+    let mut cfg = cfg.clone();
+    cfg.timeout_seconds = 8;
+    cfg.max_retries = 0;
+    let request = ChatRequest {
+        model: cfg.active_base_model(),
+        messages: vec![codingbuddy_core::ChatMessage::User {
+            content: "Reply with OK.".into(),
+        }],
+        tools: Vec::new(),
+        tool_choice: codingbuddy_core::ToolChoice::none(),
+        max_tokens: 32,
+        temperature: None,
+        top_p: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logprobs: None,
+        top_logprobs: None,
+        thinking: None,
+        images: Vec::new(),
+        provider_options: Default::default(),
+        response_format: None,
+    };
+    ApiClient::new(cfg)?.complete_chat(&request)?;
+    Ok(())
 }
 
 impl ApiClient {
     pub fn new(cfg: LlmConfig) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let api_key = resolve_key_from_config(&cfg);
         Ok(Self {
@@ -125,6 +266,53 @@ impl ApiClient {
         self.api_key = resolve_key_from_config(&self.cfg);
     }
 
+    fn with_chat_cancellation(
+        &self,
+        operation: impl FnOnce(ApiClient) -> Result<LlmResponse> + Send + 'static,
+    ) -> Result<LlmResponse> {
+        let Some(token) = &self.cancel_token else {
+            return operation(self.clone());
+        };
+        anyhow::ensure!(!token.is_cancelled(), "Turn interrupted");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let client = self.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(operation(client));
+        });
+        loop {
+            anyhow::ensure!(!token.is_cancelled(), "Turn interrupted");
+            match rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn check_cancellation(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .cancel_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled()),
+            "Turn interrupted"
+        );
+        Ok(())
+    }
+
+    fn wait_before_retry(&self, delay: Duration) -> Result<()> {
+        if self.cancel_token.is_none() {
+            thread::sleep(delay);
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        while let Some(remaining) = delay.checked_sub(started.elapsed()) {
+            self.check_cancellation()?;
+            thread::sleep(remaining.min(Duration::from_millis(40)));
+        }
+        self.check_cancellation()
+    }
+
     /// Attach a cancellation token that will be checked during streaming.
     pub fn set_cancel_token(&mut self, token: CancellationToken) {
         self.cancel_token = Some(token);
@@ -134,16 +322,44 @@ impl ApiClient {
     /// Returns a list of model IDs. Fails gracefully (empty vec) on error.
     fn discover_models_from_api(&self) -> Vec<String> {
         let provider = self.provider_config();
+        if !provider.discovery.enabled {
+            return Vec::new();
+        }
         let base = provider.base_url.trim_end_matches('/');
-        let prefix = if provider.openai_compat_prefix {
+        let prefix = if provider.openai_compat_prefix && !base.ends_with("/v1") {
             "/v1"
         } else {
             ""
         };
-        let url = format!("{base}{prefix}/models");
-        let mut req = self.client.get(&url);
-        if let Some(ref key) = self.api_key {
-            req = req.bearer_auth(key);
+        let kind = self
+            .cfg
+            .active_provider_kind()
+            .unwrap_or(ProviderKind::OpenAiCompatible);
+        let protocol = protocol::select_chat_protocol(&provider, kind);
+        let path = match (kind, protocol) {
+            (ProviderKind::Ollama, _) => "/api/tags".to_owned(),
+            (_, protocol::ChatProtocol::GeminiGenerateContent) => "/v1beta/models".to_owned(),
+            (_, protocol::ChatProtocol::AnthropicMessages) => "/v1/models".to_owned(),
+            _ => format!("{prefix}/models"),
+        };
+        let path = provider
+            .discovery
+            .models_endpoint
+            .as_deref()
+            .filter(|path| path.starts_with('/') && !path.starts_with("//"))
+            .unwrap_or(&path);
+        let base = if kind == ProviderKind::Ollama {
+            base.strip_suffix("/v1").unwrap_or(base)
+        } else {
+            base
+        };
+        let url = format!("{base}{path}");
+        let mut req =
+            self.apply_auth_for_protocol(self.client.get(url), self.api_key.as_deref(), protocol);
+        if protocol == protocol::ChatProtocol::GeminiGenerateContent
+            && let Some(key) = &self.api_key
+        {
+            req = req.header("x-goog-api-key", key);
         }
         let resp = match req.timeout(Duration::from_secs(5)).send() {
             Ok(r) => r,
@@ -154,10 +370,16 @@ impl ApiClient {
             Err(_) => return Vec::new(),
         };
         body.get("data")
+            .or_else(|| body.get("models"))
             .and_then(|d| d.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
+                    .filter_map(|m| {
+                        m.get("id")
+                            .or_else(|| m.get("name"))
+                            .and_then(|v| v.as_str())
+                            .map(|id| id.strip_prefix("models/").unwrap_or(id).to_owned())
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -217,6 +439,15 @@ impl ApiClient {
                 _ => builder,
             },
             protocol::AuthStrategy::QueryApiKey
+                if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent
+                    && provider_config.auth_strategy.is_none() =>
+            {
+                match api_key {
+                    Some(key) => builder.header("x-goog-api-key", key),
+                    None => builder,
+                }
+            }
+            protocol::AuthStrategy::QueryApiKey
             | protocol::AuthStrategy::AwsSigV4
             | protocol::AuthStrategy::None => builder,
         };
@@ -241,11 +472,21 @@ impl ApiClient {
 
     fn resolve_request_api_key(&self) -> Result<Option<String>> {
         let provider = self.provider_config();
+        if self
+            .cfg
+            .active_provider()
+            .auth_strategy
+            .as_deref()
+            .and_then(protocol::parse_auth_strategy)
+            == Some(protocol::AuthStrategy::None)
+        {
+            return Ok(None);
+        }
         let key = self.resolve_api_key();
         if key.is_some() {
             return Ok(key);
         }
-        if provider.api_key_env.trim().is_empty() {
+        if !provider_requires_key(&self.cfg) {
             return Ok(None);
         }
         Err(anyhow!(
@@ -260,7 +501,7 @@ impl ApiClient {
         }
         let provider = self.provider_config();
         let base = provider.base_url.trim_end_matches('/');
-        let prefix = if provider.openai_compat_prefix {
+        let prefix = if provider.openai_compat_prefix && !base.ends_with("/v1") {
             "/v1"
         } else {
             ""
@@ -327,7 +568,7 @@ impl ApiClient {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
                     let retry_after = parse_retry_after(resp.headers());
-                    let body = resp.text()?;
+                    let body = resp.text().map_err(reqwest::Error::without_url)?;
                     if status.is_success() {
                         let mut parsed = if self.cfg.stream {
                             parse_streaming_payload(&body)?
@@ -343,7 +584,12 @@ impl ApiClient {
                     }
 
                     last_err = Some(with_compatibility_context(
-                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        format_api_error(
+                            status,
+                            &redact_key(&body, api_key),
+                            attempt,
+                            self.cfg.max_retries,
+                        ),
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
@@ -701,7 +947,13 @@ impl ApiClient {
             protocol::ChatProtocol::GeminiGenerateContent => {
                 let base = provider.base_url.trim_end_matches('/');
                 let url = providers::google::endpoint(base, &req.model, false);
-                if let Some(key) = api_key {
+                if let Some(key) = api_key
+                    && provider
+                        .auth_strategy
+                        .as_deref()
+                        .and_then(protocol::parse_auth_strategy)
+                        == Some(protocol::AuthStrategy::QueryApiKey)
+                {
                     providers::google::append_api_key(&url, key)
                 } else {
                     url
@@ -713,6 +965,7 @@ impl ApiClient {
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
+            self.check_cancellation()?;
             let builder = self
                 .apply_auth_for_protocol(self.client.post(&endpoint), api_key, chat_protocol)
                 .json(&prepared.payload);
@@ -723,7 +976,7 @@ impl ApiClient {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
                     let retry_after = parse_retry_after(resp.headers());
-                    let body = resp.text()?;
+                    let body = resp.text().map_err(reqwest::Error::without_url)?;
                     if status.is_success() {
                         let response = match chat_protocol {
                             protocol::ChatProtocol::AnthropicMessages => {
@@ -745,11 +998,20 @@ impl ApiClient {
                         return Ok(response);
                     }
                     last_err = Some(with_compatibility_context(
-                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        format_api_error(
+                            status,
+                            &redact_key(&body, api_key),
+                            attempt,
+                            self.cfg.max_retries,
+                        ),
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        self.wait_before_retry(retry_delay_ms(
+                            self.cfg.retry_base_ms,
+                            attempt,
+                            retry_after,
+                        ))?;
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -761,7 +1023,11 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
+                        self.wait_before_retry(retry_delay_ms(
+                            NETWORK_RETRY_BASE_MS,
+                            attempt,
+                            None,
+                        ))?;
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -790,7 +1056,7 @@ impl ApiClient {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
                     let retry_after = parse_retry_after(resp.headers());
-                    let body = resp.text()?;
+                    let body = resp.text().map_err(reqwest::Error::without_url)?;
                     if status.is_success() {
                         return parse_fim_non_streaming_payload(&body);
                     }
@@ -983,7 +1249,13 @@ impl ApiClient {
             protocol::ChatProtocol::GeminiGenerateContent => {
                 let base = provider.base_url.trim_end_matches('/');
                 let url = providers::google::endpoint(base, &req.model, true);
-                if let Some(key) = api_key {
+                if let Some(key) = api_key
+                    && provider
+                        .auth_strategy
+                        .as_deref()
+                        .and_then(protocol::parse_auth_strategy)
+                        == Some(protocol::AuthStrategy::QueryApiKey)
+                {
                     providers::google::append_api_key(&url, key)
                 } else {
                     url
@@ -995,6 +1267,7 @@ impl ApiClient {
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
+            self.check_cancellation()?;
             let builder = self
                 .apply_auth_for_protocol(self.client.post(&stream_endpoint), api_key, chat_protocol)
                 .json(&prepared.payload);
@@ -1251,11 +1524,20 @@ impl ApiClient {
 
                     let body = resp.text().unwrap_or_default();
                     last_err = Some(with_compatibility_context(
-                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        format_api_error(
+                            status,
+                            &redact_key(&body, api_key),
+                            attempt,
+                            self.cfg.max_retries,
+                        ),
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        self.wait_before_retry(retry_delay_ms(
+                            self.cfg.retry_base_ms,
+                            attempt,
+                            retry_after,
+                        ))?;
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -1267,7 +1549,11 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
+                        self.wait_before_retry(retry_delay_ms(
+                            NETWORK_RETRY_BASE_MS,
+                            attempt,
+                            None,
+                        ))?;
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -1595,7 +1881,12 @@ impl ApiClient {
 
                     let body = resp.text().unwrap_or_default();
                     last_err = Some(with_compatibility_context(
-                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        format_api_error(
+                            status,
+                            &redact_key(&body, api_key),
+                            attempt,
+                            self.cfg.max_retries,
+                        ),
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
@@ -1660,7 +1951,9 @@ impl LlmClient for ApiClient {
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.validate_chat_request_contract(&normalized_req)?;
         self.validate_thinking_params(&normalized_req)?;
-        self.complete_chat_inner(&normalized_req, key.as_deref())
+        self.with_chat_cancellation(move |client| {
+            client.complete_chat_inner(&normalized_req, key.as_deref())
+        })
     }
 
     fn complete_chat_streaming(
@@ -1674,7 +1967,15 @@ impl LlmClient for ApiClient {
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.validate_chat_request_contract(&normalized_req)?;
         self.validate_thinking_params(&normalized_req)?;
-        self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb)
+        self.with_chat_cancellation(move |client| {
+            let token = client.cancel_token.clone();
+            let guarded = std::sync::Arc::new(move |chunk| {
+                if !token.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    cb(chunk);
+                }
+            });
+            client.complete_chat_streaming_inner(&normalized_req, key.as_deref(), guarded)
+        })
     }
 
     fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
@@ -1740,6 +2041,13 @@ impl LlmClient for ApiClient {
     }
 }
 
+fn redact_key<'a>(body: &'a str, key: Option<&str>) -> std::borrow::Cow<'a, str> {
+    match key.filter(|key| !key.is_empty()) {
+        Some(key) if body.contains(key) => body.replace(key, "***").into(),
+        _ => body.into(),
+    }
+}
+
 /// Produce a user-friendly error from an LLM API HTTP response.
 fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8) -> anyhow::Error {
     // Parse structured error from JSON body: {"error": {"type": "...", "message": "..."}}
@@ -1762,10 +2070,7 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
             error_type,
             detail
         ),
-        StatusCode::UNAUTHORIZED => anyhow!(
-            "Invalid or missing API key (HTTP 401).\n\
-             Set the active provider API key environment variable or configure llm.api_key in settings."
-        ),
+        StatusCode::UNAUTHORIZED => ConnectionError::RejectedCredential.into(),
         StatusCode::PAYMENT_REQUIRED => anyhow!(
             "Insufficient balance or billing issue (HTTP 402). Check the active provider account."
         ),
@@ -1842,7 +2147,7 @@ fn format_transport_error(err: &reqwest::Error) -> anyhow::Error {
              Retrying with exponential backoff."
         )
     } else {
-        anyhow!("Network error: {err}. Retrying with exponential backoff if retries remain.")
+        anyhow!("Network error. Check the configured endpoint and retry.")
     }
 }
 
@@ -1867,7 +2172,11 @@ fn with_compatibility_context(
     err: anyhow::Error,
     compatibility: &AppliedCompatibility,
 ) -> anyhow::Error {
-    anyhow!("{err}. {}", compatibility_error_context(compatibility))
+    if err.is::<ConnectionError>() {
+        err
+    } else {
+        anyhow!("{err}. {}", compatibility_error_context(compatibility))
+    }
 }
 
 fn should_retry_status(status: StatusCode) -> bool {

@@ -66,12 +66,13 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
                 }
                 for tc in tool_calls {
                     let args: Value = serde_json::from_str(&tc.arguments).unwrap_or_default();
-                    parts.push(json!({
-                        "functionCall": {
-                            "name": tc.name,
-                            "args": args
-                        }
-                    }));
+                    let mut part = json!({
+                        "functionCall": { "name": tc.name, "args": args }
+                    });
+                    if let Some(signature) = gemini_signature(&tc.id) {
+                        part["thoughtSignature"] = json!(signature);
+                    }
+                    parts.push(part);
                 }
                 if parts.is_empty() {
                     parts.push(json!({ "text": "" }));
@@ -160,6 +161,21 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
     Ok(payload)
 }
 
+// Carry the opaque signature with the tool-call identity through the common
+// tool loop. Only this adapter interprets it.
+fn gemini_call_id(index: usize, part: &Value) -> String {
+    match part.get("thoughtSignature").and_then(Value::as_str) {
+        Some(signature) => format!("gemini:{index}:{signature}"),
+        None => format!("call_{index}"),
+    }
+}
+
+fn gemini_signature(id: &str) -> Option<&str> {
+    id.strip_prefix("gemini:")?
+        .split_once(':')
+        .map(|(_, signature)| signature)
+}
+
 /// Parse a non-streaming Gemini GenerateContent response.
 pub fn parse_response(body: &str) -> Result<LlmResponse> {
     let v: Value = serde_json::from_str(body)?;
@@ -179,7 +195,9 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
             .and_then(|p| p.as_array())
     {
         for (i, part) in parts.iter().enumerate() {
-            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+            if part.get("thought") != Some(&Value::Bool(true))
+                && let Some(t) = part.get("text").and_then(|t| t.as_str())
+            {
                 text.push_str(t);
             }
             if let Some(fc) = part.get("functionCall") {
@@ -190,7 +208,7 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
                     .to_string();
                 let args = fc.get("args").cloned().unwrap_or_default();
                 tool_calls.push(LlmToolCall {
-                    id: format!("call_{i}"),
+                    id: gemini_call_id(i, part),
                     name,
                     arguments: serde_json::to_string(&args).unwrap_or_default(),
                 });
@@ -272,7 +290,7 @@ pub fn parse_streaming_chunk(data: &Value) -> StreamEvent {
                 .to_string();
             let args = fc.get("args").cloned().unwrap_or_default();
             events.push(StreamEvent::ToolCall {
-                id: format!("call_{i}"),
+                id: gemini_call_id(i, part),
                 name,
                 arguments: serde_json::to_string(&args).unwrap_or_default(),
             });

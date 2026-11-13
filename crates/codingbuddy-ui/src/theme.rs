@@ -1,17 +1,14 @@
 use ratatui::style::{Color, Modifier, Style};
-use std::sync::OnceLock;
-
-/// Global active theme. Initialized once at TUI startup.
-static ACTIVE_THEME: OnceLock<TuiTheme> = OnceLock::new();
-
-/// Initialize the global theme. Call once at TUI startup.
-pub fn init_theme(theme: TuiTheme) {
-    let _ = ACTIVE_THEME.set(theme);
+thread_local! {
+    static ACTIVE_THEME: std::cell::RefCell<TuiTheme> = std::cell::RefCell::new(TuiTheme::dark());
 }
 
-/// Get the active theme. Returns dark theme if not yet initialized.
-pub fn theme() -> &'static TuiTheme {
-    ACTIVE_THEME.get_or_init(TuiTheme::dark)
+pub fn init_theme(theme: TuiTheme) {
+    ACTIVE_THEME.with(|active| active.replace(theme));
+}
+
+pub fn theme() -> TuiTheme {
+    ACTIVE_THEME.with(|active| active.borrow().clone())
 }
 
 /// Full TUI color palette with semantic roles.
