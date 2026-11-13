@@ -38,10 +38,6 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
             engine.set_lint_command(lang.trim(), cmd.trim());
         }
     }
-    // Apply --model flag with provider/model syntax support
-    if let Some(ref model_spec) = cli.model {
-        engine.apply_model_spec(model_spec);
-    }
 }
 
 /// Subagent orchestration connects the parallel Worker execution to isolated engine scopes.
@@ -245,133 +241,20 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         session_id: None,
         profile_override: None,
         model_spec,
+        ..Default::default()
     }
 }
 
-pub(crate) fn ensure_llm_ready(cwd: &Path, json_mode: bool) -> Result<()> {
-    let cfg = AppConfig::ensure(cwd)?;
-    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)
+pub(crate) fn ensure_llm_ready(cwd: &Path, _json_mode: bool) -> Result<()> {
+    codingbuddy_llm::check_provider(&AppConfig::load(cwd)?.llm)
 }
 
-pub(crate) fn ensure_llm_ready_with_cfg(
-    cwd: Option<&Path>,
-    cfg: &AppConfig,
-    json_mode: bool,
-) -> Result<()> {
-    use std::io::IsTerminal;
-
-    let _provider_kind = cfg.llm.active_provider_kind().ok_or_else(|| {
-        anyhow!(
-            "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
-            cfg.llm.provider
-        )
-    })?;
-
-    let provider = cfg.llm.active_provider();
-    let env_key = provider.api_key_env.trim();
-    if env_key.is_empty() {
-        return Ok(());
+pub(crate) fn selected_config(cwd: &Path, model: Option<&str>) -> Result<AppConfig> {
+    let mut cfg = AppConfig::load(cwd)?;
+    if let Some(spec) = model.filter(|spec| !crate::commands::chat::is_max_think_selection(spec)) {
+        cfg.llm.apply_model_spec(spec);
     }
-
-    if std::env::var(env_key)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-
-    if let Some(configured_key) = cfg
-        .llm
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        // SAFETY: We set process-local environment for this CLI process before worker threads start.
-        unsafe {
-            std::env::set_var(env_key, configured_key);
-        }
-        return Ok(());
-    }
-
-    let interactive_tty = std::io::stderr().is_terminal();
-    if json_mode || !interactive_tty {
-        return Err(anyhow!("{} is required. Set it and retry.", env_key));
-    }
-
-    eprintln!(
-        "API key is required to use provider '{}'.",
-        cfg.llm.provider
-    );
-    let prompt = format!("Enter {}: ", env_key);
-    let key = rpassword::prompt_password(prompt)?;
-    let trimmed = key.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("received empty API key"));
-    }
-    // SAFETY: We set process-local environment for this CLI process before worker threads start.
-    unsafe {
-        std::env::set_var(env_key, trimmed);
-    }
-    if let Some(cwd) = cwd {
-        maybe_persist_api_key(cwd, env_key, trimmed)?;
-    }
-    Ok(())
-}
-
-fn maybe_persist_api_key(cwd: &Path, env_key: &str, api_key: &str) -> Result<()> {
-    use std::io::{IsTerminal, Write};
-
-    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        return Ok(());
-    }
-    eprint!(
-        "Save API key to {} for this workspace? [Y/n]: ",
-        AppConfig::project_local_settings_path(cwd).display()
-    );
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    let normalized = answer.trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "n" | "no") {
-        return Ok(());
-    }
-
-    let local_path = AppConfig::project_local_settings_path(cwd);
-    if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut root = if local_path.exists() {
-        let raw = fs::read_to_string(&local_path)?;
-        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-    if !root.is_object() {
-        root = json!({});
-    }
-    let map = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("settings.local.json root must be an object"))?;
-    let llm_value = map.entry("llm".to_string()).or_insert_with(|| json!({}));
-    if !llm_value.is_object() {
-        *llm_value = json!({});
-    }
-    if let Some(llm) = llm_value.as_object_mut() {
-        llm.insert("api_key".to_string(), json!(api_key));
-        llm.insert("api_key_env".to_string(), json!(env_key));
-    }
-    fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&local_path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&local_path, perms)?;
-    }
-    eprintln!("saved API key in {}", local_path.display());
-    Ok(())
+    Ok(cfg)
 }
 
 pub(crate) fn read_session_events(cwd: &Path, session_id: Uuid) -> Result<Vec<EventEnvelope>> {

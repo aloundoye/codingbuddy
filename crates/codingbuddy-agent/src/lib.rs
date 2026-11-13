@@ -101,6 +101,10 @@ pub struct ChatOptions {
     pub profile_override: Option<String>,
     /// Optional `provider/model` selector applied to this turn without mutating persisted config.
     pub model_spec: Option<String>,
+    /// Effective connection for this turn, including session-only credentials.
+    pub llm_config: Option<codingbuddy_core::LlmConfig>,
+    pub cancellation: Option<codingbuddy_core::CancellationToken>,
+    pub allow_history_transfer: bool,
 }
 
 pub struct AgentEngine {
@@ -128,9 +132,15 @@ pub struct AgentEngine {
 
 impl AgentEngine {
     pub fn new(workspace: &Path) -> Result<Self> {
+        Self::new_with_config(
+            workspace,
+            AppConfig::ensure(workspace).context("failed to load config")?,
+        )
+    }
+
+    pub fn new_with_config(workspace: &Path, cfg: AppConfig) -> Result<Self> {
         let mut prof = codingbuddy_core::profiler::StartupProfiler::new();
 
-        let cfg = AppConfig::ensure(workspace).context("failed to load config")?;
         prof.mark("config_load");
 
         let llm = Box::new(ApiClient::new(cfg.llm.clone()).context("failed to create LLM client")?);
@@ -272,11 +282,16 @@ impl AgentEngine {
     /// Apply a `provider/model-id` spec (e.g. `"anthropic/claude-sonnet-4-6-20250514"`).
     pub fn apply_model_spec(&mut self, spec: &str) {
         self.cfg.llm.apply_model_spec(spec);
+        if let Ok(client) = ApiClient::new(self.cfg.llm.clone()) {
+            self.llm = Box::new(client);
+        }
     }
 
     fn effective_config(&self, options: &ChatOptions) -> AppConfig {
         let mut cfg = self.cfg.clone();
-        if let Some(spec) = options.model_spec.as_deref() {
+        if let Some(llm) = &options.llm_config {
+            cfg.llm = llm.clone();
+        } else if let Some(spec) = options.model_spec.as_deref() {
             cfg.llm.apply_model_spec(spec);
         }
         cfg
@@ -287,12 +302,15 @@ impl AgentEngine {
         cfg: &AppConfig,
         options: &ChatOptions,
     ) -> Result<Option<ApiClient>> {
-        if options
-            .model_spec
-            .as_deref()
-            .is_some_and(|spec| !spec.trim().is_empty())
+        if options.llm_config.is_some()
+            || options.model_spec.is_some()
+            || options.cancellation.is_some()
         {
-            Ok(Some(ApiClient::new(cfg.llm.clone())?))
+            let mut client = ApiClient::new(cfg.llm.clone())?;
+            if let Some(token) = &options.cancellation {
+                client.set_cancel_token(token.clone());
+            }
+            Ok(Some(client))
         } else {
             Ok(None)
         }
@@ -1040,6 +1058,8 @@ impl AgentEngine {
             loop_.set_hooks(hooks);
         }
 
+        loop_.cancellation = options.cancellation.clone();
+
         // Wire config watcher for hot-reload polling between tool-use turns
         if let Some(ref watcher) = self.config_watcher {
             loop_.set_config_watcher(watcher);
@@ -1179,28 +1199,38 @@ impl AgentEngine {
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
         let session = self.ensure_session_record_for(options.session_id)?;
         options.session_id = Some(session.session_id);
-        if options
-            .model_spec
-            .as_deref()
-            .is_some_and(|spec| !spec.trim().is_empty())
-        {
-            let effective = self.effective_config(&options);
-            let model = effective.llm.active_base_model();
-            self.stream(StreamChunk::ModelChanged {
-                model: model.clone(),
-            });
-            self.append_event_best_effort_for_session(
-                Some(session.session_id),
-                EventKind::ProviderSelected {
-                    provider: effective.llm.provider.clone(),
-                    model,
-                },
-            );
+        let effective = self.effective_config(&options);
+        let model = effective.llm.active_base_model();
+        let destination = effective.llm.connection_id();
+        let projection = self.store.rebuild_from_events(session.session_id)?;
+        if !projection.chat_messages.is_empty() && !options.allow_history_transfer {
+            let changed =
+                projection
+                    .provider_selection
+                    .as_ref()
+                    .is_some_and(|(provider, _, previous)| {
+                        provider != &effective.llm.provider
+                            || previous
+                                .as_ref()
+                                .is_some_and(|previous| previous != &destination)
+                    });
+            if changed {
+                return Err(anyhow!(
+                    "Conversation belongs to a different provider or endpoint. Resume interactively to choose whether to share it."
+                ));
+            }
         }
-
-        if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
-            options.chat_history = projection.chat_messages;
-        }
+        options.chat_history = projection.chat_messages;
+        self.store.append_event(&EventEnvelope {
+            seq_no: self.store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::ProviderSelected {
+                provider: effective.llm.provider.clone(),
+                model,
+                destination: Some(destination),
+            },
+        })?;
 
         self.append_event_best_effort_for_session(
             Some(session.session_id),
@@ -1213,7 +1243,9 @@ impl AgentEngine {
 
         let result = if !options.tools {
             self.analyze_with_options(&prompt_enriched, options)
-        } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
+        } else if options.cancellation.is_none()
+            && should_run_team_orchestration(self, &prompt_enriched, &options)
+        {
             team::run(self, &prompt_enriched, &options)
         } else {
             self.run_tool_use_loop(&prompt_enriched, &options)

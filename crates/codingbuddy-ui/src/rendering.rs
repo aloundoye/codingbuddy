@@ -38,6 +38,11 @@ fn syntect_color_to_ratatui(c: syntect::highlighting::Color) -> Color {
 
 /// Events sent from the background agent thread to the TUI event loop.
 pub enum TuiStreamEvent {
+    Menu(Option<crate::TerminalMenu>),
+    ConnectionChanged {
+        ready: bool,
+        theme: Option<String>,
+    },
     /// Incremental content text from the LLM.
     ContentDelta(String),
     /// Incremental reasoning/thinking text from the LLM.
@@ -88,11 +93,20 @@ pub enum TuiStreamEvent {
         error: String,
     },
     /// A persisted system/background notice arrived outside the active turn.
-    SystemNotice { line: String, error: bool },
+    SystemNotice {
+        line: String,
+        error: bool,
+    },
     /// Watch mode auto-triggered because comment digest changed.
-    WatchTriggered { digest: u64, comment_count: usize },
+    WatchTriggered {
+        digest: u64,
+        comment_count: usize,
+    },
     /// Display an inline image in the terminal (raw bytes).
-    ImageDisplay { data: Vec<u8>, label: String },
+    ImageDisplay {
+        data: Vec<u8>,
+        label: String,
+    },
     /// Clear any previously streamed text — the response contained tool calls,
     /// so interleaved text fragments are noise and should be removed.
     ClearStreamingText,
@@ -111,9 +125,15 @@ pub enum TuiStreamEvent {
         cost_usd: f64,
     },
     /// Role/phase header for clear visual boundaries.
-    RoleHeader { role: String, model: String },
+    RoleHeader {
+        role: String,
+        model: String,
+    },
     /// Live progress data from a running tool (e.g. bash stdout).
-    ToolProgress { tool_name: String, data: String },
+    ToolProgress {
+        tool_name: String,
+        data: String,
+    },
     /// An error occurred during agent execution.
     Error(String),
     /// Agent execution completed with the given output.
@@ -127,7 +147,11 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         // Show cursor in case it was hidden
-        let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            crossterm::cursor::Show
+        );
     }
 }
 

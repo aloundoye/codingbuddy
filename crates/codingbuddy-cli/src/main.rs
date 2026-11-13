@@ -50,7 +50,7 @@ use commands::status::{run_context, run_models, run_status, run_usage};
 use commands::tasks::run_tasks;
 use commands::update::run_update;
 use context::{
-    apply_cli_flags, chat_options_from_cli, ensure_llm_ready, finalize_background_subagent_run,
+    apply_cli_flags, chat_options_from_cli, finalize_background_subagent_run, selected_config,
     wire_subagent_worker,
 };
 use output::print_json;
@@ -1437,12 +1437,12 @@ fn run() -> Result<()> {
 
     // Handle --continue: resume last session
     if cli.continue_session {
-        return run_continue_session(&cwd, cli.json, cli.model.as_deref());
+        return run_continue_session(&cwd, cli.json, &cli);
     }
 
     // Handle --resume SESSION_ID: resume specific session
     if let Some(ref session_id) = cli.resume_session {
-        return run_resume_specific(&cwd, session_id, cli.json, cli.model.as_deref());
+        return run_resume_specific(&cwd, session_id, cli.json, &cli);
     }
 
     let command = cli
@@ -1470,8 +1470,9 @@ fn run() -> Result<()> {
         }
         Commands::Autopilot(args) => run_autopilot_cmd(&cwd, args, cli.json),
         Commands::Ask(args) => {
-            ensure_llm_ready(&cwd, cli.json)?;
-            let mut engine = AgentEngine::new(&cwd)?;
+            let cfg = selected_config(&cwd, cli.model.as_deref())?;
+            codingbuddy_llm::check_provider(&cfg.llm)?;
+            let mut engine = AgentEngine::new_with_config(&cwd, cfg)?;
             apply_cli_flags(&mut engine, &cli);
             wire_subagent_worker(&engine, &cwd);
             let mode = match args.mode.trim().to_ascii_lowercase().as_str() {
@@ -1511,8 +1512,9 @@ fn run() -> Result<()> {
             Ok(())
         }
         Commands::Plan(args) => {
-            ensure_llm_ready(&cwd, cli.json)?;
-            let engine = AgentEngine::new(&cwd)?;
+            let cfg = selected_config(&cwd, cli.model.as_deref())?;
+            codingbuddy_llm::check_provider(&cfg.llm)?;
+            let engine = AgentEngine::new_with_config(&cwd, cfg)?;
             let options = chat_options_from_cli(&cli, true, ChatMode::Code);
             let plan_prompt = format!(
                 "Create a detailed implementation plan for: {}\n\nReturn ONLY a structured plan with steps, files, and verification commands. Do NOT implement any changes.",

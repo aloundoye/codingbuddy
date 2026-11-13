@@ -5,7 +5,10 @@ pub(crate) struct ChatTuiArgs<'a> {
     pub(crate) allow_tools: bool,
     pub(crate) cfg: &'a AppConfig,
     pub(crate) initial_force_max_think: bool,
-    pub(crate) initial_model_spec: Option<String>,
+    pub(crate) needs_connection: bool,
+    pub(crate) open_connect: bool,
+    pub(crate) configured: bool,
+    pub(crate) cli: Option<&'a crate::Cli>,
     pub(crate) teammate_mode: Option<String>,
     pub(crate) repo_root_override: Option<PathBuf>,
     pub(crate) debug_context: bool,
@@ -20,7 +23,10 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         allow_tools,
         cfg,
         initial_force_max_think,
-        initial_model_spec,
+        needs_connection,
+        open_connect,
+        configured,
+        cli,
         teammate_mode,
         repo_root_override,
         debug_context,
@@ -32,13 +38,24 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     if debug {
         eprintln!("[debug] creating agent engine...");
     }
-    let engine = Arc::new(AgentEngine::new(cwd)?);
+    let mut engine = AgentEngine::new_with_config(cwd, cfg.clone())?;
+    if let Some(cli) = cli {
+        apply_cli_flags(&mut engine, cli);
+    }
+    let engine = Arc::new(engine);
     wire_subagent_worker(&engine, cwd);
     if debug {
         eprintln!("[debug] agent engine ready");
     }
     let force_max_think = Arc::new(AtomicBool::new(initial_force_max_think));
-    let active_model_spec = Arc::new(std::sync::Mutex::new(initial_model_spec));
+    let connection = Arc::new(std::sync::Mutex::new(connections::Connection::new(
+        cfg.llm.clone(),
+        !needs_connection,
+        configured,
+    )));
+    let cancellation = Arc::new(std::sync::Mutex::new(
+        codingbuddy_core::CancellationToken::new(),
+    ));
     let additional_dirs = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
     let read_only_mode = Arc::new(AtomicBool::new(false));
     let active_chat_mode = Arc::new(std::sync::Mutex::new(ChatMode::Code));
@@ -50,6 +67,19 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
 
     // Create the channel for TUI stream events.
     let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
+
+    let menus = Arc::new(connections::Menus {
+        cwd: cwd.to_path_buf(),
+        state: Arc::clone(&connection),
+        session: Arc::clone(&active_session_id),
+        chat_mode: Arc::clone(&active_chat_mode),
+        read_only: Arc::clone(&read_only_mode),
+        allow_tools,
+        tx: tx.clone(),
+    });
+    menus.review_resume()?;
+    let menus_for_submit = Arc::clone(&menus);
+    let turn_cancellation = Arc::clone(&cancellation);
 
     // Set approval handler that routes through the TUI channel.
     {
@@ -70,19 +100,23 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         }));
     }
 
-    let status = current_ui_status(
+    let mut status = current_ui_status(
         cwd,
         cfg,
         force_max_think.load(Ordering::Relaxed),
         initial_session_id,
     )?;
+    status.model = if needs_connection {
+        "Enter to connect · /connect".into()
+    } else {
+        format!("{}/{}", cfg.llm.provider, cfg.llm.active_base_model())
+    };
     let bindings = load_tui_keybindings(cwd, cfg);
     let theme = match cfg.theme.mode.as_str() {
         "dark" | "light" => TuiTheme::from_preference(&cfg.theme.mode),
         _ => TuiTheme::from_preference("auto"),
     };
     let fmt_refresh = Arc::clone(&force_max_think);
-    let active_model_spec_for_closure = Arc::clone(&active_model_spec);
     let additional_dirs_for_closure = Arc::clone(&additional_dirs);
     let read_only_for_closure = Arc::clone(&read_only_mode);
     let active_mode_for_closure = Arc::clone(&active_chat_mode);
@@ -191,6 +225,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     if debug {
         eprintln!("[debug] starting TUI shell...");
     }
+    let status_connection = Arc::clone(&connection);
     run_tui_shell_with_bindings(
         status,
         bindings,
@@ -315,58 +350,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             "config file: {}",
                             AppConfig::project_settings_path(cwd).display()
                         ),
-                        SlashCommand::Model(model) => {
-                            if let Some(ref model) = model {
-                                let thinking = is_max_think_selection(model);
-                                let active_mode = active_mode_for_closure
-                                    .lock()
-                                    .map(|guard| *guard)
-                                    .unwrap_or(ChatMode::Code);
-                                if !thinking
-                                    && let Some(warning) = model_switch_safety_message(
-                                        cwd,
-                                        cfg,
-                                        model,
-                                        allow_tools,
-                                        read_only_for_closure.load(Ordering::Relaxed),
-                                        active_mode,
-                                    )
-                                {
-                                    warning
-                                } else {
-                                    force_max_think.store(thinking, Ordering::Relaxed);
-                                    if let Ok(mut guard) = active_model_spec_for_closure.lock() {
-                                        if thinking {
-                                            *guard = None;
-                                        } else {
-                                            *guard = Some(model.clone());
-                                        }
-                                    }
-                                    if force_max_think.load(Ordering::Relaxed) {
-                                        format!(
-                                            "model mode: thinking-enabled ({})",
-                                            cfg.llm.active_reasoner_model()
-                                        )
-                                    } else {
-                                        let active_model = active_model_spec_for_closure
-                                            .lock()
-                                            .ok()
-                                            .and_then(|guard| guard.clone())
-                                            .map(|spec| {
-                                                active_model_for_display(cfg, Some(&spec), false)
-                                            })
-                                            .unwrap_or_else(|| cfg.llm.active_base_model());
-                                        format!(
-                                            "model mode: auto ({} thinking=on-demand)",
-                                            active_model
-                                        )
-                                    }
-                                }
-                            } else {
-                                // No argument — show model list
-                                format_models_list(cwd, cfg)
-                            }
-                        }
+                        SlashCommand::Model(_) => "Use /models to choose a model.".into(),
                         SlashCommand::Provider(provider) => format_provider_info(cfg, provider),
                         SlashCommand::Cost => {
                             let store = Store::new(cwd)?;
@@ -894,6 +878,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                                 if let Ok(mut guard) = active_session_for_closure.lock() {
                                     *guard = Some(session_id);
                                 }
+                                menus_for_submit.review_resume()?;
                                 payload["message"]
                                     .as_str()
                                     .unwrap_or("active chat session updated")
@@ -1060,6 +1045,20 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 return;
             }
 
+            let (llm_config, allow_history_transfer) = {
+                let mut state = connection.lock().unwrap();
+                if !state.ready {
+                    let _ = tx.send(TuiStreamEvent::Error(
+                        "Connect a provider with /connect.".into(),
+                    ));
+                    return;
+                }
+                (
+                    state.llm.clone(),
+                    std::mem::take(&mut state.allow_history_transfer),
+                )
+            };
+            let token = turn_cancellation.lock().unwrap().clone();
             // Agent prompt — expand @file mentions and set stream callback.
             let engine_clone = Arc::clone(&engine);
             let mut prompt = codingbuddy_ui::expand_at_mentions(prompt);
@@ -1090,15 +1089,13 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 .map(|mut imgs| std::mem::take(&mut *imgs))
                 .unwrap_or_default();
             let teammate_mode_for_turn = teammate_mode.clone();
-            let session_id_for_turn = active_session_for_closure
-                .lock()
-                .map(|guard| *guard)
-                .unwrap_or(None);
-            let model_spec_for_turn = active_model_spec_for_closure
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone());
-
+            let session_id_for_turn = match menus_for_submit.ensure_session() {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    let _ = tx.send(TuiStreamEvent::Error(error.to_string()));
+                    return;
+                }
+            };
             engine.set_stream_callback(std::sync::Arc::new(move |chunk| match chunk {
                 StreamChunk::ContentDelta(s) => {
                     let _ = tx_stream.send(TuiStreamEvent::ContentDelta(s));
@@ -1169,10 +1166,10 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                     });
                 }
                 StreamChunk::SecurityWarning { message } => {
-                    let _ = tx_stream.send(TuiStreamEvent::Error(format!("⚠ Security: {message}")));
+                    let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: format!("Security: {message}"), error: true });
                 }
                 StreamChunk::Error { message, .. } => {
-                    let _ = tx_stream.send(TuiStreamEvent::Error(message));
+                    let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: message, error: true });
                 }
                 StreamChunk::PhaseTransition { from, to } => {
                     let _ = tx_stream.send(TuiStreamEvent::ModeTransition {
@@ -1219,13 +1216,16 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 StreamChunk::Done { .. } => {}
             }));
 
+            let connection_for_turn = Arc::clone(&connection);
             let prompt_repo_root_override = repo_root_override.clone();
             thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     engine_clone.chat_with_options(
                         &prompt,
                         ChatOptions {
-                            tools: allow_tools && !read_only_for_turn,
+                            tools: allow_tools
+                                && !read_only_for_turn
+                                && mode_for_turn == ChatMode::Code,
                             force_max_think: max_think,
                             additional_dirs: prompt_additional_dirs,
                             repo_root_override: prompt_repo_root_override.clone(),
@@ -1236,7 +1236,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             watch_files: watch_files_enabled,
                             images: images_for_turn,
                             session_id: session_id_for_turn,
-                            model_spec: model_spec_for_turn.clone(),
+                            llm_config: Some(llm_config),
+                            cancellation: Some(token),
+                            allow_history_transfer,
                             ..Default::default()
                         },
                     )
@@ -1246,7 +1248,18 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         let _ = tx_done.send(TuiStreamEvent::Done(output));
                     }
                     Ok(Err(e)) => {
-                        let _ = tx_done.send(TuiStreamEvent::Error(e.to_string()));
+                        let error = format!("{e:#}");
+                        if e.downcast_ref::<codingbuddy_llm::ConnectionError>()
+                            .is_some()
+                            && let Ok(mut connection) = connection_for_turn.lock()
+                        {
+                            connection.ready = false;
+                            let _ = tx_done.send(TuiStreamEvent::ConnectionChanged {
+                                ready: false,
+                                theme: None,
+                            });
+                        }
+                        let _ = tx_done.send(TuiStreamEvent::Error(error));
                     }
                     Err(panic_payload) => {
                         let msg = panic_payload
@@ -1263,14 +1276,37 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         },
         move || {
             let session_override = active_session_id.lock().map(|guard| *guard).unwrap_or(None);
+            let mut effective = cfg.clone();
+            let state = status_connection.lock().ok()?;
+            effective.llm = state.llm.clone();
+            let ready = state.ready;
+            drop(state);
             current_ui_status(
                 cwd,
-                cfg,
+                &effective,
                 fmt_refresh.load(Ordering::Relaxed),
                 session_override,
             )
             .ok()
+            .map(|mut status| {
+                status.model = if ready {
+                    format!(
+                        "{}/{}",
+                        effective.llm.provider,
+                        effective.llm.active_base_model()
+                    )
+                } else {
+                    "Enter to connect · /connect".into()
+                };
+                status
+            })
         },
         ml_completion_cb,
+        codingbuddy_ui::TerminalControls {
+            on_menu: Some(Box::new(move |id, value| menus.action(id, value))),
+            needs_connection,
+            open_connect,
+            cancellation: Some(cancellation),
+        },
     )
 }

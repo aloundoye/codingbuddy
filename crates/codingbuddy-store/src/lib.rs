@@ -3517,6 +3517,7 @@ pub struct RebuildProjection {
     pub transcript: Vec<String>,
     /// Structured chat messages for accurate session resume (from ChatTurn events).
     pub chat_messages: Vec<ChatMessage>,
+    pub provider_selection: Option<(String, String, Option<String>)>,
     pub latest_plan: Option<Plan>,
     pub step_status: Vec<(Uuid, bool, String)>,
     pub staged_patches: Vec<Uuid>,
@@ -3544,6 +3545,14 @@ pub struct RebuildProjection {
 
 fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
     match &event.kind {
+        EventKind::ProviderSelected {
+            provider,
+            model,
+            destination,
+        } => {
+            proj.provider_selection = Some((provider.clone(), model.clone(), destination.clone()));
+        }
+
         EventKind::TurnAdded { role, content } => {
             proj.transcript.push(format!("{role}: {content}"))
         }

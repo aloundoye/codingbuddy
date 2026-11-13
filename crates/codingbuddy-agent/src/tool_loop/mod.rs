@@ -142,6 +142,7 @@ Initialize it before edits, keep exactly one in_progress item, and update it aft
 /// which tools to call at each step.
 pub struct ToolUseLoop<'a> {
     llm: &'a (dyn LlmClient + Send + Sync),
+    pub(crate) cancellation: Option<codingbuddy_core::CancellationToken>,
     tool_host: Arc<dyn ToolHost + Send + Sync>,
     config: ToolLoopConfig,
     messages: Vec<ChatMessage>,
@@ -290,6 +291,7 @@ impl<'a> ToolUseLoop<'a> {
             active_worktree: None,
             recent_file_accesses: Vec::new(),
             config_watcher: None,
+            cancellation: None,
         }
     }
 
@@ -1001,6 +1003,7 @@ impl<'a> ToolUseLoop<'a> {
         let mut verbosity_nudge_count: usize = 0;
 
         loop {
+            self.check_cancellation()?;
             // Poll config watcher for hot-reload between turns.
             if let Some(watcher) = self.config_watcher
                 && let Some(changed_path) = watcher.poll_change()
@@ -1139,6 +1142,8 @@ impl<'a> ToolUseLoop<'a> {
             } else {
                 self.llm.complete_chat(&request)?
             };
+
+            self.check_cancellation()?;
 
             if let Some(compatibility) = response.compatibility.as_ref()
                 && (!compatibility.transforms.is_empty()
@@ -1857,8 +1862,20 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
+    fn check_cancellation(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .cancellation
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled()),
+            "Turn interrupted"
+        );
+        Ok(())
+    }
+
     /// Execute a single tool call, handling approval flow, hooks, events, and checkpoints.
     fn execute_tool_call(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
+        self.check_cancellation()?;
         let mut records = Vec::new();
         let start = Instant::now();
 
@@ -2171,6 +2188,7 @@ impl<'a> ToolUseLoop<'a> {
             let _ = cp("before tool execution", &modified_paths);
         }
 
+        self.check_cancellation()?;
         // Execute the approved tool
         let approved_call = permission_execution::approved_call_after_permission(proposal);
         let mut result = self.tool_host.execute(approved_call);

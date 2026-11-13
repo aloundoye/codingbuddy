@@ -52,6 +52,8 @@ use stream_runtime::{
     StreamEventResult, StreamRuntimeState, approval_explanation, filter_stream_event,
     handle_stream_event,
 };
+mod menu;
+pub use menu::TerminalMenu;
 pub use theme::TuiTheme;
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
 where
@@ -77,7 +79,18 @@ where
         },
         || None,
         None,
+        TerminalControls::default(),
     )
+}
+
+type MenuAction<'a> = dyn FnMut(&str, String) + 'a;
+
+#[derive(Default)]
+pub struct TerminalControls<'a> {
+    pub on_menu: Option<Box<MenuAction<'a>>>,
+    pub needs_connection: bool,
+    pub open_connect: bool,
+    pub cancellation: Option<Arc<std::sync::Mutex<codingbuddy_core::CancellationToken>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -90,6 +103,7 @@ pub fn run_tui_shell_with_bindings<F, S>(
     mut on_submit: F,
     mut refresh_status: S,
     ml_completion: Option<MlCompletionCallback>,
+    mut controls: TerminalControls<'_>,
 ) -> Result<()>
 where
     F: FnMut(&str),
@@ -148,6 +162,7 @@ where
 
     enable_raw_mode()?;
     let _guard = TerminalGuard;
+    crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     // Inline viewport: bottom rows managed by ratatui
@@ -189,7 +204,7 @@ where
     let mut history_cursor: Option<usize> = None;
     let mut saved_input = String::new();
     let mut info_line =
-        String::from(" Ctrl+C exit | Tab autocomplete | Shift+Tab agent | /model models");
+        String::from(" Ctrl+C exit | Tab autocomplete | Shift+Tab agent | / commands");
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
     let mut cursor_visible;
@@ -223,6 +238,12 @@ where
     let mut last_phase_event_at = Instant::now();
     let mut last_phase_heartbeat_at = Instant::now();
     let mut last_mission_refresh_at = Instant::now();
+    let mut menu: Option<TerminalMenu> = None;
+    if controls.open_connect
+        && let Some(action) = controls.on_menu.as_mut()
+    {
+        action("connect", String::new());
+    }
     let mut model_picker: Option<ModelPickerState> = None;
     let mut help_modal: Option<state::HelpModalState> = None;
     let mut active_profile_display: Option<String> = None;
@@ -279,6 +300,10 @@ where
         )?;
 
         terminal.draw(|frame| {
+            if let Some(menu) = &menu {
+                menu.render(frame);
+                return;
+            }
             let area = frame.area();
             if area.width == 0 || area.height < 3 {
                 return;
@@ -326,7 +351,9 @@ where
                 )
             };
             let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
-            let desired_input_rows = if pending_approval.is_some() || reverse_search_active {
+            let desired_input_rows = if pending_approval.is_some() {
+                3
+            } else if reverse_search_active {
                 INPUT_MIN_HEIGHT as usize
             } else if vim_enabled && vim_mode == VimMode::Command {
                 wrapped_text_rows(
@@ -483,18 +510,17 @@ where
                         },
                     )
                 };
-                let prompt = format!(
-                    " [{severity}] {tool_name}  {}  [y] Allow  [a] Always  [n] Deny ",
-                    truncate_inline(&explanation, 72)
-                );
+                let style = Style::default()
+                    .fg(Color::Black)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD);
+                let target = format!(" [{severity}] {explanation}");
+                let target = truncate_inline(&target, usize::from(width).saturating_mul(2));
                 frame.render_widget(
-                    Paragraph::new(Line::from(vec![Span::styled(
-                        truncate_inline(&prompt, width.saturating_sub(1) as usize),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
+                    Paragraph::new(vec![
+                        Line::styled(" [y] Allow  [a] Always  [n] Deny", style),
+                        Line::styled(target, style),
+                    ])
                     .wrap(Wrap { trim: false }),
                     input_area,
                 );
@@ -675,6 +701,27 @@ where
 
         // Drain streaming events from background agent thread.
         while let Ok(ev) = stream_rx.try_recv() {
+            let ev = match ev {
+                TuiStreamEvent::Menu(next) => {
+                    menu = next;
+                    continue;
+                }
+                TuiStreamEvent::ConnectionChanged { ready, theme } => {
+                    controls.needs_connection = !ready;
+                    if let Some(theme) = theme {
+                        theme::init_theme(TuiTheme::from_preference(&theme));
+                    }
+                    if let Some(updated) = refresh_status() {
+                        status = updated;
+                    }
+                    continue;
+                }
+                other => other,
+            };
+            if cancelled && matches!(ev, TuiStreamEvent::Done(_) | TuiStreamEvent::Error(_)) {
+                is_processing = false;
+                info_line = "Interrupted".into();
+            }
             let Some(ev) = filter_stream_event(ev, &mut cancelled) else {
                 continue;
             };
@@ -762,7 +809,9 @@ where
         // Check for external SIGINT (e.g. `kill -INT`).
         if sigint_flag.swap(false, Ordering::Relaxed) {
             if is_processing {
-                is_processing = false;
+                if let Some(token) = &controls.cancellation {
+                    token.lock().unwrap().cancel();
+                }
                 cancelled = true;
                 streaming_buffer.clear();
                 shell.active_tool = None;
@@ -772,7 +821,7 @@ where
                 if let Some((_, _, response_tx)) = pending_approval.take() {
                     let _ = response_tx.send(false);
                 }
-                info_line = "interrupted — press Ctrl+C again to exit".to_string();
+                info_line = "Stopping the current turn…".to_string();
             } else {
                 break;
             }
@@ -787,6 +836,10 @@ where
                 continue;
             }
             Event::Paste(pasted) => {
+                if let Some(menu) = menu.as_mut() {
+                    menu.paste(&pasted);
+                    continue;
+                }
                 input.insert_str(cursor_pos.min(input.len()), &pasted);
                 cursor_pos = (cursor_pos + pasted.len()).min(input.len());
                 info_line = "pasted input".to_string();
@@ -797,6 +850,20 @@ where
         };
         // Only handle key press events (ignore release/repeat on platforms that send them)
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if let Some(current) = menu.as_mut() {
+            if key.code == KeyCode::Esc || key == bindings.exit {
+                menu = None;
+                if let Some(action) = controls.on_menu.as_mut() {
+                    action("cancel", String::new());
+                }
+            } else if let Some((id, value)) = current.key(key)
+                && let Some(action) = controls.on_menu.as_mut()
+            {
+                action(&id, value);
+            }
             continue;
         }
 
@@ -953,7 +1020,9 @@ where
 
         if key == bindings.exit {
             if is_processing {
-                is_processing = false;
+                if let Some(token) = &controls.cancellation {
+                    token.lock().unwrap().cancel();
+                }
                 cancelled = true;
                 streaming_buffer.clear();
                 shell.active_tool = None;
@@ -962,7 +1031,7 @@ where
                 if let Some((_, _, response_tx)) = pending_approval.take() {
                     let _ = response_tx.send(false);
                 }
-                info_line = "interrupted — press Ctrl+C again to exit".to_string();
+                info_line = "Stopping the current turn…".to_string();
                 continue;
             }
             break;
@@ -1561,6 +1630,9 @@ where
             shell.push_user(&plan_cmd);
             is_processing = true;
             cancelled = false;
+            if let Some(token) = &controls.cancellation {
+                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+            }
             active_phase = None;
             last_phase_event_at = Instant::now();
             last_phase_heartbeat_at = Instant::now();
@@ -1606,6 +1678,9 @@ where
             cursor_pos = 0;
             is_processing = true;
             cancelled = false;
+            if let Some(token) = &controls.cancellation {
+                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+            }
             active_phase = None;
             last_phase_event_at = Instant::now();
             last_phase_heartbeat_at = Instant::now();
@@ -1817,7 +1892,48 @@ where
             }
             let prompt = input.trim().to_string();
             if prompt.is_empty() {
+                if controls.needs_connection
+                    && let Some(action) = controls.on_menu.as_mut()
+                {
+                    action("connect", String::new());
+                }
                 continue;
+            }
+            if let Some(action) = controls.on_menu.as_mut() {
+                let command = match prompt.as_str() {
+                    "/connect" | "/provider" | "/login" => Some("connect"),
+                    "/models" | "/model" => Some("models"),
+                    "/settings" | "/config" => Some("settings"),
+                    "/logout" => Some("remove-key"),
+                    "/" => Some("commands"),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    action(command, String::new());
+                    input.clear();
+                    cursor_pos = 0;
+                    continue;
+                }
+                if !prompt.starts_with('/') && controls.needs_connection {
+                    action("connect", String::new());
+                    continue;
+                }
+                if let Some(spec) = prompt
+                    .strip_prefix("/model ")
+                    .or_else(|| prompt.strip_prefix("/provider "))
+                {
+                    action(
+                        if prompt.starts_with("/model ") {
+                            "model-spec"
+                        } else {
+                            "provider-id"
+                        },
+                        spec.trim().into(),
+                    );
+                    input.clear();
+                    cursor_pos = 0;
+                    continue;
+                }
             }
             if let Some(result) = parse_vim_slash_command(&prompt) {
                 match result {
@@ -1886,6 +2002,9 @@ where
             history_cursor = None;
             is_processing = true;
             cancelled = false;
+            if let Some(token) = &controls.cancellation {
+                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+            }
             active_phase = None;
             last_phase_event_at = Instant::now();
             last_phase_heartbeat_at = Instant::now();
@@ -1971,7 +2090,11 @@ where
                             info_line = new_ac.display_lines(6).join("  ");
                             autocomplete_dropdown = Some(new_ac);
                         }
-                    } else if ch == '/' && cursor_pos == 1 && input == "/" {
+                    } else if ch == '/'
+                        && cursor_pos == 1
+                        && input == "/"
+                        && controls.on_menu.is_none()
+                    {
                         // Trigger slash command autocomplete at start of input
                         let suggestions = slash_command_suggestions("", 8);
                         if !suggestions.is_empty() {

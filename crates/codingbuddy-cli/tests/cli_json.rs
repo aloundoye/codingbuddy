@@ -965,3 +965,73 @@ fn extract_prompt_from_request_body(body: &[u8]) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
 }
+
+#[test]
+fn explicit_model_checks_and_uses_only_the_selected_provider() {
+    let workspace = TempDir::new().expect("workspace");
+    let user = TempDir::new().expect("isolated user settings");
+    let target = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), "http://127.0.0.1:1/chat/completions");
+    let settings = workspace.path().join(".codingbuddy/settings.local.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    value["llm"]["providers"]["my-gateway"] = serde_json::json!({
+        "kind": "openai-compatible",
+        "base_url": target.endpoint.strip_suffix("/chat/completions").unwrap(),
+        "api_key_env": "CODINGBUDDY_TEST_GATEWAY_KEY",
+        "models": { "chat": "example/model-high" }
+    });
+    value["llm"]["timeout_seconds"] = 2.into();
+    value["llm"]["max_retries"] = 0.into();
+    fs::write(&settings, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
+        .current_dir(workspace.path())
+        .env("HOME", user.path())
+        .env("USERPROFILE", user.path())
+        .env_remove("DEEPSEEK_API_KEY")
+        .env("CODINGBUDDY_TEST_GATEWAY_KEY", "mock-credential")
+        .args([
+            "--json",
+            "--model",
+            "my-gateway/example/model-high",
+            "ask",
+            "hello",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: Value = serde_json::from_slice(&output).unwrap();
+    assert!(result["output"].as_str().unwrap().contains("Mock response"));
+}
+
+#[test]
+fn headless_resume_rejects_a_different_endpoint_before_reading_a_prompt() {
+    let workspace = TempDir::new().expect("workspace");
+    let user = TempDir::new().expect("isolated user settings");
+    let original = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &original.endpoint);
+    let command = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"));
+        cmd.current_dir(workspace.path())
+            .env("HOME", user.path())
+            .env("USERPROFILE", user.path())
+            .env("DEEPSEEK_API_KEY", "fixture-credential");
+        cmd
+    };
+    command()
+        .args(["--json", "ask", "remember this private message"])
+        .assert()
+        .success();
+    let replacement = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &replacement.endpoint);
+    let result = command()
+        .args(["--json", "--continue"])
+        .write_stdin("hello\n")
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(String::from_utf8_lossy(&result).contains("different provider or endpoint"));
+}

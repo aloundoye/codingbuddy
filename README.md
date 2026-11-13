@@ -76,24 +76,22 @@ codingbuddy doctor    # Check dependencies and config
 
 ## Quickstart
 
-```bash
-# Configure (pick any provider)
-export DEEPSEEK_API_KEY="sk-..."      # or OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
+Run `codingbuddy` from your project directory. With no active connection, choose
+**Connect a provider**. CodingBuddy can use an environment key or accept a masked
+paste and save it in your system credential store. Ollama can run without a key.
 
-# Chat
-codingbuddy chat
+- Type `/` and press Enter to browse commands.
+- Use `/connect` to connect another provider or add an OpenAI-compatible endpoint.
+- Use `/models` to select a model for the current chat.
+- Use `/settings` to change the theme or save the active model as your default.
+- Use `codingbuddy --continue` to resume your latest conversation.
 
-# Or run the first-time project setup
-codingbuddy chat
-> /init
-```
+The provider menu supports OpenAI Chat Completions, Anthropic, Google Gemini,
+DeepSeek, OpenRouter, Ollama, and custom OpenAI-compatible endpoints. Coding
+mode requires a tool-capable model. Use `/ask` for chat-only models.
 
-Switch providers in `.codingbuddy/settings.json`:
-```json
-{ "llm": { "provider": "anthropic" } }
-```
-
-Available providers: `deepseek` (default), `openai-compatible`, `anthropic`, `google`, `groq`, `openrouter`, `ollama`.
+For scripts, configure a provider credential in the environment and select the
+model with `codingbuddy --model provider/model -p "Summarize this repo"`.
 
 ## Features
 
@@ -207,7 +205,9 @@ codingbuddy completions --shell zsh # Shell completions
 /cost               Session cost breakdown
 /compact            Force conversation compaction
 /clear              Reset conversation
-/provider           Show/switch provider
+/connect            Connect or switch providers
+/models             Choose a model
+/settings           Change the default model or theme
 /skills             List available skills
 /mcp                Manage MCP servers
 /vim                Toggle vim keybindings

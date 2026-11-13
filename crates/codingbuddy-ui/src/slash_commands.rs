@@ -182,6 +182,8 @@ impl SlashCommand {
 
 /// Slash commands with short descriptions for the autocomplete dropdown.
 pub const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
+    ("connect", "Connect or manage providers"),
+    ("settings", "Change model defaults and theme"),
     ("help", "Show available commands"),
     ("ask", "Ask a question (read-only)"),
     ("code", "Switch to code mode"),

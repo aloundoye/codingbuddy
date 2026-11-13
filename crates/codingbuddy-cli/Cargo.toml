@@ -10,6 +10,7 @@ name = "codingbuddy"
 path = "src/main.rs"
 
 [dependencies]
+tempfile.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -17,7 +18,6 @@ clap_complete.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
-rpassword.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 glob.workspace = true
@@ -49,4 +49,3 @@ local-ml-usearch = ["local-ml", "codingbuddy-agent/local-ml-usearch"]
 
 [dev-dependencies]
 assert_cmd = "2"
-tempfile = "3"
