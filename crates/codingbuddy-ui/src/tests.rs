@@ -1730,6 +1730,25 @@ fn vim_insert_mode_toggle() {
 }
 
 #[test]
+fn live_slash_dropdown_filters_and_prefers_exact_commands() {
+    let all = input::slash_dropdown(input::slash_query("/", 1).unwrap()).unwrap();
+    assert!(all.suggestions.len() > 8);
+    let mut filtered = input::slash_dropdown(input::slash_query("/mode", 5).unwrap()).unwrap();
+    assert_eq!(
+        slash_suggestion_to_command(filtered.selected_value().unwrap()),
+        "/model"
+    );
+    filtered.down();
+    assert_eq!(
+        slash_suggestion_to_command(filtered.selected_value().unwrap()),
+        "/models"
+    );
+    assert!(input::slash_query("/model ", 7).is_none());
+    assert!(input::slash_dropdown("typo").is_none());
+    assert!(input::slash_dropdown("co").is_some());
+}
+
+#[test]
 fn slash_suggestions_filter_by_prefix() {
     let all = slash_command_suggestions("", 100);
     assert!(all.len() > 10, "should list many commands");

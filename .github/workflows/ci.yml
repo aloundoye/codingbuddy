@@ -60,16 +60,16 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: tests (workspace split: core)
+      - name: "tests (workspace split: core)"
         run: cargo test --workspace --all-targets --exclude codingbuddy-agent --exclude codingbuddy-cli --exclude codingbuddy-ui
 
-      - name: tests (workspace split: agent)
+      - name: "tests (workspace split: agent)"
         run: cargo test -p codingbuddy-agent --all-targets
 
-      - name: tests (workspace split: cli)
+      - name: "tests (workspace split: cli)"
         run: cargo test -p codingbuddy-cli --all-targets
 
-      - name: tests (workspace split: ui)
+      - name: "tests (workspace split: ui)"
         run: cargo test -p codingbuddy-ui --all-targets
 
       - name: build

@@ -265,37 +265,24 @@ impl Menus {
                     return self.handle("connect", String::new());
                 }
             }
-            "paste-key" => self.menu(TerminalMenu::field(
-                "API key",
-                "Paste your key. Input is hidden.",
-                "key-entered",
-                true,
-            )),
-            "key-entered" => {
+            "paste-key" => self.prompt_key(),
+            "key-entered" | "key-entered-save" => {
+                state.save_key = id == "key-entered-save";
                 anyhow::ensure!(!value.trim().is_empty(), "The API key is empty");
                 let llm = state
                     .pending
                     .as_mut()
                     .ok_or_else(|| anyhow!("Choose a provider first"))?;
                 llm.api_key = Some(value.trim().into());
-                self.menu(TerminalMenu::choices(
-                    "Save API key?",
-                    "Use your system credential store",
-                    choices(&[
-                        ("key-save", "Save securely"),
-                        ("key-once", "Use for this session"),
-                    ]),
-                ));
+                let llm = llm.clone();
+                if llm.active_base_model().trim().is_empty() {
+                    self.discover(&mut state, llm);
+                } else if let Err(error) = self.verify(&mut state, llm.clone()) {
+                    self.notify(error.to_string(), true);
+                    self.discover(&mut state, llm);
+                }
             }
-            "key-save" | "key-once" => {
-                let llm = state
-                    .pending
-                    .take()
-                    .ok_or_else(|| anyhow!("Choose a provider first"))?;
-                state.save_key = id == "key-save";
-                self.discover(&mut state, llm);
-            }
-            "key-use" => {
+            "key-use" | "retry-models" => {
                 let llm = state
                     .pending
                     .take()
@@ -424,17 +411,35 @@ impl Menus {
         Ok(())
     }
 
+    fn prompt_key(&self) {
+        self.menu(
+            TerminalMenu::field(
+                "API key",
+                "Paste your key. Input is hidden.",
+                "key-entered",
+                true,
+            )
+            .with_save_action("key-entered-save"),
+        );
+    }
+
     fn begin(&self, state: &mut Connection, llm: LlmConfig) {
         state.save_key = false;
         if codingbuddy_llm::provider_requires_key(&llm) {
-            let mut entries = Vec::new();
-            if codingbuddy_llm::resolve_key_from_config(&llm).is_some() {
-                entries.extend(choices(&[("key-use", "Use available credential")]));
-            }
-            entries.extend(choices(&[("paste-key", "Paste an API key")]));
-            let hint = format!("Credential: {}", llm.active_provider().api_key_env);
+            let has_key = codingbuddy_llm::resolve_key_from_config(&llm).is_some();
             state.pending = Some(llm);
-            self.menu(TerminalMenu::choices("API key", &hint, entries));
+            if has_key {
+                self.menu(TerminalMenu::actions(
+                    "Credential options",
+                    "A credential is available for this provider.",
+                    choices(&[
+                        ("key-use", "Use available credential"),
+                        ("paste-key", "Enter a different API key"),
+                    ]),
+                ));
+            } else {
+                self.prompt_key();
+            }
         } else {
             self.discover(state, llm);
         }
@@ -499,7 +504,7 @@ impl Menus {
         };
         self.menu(TerminalMenu::choices(
             "Checking connection",
-            "Verifying model access…",
+            &format!("Verifying {}/{}…", llm.provider, llm.active_base_model()),
             Vec::new(),
         ));
         thread::spawn(move || {
@@ -507,8 +512,30 @@ impl Menus {
             if let Ok(mut state) = controller.state.lock()
                 && state.generation == generation
             {
-                let result = result.and_then(|()| controller.select(&mut state, llm));
                 if let Err(error) = result {
+                    let rejected = error
+                        .downcast_ref::<codingbuddy_llm::ConnectionError>()
+                        .is_some_and(|error| {
+                            matches!(error, codingbuddy_llm::ConnectionError::RejectedCredential)
+                        });
+                    let message = if rejected {
+                        "The provider rejected the API key."
+                    } else {
+                        "Could not verify the model. Details are in the chat."
+                    };
+                    controller.notify(error.to_string(), true);
+                    let mut actions = vec![("retry-models", "Choose another model")];
+                    if codingbuddy_llm::provider_requires_key(&llm) {
+                        actions.insert(0, ("paste-key", "Enter a different API key"));
+                    }
+                    actions.push(("cancel", "Return to chat"));
+                    state.pending = Some(llm);
+                    controller.menu(TerminalMenu::actions(
+                        "Connection failed",
+                        message,
+                        choices(&actions),
+                    ));
+                } else if let Err(error) = controller.select(&mut state, llm) {
                     controller.notify(error.to_string(), true);
                     let _ = controller.tx.send(TuiStreamEvent::Menu(None));
                 }
@@ -641,6 +668,14 @@ impl Menus {
         state.ready = true;
         state.pending = None;
         self.changed(state, None);
+        self.notify(
+            format!(
+                "Connected to {}/{}.",
+                state.llm.provider,
+                state.llm.active_base_model()
+            ),
+            false,
+        );
         Ok(())
     }
 
