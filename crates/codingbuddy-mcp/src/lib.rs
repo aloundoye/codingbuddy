@@ -116,6 +116,7 @@ pub struct McpPromptArgument {
 pub struct McpManager {
     workspace: PathBuf,
     store: Store,
+    trusted_workspace: bool,
 }
 
 impl McpManager {
@@ -123,6 +124,7 @@ impl McpManager {
         Ok(Self {
             workspace: workspace.to_path_buf(),
             store: Store::new(workspace)?,
+            trusted_workspace: codingbuddy_core::workspace_is_trusted(workspace),
         })
     }
 
@@ -173,7 +175,12 @@ impl McpManager {
         if let Some(path) = Self::user_local_config_path() {
             merged.extend(load_config_if_exists(&path)?.servers);
         }
-        merged.extend(self.load_project_config()?.servers);
+        if self.trusted_workspace {
+            merged.extend(self.load_project_config()?.servers);
+        }
+        if let Some(managed) = codingbuddy_policy::load_managed_settings() {
+            merged.retain(|server| codingbuddy_policy::is_mcp_server_allowed(&server.id, &managed));
+        }
         // P5-13: Expand environment variables in all server configs
         for server in &mut merged {
             if let Err(e) = expand_server_env_vars(server) {
@@ -2345,12 +2352,18 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn trusted_manager(workspace: &Path) -> McpManager {
+        let mut manager = McpManager::new(workspace).expect("manager");
+        manager.trusted_workspace = true;
+        manager
+    }
+
     #[test]
     fn add_list_remove_server_round_trip() {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-test-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2381,7 +2394,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-test-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2692,7 +2705,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-test-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2727,7 +2740,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-test-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2757,7 +2770,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-test-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2810,7 +2823,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-ctx-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2841,7 +2854,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-ctx2-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2870,7 +2883,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-ctx3-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -2955,7 +2968,7 @@ mod tests {
     fn autocomplete_resources_no_servers_returns_empty() {
         let workspace = std::env::temp_dir().join(format!("codingbuddy-mcp-ac-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         let results = manager.autocomplete_resources("@").expect("autocomplete");
         assert!(results.is_empty());
@@ -2966,7 +2979,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-ac2-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         // No servers → empty results (can't test with real servers in unit tests)
         let results = manager.autocomplete_resources("").expect("autocomplete");
@@ -3040,7 +3053,7 @@ data: {"other":"ignored"}
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-sse-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {
@@ -3085,7 +3098,7 @@ data: {"other":"ignored"}
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-managed-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
-        let manager = McpManager::new(&workspace).expect("manager");
+        let manager = trusted_manager(&workspace);
 
         manager
             .add_server(McpServer {

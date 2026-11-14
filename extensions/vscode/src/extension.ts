@@ -252,8 +252,12 @@ class DeepSeekChatPanel {
           const resp = await this.client.patchApply(this.sessionId!, msg.patchId);
           if (resp.error) {
             this.addEntry({ role: "tool", content: `Patch error: ${resp.error.message}` });
-          } else {
+          } else if ((resp.result as { applied?: boolean } | undefined)?.applied) {
             this.addEntry({ role: "tool", content: `Patch applied: ${msg.patchId}` });
+          } else {
+            const result = resp.result as { conflicts?: string[] } | undefined;
+            const conflicts = result?.conflicts?.join(", ");
+            this.addEntry({ role: "tool", content: conflicts ? `Patch conflicts: ${conflicts}` : "Patch could not be applied." });
           }
         }
         break;

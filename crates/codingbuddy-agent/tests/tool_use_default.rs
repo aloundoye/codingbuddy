@@ -82,15 +82,10 @@ fn init_workspace(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Enable the phase loop in workspace settings (off by default).
-fn enable_phase_loop(path: &Path) -> Result<()> {
-    let settings_dir = path.join(".codingbuddy");
-    fs::create_dir_all(&settings_dir)?;
-    fs::write(
-        settings_dir.join("settings.json"),
-        r#"{"agent_loop":{"phase_loop_enabled":true}}"#,
-    )?;
-    Ok(())
+fn phase_loop_config() -> AppConfig {
+    let mut config = AppConfig::default();
+    config.agent_loop.phase_loop_enabled = true;
+    config
 }
 
 fn build_engine(path: &Path, responses: Vec<LlmResponse>) -> Result<AgentEngine> {
@@ -1368,11 +1363,11 @@ fn exit_plan_mode_persists_plan_and_session_state() -> Result<()> {
 fn complex_prompt_auto_enters_plan_and_persists_draft_state() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
-    enable_phase_loop(temp.path())?;
 
-    let engine = build_engine(
+    let engine = AgentEngine::new_with_config_and_llm(
         temp.path(),
-        vec![
+        phase_loop_config(),
+        Box::new(ScriptedLlm::new(vec![
             tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
             tool_call_response(vec![(
                 "call_2",
@@ -1385,7 +1380,7 @@ fn complex_prompt_auto_enters_plan_and_persists_draft_state() -> Result<()> {
             ),
             tool_call_response(vec![("call_4", "exit_plan_mode", "{}")]),
             text_response("Plan saved for review."),
-        ],
+        ])),
     )?;
 
     let phase_chunks = Arc::new(Mutex::new(Vec::new()));
@@ -1423,7 +1418,6 @@ fn complex_prompt_auto_enters_plan_and_persists_draft_state() -> Result<()> {
 fn approved_plan_execution_emits_full_phase_path_and_loads_plan_context() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
-    enable_phase_loop(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![
         tool_call_response(vec![("call_1", "tool_search", r#"{"query":"plan mode"}"#)]),
@@ -1448,7 +1442,7 @@ fn approved_plan_execution_emits_full_phase_path_and_loads_plan_context() -> Res
         text_response("Verified the change."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
-    let mut engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+    let mut engine = AgentEngine::new_with_config_and_llm(temp.path(), phase_loop_config(), llm)?;
     engine.set_permission_mode("bypassPermissions");
 
     let phase_chunks = Arc::new(Mutex::new(Vec::new()));

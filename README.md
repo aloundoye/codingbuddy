@@ -240,10 +240,10 @@ CodingBuddy includes an optional web interface for browser-based access:
 # Start HTTP server with web UI
 codingbuddy serve --transport http --web
 
-# Open http://127.0.0.1:8199 in your browser
+# Open the URL printed by CodingBuddy, including its token fragment.
 ```
 
-The web frontend connects to the same JSON-RPC backend used by IDE integrations. Build it from the `web/` directory:
+HTTP listens on a loopback IP and requires the token generated at server startup. The browser API serves the launch workspace and exposes session creation, prompts, and prompt output. Build the frontend from the `web/` directory:
 
 ```bash
 cd web && npm install && npm run build
@@ -256,7 +256,18 @@ codingbuddy serve --transport http
 
 # Terminal 2: start the dev server (proxies /rpc to backend)
 cd web && npm run dev
+# Append /#token=<printed token> to the dev server URL.
 ```
+
+## Workspace trust
+
+CodingBuddy reads user settings from `~/.codingbuddy/settings.json`. Workspaces start with display and language preferences enabled. To activate project runtime settings, hooks, and project MCP servers for a repository you trust, run:
+
+```bash
+CODINGBUDDY_TRUST_WORKSPACE="$(pwd -P)" codingbuddy chat
+```
+
+Use the workspace's absolute path when launching from another directory or from an IDE. This setting also applies to headless launches. Put provider credentials in user settings, the keyring, or your environment. Sandbox configuration alone does not waive Bash approval.
 
 ## Development
 

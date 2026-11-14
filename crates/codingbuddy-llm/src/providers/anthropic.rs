@@ -36,17 +36,9 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
             ChatMessage::Assistant {
                 content,
                 tool_calls,
-                reasoning_content,
+                ..
             } => {
                 let mut blocks: Vec<Value> = Vec::new();
-                if let Some(reasoning) = reasoning_content
-                    && !reasoning.is_empty()
-                {
-                    blocks.push(json!({
-                        "type": "thinking",
-                        "thinking": reasoning
-                    }));
-                }
                 if let Some(text) = content
                     && !text.is_empty()
                 {
@@ -129,22 +121,17 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
         payload["tools"] = json!(tools);
     }
 
-    // Thinking / extended thinking
-    if let Some(ref thinking) = req.thinking
-        && thinking.thinking_type == "enabled"
-    {
+    // The current shared transcript cannot replay signed thinking blocks with tools.
+    let thinking = req
+        .thinking
+        .as_ref()
+        .filter(|thinking| thinking.thinking_type == "enabled" && req.tools.is_empty());
+    if let Some(thinking) = thinking {
         payload["thinking"] = json!({
             "type": "enabled",
             "budget_tokens": thinking.budget_tokens.unwrap_or(8192)
         });
-    }
-
-    // Temperature (omit when thinking is enabled)
-    let thinking_on = req
-        .thinking
-        .as_ref()
-        .is_some_and(|t| t.thinking_type == "enabled");
-    if !thinking_on {
+    } else {
         if let Some(temp) = req.temperature {
             payload["temperature"] = json!(temp);
         }
@@ -285,8 +272,10 @@ pub fn parse_streaming_event(event_type: &str, data: &Value) -> StreamEvent {
             let stop_reason = data
                 .get("delta")
                 .and_then(|d| d.get("stop_reason"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("end_turn");
+                .and_then(Value::as_str);
+            let Some(stop_reason) = stop_reason else {
+                return StreamEvent::None;
+            };
             let finish = match stop_reason {
                 "tool_use" => "tool_calls",
                 "end_turn" | "stop_sequence" => "stop",

@@ -216,19 +216,13 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
         }
     }
 
-    let finish_reason = if !tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        let raw = candidate
-            .and_then(|c| c.get("finishReason"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("STOP");
-        match raw {
-            "STOP" => "stop",
-            "MAX_TOKENS" => "length",
-            "SAFETY" => "content_filter",
-            _ => "stop",
-        }
+    let finish_reason = match candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(Value::as_str)
+    {
+        Some(reason) => finish_reason_for(reason, !tool_calls.is_empty()),
+        None if !tool_calls.is_empty() => "incomplete",
+        None => "stop",
     };
 
     let usage = parse_gemini_usage(&v);
@@ -267,11 +261,7 @@ pub fn parse_streaming_chunk(data: &Value) -> StreamEvent {
 
     let Some(parts) = parts else {
         if let Some(reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
-            let finish = match reason {
-                "STOP" => "stop",
-                "MAX_TOKENS" => "length",
-                _ => "stop",
-            };
+            let finish = finish_reason_for(reason, false);
             return StreamEvent::Finish(finish.to_string());
         }
         return StreamEvent::None;
@@ -298,18 +288,10 @@ pub fn parse_streaming_chunk(data: &Value) -> StreamEvent {
     }
 
     if let Some(reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
-        let finish = match reason {
-            "STOP"
-                if events
-                    .iter()
-                    .any(|e| matches!(e, StreamEvent::ToolCall { .. })) =>
-            {
-                "tool_calls"
-            }
-            "STOP" => "stop",
-            "MAX_TOKENS" => "length",
-            _ => "stop",
-        };
+        let has_tool_calls = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCall { .. }));
+        let finish = finish_reason_for(reason, has_tool_calls);
         events.push(StreamEvent::Finish(finish.to_string()));
     }
 
@@ -319,6 +301,16 @@ pub fn parse_streaming_chunk(data: &Value) -> StreamEvent {
         StreamEvent::None
     } else {
         StreamEvent::Multiple(events)
+    }
+}
+
+fn finish_reason_for(reason: &str, has_tool_calls: bool) -> &'static str {
+    match reason {
+        "STOP" if has_tool_calls => "tool_calls",
+        "STOP" => "stop",
+        "MAX_TOKENS" => "length",
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => "content_filter",
+        _ => "incomplete",
     }
 }
 

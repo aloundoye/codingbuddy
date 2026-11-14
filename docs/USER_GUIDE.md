@@ -464,6 +464,10 @@ Add to `.codingbuddy/settings.json`:
 }
 ```
 
+Project hooks require explicit workspace trust. Launch CodingBuddy with
+`CODINGBUDDY_TRUST_WORKSPACE` set to the absolute path of the workspace.
+Hooks in user settings are loaded independently of workspace trust.
+
 ### Available Events
 
 | Event | When it fires | Use case |

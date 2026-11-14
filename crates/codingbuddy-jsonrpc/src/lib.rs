@@ -218,6 +218,38 @@ impl IdeRpcHandler {
         }
     }
 
+    /// Browser transport exposes only the operations used by the bundled client.
+    pub fn handle_http(&self, method: &str, params: Value) -> Result<Value> {
+        match method {
+            "session/open" => self.handle_session_open(serde_json::json!({
+                "workspace_root": self.workspace_path().canonicalize()?
+            })),
+            "prompt/execute" => {
+                let session_id = require_uuid(&params, "session_id")?;
+                let session = self
+                    .store
+                    .load_session(session_id)?
+                    .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+                anyhow::ensure!(
+                    Path::new(&session.workspace_root).canonicalize()?
+                        == self.workspace_path().canonicalize()?,
+                    "session belongs to another workspace"
+                );
+                let prompt = params
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("missing 'prompt' parameter"))?;
+                self.handle_prompt_execute(serde_json::json!({
+                    "session_id": session_id,
+                    "prompt": prompt,
+                    "include_partial_messages": true
+                }))
+            }
+            "prompt/stream_next" => self.handle_prompt_stream_next(params),
+            _ => Err(anyhow!("method unavailable over HTTP: {method}")),
+        }
+    }
+
     // -- Session methods --
 
     fn handle_session_open(&self, params: Value) -> Result<Value> {
@@ -341,18 +373,6 @@ impl IdeRpcHandler {
                 content: prompt.clone(),
             });
 
-        // Record the prompt as a ChatTurn event.
-        self.store.append_event(&codingbuddy_store::NewEvent {
-            event_id: uuid::Uuid::now_v7(),
-            at: chrono::Utc::now(),
-            session_id,
-            kind: EventKind::ChatTurn {
-                message: ChatMessage::User {
-                    content: prompt.clone(),
-                },
-            },
-        })?;
-
         // Execute the real agent runtime and collect deterministic stream events.
         let prompt_id = Uuid::now_v7();
         let include_partial = params
@@ -402,6 +422,16 @@ impl IdeRpcHandler {
 
         let (status, output, error_message) =
             if let Some(mock_output) = params.get("mock_output").and_then(|v| v.as_str()) {
+                self.store.append_event(&codingbuddy_store::NewEvent {
+                    event_id: uuid::Uuid::now_v7(),
+                    at: chrono::Utc::now(),
+                    session_id,
+                    kind: EventKind::ChatTurn {
+                        message: ChatMessage::User {
+                            content: prompt.clone(),
+                        },
+                    },
+                })?;
                 if let Ok(mut guard) = stream_rows.lock() {
                     guard.push(stream_chunk_to_event_json(&StreamChunk::ContentDelta(
                         mock_output.to_string(),
@@ -422,6 +452,7 @@ impl IdeRpcHandler {
                 }));
 
                 let chat_options = ChatOptions {
+                    session_id: Some(session_id),
                     tools,
                     force_max_think,
                     additional_dirs,
@@ -449,18 +480,18 @@ impl IdeRpcHandler {
                     reasoning_content: None,
                     tool_calls: vec![],
                 });
-            self.store.append_event(&codingbuddy_store::NewEvent {
-                event_id: uuid::Uuid::now_v7(),
-                at: chrono::Utc::now(),
-                session_id,
-                kind: EventKind::ChatTurn {
-                    message: ChatMessage::Assistant {
-                        content: Some(output.clone()),
-                        reasoning_content: None,
-                        tool_calls: vec![],
+            if params.get("mock_output").and_then(Value::as_str).is_some() {
+                self.store.append_event(&codingbuddy_store::NewEvent::new(
+                    session_id,
+                    EventKind::ChatTurn {
+                        message: ChatMessage::Assistant {
+                            content: Some(output.clone()),
+                            reasoning_content: None,
+                            tool_calls: vec![],
+                        },
                     },
-                },
-            })?;
+                ))?;
+            }
         }
 
         if include_partial {
@@ -1026,7 +1057,9 @@ impl IdeRpcHandler {
             return Err(anyhow!("patch not found: {patch_id}"));
         }
 
-        let applied = projection.applied_patches.contains(&patch_id);
+        let applied = codingbuddy_diff::PatchStore::new(self.workspace_path())?
+            .read_patch(patch_id)?
+            .applied;
         Ok(serde_json::json!({
             "patch_id": patch_id.to_string(),
             "staged": true,
@@ -1038,22 +1071,77 @@ impl IdeRpcHandler {
         let session_id = require_uuid(&params, "session_id")?;
         let patch_id = require_uuid(&params, "patch_id")?;
 
-        // Record patch applied event.
-        self.store.append_event(&codingbuddy_store::NewEvent {
-            event_id: uuid::Uuid::now_v7(),
-            at: chrono::Utc::now(),
-            session_id,
-            kind: EventKind::PatchApplied {
-                patch_id,
-                applied: true,
-                conflicts: vec![],
-            },
-        })?;
+        let projection = self.store.rebuild_from_events(session_id)?;
+        anyhow::ensure!(
+            projection.staged_patches.contains(&patch_id),
+            "patch not found: {patch_id}"
+        );
+        let workspace = self.workspace_path().canonicalize()?;
+        let session = self
+            .store
+            .load_session(session_id)?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        anyhow::ensure!(
+            Path::new(&session.workspace_root).canonicalize()? == workspace,
+            "session belongs to another workspace"
+        );
 
+        let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(&workspace)?;
+        let config = AppConfig::load(&workspace)?;
+        let policy = codingbuddy_policy::PolicyEngine::from_app_config(&config.policy);
+        let call = codingbuddy_core::ToolCall {
+            name: "patch.apply".to_string(),
+            args: serde_json::json!({"patch_id": patch_id}),
+            requires_approval: true,
+        };
+        anyhow::ensure!(
+            !policy.denies_tool(&call),
+            "patch application denied by policy"
+        );
+
+        let patches = codingbuddy_diff::PatchStore::new(&workspace)?;
+        if patches.read_patch(patch_id)?.applied {
+            return Ok(serde_json::json!({"patch_id": patch_id, "applied": true, "conflicts": []}));
+        }
+
+        let checkpoint =
+            codingbuddy_memory::MemoryManager::new(&workspace)?.create_checkpoint("patch_apply")?;
+        self.store.append_event(&codingbuddy_store::NewEvent::new(
+            session_id,
+            EventKind::CheckpointCreated {
+                checkpoint_id: checkpoint.checkpoint_id,
+                reason: checkpoint.reason,
+                files_count: checkpoint.files_count,
+                snapshot_path: checkpoint.snapshot_path,
+            },
+        ))?;
+        let (applied, conflicts) = codingbuddy_diff::PatchStore::new(&workspace)?.apply_checked(
+            &workspace,
+            patch_id,
+            |path| {
+                let resolved = files.resolve(path, true)?;
+                policy.check_path_name(&resolved)?;
+                let call = codingbuddy_core::ToolCall {
+                    name: "fs.edit".to_string(),
+                    args: serde_json::json!({"path": resolved}),
+                    requires_approval: true,
+                };
+                anyhow::ensure!(!policy.denies_tool(&call), "patch target denied by policy");
+                Ok(())
+            },
+        )?;
+        self.store.append_event(&codingbuddy_store::NewEvent::new(
+            session_id,
+            EventKind::PatchApplied {
+                patch_id,
+                applied,
+                conflicts: conflicts.clone(),
+            },
+        ))?;
         Ok(serde_json::json!({
-            "patch_id": patch_id.to_string(),
-            "applied": true,
-            "conflicts": [],
+            "patch_id": patch_id,
+            "applied": applied,
+            "conflicts": conflicts
         }))
     }
 
@@ -1341,7 +1429,16 @@ impl IdeRpcHandler {
 
     fn handle_config_get(&self, params: Value) -> Result<Value> {
         let cfg = AppConfig::load(self.workspace_path()).unwrap_or_default();
-        let full = serde_json::to_value(&cfg)?;
+        let mut full = serde_json::to_value(&cfg)?;
+        if let Some(llm) = full.get_mut("llm").and_then(Value::as_object_mut) {
+            llm.remove("api_key");
+            if let Some(providers) = llm.get_mut("providers").and_then(Value::as_object_mut) {
+                for provider in providers.values_mut().filter_map(Value::as_object_mut) {
+                    provider.remove("headers");
+                    provider.remove("payload_options");
+                }
+            }
+        }
 
         if let Some(key) = params.get("key").and_then(|v| v.as_str()) {
             // Dot-separated key path: "llm.base_model" -> cfg["llm"]["base_model"]

@@ -3,27 +3,16 @@ use clap::CommandFactory;
 use clap_complete::generate;
 use codingbuddy_jsonrpc::{JsonRpcRequest, JsonRpcResponse, RpcHandler};
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 const MAX_RPC_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
 static HEADER_JSON: LazyLock<tiny_http::Header> =
     LazyLock::new(|| "Content-Type: application/json".parse().unwrap());
-static HEADER_CORS: LazyLock<tiny_http::Header> =
-    LazyLock::new(|| "Access-Control-Allow-Origin: *".parse().unwrap());
-static HEADER_CORS_METHODS: LazyLock<tiny_http::Header> = LazyLock::new(|| {
-    "Access-Control-Allow-Methods: POST, GET, OPTIONS"
-        .parse()
-        .unwrap()
-});
-static HEADER_CORS_HEADERS: LazyLock<tiny_http::Header> = LazyLock::new(|| {
-    "Access-Control-Allow-Headers: Content-Type"
-        .parse()
-        .unwrap()
-});
-
 use crate::{Cli, CompletionsArgs, NativeHostArgs, ServeArgs};
 
 const MAX_NATIVE_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -50,21 +39,15 @@ pub(crate) fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
             codingbuddy_jsonrpc::run_stdio_server(&handler)
         }
         "http" => {
-            let bind = format!("{}:{}", args.host, args.port);
-            if json_mode {
-                println!(
-                    "{}",
-                    json!({"status": "starting", "transport": "http", "address": bind})
-                );
-            } else {
-                eprintln!("codingbuddy: starting HTTP server on http://{bind}");
-                if args.web {
-                    eprintln!("codingbuddy: web UI available at http://{bind}/");
-                }
-            }
-            let workspace = std::env::current_dir()?;
-            let handler = Arc::new(codingbuddy_jsonrpc::IdeRpcHandler::new(&workspace)?);
-            run_http_server(&bind, handler, args.web)
+            let ip = args.host.parse::<IpAddr>()?;
+            anyhow::ensure!(
+                ip.is_loopback(),
+                "HTTP transport requires a loopback IP address"
+            );
+            let bind = SocketAddr::new(ip, args.port);
+            let workspace = std::env::current_dir()?.canonicalize()?;
+            let handler = codingbuddy_jsonrpc::IdeRpcHandler::new(&workspace)?;
+            run_http_server(bind, &handler, args.web, json_mode)
         }
         other => Err(anyhow!(
             "unsupported transport '{}' (supported: stdio, http)",
@@ -74,20 +57,65 @@ pub(crate) fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
 }
 
 fn run_http_server(
-    bind: &str,
-    handler: Arc<codingbuddy_jsonrpc::IdeRpcHandler>,
+    bind: SocketAddr,
+    handler: &codingbuddy_jsonrpc::IdeRpcHandler,
     serve_web: bool,
+    json_mode: bool,
 ) -> Result<()> {
+    use rand::RngCore;
+
     let server =
         tiny_http::Server::http(bind).map_err(|e| anyhow!("failed to bind HTTP server: {e}"))?;
+    let address = server.server_addr().to_string();
+    let origin = format!("http://{address}");
+    let mut token_bytes = [0u8; 32];
+    rand::rngs::OsRng.try_fill_bytes(&mut token_bytes)?;
+    let token = format!("{:x}", sha2::Sha256::digest(token_bytes));
+    let authorization = format!("Bearer {token}");
+    if json_mode {
+        println!(
+            "{}",
+            json!({"status": "starting", "transport": "http", "address": address, "token": token})
+        );
+        io::stdout().flush()?;
+    } else if serve_web {
+        eprintln!("Open {origin}/#token={token}");
+    } else {
+        eprintln!("CodingBuddy HTTP RPC at {origin}/rpc");
+        eprintln!("Authorization: {authorization}");
+    }
     let dist_dir = if serve_web { resolve_web_dist() } else { None };
 
     for request in server.incoming_requests() {
+        let header = |name: &'static str| {
+            request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv(name))
+                .map(|header| header.value.as_str())
+        };
+        let valid_origin = header("Host") == Some(address.as_str())
+            && header("Origin").is_none_or(|value| value == origin);
+        if !valid_origin {
+            let _ = request.respond(tiny_http::Response::empty(403));
+            continue;
+        }
+
         let method = request.method().to_string();
         let url = request.url().to_string();
 
         match (method.as_str(), url.as_str()) {
-            ("POST", "/rpc") => handle_rpc_request(request, &handler),
+            ("POST", "/rpc") => {
+                use subtle::ConstantTimeEq;
+                let authorized = header("Authorization").is_some_and(|value| {
+                    bool::from(value.as_bytes().ct_eq(authorization.as_bytes()))
+                });
+                if authorized {
+                    handle_rpc_request(request, handler);
+                } else {
+                    let _ = request.respond(tiny_http::Response::empty(401));
+                }
+            }
             ("GET", "/health") => {
                 let _ = request.respond(
                     tiny_http::Response::from_string(r#"{"status":"ok"}"#)
@@ -99,14 +127,6 @@ fn run_http_server(
             }
             ("GET", path) if dist_dir.is_some() && path.starts_with("/assets/") => {
                 serve_web_asset(request, dist_dir.as_deref().unwrap(), path)
-            }
-            ("OPTIONS", _) => {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("")
-                        .with_header(HEADER_CORS.clone())
-                        .with_header(HEADER_CORS_METHODS.clone())
-                        .with_header(HEADER_CORS_HEADERS.clone()),
-                );
             }
             _ => {
                 let _ = request.respond(
@@ -126,8 +146,7 @@ fn send_parse_error(request: tiny_http::Request) {
             r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#,
         )
         .with_status_code(400)
-        .with_header(HEADER_JSON.clone())
-        .with_header(HEADER_CORS.clone()),
+        .with_header(HEADER_JSON.clone()),
     );
 }
 
@@ -138,9 +157,10 @@ fn handle_rpc_request(
     let mut body = String::new();
     if request
         .as_reader()
-        .take(MAX_RPC_BODY_BYTES)
+        .take(MAX_RPC_BODY_BYTES + 1)
         .read_to_string(&mut body)
         .is_err()
+        || body.len() as u64 > MAX_RPC_BODY_BYTES
     {
         send_parse_error(request);
         return;
@@ -154,7 +174,7 @@ fn handle_rpc_request(
         }
     };
 
-    let response = match handler.handle(&rpc_req.method, rpc_req.params) {
+    let response = match handler.handle_http(&rpc_req.method, rpc_req.params) {
         Ok(result) => JsonRpcResponse::success(rpc_req.id, result),
         Err(e) => {
             JsonRpcResponse::error(rpc_req.id, codingbuddy_jsonrpc::ERR_INTERNAL, e.to_string())
@@ -162,11 +182,8 @@ fn handle_rpc_request(
     };
 
     let json = serde_json::to_string(&response).unwrap_or_default();
-    let _ = request.respond(
-        tiny_http::Response::from_string(json)
-            .with_header(HEADER_JSON.clone())
-            .with_header(HEADER_CORS.clone()),
-    );
+    let _ =
+        request.respond(tiny_http::Response::from_string(json).with_header(HEADER_JSON.clone()));
 }
 
 fn resolve_web_dist() -> Option<PathBuf> {
@@ -176,8 +193,7 @@ fn resolve_web_dist() -> Option<PathBuf> {
             return beside_exe;
         }
     }
-    let workspace = std::env::current_dir().ok()?;
-    let dev = workspace.join("web/dist");
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/dist");
     if dev.is_dir() {
         return Some(dev);
     }

@@ -554,8 +554,6 @@ pub struct PolicyEngine {
     cfg: PolicyConfig,
     secret_regexes: Vec<Regex>,
     permission_mode: PermissionMode,
-    /// When sandbox is enabled with auto_allow_bash_if_sandboxed, auto-approve bash.
-    sandbox_auto_allow_bash: bool,
     /// Workspace root for path canonicalization. Absolute paths under this root
     /// are permitted; symlinks resolving outside it are blocked.
     workspace_root: Option<std::path::PathBuf>,
@@ -569,7 +567,6 @@ impl Clone for PolicyEngine {
             cfg: self.cfg.clone(),
             secret_regexes: self.secret_regexes.clone(),
             permission_mode: self.permission_mode,
-            sandbox_auto_allow_bash: self.sandbox_auto_allow_bash,
             workspace_root: self.workspace_root.clone(),
             audit_log: std::sync::Mutex::new(
                 self.audit_log
@@ -609,7 +606,6 @@ impl PolicyEngine {
             cfg,
             secret_regexes,
             permission_mode,
-            sandbox_auto_allow_bash: false,
             workspace_root: None,
             audit_log: std::sync::Mutex::new(Vec::new()),
         }
@@ -674,10 +670,7 @@ impl PolicyEngine {
         if let Some(team_policy) = load_team_policy_override() {
             mapped = apply_team_policy_override(mapped, &team_policy);
         }
-        let sandbox_auto_allow_bash =
-            cfg.sandbox.enabled && cfg.sandbox.auto_allow_bash_if_sandboxed;
         let mut engine = Self::new(mapped);
-        engine.sandbox_auto_allow_bash = sandbox_auto_allow_bash;
         // Apply managed settings (enterprise overrides).
         if let Some(managed) = load_managed_settings() {
             apply_managed_settings(&mut engine, &managed);
@@ -773,6 +766,14 @@ impl PolicyEngine {
             })
     }
 
+    pub fn denies_tool(&self, call: &ToolCall) -> bool {
+        self.permission_mode != PermissionMode::BypassPermissions
+            && ((self.permission_mode == PermissionMode::Locked
+                && self.is_blocked_in_locked_mode(call))
+                || evaluate_permission_rules(&self.cfg.permission_rules, call).as_deref()
+                    == Some("deny"))
+    }
+
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
         // BypassPermissions skips ALL checks -- this is intentional and requires
         // both `--dangerously-skip-permissions` and `--allow-dangerously-skip-permissions`
@@ -792,6 +793,14 @@ impl PolicyEngine {
                 });
             }
             return false;
+        }
+
+        if self.permission_mode == PermissionMode::Locked && self.is_blocked_in_locked_mode(call) {
+            return true;
+        }
+
+        if let Some(decision) = evaluate_permission_rules(&self.cfg.permission_rules, call) {
+            return decision != "allow";
         }
 
         // Check persistent bash approvals (project-scoped, "don't ask again").
@@ -815,23 +824,6 @@ impl PolicyEngine {
                 .and_then(|v| v.as_str())
             && bash_classifier::classify_bash_command(cmd) == bash_classifier::BashSafety::Safe
         {
-            return false;
-        }
-
-        // Check granular permission rules first (they take priority).
-        if !self.cfg.permission_rules.is_empty()
-            && let Some(decision) = evaluate_permission_rules(&self.cfg.permission_rules, call)
-        {
-            return match decision.as_str() {
-                "allow" => false,
-                "deny" | "ask" => true,
-                _ => true,
-            };
-        }
-
-        // Sandbox auto-approve: if sandbox is enabled with auto_allow_bash_if_sandboxed,
-        // bash commands don't need approval since they'll be sandboxed at execution time.
-        if self.sandbox_auto_allow_bash && call.name == "bash.run" {
             return false;
         }
 
@@ -2402,22 +2394,17 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_auto_allow_bash_skips_approval() {
-        let mut policy = PolicyEngine::new(PolicyConfig {
-            permission_mode: PermissionMode::Ask,
-            approve_bash: true, // normally requires approval
-            ..PolicyConfig::default()
-        });
-        let bash_call = ToolCall {
+    fn sandbox_config_alone_does_not_approve_bash() {
+        let mut config = codingbuddy_core::PolicyConfig::default();
+        config.sandbox.enabled = true;
+        config.sandbox.auto_allow_bash_if_sandboxed = true;
+        let policy = PolicyEngine::from_app_config(&config);
+        let call = ToolCall {
             name: "bash.run".to_string(),
-            args: json!({"cmd": "unknown_command"}),
-            requires_approval: false,
+            args: serde_json::json!({"cmd": "npm install"}),
+            requires_approval: true,
         };
-        // Without sandbox auto-allow, approval is required
-        assert!(policy.requires_approval(&bash_call));
-        // With sandbox auto-allow, bash is auto-approved
-        policy.sandbox_auto_allow_bash = true;
-        assert!(!policy.requires_approval(&bash_call));
+        assert!(policy.requires_approval(&call));
     }
 
     #[test]
