@@ -745,7 +745,7 @@ impl ToolName {
             Self::WebSearch => "web search internet documentation",
             Self::NotebookRead => "read jupyter notebook ipynb",
             Self::NotebookEdit => "edit jupyter notebook ipynb",
-            Self::IndexQuery => "query semantic code index retrieval",
+            Self::IndexQuery => "search indexed code by keywords",
             Self::PatchStage => "stage patch diff hunks",
             Self::PatchApply => "apply patch diff hunks",
             Self::PatchDirect => "direct patch unified diff apply",

@@ -135,18 +135,9 @@ model with `codingbuddy --model provider/model -p "Summarize this repo"`.
 - **Skill catalog**: Skills with `when_to_use` injected into system prompt so LLM auto-invokes
 - **Custom agents**: `.codingbuddy/agents/*.md` with model override, max_turns, tool restrictions
 
-### Local ML (Feature-Gated)
-- **Embeddings**: Jina Code v2 via Candle for local vector search
-- **Ghost text completion**: DeepSeek Coder 1.3B autocomplete with Tab/Alt+Right accept
-- **Privacy router**: 3-layer detection (path globs, content regex, secret patterns) with Block/Redact/LocalOnly policies
-- **Memory-aware loading**: Cascades Full → ReducedContext → CpuOnly → Skip based on available memory
-- **Hybrid retrieval**: Reciprocal Rank Fusion combining vector + BM25 scores
-
-Enable with: `cargo build --release --bin codingbuddy --features local-ml`
-
 ## Architecture
 
-18-crate Rust workspace. Edition 2024, Rust 1.94.1, resolver v2.
+17-crate Rust workspace. Edition 2024, Rust 1.94.1, resolver v2.
 
 | Crate | Role |
 |-------|------|
@@ -158,12 +149,11 @@ Enable with: `cargo build --release --bin codingbuddy --features local-ml`
 | `codingbuddy-policy` | Permission engine, glob rules, approval gates, output scanner |
 | `codingbuddy-hooks` | 14 lifecycle events, hook runtime, permission decisions |
 | `codingbuddy-lsp` | Post-edit validation with timeout, command caching, per-language config |
-| `codingbuddy-local-ml` | Local ML: embeddings, completion, chunking, vector index, privacy router |
 | `codingbuddy-store` | SQLite session persistence, legacy JSONL import, persistent approvals |
 | `codingbuddy-memory` | Long-term memory, shadow commits, checkpoints, auto-extraction |
 | `codingbuddy-index` | Full-text code index (Tantivy), RAG retrieval |
 | `codingbuddy-mcp` | MCP server management (JSON-RPC stdio/http/SSE) |
-| `codingbuddy-ui` | TUI rendering (ratatui), themes, modals, vim mode, ghost text |
+| `codingbuddy-ui` | TUI rendering (ratatui), themes, modals, Vim mode, history suggestions |
 | `codingbuddy-diff` | Unified diff parsing, patch staging |
 | `codingbuddy-subagent` | Background tasks, worktree isolation, custom agent definitions |
 | `codingbuddy-jsonrpc` | JSON-RPC server for IDE integration |

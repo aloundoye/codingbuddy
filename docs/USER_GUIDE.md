@@ -18,7 +18,7 @@ A complete guide to using CodingBuddy — from first install to advanced feature
 10. [Skills](#skills)
 11. [Subagents](#subagents)
 12. [MCP Servers](#mcp-servers)
-13. [Local ML](#local-ml)
+13. [Privacy Filtering](#privacy-filtering)
 14. [Session Management](#session-management)
 15. [Code Index](#code-index)
 16. [Autopilot](#autopilot)
@@ -55,11 +55,6 @@ cargo build --release --bin codingbuddy
 # Binary at ./target/release/codingbuddy
 ```
 
-For local ML support (optional, adds ~10MB + model downloads):
-
-```bash
-cargo build --release --bin codingbuddy --features local-ml
-```
 
 ### Verify installation
 
@@ -146,8 +141,7 @@ MCP tools (`mcp__*`) always pass through regardless of profile.
 | **Page Up / Page Down** | Scroll the conversation while the prompt stays at the bottom |
 | **Ctrl+R** | Reverse history search |
 | **Shift+Tab** | Cycle agent profile (build→explore→plan→bash→general) |
-| **Tab** | Accept autocomplete / ghost text suggestion |
-| **Alt+Right** | Accept one word of ghost text |
+| **Tab** | Accept autocomplete or a history suggestion |
 | **Esc** | Dismiss overlay / vim normal mode |
 | **Ctrl+V** | Paste (includes image paste support) |
 | **Y** | Approve tool call (at approval prompt) |
@@ -322,14 +316,6 @@ If the agent repeats the same tool call identically 3+ times (e.g., reading the 
 - If the agent hits a compile error or test failure, it gets guidance to re-read the error and reconsider its approach
 - If it hits the same error 3+ times, it gets stronger guidance to try a completely different strategy
 - This resets on success
-
-### Per-Turn Retrieval
-
-When local ML is enabled, the retrieval pipeline fires on every turn — not just the first message:
-- Relevant code chunks are injected as context before each LLM call
-- Budget adapts to remaining context window (remaining_tokens / 5)
-- Skips when context is nearly full (< 500 tokens remaining)
-- Index updates incrementally using SHA-256 change detection
 
 ### Long Conversations
 
@@ -636,77 +622,20 @@ MCP server prompts are available as slash commands. Environment variables in ser
 
 ---
 
-## Local ML
+## Privacy Filtering
 
-An optional feature-gated layer (`--features local-ml`) that runs ML models locally on your machine. When the feature is disabled (default), mock backends are used — the system still works but with simpler retrieval.
-
-### What Local ML Provides
-
-| Feature | Without `local-ml` | With `local-ml` |
-|---------|-------------------|-----------------|
-| **Code retrieval** | BM25 keyword search | Hybrid: Vector (Jina Code v2) + BM25 with Reciprocal Rank Fusion |
-| **Ghost text** | History-based suggestions | DeepSeek Coder 1.3B real completions (Tab/Alt+Right accept) |
-| **Privacy scanning** | Regex pattern detection | 3-layer: path globs + content regex + ML-based secret detection |
-| **Reranking** | No reranking | Cross-encoder reranking for search results |
-
-### Building with Local ML
+Enable the privacy filter in `.codingbuddy/settings.json` with `"privacy": {"enabled": true}`.
+Use `sensitive_globs` for path patterns and `sensitive_regex` for additional content patterns.
+The default policy is `redact`. You can also select `block_cloud` or `local_only_summary`.
 
 ```bash
-cargo build --release --bin codingbuddy --features local-ml
-# Or with HNSW vector index:
-cargo build --release --bin codingbuddy --features local-ml-usearch
+codingbuddy privacy scan
+codingbuddy privacy policy show
+codingbuddy privacy policy test <path>
 ```
 
-### Configuration
-
-```json
-{
-  "local_ml": {
-    "enabled": true,
-    "embeddings": {
-      "model_id": "jinaai/jina-embeddings-v2-base-code"
-    },
-    "autocomplete": {
-      "model_id": "deepseek-ai/deepseek-coder-1.3b-base",
-      "device": "metal",
-      "max_tokens": 64
-    },
-    "privacy": {
-      "enabled": true,
-      "policy": "redact"
-    }
-  }
-}
-```
-
-### Memory-Aware Model Loading
-
-The system automatically adjusts model loading based on available RAM:
-- **Full**: Load complete model with full context
-- **ReducedContext**: Load with smaller context window
-- **CpuOnly**: Skip GPU, use CPU inference
-- **Skip**: Don't load (insufficient memory) — falls back to mock backend
-
-### Architecture
-
-The `codingbuddy-local-ml` crate (7,200 lines) provides:
-- `EmbeddingsBackend` / `LocalGenBackend` / `VectorIndexBackend` traits with mock + Candle implementations
-- `chunk_workspace()` with overlapping windows and gitignore-aware file scanning
-- `HybridRetriever` combining vector + BM25 scores via Reciprocal Rank Fusion
-- `ModelManager` with parallel downloads, stall detection, and resume support
-- `PrivacyRouter` with 3-layer detection and Block/Redact/LocalOnlySummary policies
-
-### Privacy Commands
-
-```bash
-codingbuddy privacy scan              # Find sensitive files in your project
-codingbuddy privacy policy            # Show current privacy rules
-codingbuddy privacy redact-preview    # Preview what would be redacted
-```
-
-### Full ML (with models)
-
-Build with `--features local-ml` to enable Candle-powered backends. Models (~300MB–1.5GB) download from HuggingFace on first use and cache locally in `.codingbuddy/models/`.
+On upgrade, CodingBuddy reads existing `local_ml.privacy` settings as a fallback.
+The top-level `privacy` settings take precedence.
 
 ---
 
@@ -727,7 +656,6 @@ codingbuddy usage                     # Show token usage and cost
 
 - provider compatibility summaries for the active/base/reasoner models
 - the last applied compatibility transforms for the current session
-- local runtime queue/load state when local ML is enabled
 - stale-vs-live runtime timestamps so operators can tell when a snapshot is old
 
 ### Checkpoints & Rewind
@@ -757,7 +685,7 @@ codingbuddy index watch               # Auto-rebuild on file changes
 codingbuddy index query "search term" # Search the index directly
 ```
 
-The index uses Tantivy (full-text search) and optionally the hybrid vector index (when local ML is enabled).
+The index uses Tantivy for full-text keyword search.
 
 ---
 
@@ -939,13 +867,3 @@ TUI requires an interactive terminal. It won't activate with:
 - Non-TTY environments
 
 Force it off: `"ui": {"enable_tui": false}`
-
-### Local ML Issues
-
-See `docs/LOCAL_ML_GUIDE.md` for detailed troubleshooting.
-
-Quick fixes:
-- Ghost text empty → need `--features local-ml` build for real completions
-- Retrieval irrelevant → `codingbuddy index --hybrid clean` to rebuild
-- Privacy false positives → adjust `local_ml.privacy.path_globs` in config
-- Model download fails → check `.codingbuddy/models/` permissions, falls back to mocks automatically

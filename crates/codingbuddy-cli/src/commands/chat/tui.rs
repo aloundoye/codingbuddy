@@ -156,72 +156,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         });
     }
 
-    // Build ML completion callback for ghost text (if local_ml + autocomplete enabled).
-    // Runners are loaded lazily and reused via a lifecycle manager with queueing/eviction.
-    let ml_completion_cb: Option<codingbuddy_ui::MlCompletionCallback> = if cfg.local_ml.enabled
-        && cfg.local_ml.autocomplete.enabled
-    {
-        if let Some(resolved_model_id) =
-            resolve_autocomplete_model_id(&cfg.local_ml.autocomplete.model_id)
-        {
-            let cache_dir = cfg.local_ml.cache_dir.clone();
-            let device_str = cfg.local_ml.device.clone();
-            let runtime_manager =
-                codingbuddy_local_ml::ModelManager::new(PathBuf::from(&cache_dir));
-            let scheduler = Arc::new(codingbuddy_local_ml::LocalRunnerLifecycleManager::new(
-                runtime_manager,
-                Arc::new({
-                    let cache_dir = cache_dir.clone();
-                    let device_str = device_str.clone();
-                    move |model_id: &str| -> Result<Arc<dyn codingbuddy_local_ml::LocalGenBackend>> {
-                        load_autocomplete_backend(model_id, &cache_dir, &device_str).or_else(
-                            |error| {
-                                eprintln!(
-                                    "[codingbuddy] local completion backend load failed for '{model_id}' ({error}), using mock backend"
-                                );
-                                Ok(Arc::new(codingbuddy_local_ml::MockGenerator::new(
-                                    String::new(),
-                                ))
-                                    as Arc<dyn codingbuddy_local_ml::LocalGenBackend>)
-                            },
-                        )
-                    }
-                }),
-            ));
-
-            // Prewarm the chosen autocomplete model in the background.
-            {
-                let scheduler = Arc::clone(&scheduler);
-                let model_id = resolved_model_id.clone();
-                std::thread::spawn(move || {
-                    if let Err(error) = scheduler.prewarm(&model_id) {
-                        eprintln!(
-                            "[codingbuddy] failed to prewarm local autocomplete model '{model_id}': {error}"
-                        );
-                    }
-                });
-            }
-
-            let max_tokens = cfg.local_ml.autocomplete.max_tokens;
-            let timeout_ms = cfg.local_ml.autocomplete.timeout_ms;
-            Some(Arc::new(move |input: &str| -> Option<String> {
-                let opts = codingbuddy_local_ml::completion::GenOpts {
-                    max_tokens,
-                    timeout_ms,
-                    ..Default::default()
-                };
-                scheduler
-                    .generate(&resolved_model_id, input, &opts)
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     if debug {
         eprintln!("[debug] starting TUI shell...");
     }
@@ -1303,7 +1237,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 status
             })
         },
-        ml_completion_cb,
         codingbuddy_ui::TerminalControls {
             on_menu: Some(Box::new(move |id, value| menus.action(id, value))),
             needs_connection,

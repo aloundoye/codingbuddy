@@ -541,7 +541,7 @@ Using dedicated tools provides structured output, better error handling, and cle
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "index_query".to_string(),
-                description: "Full-text semantic search across the code index. Returns matching file paths and snippets ranked by relevance. Use for conceptual searches (e.g. 'authentication middleware') when you don't know the exact string. For exact pattern matching, use fs_grep instead.".to_string(),
+                description: "Keyword search across the workspace code index. Returns file paths and snippets ranked by relevance. Use terms likely to appear in the code, such as 'authentication middleware'. Use fs_grep for literal or regex matches.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",

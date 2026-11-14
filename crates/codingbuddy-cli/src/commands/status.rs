@@ -10,8 +10,7 @@ use uuid::Uuid;
 
 use crate::UsageArgs;
 use crate::commands::operator_diagnostics::{
-    provider_compatibility_diagnostics, runtime_operator_diagnostics,
-    summarize_applied_compatibility,
+    provider_compatibility_diagnostics, summarize_applied_compatibility,
 };
 use crate::commands::plan::{current_plan_payload, plan_state_label, workflow_phase_label};
 use crate::commands::tasks::{mission_control_payload, render_mission_control_lines};
@@ -184,10 +183,6 @@ pub(crate) fn current_ui_status(
             )
         })
         .unwrap_or_default();
-    let runtime_snapshot =
-        codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
-            .runtime_snapshot();
-    let runtime_diagnostics = runtime_operator_diagnostics(&runtime_snapshot);
 
     Ok(UiStatus {
         model: selected_model,
@@ -233,7 +228,6 @@ pub(crate) fn current_ui_status(
         .filter(|value| !value.trim().is_empty())
         .collect::<Vec<_>>()
         .join(" | "),
-        runtime_diagnostics_summary: runtime_diagnostics.summary,
         compaction_count,
         replay_count,
     })
@@ -361,10 +355,6 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
     let mcp_servers = McpManager::new(cwd)
         .and_then(|manager| manager.list_servers())
         .unwrap_or_default();
-    let runtime_snapshot =
-        codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
-            .runtime_snapshot();
-    let runtime_diagnostics = runtime_operator_diagnostics(&runtime_snapshot);
     let base_model_diagnostics =
         provider_compatibility_diagnostics(&cfg, &cfg.llm.active_base_model());
     let reasoner_model = cfg.llm.active_reasoner_model();
@@ -417,14 +407,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "sandbox_mode": cfg.policy.sandbox_mode,
                 "allowlist_entries": cfg.policy.allowlist.len(),
             },
-            "local_ml": {
-                "enabled": cfg.local_ml.enabled,
-                "runtime": {
-                    "summary": runtime_diagnostics.summary,
-                    "highlights": runtime_diagnostics.highlights,
-                    "snapshot": runtime_snapshot,
-                }
-            },
+            "privacy": {"enabled": cfg.privacy.enabled},
             "mcp_servers": mcp_servers.len(),
             "autopilot": latest_autopilot.map(|run| json!({
                 "run_id": run.run_id,
@@ -464,14 +447,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "sandbox_mode": cfg.policy.sandbox_mode,
                 "allowlist_entries": cfg.policy.allowlist.len(),
             },
-            "local_ml": {
-                "enabled": cfg.local_ml.enabled,
-                "runtime": {
-                    "summary": runtime_diagnostics.summary,
-                    "highlights": runtime_diagnostics.highlights,
-                    "snapshot": runtime_snapshot,
-                }
-            },
+            "privacy": {"enabled": cfg.privacy.enabled},
             "mcp_servers": mcp_servers.len(),
             "autopilot": null,
         })
@@ -517,11 +493,6 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             && !summary.is_empty()
         {
             println!("provider compatibility {}", summary);
-        }
-        if let Some(summary) = payload["local_ml"]["runtime"]["summary"].as_str()
-            && !summary.is_empty()
-        {
-            println!("runtime {}", summary);
         }
         if let Some(plan) = payload.get("plan").filter(|value| !value.is_null()) {
             println!(

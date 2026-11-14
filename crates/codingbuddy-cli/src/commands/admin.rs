@@ -12,9 +12,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::commands::operator_diagnostics::{
-    provider_compatibility_diagnostics, runtime_operator_diagnostics,
-};
+use crate::commands::operator_diagnostics::provider_compatibility_diagnostics;
 use crate::context::*;
 use crate::output::*;
 use crate::util::*;
@@ -369,49 +367,6 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
     }
     println!();
 
-    // ── Local ML ──
-    print_section("Local ML");
-    let ml_enabled = payload["local_ml"]["enabled"].as_bool().unwrap_or(false);
-    print_check(
-        ml_enabled,
-        &format!(
-            "Local ML: {}",
-            if ml_enabled {
-                "enabled"
-            } else {
-                "disabled (run `codingbuddy setup --local-ml` to enable)"
-            },
-        ),
-    );
-    if ml_enabled {
-        let privacy = payload["local_ml"]["privacy_enabled"]
-            .as_bool()
-            .unwrap_or(false);
-        let autocomplete = payload["local_ml"]["autocomplete_enabled"]
-            .as_bool()
-            .unwrap_or(false);
-        print_check(
-            privacy,
-            &format!(
-                "Privacy scanning: {}",
-                if privacy { "enabled" } else { "disabled" }
-            ),
-        );
-        print_check(
-            autocomplete,
-            &format!(
-                "Autocomplete: {}",
-                if autocomplete { "enabled" } else { "disabled" }
-            ),
-        );
-        if let Some(summary) = payload["local_ml"]["runtime"]["summary"].as_str()
-            && !summary.is_empty()
-        {
-            print_info(&format!("Runtime: {summary}"));
-        }
-    }
-    println!();
-
     // ── Storage ──
     print_section("Storage");
     let runtime_dir = payload["runtime_dir"].as_str().unwrap_or("?");
@@ -628,18 +583,6 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         .transpose()?
         .and_then(|projection| projection.last_provider_compatibility);
 
-    let runtime_snapshot =
-        codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
-            .runtime_snapshot();
-    let runtime_diagnostics = runtime_operator_diagnostics(&runtime_snapshot);
-    let mut local_ml_runtime = serde_json::to_value(runtime_snapshot).unwrap_or_else(|_| json!({}));
-    if let Some(obj) = local_ml_runtime.as_object_mut() {
-        obj.insert("summary".to_string(), json!(runtime_diagnostics.summary));
-        obj.insert(
-            "highlights".to_string(),
-            json!(runtime_diagnostics.highlights),
-        );
-    }
     let model_catalog = cfg.llm.model_catalog();
     let provider_model_count = model_catalog.for_provider(&cfg.llm.provider).len();
     let active_catalog_entry = model_catalog
@@ -694,12 +637,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "installed": plugins.len(),
             "enabled": plugins.iter().filter(|p| p.enabled).count(),
         },
-        "local_ml": {
-            "enabled": cfg.local_ml.enabled,
-            "privacy_enabled": cfg.local_ml.privacy.enabled,
-            "autocomplete_enabled": cfg.local_ml.autocomplete.enabled,
-            "runtime": local_ml_runtime,
-        },
+        "privacy": {"enabled": cfg.privacy.enabled},
         "hooks": {
             "count": hooks_count,
         },
@@ -786,14 +724,6 @@ pub(crate) fn format_doctor_display(payload: &serde_json::Value) -> String {
         out.push_str(&format!("  \u{2713} Hooks            {n} configured\n"));
     }
 
-    // Local ML
-    let ml_enabled = payload["local_ml"]["enabled"].as_bool() == Some(true);
-    out.push_str(&format!(
-        "  {} Local ML         {}\n",
-        if ml_enabled { "\u{2713}" } else { "\u{2717}" },
-        if ml_enabled { "enabled" } else { "disabled" }
-    ));
-
     // Warnings
     if let Some(warnings) = payload["warnings"].as_array()
         && !warnings.is_empty()
@@ -815,19 +745,10 @@ pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()
     let session = ensure_session_record(cwd, &store)?;
 
     match cmd {
-        IndexCmd::Build { hybrid } => {
+        IndexCmd::Build => {
             let manifest = service.build(&session)?;
-            if hybrid {
-                // Log that hybrid mode was requested (vector index built separately)
-                if !json_mode {
-                    println!("hybrid mode: BM25 index built; vector index via local-ml");
-                }
-            }
             if json_mode {
-                print_json(&serde_json::json!({
-                    "manifest": manifest,
-                    "hybrid": hybrid,
-                }))?;
+                print_json(&json!({"manifest": manifest}))?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
             }
@@ -1361,44 +1282,6 @@ pub(crate) fn run_clean(cwd: &Path, args: CleanArgs, json_mode: bool) -> Result<
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[test]
-    fn doctor_includes_local_ml() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path();
-        // Ensure minimal config exists
-        let dir = cwd.join(".codingbuddy");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("settings.json"), "{}").unwrap();
-
-        let payload = doctor_payload(cwd, &DoctorArgs { model: None }).unwrap();
-        let local_ml = &payload["local_ml"];
-        assert!(local_ml.is_object(), "doctor payload must include local_ml");
-        assert!(local_ml.get("enabled").is_some());
-        assert!(local_ml.get("privacy_enabled").is_some());
-        assert!(local_ml.get("autocomplete_enabled").is_some());
-        assert!(
-            local_ml["runtime"].is_object(),
-            "doctor payload must include local_ml runtime lifecycle snapshot"
-        );
-        assert!(local_ml["runtime"]["metrics"].is_object());
-        assert!(local_ml["runtime"]["recent_events"].is_array());
-        assert!(local_ml["runtime"]["warm_models"].is_array());
-        assert!(local_ml["runtime"]["summary"].is_string());
-        assert!(local_ml["runtime"]["highlights"].is_array());
-        assert!(
-            local_ml["runtime"]["scheduler"].is_object(),
-            "doctor payload must include runtime scheduler policy snapshot"
-        );
-        assert!(local_ml["runtime"]["scheduler"]["max_concurrent_requests"].is_number());
-        assert!(local_ml["runtime"]["scheduler"]["max_queue_depth"].is_number());
-        assert!(local_ml["runtime"]["scheduler"]["max_queue_wait_ms"].is_number());
-        assert!(
-            payload["llm"]["model_catalog"].is_object(),
-            "doctor payload must include model catalog diagnostics"
-        );
-        assert!(payload["llm"]["model_catalog"]["total_models"].is_number());
-    }
 
     #[test]
     fn doctor_includes_capability_profiles_with_rules() {
