@@ -16,7 +16,6 @@ members = [
   "crates/codingbuddy-subagent",
   "crates/codingbuddy-hooks",
   "crates/codingbuddy-jsonrpc",
-  "crates/codingbuddy-local-ml",
   "crates/codingbuddy-lsp",
 ]
 resolver = "2"
@@ -82,10 +81,6 @@ jsonschema = "0.27"
 shell-words = "1.1"
 strsim = "0.11"
 tiny_http = "0.12"
-
-# gemm-f16 0.19 requires inlining its FP16 assembly helpers on AArch64.
-[profile.dev.package.gemm-f16]
-opt-level = 1
 
 [profile.release]
 lto = "thin"

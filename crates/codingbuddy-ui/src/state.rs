@@ -219,12 +219,6 @@ impl ChatShell {
                 status.provider_diagnostics_summary
             ));
         }
-        if !status.runtime_diagnostics_summary.is_empty() {
-            self.push_system(format!(
-                "Runtime diagnostics: {}",
-                status.runtime_diagnostics_summary
-            ));
-        }
         self.push_system(format!(
             "Autopilot: {}",
             if status.autopilot_running {
@@ -675,10 +669,19 @@ impl AutocompleteState {
 
     /// Format the dropdown display as text lines for the info area.
     pub fn display_lines(&self, max_lines: usize) -> Vec<String> {
-        let total = self.suggestions.len();
-        if total == 0 {
+        if self.suggestions.is_empty() {
             return vec!["no matches".to_string()];
         }
+        self.visible_range(max_lines)
+            .map(|i| {
+                let marker = if i == self.selected { ">" } else { " " };
+                format!("{marker} {}", self.suggestions[i])
+            })
+            .collect()
+    }
+
+    pub(crate) fn visible_range(&self, max_lines: usize) -> std::ops::Range<usize> {
+        let total = self.suggestions.len();
         let show = total.min(max_lines);
         // Center viewport on selected
         let half = show / 2;
@@ -689,108 +692,7 @@ impl AutocompleteState {
         } else {
             self.selected - half
         };
-        let end = (start + show).min(total);
-
-        (start..end)
-            .map(|i| {
-                let marker = if i == self.selected { ">" } else { " " };
-                format!("{marker} {}", self.suggestions[i])
-            })
-            .collect()
-    }
-}
-
-// ─── ML Ghost Text ──────────────────────────────────────────────────────────
-
-/// State for ML-powered ghost text (autocomplete) suggestions.
-///
-/// Ghost text rendering priority: ML suggestion > history ghost > none.
-/// Uses DarkGray italic styling to distinguish from user input.
-#[derive(Debug, Clone)]
-pub struct GhostTextState {
-    /// The current ghost text suggestion, if any.
-    pub suggestion: Option<String>,
-    /// When the last text edit occurred (for debounce). Only text-changing
-    /// keystrokes update this — cursor movement does not.
-    pub last_edit: Instant,
-    /// Whether a completion request is pending (debounce not yet elapsed).
-    pub pending: bool,
-    /// Debounce duration (default 200ms).
-    pub debounce_ms: u64,
-    /// Minimum input length before triggering completions.
-    pub min_input_len: usize,
-}
-
-impl Default for GhostTextState {
-    fn default() -> Self {
-        Self {
-            suggestion: None,
-            last_edit: Instant::now(),
-            pending: false,
-            debounce_ms: 200,
-            min_input_len: 3,
-        }
-    }
-}
-
-impl GhostTextState {
-    /// Record a text-editing keystroke — clears current suggestion and resets debounce.
-    /// Call this only for keystrokes that actually change the input text (insertions,
-    /// deletions), not for cursor movement or navigation.
-    pub fn on_keystroke(&mut self) {
-        self.suggestion = None;
-        self.last_edit = Instant::now();
-        self.pending = true;
-    }
-
-    /// Check if the debounce period has elapsed and a completion should be requested.
-    pub fn should_request(&self, input_len: usize) -> bool {
-        self.pending
-            && input_len >= self.min_input_len
-            && self.last_edit.elapsed() >= Duration::from_millis(self.debounce_ms)
-    }
-
-    /// Set the suggestion from a completion callback result.
-    pub fn set_suggestion(&mut self, text: Option<String>) {
-        self.suggestion = text;
-        self.pending = false;
-    }
-
-    /// Accept the full ghost text suggestion, returning it.
-    pub fn accept_full(&mut self) -> Option<String> {
-        self.pending = false;
-        self.suggestion.take()
-    }
-
-    /// Accept one word from the ghost text suggestion.
-    ///
-    /// Uses word boundary detection that treats alphanumeric and underscore
-    /// characters as part of a word (matching identifier conventions).
-    pub fn accept_word(&mut self) -> Option<String> {
-        if let Some(ref text) = self.suggestion {
-            let trimmed = text.trim_start();
-            let leading_ws = text.len() - trimmed.len();
-            // Find end of the word: alphanumeric or underscore characters
-            let word_len = trimmed
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(trimmed.len());
-            // If we're at a non-word char, take at least one character
-            let word_end = leading_ws + word_len.max(1).min(trimmed.len());
-            if word_end == 0 {
-                return self.accept_full();
-            }
-            let word = text[..word_end].to_string();
-            let remaining = &text[word_end..];
-            if remaining.is_empty() {
-                self.suggestion = None;
-            } else {
-                self.suggestion = Some(remaining.to_string());
-            }
-            self.pending = false;
-            Some(word)
-        } else {
-            None
-        }
+        start..(start + show).min(total)
     }
 }
 
@@ -858,8 +760,3 @@ impl HelpModalState {
         &self.lines[self.scroll..end]
     }
 }
-
-/// Type alias for the ML completion callback.
-///
-/// Takes the current input text and returns an optional completion suggestion.
-pub type MlCompletionCallback = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;

@@ -16,11 +16,6 @@ pub mod watch;
 
 pub use repo_map::clear_tag_cache;
 
-/// Whether the binary was compiled with real Candle ML backends.
-pub fn has_local_ml_feature() -> bool {
-    cfg!(feature = "local-ml")
-}
-
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use codingbuddy_core::{
@@ -892,7 +887,6 @@ impl AgentEngine {
             subagent_worker: self.build_subagent_worker(),
             skill_runner: self.build_skill_runner(),
             workspace: Some(self.workspace.clone()),
-            retriever: build_retriever_callback(&self.workspace, &cfg),
             privacy_router: build_privacy_router(&cfg),
             images: options.images.clone(),
             initial_context,
@@ -1456,182 +1450,14 @@ fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {
     }
 }
 
-/// Build a retriever callback from config. Returns None if local_ml is disabled.
-///
-/// Uses MockEmbeddings (deterministic SHA-256 hashing) by default for consistent
-/// file-level retrieval. When compiled with `--features local-ml`, tries Candle
-/// embeddings (jina-code-v2) first for true semantic search.
-fn build_retriever_callback(
-    workspace: &std::path::Path,
-    cfg: &codingbuddy_core::AppConfig,
-) -> Option<tool_loop::RetrieverCallback> {
-    if !cfg.local_ml.enabled {
-        return None;
-    }
-
-    // Build embeddings backend: real Candle model with local-ml, deterministic mock without.
-    // Only use already-cached models — never block the main thread downloading.
-    // Models are pre-downloaded via `codingbuddy setup` or the first-time wizard.
-    #[cfg(feature = "local-ml")]
-    let embeddings: std::sync::Arc<dyn codingbuddy_local_ml::EmbeddingsBackend> = {
-        let mut mgr = codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(
-            &cfg.local_ml.cache_dir,
-        ));
-        if mgr.status(&cfg.local_ml.embeddings.model_id) != codingbuddy_local_ml::ModelStatus::Ready
-        {
-            eprintln!(
-                "[codingbuddy] embedding model '{}' not cached, using mock (run `codingbuddy setup` to download)",
-                cfg.local_ml.embeddings.model_id
-            );
-            std::sync::Arc::new(codingbuddy_local_ml::MockEmbeddings::new(384))
-        } else {
-            let model_path = std::path::PathBuf::from(&cfg.local_ml.cache_dir)
-                .join(&cfg.local_ml.embeddings.model_id);
-            let _ = mgr.mark_runtime_used(&cfg.local_ml.embeddings.model_id);
-            let _ = mgr.evict_idle_runtime_models();
-            let device = codingbuddy_local_ml::parse_device(&cfg.local_ml.device);
-            match codingbuddy_local_ml::CandleEmbeddings::load(
-                &model_path.join("model.safetensors"),
-                &model_path.join("config.json"),
-                &model_path.join("tokenizer.json"),
-                &device,
-                cfg.local_ml.embeddings.normalize,
-            ) {
-                Ok(emb) => std::sync::Arc::new(emb),
-                Err(e) => {
-                    eprintln!(
-                        "[codingbuddy] candle embeddings load failed ({e}), falling back to mock"
-                    );
-                    std::sync::Arc::new(codingbuddy_local_ml::MockEmbeddings::new(384))
-                }
-            }
-        }
-    };
-    #[cfg(not(feature = "local-ml"))]
-    let embeddings: std::sync::Arc<dyn codingbuddy_local_ml::EmbeddingsBackend> =
-        std::sync::Arc::new(codingbuddy_local_ml::MockEmbeddings::new(384));
-
-    // Build vector index path
-    let index_path = workspace.join(".codingbuddy").join("vector_index");
-    let chunk_config = codingbuddy_local_ml::ChunkConfig {
-        chunk_lines: cfg.local_ml.index.chunk_lines,
-        ..Default::default()
-    };
-
-    // Build hybrid retriever: use UsearchBackend only when explicitly enabled;
-    // otherwise stick to the built-in brute-force backend for portability.
-    #[cfg(all(feature = "local-ml-usearch", not(target_os = "windows")))]
-    let retriever = match codingbuddy_local_ml::UsearchBackend::new(embeddings.dimension()) {
-        Ok(backend) => codingbuddy_local_ml::HybridRetriever::new_with_backend(
-            &index_path,
-            embeddings,
-            Box::new(backend),
-            None,
-            0.7,
-            chunk_config,
-        ),
-        Err(_) => codingbuddy_local_ml::HybridRetriever::new(
-            &index_path,
-            embeddings,
-            None,
-            0.7,
-            chunk_config,
-        ),
-    };
-    #[cfg(all(
-        feature = "local-ml",
-        any(not(feature = "local-ml-usearch"), target_os = "windows")
-    ))]
-    let retriever = codingbuddy_local_ml::HybridRetriever::new(
-        &index_path,
-        embeddings,
-        None,
-        0.7,
-        chunk_config,
-    );
-    #[cfg(not(feature = "local-ml"))]
-    let retriever = codingbuddy_local_ml::HybridRetriever::new(
-        &index_path,
-        embeddings,
-        None,
-        0.7,
-        chunk_config,
-    );
-    let retriever = match retriever {
-        Ok(r) => std::sync::Arc::new(std::sync::Mutex::new(r)),
-        Err(e) => {
-            eprintln!("[codingbuddy] retriever init failed ({e}), retrieval disabled");
-            return None;
-        }
-    };
-
-    // Lazy index on first retrieval call
-    let workspace_path = workspace.to_path_buf();
-    let indexed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Kick off index build in background so it doesn't block the first LLM call.
-    {
-        let bg_retriever = retriever.clone();
-        let bg_workspace = workspace_path.clone();
-        let bg_indexed = indexed.clone();
-        std::thread::spawn(move || {
-            if let Ok(mut r) = bg_retriever.lock() {
-                let _ = r.build_index(&bg_workspace);
-                bg_indexed.store(true, std::sync::atomic::Ordering::Release);
-            }
-        });
-    }
-
-    Some(std::sync::Arc::new(
-        move |query: &str, max_results: usize| {
-            // Skip retrieval if index is still building in background
-            if !indexed.load(std::sync::atomic::Ordering::Acquire) {
-                return Ok(vec![]);
-            }
-
-            let retriever = retriever
-                .lock()
-                .map_err(|e| anyhow!("retriever lock: {e}"))?;
-
-            let filter = codingbuddy_local_ml::SearchFilter {
-                max_results,
-                ..Default::default()
-            };
-            let results = retriever.search(query, max_results, &filter)?;
-            Ok(results
-                .into_iter()
-                .map(|r| tool_loop::RetrievalContext {
-                    file_path: r.chunk.file_path.to_string_lossy().to_string(),
-                    start_line: r.chunk.start_line,
-                    end_line: r.chunk.end_line,
-                    content: r.chunk.content,
-                    score: r.hybrid_score,
-                })
-                .collect())
-        },
-    ))
-}
-
 /// Build a privacy router from config. Returns None if privacy is disabled.
 fn build_privacy_router(
     cfg: &codingbuddy_core::AppConfig,
-) -> Option<std::sync::Arc<codingbuddy_local_ml::PrivacyRouter>> {
-    if !cfg.local_ml.enabled || !cfg.local_ml.privacy.enabled {
+) -> Option<std::sync::Arc<codingbuddy_policy::privacy::PrivacyRouter>> {
+    if !cfg.privacy.enabled {
         return None;
     }
-    let privacy_config = codingbuddy_local_ml::PrivacyConfig {
-        enabled: true,
-        sensitive_globs: cfg.local_ml.privacy.sensitive_globs.clone(),
-        sensitive_regex: cfg.local_ml.privacy.sensitive_regex.clone(),
-        policy: match cfg.local_ml.privacy.policy.as_str() {
-            "block_cloud" => codingbuddy_local_ml::PrivacyPolicy::BlockCloud,
-            "local_only_summary" => codingbuddy_local_ml::PrivacyPolicy::LocalOnlySummary,
-            _ => codingbuddy_local_ml::PrivacyPolicy::Redact,
-        },
-        store_raw_in_logs: cfg.local_ml.privacy.store_raw_in_logs,
-        strict_regex: false,
-    };
-    codingbuddy_local_ml::PrivacyRouter::new(privacy_config)
+    codingbuddy_policy::privacy::PrivacyRouter::from_settings(&cfg.privacy)
         .ok()
         .map(std::sync::Arc::new)
 }
@@ -1959,16 +1785,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
-    }
-
-    #[test]
-    fn has_local_ml_feature_returns_bool() {
-        // Without local-ml feature compiled, should return false.
-        let result = super::has_local_ml_feature();
-        #[cfg(not(feature = "local-ml"))]
-        assert!(!result);
-        #[cfg(feature = "local-ml")]
-        assert!(result);
     }
 
     #[test]

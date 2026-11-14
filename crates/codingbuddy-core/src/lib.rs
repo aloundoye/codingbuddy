@@ -1139,14 +1139,14 @@ pub enum EventKind {
         transforms: Vec<String>,
         degraded_inputs: Vec<String>,
     },
-    /// Vector/code index was built from scratch.
+    /// Code index was built from scratch.
     #[serde(alias = "IndexBuildV1")]
     IndexBuild {
         chunks_indexed: u64,
         files_processed: u64,
         duration_ms: u64,
     },
-    /// Vector/code index was incrementally updated.
+    /// Code index was incrementally updated.
     #[serde(alias = "IndexUpdateV1")]
     IndexUpdate {
         chunks_added: u64,
@@ -1154,14 +1154,14 @@ pub enum EventKind {
         files_changed: u64,
         duration_ms: u64,
     },
-    /// A retrieval query was executed against the vector index.
+    /// A retrieval query was executed against the code index.
     #[serde(alias = "IndexQueryV1")]
     IndexQueryEvent {
         query: String,
         results_count: u64,
         duration_ms: u64,
     },
-    /// Retrieval context was injected before an LLM call.
+    /// Legacy event retained to replay sessions with automatic retrieval.
     #[serde(alias = "RetrievalV1")]
     Retrieval {
         query: String,
@@ -1178,7 +1178,7 @@ pub enum EventKind {
     /// Content was blocked from cloud by the privacy router.
     #[serde(alias = "PrivacyBlockV1")]
     PrivacyBlock { path: String, reason: String },
-    /// Local autocomplete / ghost text was generated.
+    /// Legacy event retained to replay sessions with model-generated autocomplete.
     #[serde(alias = "AutocompleteV1")]
     Autocomplete {
         model_id: String,
@@ -1398,7 +1398,7 @@ impl EventKind {
             // IDE
             Self::IdeSessionStarted { .. } => "ide",
 
-            // Local ML
+            // Code index and legacy retrieval
             Self::IndexBuild { .. }
             | Self::IndexUpdate { .. }
             | Self::IndexQueryEvent { .. }
@@ -2159,7 +2159,7 @@ pub struct AppConfig {
     /// Post-edit LSP validation config (which languages to check after edits).
     #[serde(default)]
     pub lsp: LspValidationConfig,
-    pub local_ml: LocalMlConfig,
+    pub privacy: PrivacyConfig,
     /// Hooks configuration (maps event names to hook definitions).
     /// Stored as raw JSON, parsed by codingbuddy-hooks at runtime.
     #[serde(default)]
@@ -2345,6 +2345,9 @@ impl AppConfig {
     pub fn load_with_provider_origin(workspace: &Path) -> Result<(Self, bool)> {
         let mut explicit = false;
         let mut merged = serde_json::to_value(Self::default())?;
+        if let Some(root) = merged.as_object_mut() {
+            root.remove("privacy");
+        }
 
         let legacy = Self::legacy_toml_path(workspace);
         if legacy.exists() {
@@ -2390,6 +2393,7 @@ impl AppConfig {
             merge_llm_settings(&mut merged, &value);
         }
 
+        migrate_privacy_settings(&mut merged);
         let mut cfg: Self = serde_json::from_value(merged)?;
         // Older generated settings wrote the implicit DeepSeek URL for every provider.
         if cfg.llm.provider != "deepseek"
@@ -2414,6 +2418,29 @@ impl AppConfig {
         fs::write(path, serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
+}
+
+fn migrate_privacy_settings(settings: &mut serde_json::Value) {
+    let Some(root) = settings.as_object_mut() else {
+        return;
+    };
+    let Some(legacy) = root.remove("local_ml") else {
+        return;
+    };
+    let Some(mut privacy) = legacy
+        .get("privacy")
+        .filter(|value| value.is_object())
+        .cloned()
+    else {
+        return;
+    };
+    privacy["enabled"] = serde_json::Value::Bool(
+        legacy["enabled"].as_bool() == Some(true) && privacy["enabled"].as_bool() == Some(true),
+    );
+    if let Some(current) = root.remove("privacy") {
+        merge_json_value(&mut privacy, &current);
+    }
+    root.insert("privacy".to_owned(), privacy);
 }
 
 // Legacy endpoint and key fields describe the provider selected by their settings layer.
@@ -3895,110 +3922,9 @@ impl Default for LspValidationConfig {
     }
 }
 
-/// Configuration for local ML capabilities (embeddings, autocomplete, privacy routing).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct LocalMlConfig {
-    /// Master switch for all local ML features.
-    pub enabled: bool,
-    /// Compute device: "auto", "cpu", "cuda", "metal".
-    pub device: String,
-    /// Directory for cached model files.
-    pub cache_dir: String,
-    /// Embeddings model configuration.
-    pub embeddings: EmbeddingsModelConfig,
-    /// Vector index configuration.
-    pub index: VectorIndexConfig,
-    /// Local autocomplete / ghost text configuration.
-    pub autocomplete: AutocompleteLocalConfig,
-    /// Privacy routing configuration.
-    pub privacy: PrivacyLocalConfig,
-}
-
-impl Default for LocalMlConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            device: "auto".to_string(),
-            cache_dir: ".codingbuddy/models".to_string(),
-            embeddings: EmbeddingsModelConfig::default(),
-            index: VectorIndexConfig::default(),
-            autocomplete: AutocompleteLocalConfig::default(),
-            privacy: PrivacyLocalConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EmbeddingsModelConfig {
-    pub enabled: bool,
-    pub model_id: String,
-    pub normalize: bool,
-    pub batch_size: usize,
-}
-
-impl Default for EmbeddingsModelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
-            normalize: true,
-            batch_size: 32,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VectorIndexConfig {
-    pub chunk_lines: usize,
-    pub chunk_overlap: usize,
-    /// Use hybrid retrieval (vector + BM25).
-    pub hybrid: bool,
-    /// Blend alpha: 0.0 = pure BM25, 1.0 = pure vector.
-    pub blend_alpha: f32,
-    /// Maximum chunks to return per query.
-    pub max_results: usize,
-}
-
-impl Default for VectorIndexConfig {
-    fn default() -> Self {
-        Self {
-            chunk_lines: 50,
-            chunk_overlap: 10,
-            hybrid: true,
-            blend_alpha: 0.7,
-            max_results: 10,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutocompleteLocalConfig {
-    pub enabled: bool,
-    pub model_id: String,
-    pub debounce_ms: u64,
-    pub timeout_ms: u64,
-    pub max_tokens: u32,
-}
-
-impl Default for AutocompleteLocalConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            model_id: "auto".to_string(),
-            debounce_ms: 200,
-            timeout_ms: 2000,
-            max_tokens: 128,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PrivacyLocalConfig {
+pub struct PrivacyConfig {
     pub enabled: bool,
     pub sensitive_globs: Vec<String>,
     pub sensitive_regex: Vec<String>,
@@ -4006,7 +3932,7 @@ pub struct PrivacyLocalConfig {
     pub store_raw_in_logs: bool,
 }
 
-impl Default for PrivacyLocalConfig {
+impl Default for PrivacyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -4728,74 +4654,32 @@ mod tests {
     }
 
     #[test]
-    fn local_ml_config_defaults_correct() {
-        let cfg = LocalMlConfig::default();
-        assert!(!cfg.enabled, "local_ml must be disabled by default");
-        assert_eq!(cfg.device, "auto");
-        assert_eq!(cfg.cache_dir, ".codingbuddy/models");
-        assert!(cfg.embeddings.enabled);
-        assert!(!cfg.autocomplete.enabled);
-        assert!(!cfg.privacy.enabled);
-        assert_eq!(cfg.index.chunk_lines, 50);
-        assert_eq!(cfg.index.chunk_overlap, 10);
-        assert!(cfg.index.hybrid);
-    }
-
-    #[test]
-    fn local_ml_config_from_json_parsed() {
-        let json = serde_json::json!({
-            "local_ml": {
-                "enabled": true,
-                "device": "metal",
-                "cache_dir": "/tmp/models",
-                "embeddings": {
-                    "enabled": true,
-                    "model_id": "jina-code-v2",
-                    "normalize": false,
-                    "batch_size": 64
+    fn legacy_privacy_settings_keep_their_effective_state() -> anyhow::Result<()> {
+        for (legacy_enabled, override_enabled, expected) in [
+            (true, None, true),
+            (false, None, false),
+            (true, Some(false), false),
+        ] {
+            let workspace = tempfile::tempdir()?;
+            let path = AppConfig::project_local_settings_path(workspace.path());
+            fs::create_dir_all(path.parent().unwrap())?;
+            let mut settings = serde_json::json!({
+                "local_ml": {
+                    "enabled": legacy_enabled,
+                    "privacy": {"enabled": true, "sensitive_regex": ["example-secret"]}
                 },
-                "index": {
-                    "chunk_lines": 100,
-                    "chunk_overlap": 20,
-                    "hybrid": false,
-                    "blend_alpha": 0.5,
-                    "max_results": 20
-                },
-                "autocomplete": {
-                    "enabled": true,
-                    "model_id": "custom-model",
-                    "debounce_ms": 300,
-                    "timeout_ms": 3000,
-                    "max_tokens": 256
-                },
-                "privacy": {
-                    "enabled": true,
-                    "sensitive_globs": ["**/.secret"],
-                    "sensitive_regex": ["SSN-\\d+"],
-                    "policy": "block_cloud",
-                    "store_raw_in_logs": true
-                }
+                "privacy": {"policy": "block_cloud"}
+            });
+            if let Some(enabled) = override_enabled {
+                settings["privacy"]["enabled"] = serde_json::json!(enabled);
             }
-        });
-        let cfg: AppConfig = serde_json::from_value(json).expect("parse");
-        assert!(cfg.local_ml.enabled);
-        assert_eq!(cfg.local_ml.device, "metal");
-        assert_eq!(cfg.local_ml.cache_dir, "/tmp/models");
-        assert_eq!(cfg.local_ml.embeddings.model_id, "jina-code-v2");
-        assert!(!cfg.local_ml.embeddings.normalize);
-        assert_eq!(cfg.local_ml.embeddings.batch_size, 64);
-        assert_eq!(cfg.local_ml.index.chunk_lines, 100);
-        assert!(!cfg.local_ml.index.hybrid);
-        assert!(cfg.local_ml.autocomplete.enabled);
-        assert_eq!(cfg.local_ml.autocomplete.max_tokens, 256);
-        assert!(cfg.local_ml.privacy.enabled);
-        assert_eq!(cfg.local_ml.privacy.policy, "block_cloud");
-    }
-
-    #[test]
-    fn local_ml_disabled_by_default_in_appconfig() {
-        let cfg = AppConfig::default();
-        assert!(!cfg.local_ml.enabled);
+            fs::write(path, serde_json::to_vec(&settings)?)?;
+            let cfg = AppConfig::load(workspace.path())?;
+            assert_eq!(cfg.privacy.enabled, expected);
+            assert_eq!(cfg.privacy.policy, "block_cloud");
+            assert_eq!(cfg.privacy.sensitive_regex, ["example-secret"]);
+        }
+        Ok(())
     }
 
     #[test]

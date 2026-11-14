@@ -24,7 +24,6 @@ mod util;
 
 use commands::admin::{run_clean, run_config, run_doctor, run_index, run_permissions, run_plugins};
 use commands::agents::run_agents;
-use commands::autocomplete_cmd::run_autocomplete;
 use commands::autopilot::run_autopilot_cmd;
 use commands::background::run_background;
 use commands::chat::{
@@ -367,7 +366,7 @@ enum Commands {
     Status,
     /// List available models for each configured provider.
     Models,
-    /// Interactive setup wizard for API key, local ML, and privacy.
+    /// Interactive setup wizard for provider connection.
     Setup(SetupArgs),
     /// Display token and cost usage.
     Usage(UsageArgs),
@@ -424,11 +423,6 @@ enum Commands {
     Privacy {
         #[command(subcommand)]
         command: commands::privacy::PrivacyCmd,
-    },
-    /// Local ML autocomplete management.
-    Autocomplete {
-        #[command(subcommand)]
-        command: commands::autocomplete_cmd::AutocompleteCmd,
     },
 }
 
@@ -653,9 +647,6 @@ struct CompactArgs {
 
 #[derive(Args, Clone, Default)]
 struct SetupArgs {
-    /// Enable local ML and privacy without interactive prompts.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    local_ml: bool,
     /// Show current setup state without prompts.
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     status: bool,
@@ -1043,11 +1034,7 @@ struct BackgroundRunShellArgs {
 
 #[derive(Subcommand)]
 enum IndexCmd {
-    Build {
-        /// Build a hybrid (vector + BM25) index.
-        #[arg(long)]
-        hybrid: bool,
-    },
+    Build,
     Update,
     Status,
     Watch {
@@ -1572,7 +1559,6 @@ fn run() -> Result<()> {
         Commands::Serve(args) => run_serve(args, cli.json),
         Commands::NativeHost(args) => run_native_host(&cwd, args),
         Commands::Privacy { command } => run_privacy(&cwd, command, cli.json),
-        Commands::Autocomplete { command } => run_autocomplete(&cwd, command, cli.json),
     }
 }
 
@@ -1595,24 +1581,11 @@ mod tests {
     }
 
     #[test]
-    fn setup_local_ml_flag_parses() {
-        let cli = Cli::try_parse_from(["codingbuddy", "setup", "--local-ml"])
-            .expect("parse setup --local-ml");
-        if let Some(Commands::Setup(args)) = cli.command {
-            assert!(args.local_ml);
-            assert!(!args.status);
-        } else {
-            panic!("expected Setup command");
-        }
-    }
-
-    #[test]
     fn setup_status_flag_parses() {
         let cli = Cli::try_parse_from(["codingbuddy", "setup", "--status"])
             .expect("parse setup --status");
         if let Some(Commands::Setup(args)) = cli.command {
             assert!(args.status);
-            assert!(!args.local_ml);
         } else {
             panic!("expected Setup command");
         }

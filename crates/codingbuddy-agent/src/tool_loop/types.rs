@@ -81,11 +81,6 @@ pub struct SkillInvocationResult {
 pub type SkillRunner =
     Arc<dyn Fn(&str, Option<&str>) -> Result<Option<SkillInvocationResult>> + Send + Sync>;
 
-/// Callback for injecting relevant code context before LLM calls.
-/// Takes `(query, max_results)` and returns matching code chunks.
-pub type RetrieverCallback =
-    Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync>;
-
 /// Request to spawn a subagent task.
 #[derive(Debug, Clone)]
 pub struct SubagentRequest {
@@ -128,11 +123,8 @@ pub struct ToolLoopConfig {
     pub skill_runner: Option<SkillRunner>,
     /// Workspace root path (for subagent spawning).
     pub workspace: Option<PathBuf>,
-    /// Optional retriever callback for injecting relevant code context before LLM calls.
-    /// Takes (query, max_results) and returns matching code chunks.
-    pub retriever: Option<RetrieverCallback>,
     /// Optional privacy router for scanning tool outputs before appending to messages.
-    pub privacy_router: Option<Arc<codingbuddy_local_ml::PrivacyRouter>>,
+    pub privacy_router: Option<Arc<codingbuddy_policy::privacy::PrivacyRouter>>,
     /// Images to include with the LLM request (multimodal).
     pub images: Vec<codingbuddy_core::ImageContent>,
     /// Initial context messages injected after the system prompt but before the
@@ -175,7 +167,6 @@ impl Default for ToolLoopConfig {
             subagent_worker: None,
             skill_runner: None,
             workspace: None,
-            retriever: None,
             privacy_router: None,
             images: vec![],
             initial_context: vec![],
@@ -186,14 +177,4 @@ impl Default for ToolLoopConfig {
             edit_validator: None,
         }
     }
-}
-
-/// A piece of retrieved code context from the workspace index.
-#[derive(Debug, Clone)]
-pub struct RetrievalContext {
-    pub file_path: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub content: String,
-    pub score: f32,
 }

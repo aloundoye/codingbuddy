@@ -209,7 +209,7 @@ impl<'a> ToolUseLoop<'a> {
             content: system_prompt,
         }];
 
-        // Inject initial context (bootstrap, retrieval) after system prompt
+        // Inject initial project context after system prompt
         for msg in &config.initial_context {
             messages.push(msg.clone());
         }
@@ -968,7 +968,6 @@ impl<'a> ToolUseLoop<'a> {
         });
 
         self.collect_directives(user_message);
-        self.inject_retrieval_context(user_message);
 
         self.execute_loop()
     }
@@ -1111,15 +1110,6 @@ impl<'a> ToolUseLoop<'a> {
                         });
                     }
                 }
-            }
-
-            // Per-turn retrieval: re-inject context every 3 tool-use turns
-            // using the latest assistant message as the query signal.
-            if turns > 0
-                && turns.is_multiple_of(3)
-                && let Some(query) = self.latest_retrieval_query()
-            {
-                self.inject_retrieval_context(&query);
             }
 
             // Build and send the LLM request
@@ -1863,106 +1853,18 @@ impl<'a> ToolUseLoop<'a> {
         true
     }
 
-    /// Inject retrieval context from the workspace vector index before each LLM call.
-    ///
-    /// Fires on every user turn (not just turn 1) to keep multi-turn conversations
-    /// grounded in the codebase. Budget based on **remaining** context window.
-    fn inject_retrieval_context(&mut self, user_message: &str) {
-        let retriever = match &self.config.retriever {
-            Some(r) => r.clone(),
-            None => return,
-        };
-
-        let max_results = 10;
-        let results = match retriever(user_message, max_results) {
-            Ok(r) if !r.is_empty() => r,
-            _ => return,
-        };
-
-        // Budget: remaining context / 5 (not total context).
-        // This avoids starving long conversations of retrieval budget.
-        let current_tokens = estimate_message_tokens(&self.messages);
-        let remaining = self
-            .config
-            .context_window_tokens
-            .saturating_sub(current_tokens);
-
-        // Skip if context nearly full (< 500 tokens remaining budget)
-        let budget_tokens = remaining / 5;
-        if budget_tokens < 500 {
-            return;
-        }
-
-        let mut context_parts = Vec::new();
-        let mut token_estimate: u64 = 0;
-
-        for r in &results {
-            let chunk_text = format!(
-                "--- {}:{}-{} (score: {:.3}) ---\n{}\n",
-                r.file_path, r.start_line, r.end_line, r.score, r.content,
-            );
-            let chunk_tokens = (chunk_text.len() as f64 / 3.5).ceil() as u64;
-            if token_estimate + chunk_tokens > budget_tokens {
-                break;
-            }
-            token_estimate += chunk_tokens;
-            context_parts.push(chunk_text);
-        }
-
-        if !context_parts.is_empty() {
-            // Remove stale retrieval messages to avoid unbounded context growth.
-            self.messages.retain(|m| {
-                !matches!(m, ChatMessage::System { content } if content.starts_with("RETRIEVAL_CONTEXT"))
-            });
-
-            let context_msg = format!(
-                "RETRIEVAL_CONTEXT (relevant code from workspace index):\n{}",
-                context_parts.join("\n")
-            );
-            self.messages.push(ChatMessage::System {
-                content: context_msg,
-            });
-
-            if let Some(ref cb) = self.event_cb {
-                cb(EventKind::Retrieval {
-                    query: user_message.to_string(),
-                    chunks_injected: context_parts.len() as u64,
-                    token_estimate,
-                });
-            }
-        }
-    }
-
-    fn latest_retrieval_query(&self) -> Option<String> {
-        let user = self.latest_user_prompt();
-        if !user.is_empty() {
-            return Some(user);
-        }
-        // Fallback: last assistant text, truncated to 200 chars
-        self.messages.iter().rev().find_map(|msg| match msg {
-            ChatMessage::Assistant {
-                content: Some(text),
-                ..
-            } if !text.is_empty() => {
-                let end = text.floor_char_boundary(200.min(text.len()));
-                Some(text[..end].to_string())
-            }
-            _ => None,
-        })
-    }
-
     /// Apply privacy router to tool output, redacting sensitive content if configured.
     fn apply_privacy_to_output(&self, output: &str) -> String {
         if let Some(ref router) = self.config.privacy_router {
             match router.apply_policy(output, None) {
-                codingbuddy_local_ml::PrivacyResult::Redacted(redacted) => {
+                codingbuddy_policy::privacy::PrivacyResult::Redacted(redacted) => {
                     self.emit(StreamChunk::SecurityWarning {
                         message: "Privacy router redacted sensitive content in tool output"
                             .to_string(),
                     });
                     return redacted;
                 }
-                codingbuddy_local_ml::PrivacyResult::Blocked => {
+                codingbuddy_policy::privacy::PrivacyResult::Blocked => {
                     self.emit(StreamChunk::SecurityWarning {
                         message: "Privacy router blocked tool output containing sensitive data"
                             .to_string(),
@@ -1970,8 +1872,10 @@ impl<'a> ToolUseLoop<'a> {
                     return "[BLOCKED: Privacy router blocked this output due to sensitive content]"
                         .to_string();
                 }
-                codingbuddy_local_ml::PrivacyResult::LocalSummary(summary) => return summary,
-                codingbuddy_local_ml::PrivacyResult::Clean(_) => {}
+                codingbuddy_policy::privacy::PrivacyResult::LocalSummary(summary) => {
+                    return summary;
+                }
+                codingbuddy_policy::privacy::PrivacyResult::Clean(_) => {}
             }
         }
         output.to_string()

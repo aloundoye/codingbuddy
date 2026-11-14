@@ -1,5 +1,6 @@
 pub mod bash_classifier;
 pub mod output_scanner;
+pub mod privacy;
 pub mod shell_parse;
 
 use codingbuddy_core::ToolCall;

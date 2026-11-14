@@ -4,15 +4,20 @@ use syntect::highlighting::{Theme as SyntectTheme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, cwd: &str) -> Rect {
+    let theme = theme::theme();
     let logo = Style::default()
-        .fg(Color::Blue)
+        .fg(theme.primary)
         .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.muted);
     let title = Span::styled("CodingBuddy", Style::default().add_modifier(Modifier::BOLD));
-    let version = Span::raw(concat!(" v", env!("CARGO_PKG_VERSION")));
+    let version = Span::styled(concat!(" v", env!("CARGO_PKG_VERSION")), muted);
     let lines = if area.height >= 10 && area.width >= 32 {
         vec![
             Line::from(vec![Span::styled("     ▄         ", logo), title, version]),
-            Line::from(vec![Span::styled(" ▗▄▀ ● ▀▀▀▀▄   ", logo), Span::raw(cwd)]),
+            Line::from(vec![
+                Span::styled(" ▗▄▀ ● ▀▀▀▀▄   ", logo),
+                Span::styled(cwd, muted),
+            ]),
             Line::from(Span::styled(" ▝▀▄▄▄▄▄▄▀▀▘", logo)),
             Line::from(Span::styled("     ▀", logo)),
         ]
@@ -29,6 +34,43 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, cwd: &st
         Rect::new(area.x, area.y, area.width, height),
     );
     Rect::new(area.x, area.y + height, area.width, area.height - height)
+}
+
+pub(crate) fn slash_suggestion_lines(
+    dropdown: &AutocompleteState,
+    max_rows: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let theme = theme::theme();
+    let visible = dropdown.visible_range(max_rows.min(5));
+    let rows = &dropdown.suggestions[visible.clone()];
+    let name_width = rows
+        .iter()
+        .filter_map(|row| row.split_once("  "))
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(width) / 2);
+    visible
+        .zip(rows)
+        .filter_map(|(index, row)| {
+            let (name, description) = row.split_once("  ")?;
+            let selected = index == dropdown.selected;
+            let name = truncate_inline(name, name_width);
+            let command = if selected { " ❯ " } else { "   " };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Some(Line::from(vec![
+                Span::styled(format!("{command}{name:<name_width$}  "), style),
+                Span::styled(description.to_owned(), Style::default().fg(theme.muted)),
+            ]))
+        })
+        .collect()
 }
 
 struct SyntectAssets {
@@ -936,23 +978,14 @@ pub(crate) fn operator_summary_line(status: &UiStatus) -> String {
             truncate_inline(&status.provider_diagnostics_summary, 40)
         )
     };
-    let runtime_diagnostics = if status.runtime_diagnostics_summary.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            " runtime={}",
-            truncate_inline(&status.runtime_diagnostics_summary, 40)
-        )
-    };
     format!(
-        "phase={phase} step={step} todo={todo} subagents={}/{} bg={} {} caps={}{}{} compaction/replay={}/{}",
+        "phase={phase} step={step} todo={todo} subagents={}/{} bg={} {} caps={}{} compaction/replay={}/{}",
         status.running_subagents,
         status.failed_subagents,
         status.running_background_jobs.max(status.background_jobs),
         blockers,
         capabilities,
         provider_diagnostics,
-        runtime_diagnostics,
         status.compaction_count,
         status.replay_count
     )
@@ -1046,9 +1079,9 @@ pub(crate) fn style_transcript_line(
     let t = super::theme::theme();
     let (prefix, prefix_style, mut body_style) = match entry.kind {
         MessageKind::User => ("❯ ", t.user_prefix_style(), t.user_body_style()),
-        MessageKind::Assistant => ("  ", Style::default(), t.assistant_body_style()),
+        MessageKind::Assistant => ("● ", Style::default(), t.assistant_body_style()),
         MessageKind::System => ("⚙ ", t.system_style(), t.system_style()),
-        MessageKind::ToolCall => ("⚡ ", t.tool_call_style(), t.tool_call_style()),
+        MessageKind::ToolCall => ("● ", t.tool_call_style(), t.tool_call_style()),
         MessageKind::ToolResult => (
             "  ↳ ",
             Style::default().fg(t.tool_result_ok),
@@ -1085,7 +1118,11 @@ pub(crate) fn style_transcript_line(
 
     // Full markdown rendering for assistant messages
     if entry.kind == MessageKind::Assistant {
-        return render_assistant_markdown(text);
+        let mut line = render_assistant_markdown(text);
+        if !text.is_empty() && !text.starts_with("```") {
+            line.spans.insert(0, Span::styled(prefix, prefix_style));
+        }
+        return line;
     }
 
     Line::from(vec![
@@ -1359,6 +1396,9 @@ pub(crate) fn render_transcript(shell: &ChatShell, collapse_plan: bool) -> Vec<L
         text: shell.streaming_text.clone(),
     });
     for entry in shell.transcript.iter().chain(streaming.iter()) {
+        if entry.kind == MessageKind::User && !lines.is_empty() {
+            lines.push(Line::default());
+        }
         let mut rendered_first_line = false;
         for sub_text in entry.text.split('\n') {
             let logical_lines = if entry.kind == MessageKind::Assistant && !in_code_block {

@@ -674,7 +674,8 @@ fn assistant_meta_lines_render_with_tool_style() {
     };
     let rendered = style_transcript_line(&entry, false, false, "");
     let text: String = rendered.iter().map(|s| s.content.to_string()).collect();
-    assert!(text.contains("⚡"));
+    assert!(text.starts_with("● "));
+    assert_eq!(rendered.spans[0].style.fg, Some(theme::theme().tool_call));
     assert!(text.contains("fs.read"));
 }
 
@@ -867,7 +868,6 @@ fn status_summary_includes_all_fields() {
         pr_review_status: None,
         provider_diagnostics_summary:
             "thinking->reasoning_effort, max_tokens->max_completion_tokens".to_string(),
-        runtime_diagnostics_summary: "warm=1/2 queue_peak=3 load_waits=1".to_string(),
         ..Default::default()
     };
     shell.push_status_summary(&status);
@@ -881,7 +881,6 @@ fn status_summary_includes_all_fields() {
     assert!(all_text.contains("auto"));
     assert!(all_text.contains("running"));
     assert!(all_text.contains("Provider compatibility:"));
-    assert!(all_text.contains("Runtime diagnostics:"));
 }
 
 #[test]
@@ -1815,6 +1814,22 @@ fn live_slash_dropdown_filters_and_prefers_exact_commands() {
 }
 
 #[test]
+fn slash_overlay_aligns_descriptions_and_keeps_selection_visible() {
+    let mut dropdown = input::slash_dropdown("").unwrap();
+    dropdown.up();
+    let lines = slash_suggestion_lines(&dropdown, 8, 60);
+    assert_eq!(lines.len(), 5);
+    assert!(lines.last().unwrap().spans[0].content.starts_with(" ❯ "));
+    let command_width = lines[0].spans[0].width();
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.spans[0].width() == command_width)
+    );
+    assert_eq!(slash_suggestion_lines(&dropdown, 2, 30).len(), 2);
+}
+
+#[test]
 fn slash_suggestions_filter_by_prefix() {
     let all = slash_command_suggestions("", 100);
     assert!(all.len() > 10, "should list many commands");
@@ -1960,106 +1975,4 @@ fn slash_catalog_covers_all_canonical_parse_commands() {
             "catalog missing /{name}"
         );
     }
-}
-
-// ── P8-08: ML Ghost Text tests ─────────────────────────────────────
-
-#[test]
-fn ghost_text_debounces() {
-    let mut ghost = GhostTextState::default();
-    // Before any keystroke, should not request
-    assert!(!ghost.should_request(5));
-
-    // After keystroke, should not request immediately (debounce not elapsed)
-    ghost.on_keystroke();
-    assert!(
-        !ghost.should_request(5),
-        "should not request before debounce"
-    );
-
-    // Still pending
-    assert!(ghost.pending);
-    assert!(ghost.suggestion.is_none());
-}
-
-#[test]
-fn ghost_text_cancels_on_keystroke() {
-    let mut ghost = GhostTextState::default();
-    ghost.set_suggestion(Some("hello world".to_string()));
-    assert!(ghost.suggestion.is_some());
-
-    // New keystroke should clear the suggestion
-    ghost.on_keystroke();
-    assert!(
-        ghost.suggestion.is_none(),
-        "keystroke should clear suggestion"
-    );
-    assert!(ghost.pending, "should mark as pending after keystroke");
-}
-
-#[test]
-fn ghost_text_tab_accepts() {
-    let mut ghost = GhostTextState::default();
-    ghost.set_suggestion(Some(" world".to_string()));
-
-    let accepted = ghost.accept_full();
-    assert_eq!(accepted, Some(" world".to_string()));
-    assert!(ghost.suggestion.is_none(), "suggestion should be consumed");
-}
-
-#[test]
-fn ghost_text_accept_word() {
-    let mut ghost = GhostTextState::default();
-    ghost.set_suggestion(Some("hello world goodbye".to_string()));
-
-    let word = ghost.accept_word();
-    assert_eq!(word, Some("hello".to_string()));
-    assert_eq!(
-        ghost.suggestion,
-        Some(" world goodbye".to_string()),
-        "remaining text should be preserved"
-    );
-
-    let word2 = ghost.accept_word();
-    assert_eq!(word2, Some(" world".to_string()));
-    assert_eq!(ghost.suggestion, Some(" goodbye".to_string()));
-}
-
-#[test]
-fn ghost_text_renders_darkgray() {
-    // Verify the DarkGray italic style is correctly constructed
-    let style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
-    let span = Span::styled("ghost text", style);
-    assert_eq!(span.style.fg, Some(Color::DarkGray));
-    assert!(span.style.add_modifier.contains(Modifier::ITALIC));
-}
-
-#[test]
-fn ghost_text_min_input_length() {
-    let mut ghost = GhostTextState::default();
-    ghost.on_keystroke();
-    // Input too short (< 3 chars)
-    assert!(
-        !ghost.should_request(2),
-        "should not request for short input"
-    );
-    // Wait past debounce and check with sufficient input
-    ghost.last_edit = Instant::now() - Duration::from_millis(300);
-    assert!(
-        ghost.should_request(5),
-        "should request for long input after debounce"
-    );
-    assert!(
-        !ghost.should_request(2),
-        "still should not request for short input"
-    );
-}
-
-#[test]
-fn ghost_text_accept_full_when_no_suggestion() {
-    let mut ghost = GhostTextState::default();
-    assert!(ghost.accept_full().is_none());
-    assert!(ghost.accept_word().is_none());
 }

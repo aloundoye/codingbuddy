@@ -1,9 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
+    layout::Rect,
     style::{Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
 /// A keyboard menu, or an input form when `field` is set.
@@ -120,8 +121,8 @@ impl TerminalMenu {
         None
     }
 
-    pub(crate) fn render(&self, frame: &mut Frame) {
-        let area = frame.area();
+    pub(crate) fn render(&self, frame: &mut Frame, area: Rect) {
+        let theme = crate::theme::theme();
         frame.render_widget(Clear, area);
         let input = if self.field.as_ref().is_some_and(|(_, masked)| *masked) {
             "*".repeat(self.input.chars().count())
@@ -149,8 +150,10 @@ impl TerminalMenu {
             |(index, (_, label))| {
                 if index == self.selected {
                     Line::styled(
-                        format!("› {label}"),
-                        Style::default().add_modifier(Modifier::REVERSED),
+                        format!("❯ {label}"),
+                        Style::default()
+                            .fg(theme.primary)
+                            .add_modifier(Modifier::BOLD),
                     )
                 } else {
                     Line::raw(format!("  {label}"))
@@ -161,7 +164,14 @@ impl TerminalMenu {
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(self.title.as_str())
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.separator))
+                    .title(Line::styled(
+                        format!(" {} ", self.title),
+                        Style::default()
+                            .fg(theme.primary)
+                            .add_modifier(Modifier::BOLD),
+                    ))
                     .title_bottom(if self.alternate_submit.is_some() {
                         " Enter connect · Ctrl+S save · Esc cancel "
                     } else if self.field.is_some() {
@@ -232,7 +242,9 @@ mod tests {
         );
         let mut secret = TerminalMenu::field("API key", "Paste your key", "key", true);
         secret.paste("sample-secret");
-        terminal.draw(|frame| secret.render(frame)).unwrap();
+        terminal
+            .draw(|frame| secret.render(frame, frame.area()))
+            .unwrap();
         let display = format!("{:?}", terminal.backend().buffer());
         assert!(!display.contains("sample-secret"));
         assert!(display.contains("*************"));

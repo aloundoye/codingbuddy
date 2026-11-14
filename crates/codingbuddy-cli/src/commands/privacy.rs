@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use codingbuddy_core::AppConfig;
-use codingbuddy_local_ml::{PrivacyConfig, PrivacyPolicy, PrivacyRouter};
+use codingbuddy_policy::privacy::PrivacyRouter;
 use serde_json::json;
 use std::path::Path;
 
@@ -43,24 +43,8 @@ pub(crate) fn run_privacy(cwd: &Path, cmd: PrivacyCmd, json_mode: bool) -> Resul
     }
 }
 
-fn build_router(cfg: &AppConfig) -> Result<PrivacyRouter> {
-    let privacy_cfg = PrivacyConfig {
-        enabled: cfg.local_ml.privacy.enabled,
-        sensitive_globs: cfg.local_ml.privacy.sensitive_globs.clone(),
-        sensitive_regex: cfg.local_ml.privacy.sensitive_regex.clone(),
-        policy: match cfg.local_ml.privacy.policy.as_str() {
-            "block" | "block_cloud" => PrivacyPolicy::BlockCloud,
-            "local_summary" => PrivacyPolicy::LocalOnlySummary,
-            _ => PrivacyPolicy::Redact,
-        },
-        store_raw_in_logs: cfg.local_ml.privacy.store_raw_in_logs,
-        strict_regex: false,
-    };
-    PrivacyRouter::new(privacy_cfg)
-}
-
 fn run_scan(cwd: &Path, cfg: &AppConfig, json_mode: bool) -> Result<()> {
-    let router = build_router(cfg)?;
+    let router = PrivacyRouter::from_settings(&cfg.privacy)?;
     let mut findings = Vec::new();
 
     // Walk the workspace looking for sensitive files and content
@@ -131,37 +115,28 @@ fn run_scan(cwd: &Path, cfg: &AppConfig, json_mode: bool) -> Result<()> {
 
 fn run_policy_show(cfg: &AppConfig, json_mode: bool) -> Result<()> {
     let policy_info = json!({
-        "enabled": cfg.local_ml.privacy.enabled,
-        "policy": cfg.local_ml.privacy.policy,
-        "sensitive_globs": cfg.local_ml.privacy.sensitive_globs,
-        "sensitive_regex": cfg.local_ml.privacy.sensitive_regex,
-        "store_raw_in_logs": cfg.local_ml.privacy.store_raw_in_logs,
+        "enabled": cfg.privacy.enabled,
+        "policy": cfg.privacy.policy,
+        "sensitive_globs": cfg.privacy.sensitive_globs,
+        "sensitive_regex": cfg.privacy.sensitive_regex,
+        "store_raw_in_logs": cfg.privacy.store_raw_in_logs,
     });
 
     if json_mode {
         print_json(&policy_info)?;
     } else {
         println!("Privacy policy:");
-        println!("  enabled: {}", cfg.local_ml.privacy.enabled);
-        println!("  policy: {}", cfg.local_ml.privacy.policy);
-        println!(
-            "  sensitive globs: {:?}",
-            cfg.local_ml.privacy.sensitive_globs
-        );
-        println!(
-            "  sensitive regex: {:?}",
-            cfg.local_ml.privacy.sensitive_regex
-        );
-        println!(
-            "  store raw in logs: {}",
-            cfg.local_ml.privacy.store_raw_in_logs
-        );
+        println!("  enabled: {}", cfg.privacy.enabled);
+        println!("  policy: {}", cfg.privacy.policy);
+        println!("  sensitive globs: {:?}", cfg.privacy.sensitive_globs);
+        println!("  sensitive regex: {:?}", cfg.privacy.sensitive_regex);
+        println!("  store raw in logs: {}", cfg.privacy.store_raw_in_logs);
     }
     Ok(())
 }
 
 fn run_policy_test(cwd: &Path, cfg: &AppConfig, path: &str, json_mode: bool) -> Result<()> {
-    let router = build_router(cfg)?;
+    let router = PrivacyRouter::from_settings(&cfg.privacy)?;
     let full_path = cwd.join(path);
 
     let mut result = json!({
@@ -175,10 +150,10 @@ fn run_policy_test(cwd: &Path, cfg: &AppConfig, path: &str, json_mode: bool) -> 
             let policy_result = router.apply_policy(&content, Some(path));
             result["content_matches"] = json!(matches.len());
             result["policy_action"] = json!(match policy_result {
-                codingbuddy_local_ml::PrivacyResult::Clean(_) => "clean",
-                codingbuddy_local_ml::PrivacyResult::Redacted(_) => "redacted",
-                codingbuddy_local_ml::PrivacyResult::Blocked => "blocked",
-                codingbuddy_local_ml::PrivacyResult::LocalSummary(_) => "local_summary",
+                codingbuddy_policy::privacy::PrivacyResult::Clean(_) => "clean",
+                codingbuddy_policy::privacy::PrivacyResult::Redacted(_) => "redacted",
+                codingbuddy_policy::privacy::PrivacyResult::Blocked => "blocked",
+                codingbuddy_policy::privacy::PrivacyResult::LocalSummary(_) => "local_summary",
             });
         } else {
             result["error"] = json!("could not read file");

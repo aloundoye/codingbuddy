@@ -42,9 +42,8 @@ use slash_commands::{SLASH_COMMAND_CATALOG, slash_suggestion_to_command};
 pub use slash_commands::{SlashCommand, slash_command_catalog_entries};
 use state::VimMode;
 pub use state::{
-    AutocompleteState, ChatShell, GhostTextState, MessageKind, MlCompletionCallback,
-    ModelPickerState, REWIND_ACTIONS, RewindPickerPhase, RewindPickerState, TranscriptEntry,
-    format_relative_time,
+    AutocompleteState, ChatShell, MessageKind, ModelPickerState, REWIND_ACTIONS, RewindPickerPhase,
+    RewindPickerState, TranscriptEntry, format_relative_time,
 };
 use statusline::render_statusline_spans;
 pub use statusline::{UiStatus, render_statusline};
@@ -78,7 +77,6 @@ where
             }
         },
         || None,
-        None,
         TerminalControls::default(),
     )
 }
@@ -102,7 +100,6 @@ pub fn run_tui_shell_with_bindings<F, S>(
     stream_rx: mpsc::Receiver<TuiStreamEvent>,
     mut on_submit: F,
     mut refresh_status: S,
-    ml_completion: Option<MlCompletionCallback>,
     mut controls: TerminalControls<'_>,
 ) -> Result<()>
 where
@@ -217,7 +214,6 @@ where
     let mut autocomplete_dropdown: Option<AutocompleteState> = None;
     let mut slash_dropdown = None;
     let mut slash_query = None;
-    let mut ml_ghost: GhostTextState = GhostTextState::default();
 
     loop {
         // Drain streaming events from background agent thread.
@@ -288,16 +284,6 @@ where
             slash_query = next_query.map(str::to_owned);
         }
 
-        // ML ghost text: check debounce and invoke completion callback
-        if ml_ghost.should_request(input.len()) {
-            if let Some(ref cb) = ml_completion {
-                let suggestion = cb(&input);
-                ml_ghost.set_suggestion(suggestion);
-            } else {
-                ml_ghost.set_suggestion(None);
-            }
-        }
-
         tick_count = tick_count.wrapping_add(1);
         shell.spinner_tick = tick_count;
         cursor_visible = tick_count % 16 < 8;
@@ -342,16 +328,20 @@ where
         }
 
         terminal.draw(|frame| {
-            if let Some(menu) = &menu {
-                menu.render(frame);
-                return;
-            }
             let area = frame.area();
             if area.width == 0 || area.height < 5 {
                 return;
             }
             let area = render_header(frame, area, &status.working_directory);
+            if let Some(menu) = &menu {
+                menu.render(frame, area);
+                return;
+            }
             let width = area.width;
+            let chrome = theme::theme();
+            let prompt_style = Style::default()
+                .fg(chrome.primary)
+                .add_modifier(Modifier::BOLD);
             let (prompt_str, prompt_style) = if vim_enabled {
                 match vim_mode {
                     VimMode::Normal => (
@@ -372,20 +362,10 @@ where
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    VimMode::Insert => (
-                        "> ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    VimMode::Insert => ("❯ ", prompt_style),
                 }
             } else {
-                (
-                    "> ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
+                ("❯ ", prompt_style)
             };
             let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
             let desired_input_rows = if pending_approval.is_some() {
@@ -467,7 +447,7 @@ where
                     })
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(chrome.separator)
             };
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -516,13 +496,8 @@ where
                     .bg(bg)
                     .add_modifier(Modifier::BOLD);
                 let target = format!(" [{severity}] {explanation}");
-                let target = truncate_inline(&target, usize::from(width).saturating_mul(2));
                 frame.render_widget(
-                    Paragraph::new(vec![
-                        Line::styled(" [y] Allow  [a] Always  [n] Deny", style),
-                        Line::styled(target, style),
-                    ])
-                    .wrap(Wrap { trim: false }),
+                    Paragraph::new(Line::styled(target, style)).wrap(Wrap { trim: false }),
                     input_area,
                 );
             } else if reverse_search_active {
@@ -576,22 +551,21 @@ where
                     Span::raw(after.to_string()),
                 ];
                 // Ghost text priority: ML suggestion > history ghost > none
-                if scroll_y == 0 && cursor_pos >= input.len() {
-                    if let Some(ref ml_text) = ml_ghost.suggestion {
-                        spans.push(Span::styled(
-                            ml_text.clone(),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        ));
-                    } else if let Some(ghost) = history_ghost_suffix(&history, &input) {
-                        spans.push(Span::styled(
-                            ghost,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        ));
-                    }
+                if input.is_empty() && !is_processing && !controls.needs_connection {
+                    spans.push(Span::styled(
+                        "Ask about this project",
+                        Style::default().fg(chrome.muted),
+                    ));
+                } else if scroll_y == 0
+                    && cursor_pos >= input.len()
+                    && let Some(ghost) = history_ghost_suffix(&history, &input)
+                {
+                    spans.push(Span::styled(
+                        ghost,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
                 }
                 frame.render_widget(
                     Paragraph::new(Line::from(spans))
@@ -620,6 +594,10 @@ where
                     shell.is_thinking,
                 )
             } else {
+                frame.render_widget(
+                    Paragraph::new(Span::styled("─".repeat(usize::from(width)), sep_style)),
+                    Rect::new(area.x, sep2_y, width, 1),
+                );
                 statusline::render_minimal_statusline(
                     &status,
                     controls.needs_connection,
@@ -665,29 +643,27 @@ where
                     Style::default().fg(Color::DarkGray),
                 ));
             }
+            if pending_approval.is_some() {
+                status_spans = vec![Span::styled(
+                    " [y] Allow · [a] Always · [n] Deny · Esc cancel",
+                    Style::default().fg(chrome.warning),
+                )];
+            }
             if let Some(dropdown) = &slash_dropdown {
-                let rows = dropdown.display_lines(usize::from(stream_area.height.min(6)));
-                let height = (rows.len() as u16).min(stream_area.height);
+                let lines =
+                    slash_suggestion_lines(dropdown, usize::from(stream_area.height), width);
+                let height = lines.len() as u16;
                 let dropdown_area = Rect::new(
                     stream_area.x,
                     stream_area.bottom().saturating_sub(height),
                     width,
                     height,
                 );
-                let lines: Vec<_> = rows
-                    .into_iter()
-                    .map(|row| {
-                        if row.starts_with('>') {
-                            Line::styled(row, Style::default().add_modifier(Modifier::REVERSED))
-                        } else {
-                            Line::raw(row)
-                        }
-                    })
-                    .collect();
                 frame.render_widget(ratatui::widgets::Clear, dropdown_area);
                 frame.render_widget(Paragraph::new(lines), dropdown_area);
-                status_spans = vec![Span::raw(
-                    " ↑↓ Select · Enter Run · Tab Complete · Esc Dismiss",
+                status_spans = vec![Span::styled(
+                    " ↑↓ select · Enter run · Tab complete · Esc dismiss",
+                    Style::default().fg(chrome.muted),
                 )];
             }
             frame.render_widget(Paragraph::new(Line::from(status_spans)), status_area);
@@ -1724,29 +1700,7 @@ where
             cursor_pos = input.len();
             continue;
         }
-        // Alt+Right: accept one word of ML ghost text
-        if key.code == KeyCode::Right
-            && key.modifiers == KeyModifiers::ALT
-            && let Some(word) = ml_ghost.accept_word()
-        {
-            input.push_str(&word);
-            cursor_pos = input.len();
-            info_line = "accepted word".to_string();
-            continue;
-        }
         if key == bindings.autocomplete {
-            // ML ghost text has highest priority
-            if cursor_pos >= input.len()
-                && !input.starts_with('/')
-                && ml_ghost.suggestion.is_some()
-                && let Some(text) = ml_ghost.accept_full()
-            {
-                input.push_str(&text);
-                cursor_pos = input.len();
-                info_line = "accepted ML suggestion".to_string();
-                continue;
-            }
-            // Then history ghost
             if cursor_pos >= input.len()
                 && !input.starts_with('/')
                 && let Some(ghost) = history_ghost_suffix(&history, &input)
@@ -1980,13 +1934,11 @@ where
                 if cursor_pos > 0 && cursor_pos <= input.len() {
                     input.remove(cursor_pos - 1);
                     cursor_pos -= 1;
-                    ml_ghost.on_keystroke();
                 }
             }
             KeyCode::Delete => {
                 if cursor_pos < input.len() {
                     input.remove(cursor_pos);
-                    ml_ghost.on_keystroke();
                 }
             }
             KeyCode::Left => {
@@ -2006,7 +1958,6 @@ where
             KeyCode::Char(ch) => {
                 input.insert(cursor_pos.min(input.len()), ch);
                 cursor_pos += ch.len_utf8();
-                ml_ghost.on_keystroke();
                 if autocomplete_dropdown.is_none() && ch == '@' {
                     let trigger = cursor_pos - 1;
                     let suggestions = autocomplete_at_suggestions("", &workspace_path);

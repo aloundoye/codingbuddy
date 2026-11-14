@@ -294,7 +294,7 @@ fn status_usage_compact_and_doctor_emit_json() {
     assert!(status.get("session_id").is_some());
     assert!(status["model"]["base"].as_str().is_some());
     assert!(status["model"]["compatibility"]["base"]["summary"].is_string());
-    assert!(status["local_ml"]["runtime"]["summary"].is_string());
+    assert!(status["privacy"]["enabled"].is_boolean());
 
     let usage = run_json(workspace.path(), &["--json", "usage", "--session"]);
     assert!(usage["records"].as_u64().is_some());

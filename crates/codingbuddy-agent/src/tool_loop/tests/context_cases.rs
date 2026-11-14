@@ -161,97 +161,6 @@ fn bootstrap_disabled_when_no_initial_context() {
     assert!(matches!(&result.messages[1], ChatMessage::User { .. }));
 }
 
-// ── P10 Batch 2: Retrieval pipeline tests ──
-
-#[test]
-fn retriever_callback_returns_results() {
-    let llm = ScriptedLlm::new(vec![make_text_response("found it")]);
-    let tool_host = Arc::new(MockToolHost::new(vec![], true));
-
-    let config = ToolLoopConfig {
-        retriever: Some(Arc::new(|_query: &str, _max: usize| {
-            Ok(vec![RetrievalContext {
-                file_path: "src/lib.rs".to_string(),
-                start_line: 1,
-                end_line: 10,
-                content: "fn main() {}".to_string(),
-                score: 0.95,
-            }])
-        })),
-        ..Default::default()
-    };
-
-    let mut loop_ = ToolUseLoop::new(
-        &llm,
-        tool_host,
-        config,
-        "system".to_string(),
-        default_tools(),
-    );
-
-    let result = loop_.run("what does main do?").unwrap();
-    // Should have retrieval context injected as a System message
-    let has_retrieval = result.messages.iter().any(|m| {
-        matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
-    });
-    assert!(has_retrieval, "retrieval context should be injected");
-}
-
-#[test]
-fn retrieval_context_appears_in_messages() {
-    let llm = ScriptedLlm::new(vec![make_text_response("done")]);
-    let tool_host = Arc::new(MockToolHost::new(vec![], true));
-
-    let config = ToolLoopConfig {
-        retriever: Some(Arc::new(|_query: &str, _max: usize| {
-            Ok(vec![
-                RetrievalContext {
-                    file_path: "auth.rs".to_string(),
-                    start_line: 10,
-                    end_line: 30,
-                    content: "pub fn verify_token() -> bool { true }".to_string(),
-                    score: 0.88,
-                },
-                RetrievalContext {
-                    file_path: "middleware.rs".to_string(),
-                    start_line: 5,
-                    end_line: 20,
-                    content: "pub fn auth_middleware() {}".to_string(),
-                    score: 0.75,
-                },
-            ])
-        })),
-        ..Default::default()
-    };
-
-    let mut loop_ = ToolUseLoop::new(
-        &llm,
-        tool_host,
-        config,
-        "system".to_string(),
-        default_tools(),
-    );
-
-    let result = loop_.run("explain auth").unwrap();
-    let retrieval_msg = result.messages.iter().find(|m| {
-        matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
-    });
-    assert!(retrieval_msg.is_some());
-    if let Some(ChatMessage::System { content }) = retrieval_msg {
-        assert!(
-            content.contains("auth.rs"),
-            "should include first result file"
-        );
-        assert!(
-            content.contains("middleware.rs"),
-            "should include second result file"
-        );
-        assert!(content.contains("verify_token"), "should include content");
-    }
-}
-
 #[test]
 fn privacy_router_filters_tool_output() {
     let llm = ScriptedLlm::new(vec![
@@ -272,15 +181,16 @@ fn privacy_router_filters_tool_output() {
     ));
 
     // Build a privacy router that will redact secrets
-    let privacy_config = codingbuddy_local_ml::PrivacyConfig {
+    let privacy_config = codingbuddy_policy::privacy::PrivacyConfig {
         enabled: true,
         sensitive_globs: vec![],
         sensitive_regex: vec![r"(?i)(api[_-]?key|secret)\s*[=:]\s*\S+".to_string()],
-        policy: codingbuddy_local_ml::PrivacyPolicy::Redact,
+        policy: codingbuddy_policy::privacy::PrivacyPolicy::Redact,
         store_raw_in_logs: false,
         strict_regex: false,
     };
-    let router = codingbuddy_local_ml::PrivacyRouter::new(privacy_config).expect("privacy router");
+    let router =
+        codingbuddy_policy::privacy::PrivacyRouter::new(privacy_config).expect("privacy router");
 
     let config = ToolLoopConfig {
         privacy_router: Some(Arc::new(router)),
@@ -310,37 +220,6 @@ fn privacy_router_filters_tool_output() {
             "secret should be redacted or blocked, got: {content}"
         );
     }
-}
-
-#[test]
-fn retriever_empty_results_no_injection() {
-    let llm = ScriptedLlm::new(vec![make_text_response("ok")]);
-    let tool_host = Arc::new(MockToolHost::new(vec![], true));
-
-    let config = ToolLoopConfig {
-        retriever: Some(Arc::new(|_query: &str, _max: usize| {
-            Ok(vec![]) // Empty results
-        })),
-        ..Default::default()
-    };
-
-    let mut loop_ = ToolUseLoop::new(
-        &llm,
-        tool_host,
-        config,
-        "system".to_string(),
-        default_tools(),
-    );
-
-    let result = loop_.run("hello").unwrap();
-    let has_retrieval = result.messages.iter().any(|m| {
-        matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
-    });
-    assert!(
-        !has_retrieval,
-        "no retrieval context when results are empty"
-    );
 }
 
 // ── P10 Batch 3: Semantic compaction tests ──
@@ -579,32 +458,6 @@ fn compaction_template_includes_key_decisions_section() {
         COMPACTION_TEMPLATE.contains("## Current State"),
         "template should include Current State section"
     );
-}
-
-#[test]
-fn retriever_none_means_no_retrieval() {
-    let llm = ScriptedLlm::new(vec![make_text_response("ok")]);
-    let tool_host = Arc::new(MockToolHost::new(vec![], true));
-
-    let config = ToolLoopConfig {
-        retriever: None, // Disabled
-        ..Default::default()
-    };
-
-    let mut loop_ = ToolUseLoop::new(
-        &llm,
-        tool_host,
-        config,
-        "system".to_string(),
-        default_tools(),
-    );
-
-    let result = loop_.run("hello").unwrap();
-    let has_retrieval = result.messages.iter().any(|m| {
-        matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
-    });
-    assert!(!has_retrieval);
 }
 
 #[test]

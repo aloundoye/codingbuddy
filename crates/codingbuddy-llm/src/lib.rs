@@ -3831,16 +3831,12 @@ mod tests {
             endpoint: server.endpoint.clone(),
             stream: false,
             providers: std::collections::HashMap::new(),
-            api_key_env: "DEEPSEEK_API_KEY_RETRY_TEST".to_string(),
+            api_key: Some("test-key".to_string()),
             max_retries: 3,
             retry_base_ms: 1,
             ..LlmConfig::default()
         };
-        let client = ApiClient::new(cfg).expect("client");
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::set_var("DEEPSEEK_API_KEY_RETRY_TEST", "test-key");
-        }
+        let client = local_mock_client(cfg);
 
         let out = client
             .complete(&LlmRequest {
@@ -3855,11 +3851,6 @@ mod tests {
             .expect("response should eventually succeed");
         assert_eq!(out.text, "ok-after-retry");
         assert!(server.request_count() >= 2);
-
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_API_KEY_RETRY_TEST");
-        }
     }
 
     #[test]
@@ -3874,16 +3865,12 @@ mod tests {
             endpoint: server.endpoint.clone(),
             stream: false,
             providers: std::collections::HashMap::new(),
-            api_key_env: "DEEPSEEK_API_KEY_RETRY_LIMIT_TEST".to_string(),
+            api_key: Some("test-key".to_string()),
             max_retries: 2,
             retry_base_ms: 1,
             ..LlmConfig::default()
         };
-        let client = ApiClient::new(cfg).expect("client");
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::set_var("DEEPSEEK_API_KEY_RETRY_LIMIT_TEST", "test-key");
-        }
+        let client = local_mock_client(cfg);
 
         let err = client
             .complete(&LlmRequest {
@@ -3898,11 +3885,6 @@ mod tests {
             .expect_err("request should fail after retries are exhausted");
         assert!(err.to_string().contains("Rate limited (HTTP 429)"));
         assert_eq!(server.request_count(), 3);
-
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_API_KEY_RETRY_LIMIT_TEST");
-        }
     }
 
     #[test]
@@ -3917,16 +3899,12 @@ mod tests {
             endpoint: server.endpoint.clone(),
             stream: false,
             providers: std::collections::HashMap::new(),
-            api_key_env: "DEEPSEEK_API_KEY_401_TEST".to_string(),
+            api_key: Some("bad-key".to_string()),
             max_retries: 2,
             retry_base_ms: 1,
             ..LlmConfig::default()
         };
-        let client = ApiClient::new(cfg).expect("client");
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::set_var("DEEPSEEK_API_KEY_401_TEST", "bad-key");
-        }
+        let client = local_mock_client(cfg);
 
         let err = client
             .complete(&LlmRequest {
@@ -3951,11 +3929,16 @@ mod tests {
         );
         // 401 is non-retryable, so only 1 request
         assert_eq!(server.request_count(), 1);
+    }
 
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_API_KEY_401_TEST");
-        }
+    fn local_mock_client(cfg: LlmConfig) -> ApiClient {
+        let mut client = ApiClient::new(cfg).expect("client");
+        client.client = Client::builder()
+            .no_proxy()
+            .timeout(StdDuration::from_secs(5))
+            .build()
+            .expect("loopback HTTP client");
+        client
     }
 
     #[derive(Clone)]
@@ -4014,7 +3997,14 @@ mod tests {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = consume_http_request(&mut stream);
+                        // Accepted sockets can inherit nonblocking mode on Windows.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking mock connection");
+                        stream
+                            .set_read_timeout(Some(StdDuration::from_secs(5)))
+                            .expect("mock request read timeout");
+                        consume_http_request(&mut stream).expect("read mock HTTP request");
                         let idx = request_count_thread.fetch_add(1, Ordering::SeqCst);
                         let selected = scripted
                             .get(idx)
@@ -4039,8 +4029,9 @@ mod tests {
                         }
                         headers.push_str("\r\n");
                         let response = format!("{headers}{}", selected.body);
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write mock HTTP response");
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(StdDuration::from_millis(2));
@@ -4064,7 +4055,7 @@ mod tests {
         while header_end.is_none() {
             let read = stream.read(&mut chunk)?;
             if read == 0 {
-                break;
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
             buffer.extend_from_slice(&chunk[..read]);
             header_end = find_subsequence(&buffer, b"\r\n\r\n").map(|idx| idx + 4);
@@ -4082,7 +4073,7 @@ mod tests {
         while body.len() < content_length {
             let read = stream.read(&mut chunk)?;
             if read == 0 {
-                break;
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
             body.extend_from_slice(&chunk[..read]);
         }
@@ -4126,15 +4117,11 @@ mod tests {
             endpoint: server.endpoint.clone(),
             stream: true,
             providers: std::collections::HashMap::new(),
-            api_key_env: "DEEPSEEK_API_KEY_STREAM_TEST".to_string(),
+            api_key: Some("test-key".to_string()),
             max_retries: 0,
             ..LlmConfig::default()
         };
-        let client = ApiClient::new(cfg).expect("client");
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::set_var("DEEPSEEK_API_KEY_STREAM_TEST", "test-key");
-        }
+        let client = local_mock_client(cfg);
 
         let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let chunks_clone = Arc::clone(&chunks);
@@ -4172,11 +4159,6 @@ mod tests {
         assert_eq!(collected[0], "hel");
         assert_eq!(collected[1], "lo");
         assert_eq!(collected[2], "[DONE]");
-
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_API_KEY_STREAM_TEST");
-        }
     }
 
     // ── P0-06: SSE keep-alive test coverage ───────────────────────────

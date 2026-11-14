@@ -1,4 +1,4 @@
-use codingbuddy_local_ml::privacy::*;
+use codingbuddy_policy::privacy::*;
 
 fn make_router(policy: PrivacyPolicy) -> PrivacyRouter {
     let config = PrivacyConfig {

@@ -10,7 +10,7 @@ pub enum PrivacyPolicy {
     /// Redact sensitive parts before sending to cloud.
     #[default]
     Redact,
-    /// Generate a local-only summary instead of sending raw content.
+    /// Replace sensitive content with a notice containing only detection metadata.
     LocalOnlySummary,
 }
 
@@ -85,6 +85,21 @@ pub struct PrivacyRouter {
 }
 
 impl PrivacyRouter {
+    pub fn from_settings(settings: &codingbuddy_core::PrivacyConfig) -> Result<Self> {
+        Self::new(PrivacyConfig {
+            enabled: settings.enabled,
+            sensitive_globs: settings.sensitive_globs.clone(),
+            sensitive_regex: settings.sensitive_regex.clone(),
+            policy: match settings.policy.as_str() {
+                "block" | "block_cloud" => PrivacyPolicy::BlockCloud,
+                "local_only_summary" | "local_summary" => PrivacyPolicy::LocalOnlySummary,
+                _ => PrivacyPolicy::Redact,
+            },
+            store_raw_in_logs: settings.store_raw_in_logs,
+            strict_regex: false,
+        })
+    }
+
     pub fn new(config: PrivacyConfig) -> Result<Self> {
         let glob_patterns: Vec<glob::Pattern> = config
             .sensitive_globs
@@ -181,7 +196,7 @@ impl PrivacyRouter {
             PrivacyPolicy::LocalOnlySummary => {
                 let summary = format!(
                     "[REDACTED: Sensitive content detected ({} patterns matched). \
-                     Path sensitive: {}. Use local model for this content.]",
+                     Path sensitive: {}.]",
                     matches.len(),
                     path_sensitive
                 );
