@@ -374,7 +374,7 @@ fn tool_cache_skips_non_cacheable() {
 }
 
 #[test]
-fn tool_cache_invalidation_by_path() {
+fn tool_cache_clears_after_writes() {
     let llm = ScriptedLlm::new(vec![make_text_response("done")]);
     let tool_host = Arc::new(MockToolHost::new(vec![], true));
     let config = ToolLoopConfig::default();
@@ -392,8 +392,7 @@ fn tool_cache_invalidation_by_path() {
     loop_.tool_cache.store("fs_read", &args, &result);
     assert!(loop_.tool_cache.lookup("fs_read", &args).is_some());
 
-    // Invalidate by path
-    loop_.tool_cache.invalidate_path("/foo/bar.rs");
+    loop_.tool_cache.clear();
     assert!(
         loop_.tool_cache.lookup("fs_read", &args).is_none(),
         "cache should be invalidated after path write"

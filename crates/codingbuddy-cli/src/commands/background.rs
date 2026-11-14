@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use codingbuddy_core::{AppConfig, EventEnvelope, EventKind, runtime_dir};
+use codingbuddy_core::{AppConfig, EventKind, runtime_dir};
 use codingbuddy_store::{BackgroundJobRecord, Store};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -328,8 +328,8 @@ pub(crate) fn spawn_background_process_for_session(
         updated_at: started_at.clone(),
     };
     store.upsert_background_job(&record)?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::BackgroundJobStarted {

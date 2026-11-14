@@ -1,3 +1,4 @@
+use codingbuddy_core::workspace_fs::WorkspaceFs;
 pub mod auto_extract;
 
 use anyhow::{Result, anyhow};
@@ -429,23 +430,20 @@ impl MemoryManager {
         let snapshot_root = checkpoint_root.join("fs");
         fs::create_dir_all(&snapshot_root)?;
 
+        let source = WorkspaceFs::open(&self.workspace)?;
+        let destination = WorkspaceFs::open(&snapshot_root)?;
         let mut files = 0_u64;
-        for entry in WalkDir::new(&self.workspace)
+        for entry in WalkDir::new(source.root())
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|e| e.path().is_file())
+            .filter(|entry| entry.file_type().is_file())
         {
-            let path = entry.path();
-            let rel = path.strip_prefix(&self.workspace)?;
-            if has_ignored_component(rel) {
-                continue;
+            let rel = entry.path().strip_prefix(source.root())?;
+            if !has_ignored_component(rel) {
+                let mut input = source.open_file(rel)?;
+                destination.copy_from(rel, &mut input)?;
+                files += 1;
             }
-            let dest = snapshot_root.join(rel);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(path, dest)?;
-            files += 1;
         }
 
         let metadata = serde_json::json!({
@@ -488,27 +486,25 @@ impl MemoryManager {
         let snapshot_root = checkpoint_root.join("fs");
         fs::create_dir_all(&snapshot_root)?;
 
+        let source = WorkspaceFs::open(&self.workspace)?;
+        let destination = WorkspaceFs::open(&snapshot_root)?;
         let mut count = 0_u64;
         for file in target_files {
-            if !file.is_file() {
-                continue;
-            }
-            // Skip binary files (heuristic: check first 512 bytes for null bytes)
-            if is_likely_binary(file) {
-                continue;
-            }
-            let rel = if file.is_absolute() {
-                file.strip_prefix(&self.workspace).unwrap_or(file.as_path())
-            } else {
-                file.as_path()
+            let rel = source.resolve(file, true)?;
+            let mut input = match source.open_file(&rel) {
+                Ok(input) => input,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             };
-            let dest = snapshot_root.join(rel);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
+            use std::io::{Read, Seek};
+            let mut prefix = [0; 512];
+            let len = input.read(&mut prefix)?;
+            if prefix[..len].contains(&0) {
+                continue;
             }
-            if fs::copy(file, &dest).is_ok() {
-                count += 1;
-            }
+            input.rewind()?;
+            destination.copy_from(&rel, &mut input)?;
+            count += 1;
         }
 
         let metadata = serde_json::json!({
@@ -1306,19 +1302,6 @@ fn has_ignored_component(path: &Path) -> bool {
             || value == OsStr::new(".codingbuddy")
             || value == OsStr::new("target")
     })
-}
-
-/// Heuristic binary detection: read up to 512 bytes and check for null bytes.
-fn is_likely_binary(path: &Path) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    use std::io::Read;
-    let mut buf = [0u8; 512];
-    let Ok(n) = f.read(&mut buf) else {
-        return false;
-    };
-    buf[..n].contains(&0)
 }
 
 fn truncate_line(input: &str, max_chars: usize) -> String {

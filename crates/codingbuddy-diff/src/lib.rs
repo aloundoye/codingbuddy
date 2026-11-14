@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use codingbuddy_core::workspace_fs::WorkspaceFs;
 use codingbuddy_core::{EventKind, Session, runtime_dir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +57,19 @@ impl PatchStore {
     }
 
     pub fn stage(&self, diff: &str, base_blob: &[u8]) -> Result<PatchSet> {
-        let target_files = extract_target_files(diff);
+        self.stage_checked(diff, base_blob, |_| Ok(()))
+    }
+
+    pub fn stage_checked(
+        &self,
+        diff: &str,
+        base_blob: &[u8],
+        check: impl Fn(&Path) -> Result<()>,
+    ) -> Result<PatchSet> {
+        let target_files = checked_patch_paths(&self.workspace, diff)?;
+        for path in &target_files {
+            check(Path::new(path))?;
+        }
         let base_sha256 = if base_blob.is_empty() {
             hash_workspace_state(&self.workspace, &target_files)?
         } else {
@@ -101,14 +116,35 @@ impl PatchStore {
         patch_id: Uuid,
         strategy: GitApplyStrategy,
     ) -> Result<(bool, Vec<String>)> {
+        self.apply_with_check(workspace, patch_id, strategy, |_| Ok(()))
+    }
+
+    pub fn apply_checked(
+        &self,
+        workspace: &Path,
+        patch_id: Uuid,
+        check: impl Fn(&Path) -> Result<()>,
+    ) -> Result<(bool, Vec<String>)> {
+        self.apply_with_check(workspace, patch_id, GitApplyStrategy::ThreeWay, check)
+    }
+
+    fn apply_with_check(
+        &self,
+        workspace: &Path,
+        patch_id: Uuid,
+        strategy: GitApplyStrategy,
+        check: impl Fn(&Path) -> Result<()>,
+    ) -> Result<(bool, Vec<String>)> {
         let mut patch = self.read_patch(patch_id)?;
+        patch.target_files = checked_patch_paths(workspace, &patch.unified_diff)?;
+        for path in &patch.target_files {
+            check(Path::new(path))?;
+        }
         patch.apply_attempts = patch.apply_attempts.saturating_add(1);
         let current_base_sha = hash_workspace_state(workspace, &patch.target_files)?;
         let base_matches = current_base_sha == patch.base_sha256;
         patch.last_base_sha256 = Some(current_base_sha.clone());
         patch.last_base_sha_match = Some(base_matches);
-
-        let diff_path = self.root.join(format!("{}.diff", patch_id));
 
         let run_apply = |use_three_way: bool| -> Result<std::process::Output> {
             let mut cmd = Command::new("git");
@@ -116,9 +152,7 @@ impl PatchStore {
             if use_three_way {
                 cmd.arg("--3way");
             }
-            cmd.arg(&diff_path);
-            cmd.current_dir(workspace);
-            cmd.output().context("failed to execute git apply")
+            git_apply(cmd, workspace, &patch.unified_diff)
         };
 
         let output = match strategy {
@@ -214,55 +248,128 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn git_apply(mut command: Command, workspace: &Path, diff: &str) -> Result<std::process::Output> {
+    let mut child = command
+        .arg("-")
+        .current_dir(workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start git apply")?;
+    std::thread::scope(|scope| {
+        let mut stdin = child.stdin.take().expect("piped git stdin");
+        let writer = scope.spawn(move || stdin.write_all(diff.as_bytes()));
+        let output = child.wait_with_output()?;
+        let written = writer.join().expect("git stdin writer panicked");
+        if output.status.success() {
+            written?;
+        }
+        Ok(output)
+    })
+}
+
 fn hash_workspace_state(workspace: &Path, files: &[String]) -> Result<String> {
+    let workspace = WorkspaceFs::open(workspace)?;
     let mut hasher = Sha256::new();
-    for rel in files {
-        hasher.update(rel.as_bytes());
+    for path in files {
+        hasher.update(path.as_bytes());
         hasher.update([0_u8]);
-        let full = workspace.join(rel);
-        if full.exists() {
-            hasher.update([1_u8]);
-            hasher.update(fs::read(full)?);
-        } else {
-            hasher.update([0_u8]);
+        let resolved = workspace.resolve(Path::new(path), true)?;
+        match workspace.read(&resolved) {
+            Ok(bytes) => {
+                hasher.update([1_u8]);
+                hasher.update(bytes);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => hasher.update([0_u8]),
+            Err(err) => return Err(err.into()),
         }
         hasher.update([255_u8]);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn extract_target_files(diff: &str) -> Vec<String> {
+fn checked_patch_paths(workspace: &Path, diff: &str) -> Result<Vec<String>> {
+    let mut command = Command::new("git");
+    command.args(["apply", "--numstat", "-z", "--allow-empty"]);
+    let output = git_apply(command, workspace, diff)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "invalid patch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let mut files = BTreeSet::new();
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let path = entry
+            .splitn(3, |byte| *byte == b'\t')
+            .nth(2)
+            .ok_or_else(|| anyhow!("invalid git patch statistics"))?;
+        files.insert(std::str::from_utf8(path)?.to_owned());
+    }
+    // Git's numstat reports only the destination of renames and copies.
     for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ ") {
-            if let Some(parsed) = parse_patch_path(path) {
-                files.insert(parsed);
-            }
-        } else if let Some(path) = line.strip_prefix("--- ")
-            && let Some(parsed) = parse_patch_path(path)
+        if let Some(path) = line
+            .strip_prefix("rename from ")
+            .or_else(|| line.strip_prefix("copy from "))
         {
-            files.insert(parsed);
+            files.insert(decode_git_path(path)?);
         }
     }
-    files.into_iter().collect()
+
+    let workspace = WorkspaceFs::open(workspace)?;
+    for path in &files {
+        let path = Path::new(path);
+        anyhow::ensure!(
+            !path.is_absolute() && !workspace.relative(path)?.as_os_str().is_empty(),
+            "invalid patch path: {}",
+            path.display()
+        );
+        workspace.resolve(path, true)?;
+    }
+    Ok(files.into_iter().collect())
 }
 
-fn parse_patch_path(raw: &str) -> Option<String> {
-    if raw == "/dev/null" {
-        return None;
+fn decode_git_path(path: &str) -> Result<String> {
+    let Some(quoted) = path.strip_prefix('"') else {
+        return Ok(path.to_owned());
+    };
+    let mut bytes = quoted
+        .strip_suffix('"')
+        .ok_or_else(|| anyhow!("unterminated git path"))?
+        .bytes();
+    let mut decoded = Vec::new();
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte != b'\\' {
+            byte
+        } else {
+            match bytes.next() {
+                Some(b'\\') => b'\\',
+                Some(b'"') => b'"',
+                Some(b'a') => 7,
+                Some(b'b') => 8,
+                Some(b'f') => 12,
+                Some(b'n') => b'\n',
+                Some(b'r') => b'\r',
+                Some(b't') => b'\t',
+                Some(b'v') => 11,
+                Some(first @ b'0'..=b'3') => {
+                    let second = bytes.next().filter(|b| (b'0'..=b'7').contains(b));
+                    let third = bytes.next().filter(|b| (b'0'..=b'7').contains(b));
+                    let (Some(second), Some(third)) = (second, third) else {
+                        anyhow::bail!("invalid octal escape in git path");
+                    };
+                    (first - b'0') * 64 + (second - b'0') * 8 + third - b'0'
+                }
+                _ => anyhow::bail!("invalid escape in git path"),
+            }
+        });
     }
-    let normalized = raw
-        .strip_prefix("a/")
-        .or_else(|| raw.strip_prefix("b/"))
-        .unwrap_or(raw);
-    if normalized.is_empty() {
-        return None;
-    }
-    // Reject path traversal attempts
-    if normalized.contains("../") || normalized.starts_with('/') {
-        return None;
-    }
-    Some(normalized.to_string())
+    Ok(String::from_utf8(decoded)?)
 }
 
 #[cfg(test)]
@@ -347,106 +454,14 @@ mod tests {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    // ── extract_target_files tests ──
-
     #[test]
-    fn extract_target_files_from_standard_diff() {
-        let diff = "\
-diff --git a/src/main.rs b/src/main.rs
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -1 +1 @@
--old
-+new
-";
-        let files = extract_target_files(diff);
-        assert_eq!(files, vec!["src/main.rs"]);
-    }
-
-    #[test]
-    fn extract_target_files_from_multi_file_diff() {
-        let diff = "\
---- a/foo.rs
-+++ b/foo.rs
-@@ -1 +1 @@
--x
-+y
---- a/bar.rs
-+++ b/bar.rs
-@@ -1 +1 @@
--a
-+b
-";
-        let files = extract_target_files(diff);
-        assert_eq!(files, vec!["bar.rs", "foo.rs"]); // BTreeSet sorts
-    }
-
-    #[test]
-    fn extract_target_files_skips_dev_null() {
-        let diff = "\
---- /dev/null
-+++ b/new_file.rs
-@@ -0,0 +1 @@
-+content
-";
-        let files = extract_target_files(diff);
-        assert_eq!(files, vec!["new_file.rs"]);
-    }
-
-    #[test]
-    fn extract_target_files_empty_diff() {
-        assert!(extract_target_files("").is_empty());
-    }
-
-    #[test]
-    fn extract_target_files_deduplicates() {
-        let diff = "\
---- a/same.rs
-+++ b/same.rs
-@@ -1 +1 @@
--a
-+b
-";
-        let files = extract_target_files(diff);
-        assert_eq!(files, vec!["same.rs"]);
-    }
-
-    // ── parse_patch_path tests ──
-
-    #[test]
-    fn parse_patch_path_strips_a_prefix() {
+    fn checked_patch_paths_include_rename_source_and_destination() {
+        let workspace = std::env::temp_dir();
+        let diff = "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n";
         assert_eq!(
-            parse_patch_path("a/src/lib.rs"),
-            Some("src/lib.rs".to_string())
+            checked_patch_paths(&workspace, diff).unwrap(),
+            ["new.txt", "old.txt"]
         );
-    }
-
-    #[test]
-    fn parse_patch_path_strips_b_prefix() {
-        assert_eq!(
-            parse_patch_path("b/src/lib.rs"),
-            Some("src/lib.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_patch_path_no_prefix() {
-        assert_eq!(
-            parse_patch_path("src/lib.rs"),
-            Some("src/lib.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_patch_path_dev_null_returns_none() {
-        assert_eq!(parse_patch_path("/dev/null"), None);
-    }
-
-    #[test]
-    fn parse_patch_path_empty_returns_none() {
-        assert_eq!(parse_patch_path(""), None);
-        // After stripping a/ prefix, nothing remains
-        assert_eq!(parse_patch_path("a/"), None);
     }
 
     // ── sha256_hex tests ──

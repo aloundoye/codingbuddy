@@ -342,9 +342,8 @@ impl IdeRpcHandler {
             });
 
         // Record the prompt as a ChatTurn event.
-        let seq = self.store.next_seq_no(session_id)?;
-        self.store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no: seq,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: chrono::Utc::now(),
             session_id,
             kind: EventKind::ChatTurn {
@@ -450,9 +449,8 @@ impl IdeRpcHandler {
                     reasoning_content: None,
                     tool_calls: vec![],
                 });
-            let seq = self.store.next_seq_no(session_id)?;
-            self.store.append_event(&codingbuddy_core::EventEnvelope {
-                seq_no: seq,
+            self.store.append_event(&codingbuddy_store::NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: chrono::Utc::now(),
                 session_id,
                 kind: EventKind::ChatTurn {
@@ -592,9 +590,8 @@ impl IdeRpcHandler {
             "step_status": projection.step_status,
         });
         fs::write(&output_path, serde_json::to_vec_pretty(&payload)?)?;
-        let seq = self.store.next_seq_no(session_id)?;
-        self.store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no: seq,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: chrono::Utc::now(),
             session_id,
             kind: EventKind::TeleportBundleCreated {
@@ -660,9 +657,8 @@ impl IdeRpcHandler {
             .and_then(|v| serde_json::from_value::<Vec<ChatMessage>>(v).ok())
             .unwrap_or_default();
         for message in &chat_messages {
-            let seq = self.store.next_seq_no(session_id)?;
-            self.store.append_event(&codingbuddy_core::EventEnvelope {
-                seq_no: seq,
+            self.store.append_event(&codingbuddy_store::NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: chrono::Utc::now(),
                 session_id,
                 kind: EventKind::ChatTurn {
@@ -675,9 +671,8 @@ impl IdeRpcHandler {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         if resume_import {
-            let seq = self.store.next_seq_no(session_id)?;
-            self.store.append_event(&codingbuddy_core::EventEnvelope {
-                seq_no: seq,
+            self.store.append_event(&codingbuddy_store::NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: chrono::Utc::now(),
                 session_id,
                 kind: EventKind::SessionResumed {
@@ -736,9 +731,8 @@ impl IdeRpcHandler {
         };
         write_handoff_descriptor(self.store.root.as_path(), &descriptor)?;
 
-        let seq = self.store.next_seq_no(session_id)?;
-        self.store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no: seq,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: chrono::Utc::now(),
             session_id,
             kind: EventKind::TeleportHandoffLinkCreated {
@@ -787,9 +781,8 @@ impl IdeRpcHandler {
         };
 
         if let Some(reason) = invalid_reason {
-            let seq = self.store.next_seq_no(descriptor.session_id)?;
-            self.store.append_event(&codingbuddy_core::EventEnvelope {
-                seq_no: seq,
+            self.store.append_event(&codingbuddy_store::NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: chrono::Utc::now(),
                 session_id: descriptor.session_id,
                 kind: EventKind::TeleportHandoffLinkConsumed {
@@ -809,9 +802,8 @@ impl IdeRpcHandler {
         descriptor.used_at = Some(now.to_rfc3339());
         write_handoff_descriptor(self.store.root.as_path(), &descriptor)?;
 
-        let seq = self.store.next_seq_no(descriptor.session_id)?;
-        self.store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no: seq,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: chrono::Utc::now(),
             session_id: descriptor.session_id,
             kind: EventKind::TeleportHandoffLinkConsumed {
@@ -852,9 +844,8 @@ impl IdeRpcHandler {
             .get("turn_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let seq = self.store.next_seq_no(parsed)?;
-        self.store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no: seq,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: chrono::Utc::now(),
             session_id: parsed,
             kind: EventKind::SessionResumed {
@@ -882,33 +873,21 @@ impl IdeRpcHandler {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as i64;
         let limit = limit.clamp(1, 500);
 
-        let conn = self.store.db()?;
-        let mut stmt = conn.prepare(
-            "SELECT seq_no, at, kind, payload
-             FROM events
-             WHERE session_id = ?1 AND seq_no > ?2
-             ORDER BY seq_no ASC
-             LIMIT ?3",
-        )?;
-        let mut rows = stmt.query([
-            session_id.to_string(),
-            after_seq.to_string(),
-            limit.to_string(),
-        ])?;
-        let mut events = Vec::new();
         let mut next_cursor = after_seq;
-        while let Some(row) = rows.next()? {
-            let seq_no = row.get::<_, i64>(0)?.max(0) as u64;
-            let payload_raw = row.get::<_, String>(3)?;
-            let payload_json = serde_json::from_str::<Value>(&payload_raw).unwrap_or(Value::Null);
-            events.push(serde_json::json!({
-                "seq_no": seq_no,
-                "at": row.get::<_, String>(1)?,
-                "kind": row.get::<_, String>(2)?,
-                "payload": payload_json,
-            }));
-            next_cursor = seq_no;
-        }
+        let events = self
+            .store
+            .poll_events(session_id, after_seq, limit as usize)?
+            .into_iter()
+            .map(|event| {
+                next_cursor = event.seq_no;
+                serde_json::json!({
+                    "seq_no": event.seq_no,
+                    "at": event.at,
+                    "kind": event.kind,
+                    "payload": event.payload,
+                })
+            })
+            .collect::<Vec<_>>();
         let done = events.len() < limit as usize;
 
         Ok(serde_json::json!({
@@ -924,31 +903,23 @@ impl IdeRpcHandler {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as i64;
         let limit = limit.clamp(1, 500);
 
-        let conn = self.store.db()?;
-        let mut stmt = conn.prepare(
-            "SELECT seq_no, at, kind, payload
-             FROM events
-             WHERE session_id = ?1
-             ORDER BY seq_no DESC
-             LIMIT ?2",
-        )?;
-        let mut rows = stmt.query([session_id.to_string(), limit.to_string()])?;
-        let mut timeline = Vec::new();
-        while let Some(row) = rows.next()? {
-            let kind = row.get::<_, String>(2)?;
-            let payload_raw = row.get::<_, String>(3)?;
-            let payload = serde_json::from_str::<Value>(&payload_raw).unwrap_or(Value::Null);
-            timeline.push(serde_json::json!({
-                "seq_no": row.get::<_, i64>(0)?.max(0) as u64,
-                "at": row.get::<_, String>(1)?,
-                "kind": kind,
-                "category": timeline_category(&kind),
-                "summary": timeline_summary(&kind, &payload),
-                "payload": payload,
-            }));
-        }
-        timeline.reverse();
+        let mut timeline = self
+            .store
+            .timeline_events(session_id, limit as usize)?
+            .into_iter()
+            .map(|event| {
+                serde_json::json!({
+                    "seq_no": event.seq_no,
+                    "at": event.at,
+                    "kind": event.kind,
+                    "category": timeline_category(&event.kind),
+                    "summary": timeline_summary(&event.kind, &event.payload),
+                    "payload": event.payload,
+                })
+            })
+            .collect::<Vec<_>>();
 
+        timeline.reverse();
         let projection = self.store.rebuild_from_events(session_id)?;
         let tasks = self.store.list_tasks(Some(session_id))?;
         let background_jobs = self.store.list_background_jobs()?;
@@ -1008,9 +979,8 @@ impl IdeRpcHandler {
             .unwrap_or_default();
 
         // Record approval event.
-        let seq = self.store.next_seq_no(session_id)?;
-        self.store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no: seq,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: chrono::Utc::now(),
             session_id,
             kind: EventKind::ToolApproved { invocation_id },
@@ -1069,9 +1039,8 @@ impl IdeRpcHandler {
         let patch_id = require_uuid(&params, "patch_id")?;
 
         // Record patch applied event.
-        let seq = self.store.next_seq_no(session_id)?;
-        self.store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no: seq,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: chrono::Utc::now(),
             session_id,
             kind: EventKind::PatchApplied {

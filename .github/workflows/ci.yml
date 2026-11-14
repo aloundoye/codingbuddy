@@ -25,13 +25,15 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
-          components: rustfmt, clippy
+        run: rustup show
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Verify workspace Rust version
+        run: |
+          expected=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
+          test "$(rustc --version | cut -d ' ' -f 2)" = "$expected"
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -64,9 +66,7 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
+        run: rustup show
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -115,15 +115,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
+        run: rustup show
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
       - name: build
         run: cargo build --workspace
+
+      - name: Filesystem regressions
+        run: cargo test --locked -p codingbuddy-tools --lib workspace_
 
       - name: cli smoke
         run: cargo run --bin codingbuddy -- --json status

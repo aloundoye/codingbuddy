@@ -1,16 +1,16 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use codingbuddy_core::{
     ChatMessage, EventEnvelope, EventKind, Plan, Session, SessionState,
     parse_event_envelope_compat, parse_event_kind_compat, runtime_dir,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Convert a deserialization error into a `rusqlite` FromSqlConversionFailure.
@@ -690,6 +690,35 @@ pub struct ArtifactRecord {
     pub created_at: String,
 }
 
+/// An event to append. Retain the same value when retrying a write.
+#[derive(Debug, Clone)]
+pub struct NewEvent {
+    pub event_id: Uuid,
+    pub at: chrono::DateTime<Utc>,
+    pub session_id: Uuid,
+    pub kind: EventKind,
+}
+
+impl NewEvent {
+    pub fn new(session_id: Uuid, kind: EventKind) -> Self {
+        Self {
+            event_id: Uuid::now_v7(),
+            at: Utc::now(),
+            session_id,
+            kind,
+        }
+    }
+}
+
+/// Stored wire fields used by event polling and timelines.
+pub struct StoredEvent {
+    pub seq_no: u64,
+    pub at: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
     db_path: PathBuf,
@@ -712,59 +741,73 @@ impl Store {
     }
 
     pub fn db(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.db_path)?)
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        Ok(conn)
     }
 
-    pub fn next_seq_no(&self, session_id: Uuid) -> Result<u64> {
-        let conn = self.db()?;
-        let mut stmt =
-            conn.prepare("SELECT COALESCE(MAX(seq_no), 0) FROM events WHERE session_id = ?1")?;
-        let current: i64 = stmt.query_row([session_id.to_string()], |r| r.get(0))?;
-        Ok((current as u64) + 1)
+    pub fn append_event(&self, event: &NewEvent) -> Result<EventEnvelope> {
+        let mut conn = self.db()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let envelope = Self::append_event_row(&tx, event)?;
+        tx.commit()?;
+        Ok(envelope)
     }
 
-    pub fn append_event(&self, event: &EventEnvelope) -> Result<()> {
-        let _append_guard = append_lock()
-            .lock()
-            .map_err(|_| anyhow!("event append lock poisoned"))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.events_path)?;
-        writeln!(file, "{}", serde_json::to_string(event)?)?;
-
-        let conn = self.db()?;
-        conn.execute(
-            "INSERT INTO events (session_id, seq_no, at, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                event.session_id.to_string(),
-                event.seq_no as i64,
-                event.at.to_rfc3339(),
-                event_kind_name(&event.kind),
-                serde_json::to_string(&event.kind)?,
-            ],
-        )?;
-        self.project_event(&conn, event)?;
-        Ok(())
-    }
-
-    /// Force-flush JSONL events file and SQLite WAL to disk.
-    /// Called after each complete LLM turn so a killed process can resume.
-    pub fn flush_sync(&self) -> Result<()> {
-        // Open with write access so fsync flushes pending writes from append_event
-        if self.events_path.exists() {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.events_path)?;
-            file.sync_all()?;
+    fn append_event_row(tx: &Connection, event: &NewEvent) -> Result<EventEnvelope> {
+        let session_id = event.session_id.to_string();
+        let event_id = event.event_id.to_string();
+        let at = event.at.to_rfc3339();
+        let payload = serde_json::to_string(&event.kind)?;
+        let existing = tx
+            .query_row(
+                "SELECT session_id, seq_no, at, payload FROM events WHERE event_id = ?1",
+                [&event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let mut envelope = EventEnvelope {
+            seq_no: 0,
+            at: event.at,
+            session_id: event.session_id,
+            kind: event.kind.clone(),
+        };
+        if let Some((owner, seq_no, timestamp, old_payload)) = existing {
+            anyhow::ensure!(
+                owner == session_id && timestamp == at && old_payload == payload,
+                "event ID {event_id} already belongs to a different event"
+            );
+            envelope.seq_no = u64::try_from(seq_no)?;
+        } else {
+            let latest: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq_no), 0) FROM events WHERE session_id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )?;
+            let next = latest.checked_add(1).context("event sequence exhausted")?;
+            envelope.seq_no = u64::try_from(next)?;
+            tx.execute(
+                "INSERT INTO events (session_id, seq_no, at, kind, payload, event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![session_id, next, at, event_kind_name(&event.kind), payload, event_id],
+            )?;
+            Self::project_event(tx, &envelope)?;
         }
-        let conn = self.db()?;
-        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-        Ok(())
+        Ok(envelope)
     }
 
     pub fn save_session(&self, session: &Session) -> Result<()> {
-        let conn = self.db()?;
+        Self::save_session_row(&self.db()?, session)
+    }
+
+    fn save_session_row(conn: &Connection, session: &Session) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO sessions (session_id, workspace_root, baseline_commit, status, budgets, active_plan_id, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -946,14 +989,10 @@ impl Store {
     }
 
     pub fn save_plan(&self, session_id: Uuid, plan: &Plan) -> Result<()> {
-        let plan_dir = self.root.join("plans");
-        fs::create_dir_all(&plan_dir)?;
-        fs::write(
-            plan_dir.join(format!("{}.json", plan.plan_id)),
-            serde_json::to_vec_pretty(plan)?,
-        )?;
+        Self::save_plan_row(&self.db()?, session_id, plan)
+    }
 
-        let conn = self.db()?;
+    fn save_plan_row(conn: &Connection, session_id: Uuid, plan: &Plan) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO plans (plan_id, session_id, version, goal, payload, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2370,27 +2409,16 @@ impl Store {
             budgets: source.budgets.clone(),
             active_plan_id: None,
         };
-        self.save_session(&forked)?;
-        let seq = self.next_seq_no(from_session_id)?;
-        self.append_event(&EventEnvelope {
-            seq_no: seq,
-            at: Utc::now(),
-            session_id: from_session_id,
-            kind: EventKind::SessionForked {
-                from_session_id,
-                to_session_id: new_id,
-            },
-        })?;
-        let child_seq = self.next_seq_no(new_id)?;
-        self.append_event(&EventEnvelope {
-            seq_no: child_seq,
-            at: Utc::now(),
-            session_id: new_id,
-            kind: EventKind::SessionForked {
-                from_session_id,
-                to_session_id: new_id,
-            },
-        })?;
+        let mut conn = self.db()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::save_session_row(&tx, &forked)?;
+        let kind = EventKind::SessionForked {
+            from_session_id,
+            to_session_id: new_id,
+        };
+        Self::append_event_row(&tx, &NewEvent::new(from_session_id, kind.clone()))?;
+        Self::append_event_row(&tx, &NewEvent::new(new_id, kind))?;
+        tx.commit()?;
         Ok(forked)
     }
 
@@ -2808,27 +2836,75 @@ impl Store {
     }
 
     pub fn rebuild_from_events(&self, session_id: Uuid) -> Result<RebuildProjection> {
-        if !self.events_path.exists() {
-            return Ok(RebuildProjection::default());
-        }
-        let file = OpenOptions::new().read(true).open(&self.events_path)?;
-        let reader = BufReader::new(file);
-
         let mut projection = RebuildProjection::default();
-        for line in reader.lines() {
-            let line = line?;
-            let event = parse_event_envelope_compat(&line)?;
-            if event.session_id != session_id {
-                continue;
-            }
+        for event in self.session_events(session_id)? {
             apply_projection(&mut projection, &event);
         }
-
         Ok(projection)
     }
 
-    fn init_db(&self) -> Result<()> {
+    pub fn session_events(&self, session_id: Uuid) -> Result<Vec<EventEnvelope>> {
         let conn = self.db()?;
+        let mut statement = conn.prepare(
+            "SELECT seq_no, at, payload FROM events WHERE session_id = ?1 ORDER BY seq_no",
+        )?;
+        let mut rows = statement.query([session_id.to_string()])?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            events.push(EventEnvelope {
+                session_id,
+                seq_no: u64::try_from(row.get::<_, i64>(0)?)?,
+                at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(1)?)?.to_utc(),
+                kind: parse_event_kind_compat(&row.get::<_, String>(2)?)?,
+            });
+        }
+        Ok(events)
+    }
+
+    pub fn poll_events(
+        &self,
+        session_id: Uuid,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>> {
+        let Ok(after_seq) = i64::try_from(after_seq) else {
+            return Ok(Vec::new());
+        };
+        self.read_event_rows(
+            "SELECT seq_no, at, kind, payload FROM events WHERE session_id = ?1 AND seq_no > ?2 ORDER BY seq_no LIMIT ?3",
+            params![session_id.to_string(), after_seq, i64::try_from(limit)?],
+        )
+    }
+
+    pub fn timeline_events(&self, session_id: Uuid, limit: usize) -> Result<Vec<StoredEvent>> {
+        self.read_event_rows(
+            "SELECT seq_no, at, kind, payload FROM events WHERE session_id = ?1 ORDER BY seq_no DESC LIMIT ?2",
+            params![session_id.to_string(), i64::try_from(limit)?],
+        )
+    }
+
+    fn read_event_rows(
+        &self,
+        sql: &str,
+        parameters: impl rusqlite::Params,
+    ) -> Result<Vec<StoredEvent>> {
+        let conn = self.db()?;
+        let mut statement = conn.prepare(sql)?;
+        let mut rows = statement.query(parameters)?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            events.push(StoredEvent {
+                seq_no: u64::try_from(row.get::<_, i64>(0)?)?,
+                at: row.get(1)?,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&row.get::<_, String>(3)?)?,
+            });
+        }
+        Ok(events)
+    }
+
+    fn init_db(&self) -> Result<()> {
+        let mut conn = self.db()?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -2836,44 +2912,174 @@ impl Store {
                 applied_at TEXT NOT NULL
              );",
         )?;
+        let latest: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if latest >= EVENT_STORAGE_VERSION {
+            return Ok(());
+        }
 
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let had_events: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events')",
+            [],
+            |row| row.get(0),
+        )?;
         for (version, sql) in MIGRATIONS {
-            let already: i64 = conn.query_row(
-                "SELECT COUNT(1) FROM schema_migrations WHERE version = ?1",
-                [*version],
-                |r| r.get(0),
+            if !Self::has_migration(&tx, *version)? {
+                tx.execute_batch(sql)?;
+                Self::record_migration(&tx, *version)?;
+            }
+        }
+        if !Self::has_migration(&tx, EVENT_STORAGE_VERSION)? {
+            self.migrate_events(&tx, had_events)?;
+            Self::record_migration(&tx, EVENT_STORAGE_VERSION)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn has_migration(conn: &Connection, version: i64) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            [version],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn record_migration(conn: &Connection, version: i64) -> Result<()> {
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![version, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_events(&self, conn: &Connection, had_events: bool) -> Result<()> {
+        conn.execute_batch(
+            "ALTER TABLE events RENAME TO legacy_events;
+             CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                seq_no INTEGER NOT NULL CHECK (seq_no > 0),
+                at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                event_id TEXT NOT NULL UNIQUE,
+                UNIQUE (session_id, seq_no)
+             );",
+        )?;
+        if had_events {
+            let mut statement = conn.prepare(
+                "SELECT MIN(id), session_id, seq_no, at, kind, payload FROM legacy_events
+                 GROUP BY session_id, seq_no, at, kind, payload ORDER BY MIN(id)",
             )?;
-            if already == 0 {
-                conn.execute_batch(sql)?;
+            let mut rows = statement.query([])?;
+            let mut sequences = std::collections::HashMap::new();
+            while let Some(row) = rows.next()? {
+                let session: String = row.get(1)?;
+                let seq = assign_legacy_sequence(&mut sequences, &session, row.get(2)?)?;
                 conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-                    params![version, Utc::now().to_rfc3339()],
+                    "INSERT INTO events (id, session_id, seq_no, at, kind, payload, event_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        row.get::<_, i64>(0)?,
+                        session,
+                        seq,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        Uuid::now_v7().to_string()
+                    ],
                 )?;
             }
+        } else {
+            self.import_archive(conn)?;
+        }
+        conn.execute_batch("DROP TABLE legacy_events;")?;
+        Ok(())
+    }
+
+    fn import_archive(&self, conn: &Connection) -> Result<()> {
+        let file = match fs::File::open(&self.events_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err).context("open legacy events.jsonl"),
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut number = 0;
+        let mut sequences = std::collections::HashMap::new();
+        let mut seen = HashSet::new();
+        while reader.read_until(b'\n', &mut line)? != 0 {
+            number += 1;
+            let parsed = std::str::from_utf8(&line)
+                .map_err(anyhow::Error::from)
+                .and_then(parse_event_envelope_compat);
+            let mut event = match parsed {
+                Ok(event) => event,
+                Err(err) if !line.ends_with(b"\n") => {
+                    eprintln!(
+                        "codingbuddy-store: skipped incomplete events.jsonl line {number}: {err}"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| format!("invalid events.jsonl line {number}"));
+                }
+            };
+            line.clear();
+            let payload = serde_json::to_string(&event.kind)?;
+            if !seen.insert((event.session_id, event.seq_no, event.at, payload.clone())) {
+                continue;
+            }
+            let session = event.session_id.to_string();
+            event.seq_no =
+                assign_legacy_sequence(&mut sequences, &session, i64::try_from(event.seq_no)?)?
+                    as u64;
+            let at = event.at.to_rfc3339();
+            if !event.session_id.is_nil() {
+                let workspace = self.root.parent().unwrap_or(&self.root).to_string_lossy();
+                let budgets = codingbuddy_core::AppConfig::default().budgets;
+                let budgets = codingbuddy_core::SessionBudgets {
+                    per_turn_seconds: budgets.max_turn_duration_secs,
+                    max_think_tokens: budgets.max_reasoner_tokens_per_session as u32,
+                };
+                conn.execute(
+                    "INSERT INTO sessions (session_id, workspace_root, status, budgets, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(session_id) DO UPDATE SET updated_at = max(updated_at, excluded.updated_at)",
+                    params![session, workspace, serde_json::to_string(&SessionState::Idle)?, serde_json::to_string(&budgets)?, at],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO events (session_id, seq_no, at, kind, payload, event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![session, i64::try_from(event.seq_no)?, at, event_kind_name(&event.kind), payload, Uuid::now_v7().to_string()],
+            )?;
+            Self::project_event(conn, &event)?;
         }
         Ok(())
     }
 
-    fn project_event(&self, conn: &Connection, event: &EventEnvelope) -> Result<()> {
+    fn project_event(conn: &Connection, event: &EventEnvelope) -> Result<()> {
+        let at = event.at.to_rfc3339();
         match &event.kind {
             EventKind::SessionStateChanged { to, .. } => {
                 conn.execute(
                     "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE session_id = ?3",
-                    params![
-                        serde_json::to_string(to)?,
-                        Utc::now().to_rfc3339(),
-                        event.session_id.to_string()
-                    ],
+                    params![serde_json::to_string(to)?, at, event.session_id.to_string()],
                 )?;
             }
             EventKind::PlanCreated { plan } | EventKind::PlanRevised { plan } => {
-                self.save_plan(event.session_id, plan)?;
+                Self::save_plan_row(conn, event.session_id, plan)?;
                 conn.execute(
                     "UPDATE sessions SET active_plan_id = ?1, status = ?2, updated_at = ?3 WHERE session_id = ?4",
                     params![
                         plan.plan_id.to_string(),
                         serde_json::to_string(&SessionState::Planning)?,
-                        Utc::now().to_rfc3339(),
+                        at,
                         event.session_id.to_string(),
                     ],
                 )?;
@@ -2884,7 +3090,7 @@ impl Store {
                     params![
                         event.session_id.to_string(),
                         invocation_id.to_string(),
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -2900,7 +3106,7 @@ impl Store {
                         command,
                         if *success { 1 } else { 0 },
                         output,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -2923,7 +3129,7 @@ impl Store {
                         *cache_hit_tokens as i64,
                         *cache_miss_tokens as i64,
                         *output_tokens as i64,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -2945,7 +3151,7 @@ impl Store {
                         *to_turn as i64,
                         *token_delta_estimate,
                         replay_pointer,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -2954,13 +3160,12 @@ impl Store {
                     "INSERT OR REPLACE INTO autopilot_runs
                      (run_id, session_id, prompt, status, stop_reason, completed_iterations, failed_iterations,
                       consecutive_failures, last_error, stop_file, heartbeat_file, tools, max_think, started_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'running', NULL, 0, 0, 0, NULL, '', '', 0, 0, ?4, ?5)",
+                     VALUES (?1, ?2, ?3, 'running', NULL, 0, 0, 0, NULL, '', '', 0, 0, ?4, ?4)",
                     params![
                         run_id.to_string(),
                         event.session_id.to_string(),
                         prompt,
-                        Utc::now().to_rfc3339(),
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -2980,7 +3185,7 @@ impl Store {
                         *failed_iterations as i64,
                         *consecutive_failures as i64,
                         last_error,
-                        Utc::now().to_rfc3339(),
+                        at,
                         run_id.to_string(),
                     ],
                 )?;
@@ -2999,7 +3204,7 @@ impl Store {
                         stop_reason,
                         *completed_iterations as i64,
                         *failed_iterations as i64,
-                        Utc::now().to_rfc3339(),
+                        at,
                         run_id.to_string(),
                     ],
                 )?;
@@ -3021,7 +3226,7 @@ impl Store {
                         if *success { 1 } else { 0 },
                         if *timed_out { 1 } else { 0 },
                         exit_code,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3039,7 +3244,7 @@ impl Store {
                         reason,
                         snapshot_path,
                         *files_count as i64,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3065,7 +3270,7 @@ impl Store {
                         event.session_id.to_string(),
                         format,
                         output_path,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3082,7 +3287,7 @@ impl Store {
                         server_id,
                         transport,
                         endpoint,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3100,7 +3305,7 @@ impl Store {
                 conn.execute(
                     "INSERT OR REPLACE INTO mcp_tools_cache (server_id, tool_name, description, schema_json, updated_at)
                      VALUES (?1, ?2, '', '{}', ?3)",
-                    params![server_id, tool_name, Utc::now().to_rfc3339()],
+                    params![server_id, tool_name, at],
                 )?;
             }
             EventKind::SubagentSpawned { run_id, name, goal } => {
@@ -3109,7 +3314,7 @@ impl Store {
                         run_id, session_id, task_id, child_session_id, background_job_id,
                         name, goal, status, output, error, created_at, updated_at
                      )
-                     VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, 'running', NULL, NULL, ?5, ?6)
+                     VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, 'running', NULL, NULL, ?5, ?5)
                      ON CONFLICT(run_id) DO UPDATE SET
                         session_id = COALESCE(subagent_runs.session_id, excluded.session_id),
                         name = excluded.name,
@@ -3121,21 +3326,20 @@ impl Store {
                         event.session_id.to_string(),
                         name,
                         goal,
-                        Utc::now().to_rfc3339(),
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
             EventKind::SubagentCompleted { run_id, output } => {
                 conn.execute(
                     "UPDATE subagent_runs SET status='completed', output=?1, error=NULL, updated_at=?2 WHERE run_id=?3",
-                    params![output, Utc::now().to_rfc3339(), run_id.to_string()],
+                    params![output, at, run_id.to_string()],
                 )?;
             }
             EventKind::SubagentFailed { run_id, error } => {
                 conn.execute(
                     "UPDATE subagent_runs SET status='failed', output=NULL, error=?1, updated_at=?2 WHERE run_id=?3",
-                    params![error, Utc::now().to_rfc3339(), run_id.to_string()],
+                    params![error, at, run_id.to_string()],
                 )?;
             }
             EventKind::CostUpdated {
@@ -3151,7 +3355,7 @@ impl Store {
                         *input_tokens as i64,
                         *output_tokens as i64,
                         *estimated_cost_usd,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3168,7 +3372,7 @@ impl Store {
                         event.session_id.to_string(),
                         summary,
                         *elapsed_ms as i64,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3186,7 +3390,7 @@ impl Store {
                         path,
                         content,
                         note,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3197,20 +3401,19 @@ impl Store {
             } => {
                 conn.execute(
                     "INSERT OR REPLACE INTO background_jobs (job_id, kind, reference, status, metadata_json, started_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'running', '{}', ?4, ?5)",
+                     VALUES (?1, ?2, ?3, 'running', '{}', ?4, ?4)",
                     params![
                         job_id.to_string(),
                         kind,
                         reference,
-                        Utc::now().to_rfc3339(),
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
             EventKind::BackgroundJobResumed { job_id, reference } => {
                 conn.execute(
                     "UPDATE background_jobs SET status='running', reference=?1, updated_at=?2 WHERE job_id=?3",
-                    params![reference, Utc::now().to_rfc3339(), job_id.to_string()],
+                    params![reference, at, job_id.to_string()],
                 )?;
             }
             EventKind::BackgroundJobStopped { job_id, reason } => {
@@ -3218,7 +3421,7 @@ impl Store {
                     "UPDATE background_jobs SET status='stopped', metadata_json=?1, updated_at=?2 WHERE job_id=?3",
                     params![
                         serde_json::json!({"reason": reason}).to_string(),
-                        Utc::now().to_rfc3339(),
+                        at,
                         job_id.to_string()
                     ],
                 )?;
@@ -3230,7 +3433,7 @@ impl Store {
                 conn.execute(
                     "INSERT OR REPLACE INTO skill_registry (skill_id, name, path, enabled, metadata_json, updated_at)
                      VALUES (?1, ?2, ?3, 1, '{}', ?4)",
-                    params![skill_id, skill_id, source_path, Utc::now().to_rfc3339()],
+                    params![skill_id, skill_id, source_path, at],
                 )?;
             }
             EventKind::ReplayExecuted {
@@ -3247,7 +3450,7 @@ impl Store {
                         if *deterministic { 1 } else { 0 },
                         *events_replayed as i64,
                         "{}",
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3255,7 +3458,7 @@ impl Store {
                 conn.execute(
                     "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
                      VALUES ('deepseek', ?1, ?2, 1, 0, ?3)",
-                    params![model, cache_key, Utc::now().to_rfc3339()],
+                    params![model, cache_key, at],
                 )?;
             }
             EventKind::OffPeakScheduled {
@@ -3265,7 +3468,7 @@ impl Store {
                 conn.execute(
                     "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
                      VALUES ('scheduler', 'off_peak', ?1, 0, 0, ?2)",
-                    params![format!("{reason}:{resume_after}"), Utc::now().to_rfc3339()],
+                    params![format!("{reason}:{resume_after}"), at],
                 )?;
             }
             EventKind::VisualArtifactCaptured {
@@ -3280,7 +3483,7 @@ impl Store {
                         artifact_id.to_string(),
                         path,
                         mime,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3296,7 +3499,7 @@ impl Store {
                         profile_id.to_string(),
                         name,
                         endpoint,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3310,7 +3513,7 @@ impl Store {
                         bundle_id.to_string(),
                         event.session_id.to_string(),
                         serde_json::json!({"path": path}).to_string(),
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3320,12 +3523,7 @@ impl Store {
                 conn.execute(
                     "INSERT INTO permission_mode_log (session_id, from_mode, to_mode, changed_at)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        event.session_id.to_string(),
-                        from,
-                        to,
-                        Utc::now().to_rfc3339(),
-                    ],
+                    params![event.session_id.to_string(), from, to, at,],
                 )?;
             }
             EventKind::TaskCreated {
@@ -3335,27 +3533,26 @@ impl Store {
             } => {
                 conn.execute(
                     "INSERT OR REPLACE INTO task_queue (task_id, session_id, title, priority, status, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5)",
                     params![
                         task_id.to_string(),
                         event.session_id.to_string(),
                         title,
                         *priority as i64,
-                        Utc::now().to_rfc3339(),
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
             EventKind::TaskCompleted { task_id, outcome } => {
                 conn.execute(
                     "UPDATE task_queue SET status = 'completed', outcome = ?1, updated_at = ?2 WHERE task_id = ?3",
-                    params![outcome, Utc::now().to_rfc3339(), task_id.to_string()],
+                    params![outcome, at, task_id.to_string()],
                 )?;
             }
             EventKind::TaskUpdated { task_id, status } => {
                 conn.execute(
                     "UPDATE task_queue SET status = ?1, updated_at = ?2 WHERE task_id = ?3",
-                    params![status, Utc::now().to_rfc3339(), task_id],
+                    params![status, at, task_id],
                 )?;
             }
             EventKind::TaskDeleted { task_id } => {
@@ -3366,7 +3563,7 @@ impl Store {
                     "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE session_id = ?3",
                     params![
                         serde_json::to_string(&SessionState::Planning)?,
-                        Utc::now().to_rfc3339(),
+                        at,
                         event.session_id.to_string(),
                     ],
                 )?;
@@ -3376,7 +3573,7 @@ impl Store {
                     "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE session_id = ?3",
                     params![
                         serde_json::to_string(&SessionState::AwaitingApproval)?,
-                        Utc::now().to_rfc3339(),
+                        at,
                         event.session_id.to_string(),
                     ],
                 )?;
@@ -3394,7 +3591,7 @@ impl Store {
                         event.session_id.to_string(),
                         preset,
                         target,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3426,7 +3623,7 @@ impl Store {
                         task_id.to_string(),
                         artifact_path,
                         serde_json::to_string(files)?,
-                        Utc::now().to_rfc3339(),
+                        at,
                     ],
                 )?;
             }
@@ -3453,37 +3650,20 @@ impl Store {
     /// Permanently delete sessions (and their events) older than `delete_days`.
     /// Returns the number of sessions deleted.
     pub fn delete_old_sessions(&self, delete_days: u32) -> Result<u64> {
-        let conn = self.db()?;
+        let mut conn = self.db()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cutoff = (Utc::now() - chrono::Duration::days(i64::from(delete_days))).to_rfc3339();
-
-        // Collect session IDs to delete
-        let mut stmt = conn.prepare("SELECT session_id FROM sessions WHERE updated_at < ?1")?;
-        let ids: Vec<String> = stmt
-            .query_map(params![cutoff], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if ids.is_empty() {
-            return Ok(0);
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT session_id FROM sessions WHERE updated_at < ?1")?;
+            stmt.query_map([cutoff], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for id in &ids {
+            tx.execute("DELETE FROM events WHERE session_id = ?1", [id])?;
+            tx.execute("DELETE FROM plans WHERE session_id = ?1", [id])?;
+            tx.execute("DELETE FROM sessions WHERE session_id = ?1", [id])?;
         }
-
-        // Delete related rows in a single transaction for atomicity.
-        conn.execute_batch("BEGIN")?;
-        let result = (|| -> Result<()> {
-            for id in &ids {
-                conn.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
-                conn.execute("DELETE FROM plans WHERE session_id = ?1", params![id])?;
-                conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![id])?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => conn.execute_batch("COMMIT")?,
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-        }
+        tx.commit()?;
         Ok(ids.len() as u64)
     }
 
@@ -3507,9 +3687,20 @@ impl Store {
     }
 }
 
-fn append_lock() -> &'static Mutex<()> {
-    static APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    APPEND_LOCK.get_or_init(|| Mutex::new(()))
+const EVENT_STORAGE_VERSION: i64 = 14;
+
+fn assign_legacy_sequence(
+    sequences: &mut std::collections::HashMap<String, i64>,
+    session: &str,
+    recorded: i64,
+) -> Result<i64> {
+    let latest = sequences.entry(session.to_owned()).or_default();
+    *latest = recorded.max(
+        latest
+            .checked_add(1)
+            .context("legacy event sequence exhausted")?,
+    );
+    Ok(*latest)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -3779,8 +3970,8 @@ mod tests {
         };
         store.save_session(&session).expect("save session");
 
-        let ev = EventEnvelope {
-            seq_no: 1,
+        let ev = NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::TurnAdded {
@@ -3819,11 +4010,9 @@ mod tests {
         store.save_session(&session).expect("save session");
 
         for i in 1..=3 {
-            let seq = store.next_seq_no(session_id).expect("next_seq_no");
-            assert_eq!(seq, i);
-            store
-                .append_event(&EventEnvelope {
-                    seq_no: seq,
+            let event = store
+                .append_event(&NewEvent {
+                    event_id: uuid::Uuid::now_v7(),
                     at: Utc::now(),
                     session_id,
                     kind: EventKind::TurnAdded {
@@ -3832,9 +4021,8 @@ mod tests {
                     },
                 })
                 .expect("append");
+            assert_eq!(event.seq_no, i);
         }
-        let final_seq = store.next_seq_no(session_id).expect("final");
-        assert_eq!(final_seq, 4);
     }
 
     #[test]
@@ -3941,8 +4129,8 @@ mod tests {
         let run1 = Uuid::now_v7();
         let run2 = Uuid::now_v7();
         store
-            .append_event(&EventEnvelope {
-                seq_no: 1,
+            .append_event(&NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: Utc::now(),
                 session_id: s1.session_id,
                 kind: EventKind::SubagentSpawned {
@@ -3953,8 +4141,8 @@ mod tests {
             })
             .expect("append s1 subagent");
         store
-            .append_event(&EventEnvelope {
-                seq_no: 2,
+            .append_event(&NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: Utc::now(),
                 session_id: s1.session_id,
                 kind: EventKind::SubagentCompleted {
@@ -3964,8 +4152,8 @@ mod tests {
             })
             .expect("append s1 complete");
         store
-            .append_event(&EventEnvelope {
-                seq_no: 1,
+            .append_event(&NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: Utc::now(),
                 session_id: s2.session_id,
                 kind: EventKind::SubagentSpawned {
@@ -4086,9 +4274,8 @@ mod tests {
             let sid = session_id;
             handles.push(std::thread::spawn(move || {
                 for i in 0..5 {
-                    let seq = (t * 5 + i + 1) as u64;
-                    let _ = s.append_event(&EventEnvelope {
-                        seq_no: seq,
+                    let _ = s.append_event(&NewEvent {
+                        event_id: uuid::Uuid::now_v7(),
                         at: Utc::now(),
                         session_id: sid,
                         kind: EventKind::TurnAdded {
@@ -4143,8 +4330,8 @@ mod tests {
             };
             store.save_session(&session).expect("save");
             store
-                .append_event(&EventEnvelope {
-                    seq_no: 1,
+                .append_event(&NewEvent {
+                    event_id: uuid::Uuid::now_v7(),
                     at: Utc::now(),
                     session_id,
                     kind: EventKind::TurnAdded {
@@ -4186,8 +4373,8 @@ mod tests {
         store.save_session(&session).expect("save session");
 
         store
-            .append_event(&EventEnvelope {
-                seq_no: 1,
+            .append_event(&NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: Utc::now(),
                 session_id: session.session_id,
                 kind: EventKind::TurnAdded {
@@ -4197,8 +4384,8 @@ mod tests {
             })
             .expect("append old");
         store
-            .append_event(&EventEnvelope {
-                seq_no: 2,
+            .append_event(&NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: Utc::now(),
                 session_id: session.session_id,
                 kind: EventKind::PluginEnabled {
@@ -4267,10 +4454,10 @@ mod tests {
             ),
         ];
 
-        for (seq, kind) in &event_specs {
+        for (_, kind) in &event_specs {
             store
-                .append_event(&EventEnvelope {
-                    seq_no: *seq,
+                .append_event(&NewEvent {
+                    event_id: uuid::Uuid::now_v7(),
                     at: Utc::now(),
                     session_id: sid,
                     kind: kind.clone(),
@@ -4287,8 +4474,8 @@ mod tests {
         assert!(rebuilt.transcript[2].contains("third"));
 
         // Verify seq_no monotonicity
-        let next = store.next_seq_no(sid).expect("next");
-        assert_eq!(next, 5);
+        let events = store.session_events(sid).expect("events");
+        assert_eq!(events.last().unwrap().seq_no, 4);
     }
 
     #[test]
@@ -4314,8 +4501,8 @@ mod tests {
         // Seed events
         for i in 1..=5 {
             store
-                .append_event(&EventEnvelope {
-                    seq_no: i,
+                .append_event(&NewEvent {
+                    event_id: uuid::Uuid::now_v7(),
                     at: Utc::now(),
                     session_id: sid,
                     kind: EventKind::TurnAdded {
@@ -4525,8 +4712,8 @@ mod tests {
         store.save_session(&session).expect("save");
 
         // Add an event for this session
-        let ev = EventEnvelope {
-            seq_no: 1,
+        let ev = NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::TurnAdded {

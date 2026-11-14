@@ -1,7 +1,6 @@
 use super::*;
 use codingbuddy_core::{
     AppConfig, ApprovedToolCall, Session, SessionBudgets, SessionState, ToolCall, ToolHost,
-    runtime_dir,
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -369,9 +368,13 @@ fn fs_read_emits_visual_artifact_event_when_enabled() {
     assert!(result.success);
     assert_eq!(result.output["binary"], true);
 
-    let events_path = runtime_dir(&workspace).join("events.jsonl");
-    let events = fs::read_to_string(events_path).expect("events");
-    assert!(events.contains("VisualArtifactCaptured"));
+    let session = store.load_latest_session().unwrap().unwrap();
+    let events = store.session_events(session.session_id).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::VisualArtifactCaptured { .. }))
+    );
 }
 
 #[test]
@@ -1558,4 +1561,120 @@ fn apply_single_edit_exact_match_preferred_over_fuzzy() {
     let result = apply_single_edit(&mut content, &edit);
     assert!(result.is_ok());
     assert_eq!(content, "let x = 42;\nlet y = 2;\n");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn workspace_file_tools_confine_links() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(workspace.join("inside")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("existing.txt"), "outside marker").unwrap();
+    fs::write(workspace.join("inside/ok.txt"), "inside marker").unwrap();
+
+    #[cfg(unix)]
+    let link_dir = |target: &Path, path: &Path| std::os::unix::fs::symlink(target, path).unwrap();
+    #[cfg(windows)]
+    let link_dir = |target: &Path, path: &Path| {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(path)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    };
+    link_dir(&outside, &workspace.join("escape"));
+    link_dir(&workspace.join("inside"), &workspace.join("internal"));
+
+    let host = LocalToolHost::new(&workspace, PolicyEngine::default()).unwrap();
+    let execute = |name: &str, args| {
+        host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: name.to_string(),
+                args,
+                requires_approval: false,
+            },
+        })
+    };
+    assert!(!execute("fs.read", json!({"path": "escape/existing.txt"})).success);
+    assert!(
+        !execute(
+            "fs.write",
+            json!({"path": "escape/new.txt", "content": "marker"})
+        )
+        .success
+    );
+    assert!(!outside.join("new.txt").exists());
+    assert!(!execute("fs.list", json!({"dir": "escape"})).success);
+    let search = execute("fs.search_rg", json!({"query": "outside marker"}));
+    assert_eq!(search.output["matches"], json!([]));
+    let read = execute("fs.read", json!({"path": "internal/ok.txt"}));
+    assert!(read.success, "{}", read.output);
+    assert!(read.output.to_string().contains("inside marker"));
+    let written = execute(
+        "fs.write",
+        json!({"path": "internal/deep/new.txt", "content": "ok"}),
+    );
+    assert!(written.success, "{}", written.output);
+    assert_eq!(
+        fs::read_to_string(workspace.join("inside/deep/new.txt")).unwrap(),
+        "ok"
+    );
+
+    let multi = execute(
+        "multi_edit",
+        json!({"files": [
+            {"path": "inside/ok.txt", "edits": [{"search": "inside marker", "replace": "changed"}]},
+            {"path": "escape/existing.txt", "edits": [{"search": "outside marker", "replace": "changed"}]}
+        ]}),
+    );
+    assert!(!multi.success);
+    assert_eq!(
+        fs::read_to_string(workspace.join("inside/ok.txt")).unwrap(),
+        "inside marker"
+    );
+    let patch = execute(
+        "patch.stage",
+        json!({"unified_diff":
+            "diff --git a/escape/new.txt b/escape/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/escape/new.txt\n@@ -0,0 +1 @@\n+outside\n"
+        }),
+    );
+    assert!(!patch.success);
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_file_tools_reject_dangling_and_blocked_aliases() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::create_dir(workspace.path().join(".ssh")).unwrap();
+    fs::write(workspace.path().join(".ssh/id_rsa"), "blocked").unwrap();
+    std::os::unix::fs::symlink(".ssh/id_rsa", workspace.path().join("alias")).unwrap();
+    std::os::unix::fs::symlink("missing", workspace.path().join("dangling")).unwrap();
+    let host = LocalToolHost::new(workspace.path(), PolicyEngine::default()).unwrap();
+    for (name, args) in [
+        ("fs.read", json!({"path": "alias"})),
+        (
+            "fs.write",
+            json!({"path": "dangling", "content": "invalid"}),
+        ),
+    ] {
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: name.to_owned(),
+                args,
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success, "{}", result.output);
+    }
+    assert!(!workspace.path().join("missing").exists());
 }

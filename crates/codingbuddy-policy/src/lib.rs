@@ -710,23 +710,24 @@ impl PolicyEngine {
             return Err(PolicyError::PathTraversal);
         }
 
-        // Canonicalize if path exists — resolves symlinks and verifies it stays
-        // under the workspace root (prevents symlink-based escapes).
-        if let Some(ref root) = self.workspace_root {
-            let resolved = if absolute_like {
-                std::fs::canonicalize(candidate).ok()
-            } else {
-                std::fs::canonicalize(root.join(candidate)).ok()
-            };
-            if let Some(canonical) = resolved
-                && !canonical.starts_with(root)
-            {
-                return Err(PolicyError::PathTraversal);
-            }
+        if let Some(root) = &self.workspace_root {
+            let workspace = codingbuddy_core::workspace_fs::WorkspaceFs::open(root)
+                .map_err(|_| PolicyError::PathTraversal)?;
+            let resolved = workspace
+                .resolve(candidate, true)
+                .map_err(|_| PolicyError::PathTraversal)?;
+            self.check_path_name(&resolved)?;
         }
+        self.check_path_name(candidate)
+    }
 
-        let lowered = path.to_ascii_lowercase();
-        if self.path_is_blocked(&lowered) {
+    /// Check a requested or resolved path name without performing filesystem I/O.
+    pub fn check_path_name(&self, path: &Path) -> Result<(), PolicyError> {
+        let normalized = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if self.path_is_blocked(&normalized) {
             return Err(PolicyError::SecretPath);
         }
         Ok(())

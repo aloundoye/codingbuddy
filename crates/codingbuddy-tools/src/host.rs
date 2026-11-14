@@ -1,5 +1,6 @@
 use super::utils::*;
 use super::*;
+use codingbuddy_core::workspace_fs::WorkspaceFs;
 
 /// Device and proc paths that could hang or produce infinite/dangerous output.
 const BLOCKED_DEVICE_PREFIXES: &[&str] = &[
@@ -19,6 +20,60 @@ fn is_blocked_device_path(path: &str) -> bool {
     BLOCKED_DEVICE_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
+}
+
+/// Validate the built-in batch envelope and resolve its child names.
+pub fn batch_children(args: &serde_json::Value) -> Result<Vec<(&str, &serde_json::Value)>> {
+    let calls = args
+        .get("tool_calls")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("tool_calls array missing"))?;
+    anyhow::ensure!(
+        (1..=25).contains(&calls.len()),
+        "batch requires 1 to 25 tool calls"
+    );
+    let read_only_tools = [
+        "fs.read",
+        "fs.list",
+        "fs.glob",
+        "fs.grep",
+        "fs.search_rg",
+        "git.status",
+        "git.diff",
+        "git.show",
+        "web.fetch",
+        "web.search",
+        "notebook.read",
+        "index.query",
+        "diagnostics.check",
+        "lsp.hover",
+        "lsp_hover",
+        "lsp.definition",
+        "lsp_definition",
+        "lsp.references",
+        "lsp_references",
+        "lsp.symbols",
+        "lsp_symbols",
+    ];
+    calls
+        .iter()
+        .map(|call| {
+            let tool = call
+                .get("tool")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow!("batch child tool is missing"))?;
+            let internal = ToolName::from_api_name(tool).map_or(tool, |name| name.as_internal());
+            anyhow::ensure!(
+                read_only_tools.contains(&internal),
+                "batch only allows individual read-only tools, got '{tool}'"
+            );
+            let args = call
+                .get("parameters")
+                .filter(|value| value.is_object())
+                .ok_or_else(|| anyhow!("batch child parameters must be an object"))?;
+            Ok((tool, args))
+        })
+        .collect()
 }
 
 fn is_review_blocked(tool_name: &str) -> bool {
@@ -49,6 +104,7 @@ pub type McpExecutor =
 
 pub struct LocalToolHost {
     workspace: PathBuf,
+    files: WorkspaceFs,
     policy: PolicyEngine,
     sandbox_mode: String,
     sandbox_wrapper: Option<String>,
@@ -79,6 +135,7 @@ impl LocalToolHost {
         policy: PolicyEngine,
         runner: Arc<dyn ShellRunner + Send + Sync>,
     ) -> Result<Self> {
+        let files = WorkspaceFs::open(workspace)?;
         let cfg = AppConfig::load(workspace).unwrap_or_default();
         let sandbox_mode = policy.sandbox_mode().to_ascii_lowercase();
         let sandbox_wrapper = cfg
@@ -94,7 +151,8 @@ impl LocalToolHost {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         Ok(Self {
-            workspace: workspace.to_path_buf(),
+            workspace: files.root().to_path_buf(),
+            files,
             patches: PatchStore::new(workspace)?,
             index: IndexService::new(workspace)?,
             store: Store::new(workspace)?,
@@ -139,6 +197,52 @@ impl LocalToolHost {
         self.review_mode
     }
 
+    fn resolve_path(&self, path: &Path, allow_missing: bool) -> Result<PathBuf> {
+        self.policy.check_path_name(&self.files.relative(path)?)?;
+        let resolved = self.files.resolve(path, allow_missing)?;
+        self.policy.check_path_name(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn resolved_path_requires_approval(&self, call: &ToolCall) -> bool {
+        if self.policy.permission_mode() == codingbuddy_policy::PermissionMode::BypassPermissions {
+            return false;
+        }
+        let (key, allow_missing) = match call.name.as_str() {
+            "fs.read" | "fs.edit" => ("path", false),
+            "fs.write" => ("path", true),
+            "fs.grep" | "fs.glob" => ("base", false),
+            _ => return false,
+        };
+        let Some(path) = call.args.get(key).and_then(|value| value.as_str()) else {
+            return false;
+        };
+        let Ok(resolved) = self.resolve_path(Path::new(path), allow_missing) else {
+            return true;
+        };
+        let mut target = call.clone();
+        target.args[key] = json!(normalize_rel_path(&resolved));
+        codingbuddy_policy::evaluate_permission_rules(self.policy.permission_rules(), &target)
+            .is_some_and(|decision| matches!(decision.as_str(), "ask" | "deny"))
+    }
+
+    fn check_resolved_rule(&self, call: &ToolCall, key: &str, resolved: &Path) -> Result<()> {
+        if self.policy.permission_mode() == codingbuddy_policy::PermissionMode::BypassPermissions {
+            return Ok(());
+        }
+        let mut target = call.clone();
+        if let Some(args) = target.args.as_object_mut() {
+            args.insert(key.to_owned(), json!(normalize_rel_path(resolved)));
+        }
+        let rules = self.policy.permission_rules();
+        let denied = [call, &target].into_iter().any(|candidate| {
+            codingbuddy_policy::evaluate_permission_rules(rules, candidate).as_deref()
+                == Some("deny")
+        });
+        anyhow::ensure!(!denied, "file target denied by policy");
+        Ok(())
+    }
+
     fn run_tool(&self, call: &ToolCall) -> Result<serde_json::Value> {
         // Enforce review mode: block all non-read tools
         if self.review_mode && is_review_blocked(&call.name) {
@@ -150,12 +254,13 @@ impl LocalToolHost {
         match call.name.as_str() {
             "fs.list" => {
                 let dir = call.args.get("dir").and_then(|v| v.as_str()).unwrap_or(".");
-                self.policy.check_path(dir)?;
-                let path = self.workspace.join(dir);
+                let path = self.resolve_path(Path::new(dir), false)?;
                 let mut out = Vec::new();
-                for entry in fs::read_dir(path)? {
+                for entry in self.files.read_dir(&path)? {
                     let e = entry?;
-                    out.push(e.file_name().to_string_lossy().to_string());
+                    if self.resolve_path(&path.join(e.file_name()), false).is_ok() {
+                        out.push(e.file_name().to_string_lossy().to_string());
+                    }
                 }
                 Ok(json!({"entries": out}))
             }
@@ -170,9 +275,8 @@ impl LocalToolHost {
                         "Cannot read device/proc file: {path}. These can hang or produce infinite output."
                     );
                 }
-                self.policy.check_path(path)?;
-                let full = self.workspace.join(path);
-                let bytes = fs::read(&full)?;
+                let full = self.resolve_path(Path::new(path), false)?;
+                let bytes = self.files.read(&full)?;
                 let sha = format!("{:x}", sha2::Sha256::digest(&bytes));
                 let mime = guess_mime(&full);
                 let max_bytes = call
@@ -214,7 +318,7 @@ impl LocalToolHost {
                     // PDF text extraction
                     if mime == "application/pdf" {
                         let pages_arg = call.args.get("pages").and_then(|v| v.as_str());
-                        match extract_pdf_text(&full, pages_arg) {
+                        match extract_pdf_text(&bytes, pages_arg) {
                             Ok(text) => {
                                 return Ok(json!({
                                     "path": path,
@@ -285,8 +389,9 @@ impl LocalToolHost {
                     .get("base")
                     .and_then(|v| v.as_str())
                     .unwrap_or(".");
-                self.policy.check_path(base)?;
-                let base_path = self.workspace.join(base);
+                let base_path = self
+                    .workspace
+                    .join(self.resolve_path(Path::new(base), false)?);
                 let mut matches = Vec::new();
                 let compiled = glob::Pattern::new(pattern)
                     .map_err(|err| anyhow!("invalid glob pattern '{pattern}': {err}"))?;
@@ -299,9 +404,9 @@ impl LocalToolHost {
                         continue;
                     }
                     let rel = normalize_rel_path(rel_path);
-                    if self.policy.check_path(&rel).is_err() {
+                    let Ok(resolved) = self.resolve_path(rel_path, false) else {
                         continue;
-                    }
+                    };
                     let rel_under_base = path
                         .strip_prefix(&base_path)
                         .map(normalize_rel_path)
@@ -309,7 +414,7 @@ impl LocalToolHost {
                     if compiled.matches(&rel) || compiled.matches(&rel_under_base) {
                         matches.push(json!({
                             "path": rel,
-                            "is_dir": path.is_dir()
+                            "is_dir": self.files.read_dir(&resolved).is_ok()
                         }));
                         if matches.len() >= limit {
                             break;
@@ -358,12 +463,10 @@ impl LocalToolHost {
                     .case_insensitive(!case_sensitive)
                     .build()?;
                 let mut matches = Vec::new();
-                self.policy.check_path(base)?;
-                let base_path = self.workspace.join(base);
+                let base_path = self
+                    .workspace
+                    .join(self.resolve_path(Path::new(base), false)?);
                 for path in walk_paths(&base_path, &self.workspace, respect_gitignore) {
-                    if !path.is_file() {
-                        continue;
-                    }
                     let rel_path = match path.strip_prefix(&self.workspace) {
                         Ok(rel) => rel,
                         Err(_) => continue,
@@ -372,9 +475,9 @@ impl LocalToolHost {
                         continue;
                     }
                     let rel = normalize_rel_path(rel_path);
-                    if self.policy.check_path(&rel).is_err() {
+                    let Ok(resolved) = self.resolve_path(rel_path, false) else {
                         continue;
-                    }
+                    };
                     let rel_under_base = path
                         .strip_prefix(&base_path)
                         .map(normalize_rel_path)
@@ -382,7 +485,7 @@ impl LocalToolHost {
                     if !compiled_glob.matches(&rel) && !compiled_glob.matches(&rel_under_base) {
                         continue;
                     }
-                    let bytes = match fs::read(&path) {
+                    let bytes = match self.files.read(&resolved) {
                         Ok(bytes) => bytes,
                         Err(_) => continue,
                     };
@@ -422,9 +525,8 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("path missing"))?;
-                self.policy.check_path(path)?;
-                let full = self.workspace.join(path);
-                let before = fs::read_to_string(&full)?;
+                let full = self.resolve_path(Path::new(path), false)?;
+                let before = self.files.read_to_string(&full)?;
                 let mut after = before.clone();
                 let mut replacements = 0usize;
                 let mut fuzzy_strategies: Vec<&str> = Vec::new();
@@ -455,7 +557,7 @@ impl LocalToolHost {
 
                 let diff = generate_unified_diff(path, &before, &after);
                 let checkpoint = self.create_checkpoint("fs_edit")?;
-                fs::write(&full, &after)?;
+                self.files.write(&full, after.as_bytes(), false)?;
                 let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                 let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
 
@@ -506,7 +608,7 @@ impl LocalToolHost {
                     maybe_run_auto_diagnostics(
                         self.runner.as_ref(),
                         &self.workspace,
-                        Some(path),
+                        full.to_str(),
                         &mut result,
                     );
                 }
@@ -525,15 +627,14 @@ impl LocalToolHost {
                     .unwrap_or(20) as usize;
                 let mut matches = Vec::new();
                 for path in walk_paths(&self.workspace, &self.workspace, true) {
-                    if !path.is_file() {
-                        continue;
-                    }
                     let rel_path = path.strip_prefix(&self.workspace)?;
                     if should_skip_rel_path(rel_path) {
                         continue;
                     }
                     let rel = rel_path.to_string_lossy().to_string();
-                    if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(resolved) = self.resolve_path(rel_path, false)
+                        && let Ok(content) = self.files.read_to_string(&resolved)
+                    {
                         for (idx, line) in content.lines().enumerate() {
                             if line.contains(q) {
                                 matches.push(json!({"path": rel, "line": idx + 1, "text": line}));
@@ -574,7 +675,11 @@ impl LocalToolHost {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10) as usize;
                 let scope = call.args.get("scope").and_then(|v| v.as_str());
-                Ok(serde_json::to_value(self.index.query(q, top_k, scope)?)?)
+                let mut response = self.index.query(q, top_k, scope)?;
+                response
+                    .results
+                    .retain(|result| self.resolve_path(Path::new(&result.path), false).is_ok());
+                Ok(serde_json::to_value(response)?)
             }
             "patch.stage" => {
                 let diff = call
@@ -589,7 +694,9 @@ impl LocalToolHost {
                     .unwrap_or("")
                     .as_bytes()
                     .to_vec();
-                let patch = self.patches.stage(diff, &base)?;
+                let patch = self
+                    .patches
+                    .stage_checked(diff, &base, |path| self.resolve_path(path, true).map(drop))?;
                 Ok(
                     json!({"patch_id": patch.patch_id.to_string(), "base_sha256": patch.base_sha256}),
                 )
@@ -601,7 +708,11 @@ impl LocalToolHost {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("patch_id missing"))?;
                 let patch_id = Uuid::parse_str(id)?;
-                let (applied, conflicts) = self.patches.apply(&self.workspace, patch_id)?;
+                let (applied, conflicts) =
+                    self.patches
+                        .apply_checked(&self.workspace, patch_id, |path| {
+                            self.resolve_path(path, true).map(drop)
+                        })?;
                 Ok(json!({"patch_id": id, "applied": applied, "conflicts": conflicts}))
             }
             "patch.direct" => {
@@ -612,8 +723,14 @@ impl LocalToolHost {
                     .get("unified_diff")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("unified_diff missing"))?;
-                let patch = self.patches.stage(diff, &[])?;
-                let (applied, conflicts) = self.patches.apply(&self.workspace, patch.patch_id)?;
+                let patch = self
+                    .patches
+                    .stage_checked(diff, &[], |path| self.resolve_path(path, true).map(drop))?;
+                let (applied, conflicts) =
+                    self.patches
+                        .apply_checked(&self.workspace, patch.patch_id, |path| {
+                            self.resolve_path(path, true).map(drop)
+                        })?;
                 let mut result = if applied {
                     json!({
                         "applied": true,
@@ -645,18 +762,14 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("path missing"))?;
-                self.policy.check_path(path)?;
+                let full = self.resolve_path(Path::new(path), true)?;
                 let content = call
                     .args
                     .get("content")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("content missing"))?;
-                let full = self.workspace.join(path);
-                if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 let checkpoint = self.create_checkpoint("fs_write")?;
-                fs::write(full, content)?;
+                self.files.write(&full, content.as_bytes(), true)?;
                 Ok(json!({
                     "written": true,
                     "checkpoint_id": checkpoint.map(|id| id.to_string())
@@ -822,9 +935,8 @@ impl LocalToolHost {
                 }
 
                 // Emit event
-                let seq = self.store.next_seq_no(uuid::Uuid::nil()).unwrap_or(1);
-                if let Err(e) = self.store.append_event(&codingbuddy_core::EventEnvelope {
-                    seq_no: seq,
+                if let Err(e) = self.store.append_event(&codingbuddy_store::NewEvent {
+                    event_id: uuid::Uuid::now_v7(),
                     at: chrono::Utc::now(),
                     session_id: uuid::Uuid::nil(),
                     kind: codingbuddy_core::EventKind::WebSearchExecuted {
@@ -853,9 +965,8 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("path missing"))?;
-                self.policy.check_path(path)?;
-                let full = self.workspace.join(path);
-                let content = fs::read_to_string(&full)?;
+                let full = self.resolve_path(Path::new(path), false)?;
+                let content = self.files.read_to_string(&full)?;
                 let nb: serde_json::Value = serde_json::from_str(&content)
                     .map_err(|e| anyhow!("invalid notebook JSON: {e}"))?;
                 let cells = nb
@@ -906,9 +1017,8 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("path missing"))?;
-                self.policy.check_path(path)?;
-                let full = self.workspace.join(path);
-                let content = fs::read_to_string(&full)?;
+                let full = self.resolve_path(Path::new(path), false)?;
+                let content = self.files.read_to_string(&full)?;
                 let mut nb: serde_json::Value = serde_json::from_str(&content)
                     .map_err(|e| anyhow!("invalid notebook JSON: {e}"))?;
                 let operation = call
@@ -990,7 +1100,7 @@ impl LocalToolHost {
                     _ => return Err(anyhow!("unknown notebook operation: {operation}")),
                 }
                 let updated = serde_json::to_string_pretty(&nb)?;
-                fs::write(&full, &updated)?;
+                self.files.write(&full, updated.as_bytes(), false)?;
                 Ok(json!({
                     "path": path,
                     "operation": operation,
@@ -1005,19 +1115,25 @@ impl LocalToolHost {
                     .get("files")
                     .and_then(|v| v.as_array())
                     .ok_or_else(|| anyhow!("files array missing"))?;
+                let targets = files
+                    .iter()
+                    .map(|entry| {
+                        let path = entry
+                            .get("path")
+                            .and_then(|value| value.as_str())
+                            .ok_or_else(|| anyhow!("path missing in file entry"))?;
+                        let resolved = self.resolve_path(Path::new(path), false)?;
+                        self.files.open_file(&resolved)?;
+                        Ok((path, resolved))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let checkpoint = self.create_checkpoint("multi_edit")?;
                 let mut results = Vec::new();
                 let mut total_replacements = 0usize;
                 let mut all_succeeded = true;
 
-                for file_entry in files {
-                    let path = file_entry
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow!("path missing in file entry"))?;
-                    self.policy.check_path(path)?;
-                    let full = self.workspace.join(path);
-                    let before = fs::read_to_string(&full)?;
+                for (file_entry, (path, full)) in files.iter().zip(targets) {
+                    let before = self.files.read_to_string(&full)?;
                     let mut after = before.clone();
                     let mut file_replacements = 0usize;
 
@@ -1044,7 +1160,7 @@ impl LocalToolHost {
                     }
 
                     let diff = generate_unified_diff(path, &before, &after);
-                    fs::write(&full, &after)?;
+                    self.files.write(&full, after.as_bytes(), false)?;
                     let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                     let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
                     total_replacements += file_replacements;
@@ -1108,11 +1224,28 @@ impl LocalToolHost {
                 Ok(result)
             }
             "diagnostics.check" => {
-                let target = call.args.get("path").and_then(|v| v.as_str());
+                let target = call
+                    .args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|path| self.resolve_path(Path::new(path), false))
+                    .transpose()?;
+                let target = target
+                    .as_deref()
+                    .map(|path| {
+                        path.to_str()
+                            .ok_or_else(|| anyhow!("diagnostic path is not UTF-8"))
+                    })
+                    .transpose()?;
                 let (cmd, source) = detect_diagnostics_command(&self.workspace, target)?;
-                let result = self
-                    .runner
-                    .run(&cmd, &self.workspace, Duration::from_secs(60))?;
+                let result = run_diagnostics(
+                    self.runner.as_ref(),
+                    &self.workspace,
+                    target,
+                    &cmd,
+                    source,
+                    60,
+                )?;
                 let diagnostics = parse_diagnostics(&result.stdout, &result.stderr, source);
                 Ok(json!({
                     "diagnostics": diagnostics,
@@ -1123,17 +1256,35 @@ impl LocalToolHost {
             }
             "lsp.hover" | "lsp_hover" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.hover(Path::new(path), line, col)?;
+                let result = self.lsp_manager.hover(
+                    &self
+                        .workspace
+                        .join(self.resolve_path(Path::new(path), false)?),
+                    line,
+                    col,
+                )?;
                 Ok(json!({ "hover": result }))
             }
             "lsp.definition" | "lsp_definition" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.definition(Path::new(path), line, col)?;
+                let result = self.lsp_manager.definition(
+                    &self
+                        .workspace
+                        .join(self.resolve_path(Path::new(path), false)?),
+                    line,
+                    col,
+                )?;
                 Ok(json!({ "definition": result }))
             }
             "lsp.references" | "lsp_references" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.references(Path::new(path), line, col)?;
+                let result = self.lsp_manager.references(
+                    &self
+                        .workspace
+                        .join(self.resolve_path(Path::new(path), false)?),
+                    line,
+                    col,
+                )?;
                 Ok(json!({ "references": result }))
             }
             "lsp.symbols" | "lsp_symbols" => {
@@ -1142,7 +1293,11 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing required parameter 'path'"))?;
-                let result = self.lsp_manager.symbols(Path::new(path))?;
+                let result = self.lsp_manager.symbols(
+                    &self
+                        .workspace
+                        .join(self.resolve_path(Path::new(path), false)?),
+                )?;
                 Ok(json!({ "symbols": result }))
             }
             "github.create_pr" | "github_create_pr" => {
@@ -1221,71 +1376,30 @@ impl LocalToolHost {
                 }
             }
             "batch" => {
-                let tool_calls = call
-                    .args
-                    .get("tool_calls")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| anyhow!("tool_calls array missing"))?;
-                if tool_calls.len() > 25 {
-                    return Err(anyhow!(
-                        "batch limited to 25 tool calls, got {}",
-                        tool_calls.len()
-                    ));
-                }
-
-                // Only allow read-only tools in batch (no writes, no nested batch)
-                let read_only_tools = [
-                    "fs.read",
-                    "fs.list",
-                    "fs.glob",
-                    "fs.grep",
-                    "fs.search_rg",
-                    "git.status",
-                    "git.diff",
-                    "git.show",
-                    "web.fetch",
-                    "web.search",
-                    "notebook.read",
-                    "index.query",
-                    "diagnostics.check",
-                    "lsp.hover",
-                    "lsp_hover",
-                    "lsp.definition",
-                    "lsp_definition",
-                    "lsp.references",
-                    "lsp_references",
-                    "lsp.symbols",
-                    "lsp_symbols",
-                ];
-                for tc in tool_calls {
-                    let tool_name = tc.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-                    if tool_name == "batch" {
-                        return Err(anyhow!("cannot nest batch inside batch"));
-                    }
-                    if !read_only_tools.contains(&tool_name) {
-                        return Err(anyhow!(
-                            "batch only allows read-only tools, got '{tool_name}'. \
-                             Use individual tool calls for write operations."
-                        ));
-                    }
-                }
-
-                // Execute each sub-call sequentially (reusing existing handlers)
-                let mut results = Vec::with_capacity(tool_calls.len());
-                let mut successes = 0usize;
-                for tc in tool_calls {
-                    let tool_name = tc.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let params = tc.get("parameters").cloned().unwrap_or(json!({}));
+                let children = batch_children(&call.args)?;
+                let mut results = Vec::with_capacity(children.len());
+                let mut successes = 0;
+                for (tool_name, params) in children {
+                    let internal = ToolName::from_api_name(tool_name)
+                        .map_or(tool_name, |name| name.as_internal());
                     let sub_call = ToolCall {
-                        name: tool_name.to_string(),
-                        args: params,
+                        name: internal.to_owned(),
+                        args: params.clone(),
                         requires_approval: false,
                     };
-                    let approved = ApprovedToolCall {
-                        invocation_id: Uuid::now_v7(),
-                        call: sub_call,
+                    let proposal = self.propose(sub_call);
+                    let sub_result = if proposal.approved {
+                        self.execute(ApprovedToolCall {
+                            invocation_id: proposal.invocation_id,
+                            call: proposal.call,
+                        })
+                    } else {
+                        ToolResult {
+                            invocation_id: proposal.invocation_id,
+                            success: false,
+                            output: json!({"error": "batch child requires independent approval"}),
+                        }
                     };
-                    let sub_result = self.execute(approved);
                     if sub_result.success {
                         successes += 1;
                     }
@@ -1472,10 +1586,68 @@ impl LocalToolHost {
 }
 
 impl ToolHost for LocalToolHost {
+    fn validate(&self, call: &ToolCall) -> Result<()> {
+        let (key, default, allow_missing) = match call.name.as_str() {
+            "fs.read" | "fs.edit" | "notebook.read" | "notebook.edit" | "lsp.hover"
+            | "lsp.definition" | "lsp.references" | "lsp.symbols" => ("path", None, false),
+            "fs.write" => ("path", None, true),
+            "fs.list" => ("dir", Some("."), false),
+            "fs.glob" | "fs.grep" => ("base", Some("."), false),
+            "diagnostics.check" if call.args.get("path").is_some() => ("path", None, false),
+            "multi_edit" => {
+                let files = call
+                    .args
+                    .get("files")
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| anyhow!("files array missing"))?;
+                for entry in files {
+                    let path = entry
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| anyhow!("path missing in file entry"))?;
+                    let resolved = self.resolve_path(Path::new(path), false)?;
+                    let file = ToolCall {
+                        name: "fs.edit".to_owned(),
+                        args: json!({"path": path}),
+                        requires_approval: true,
+                    };
+                    self.check_resolved_rule(&file, "path", &resolved)?;
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let path = call
+            .args
+            .get(key)
+            .and_then(|value| value.as_str())
+            .or(default)
+            .ok_or_else(|| anyhow!("{key} missing"))?;
+        let resolved = self.resolve_path(Path::new(path), allow_missing)?;
+        self.check_resolved_rule(call, key, &resolved)
+    }
+
+    fn cache_key(&self, call: &ToolCall) -> serde_json::Value {
+        let (field, default) = match call.name.as_str() {
+            "fs.read" => ("path", ""),
+            "fs.list" => ("dir", "."),
+            "fs.glob" | "fs.grep" => ("base", "."),
+            _ => return call.args.clone(),
+        };
+        let path = call
+            .args
+            .get(field)
+            .and_then(|value| value.as_str())
+            .unwrap_or(default);
+        let resolved = self.resolve_path(Path::new(path), false).ok();
+        json!({"arguments": call.args, "resolved": resolved})
+    }
+
     fn propose(&self, call: ToolCall) -> ToolProposal {
         ToolProposal {
             invocation_id: Uuid::now_v7(),
-            approved: !self.policy.requires_approval(&call),
+            approved: !self.policy.requires_approval(&call)
+                && !self.resolved_path_requires_approval(&call),
             call,
         }
     }
@@ -1483,7 +1655,7 @@ impl ToolHost for LocalToolHost {
     fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
         let call = approved.call;
         self.execute_hooks("pretooluse", Some(&call), None);
-        let (success, output) = match self.run_tool(&call) {
+        let (success, output) = match self.validate(&call).and_then(|()| self.run_tool(&call)) {
             Ok(output) => (true, output),
             Err(err) => {
                 let message = err.to_string();
@@ -1568,11 +1740,8 @@ impl LocalToolHost {
         let Ok(Some(session)) = self.store.load_latest_session() else {
             return;
         };
-        let Ok(seq_no) = self.store.next_seq_no(session.session_id) else {
-            return;
-        };
-        let event = EventEnvelope {
-            seq_no,
+        let event = codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::HookExecuted {
@@ -1592,11 +1761,8 @@ impl LocalToolHost {
         let Ok(Some(session)) = self.store.load_latest_session() else {
             return;
         };
-        let Ok(seq_no) = self.store.next_seq_no(session.session_id) else {
-            return;
-        };
-        let event = EventEnvelope {
-            seq_no,
+        let event = codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::VisualArtifactCaptured {
@@ -1616,8 +1782,8 @@ impl LocalToolHost {
         let Ok(Some(session)) = self.store.load_latest_session() else {
             return Ok(Some(checkpoint.checkpoint_id));
         };
-        let event = EventEnvelope {
-            seq_no: self.store.next_seq_no(session.session_id)?,
+        let event = codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::CheckpointCreated {

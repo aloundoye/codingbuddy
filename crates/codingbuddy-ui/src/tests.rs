@@ -1208,6 +1208,30 @@ fn extract_fence_lang_extracts_language() {
 }
 
 #[test]
+fn header_shows_logo_and_version_in_regular_and_short_terminals() {
+    use ratatui::backend::TestBackend;
+
+    for (height, header_height) in [(20, 4), (8, 1)] {
+        let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
+        let frame = terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let body = render_header(frame, area, "/workspace");
+                assert_eq!(
+                    body,
+                    Rect::new(0, header_height, 60, height - header_height)
+                );
+            })
+            .unwrap();
+        let row = (0..60)
+            .map(|x| frame.buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(row.contains('▄'));
+        assert!(row.contains(concat!("CodingBuddy v", env!("CARGO_PKG_VERSION"))));
+    }
+}
+
+#[test]
 fn wrapped_line_height_tracks_soft_wrapping() {
     let line = Line::from("abcdefghijklmnopqrstuvwxyz");
     assert_eq!(wrapped_line_height(&line, 10), 3);
