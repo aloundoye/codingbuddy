@@ -55,15 +55,13 @@ impl IndexService {
 
     pub fn build(&self, session: &Session) -> Result<Manifest> {
         let mut files = BTreeMap::new();
+        let workspace = codingbuddy_core::workspace_fs::WorkspaceFs::open(&self.workspace)?;
         for path in workspace_file_paths(&self.workspace, true) {
-            if !path.is_file() {
-                continue;
-            }
             let rel = path
                 .strip_prefix(&self.workspace)?
                 .to_string_lossy()
                 .to_string();
-            let bytes = fs::read(path)?;
+            let bytes = workspace.read(Path::new(&rel))?;
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
             files.insert(rel, format!("{:x}", hasher.finalize()));
@@ -221,9 +219,9 @@ impl IndexService {
         let index = Index::create_in_dir(&tantivy_dir, schema)?;
         let mut writer = index.writer(50_000_000)?;
 
+        let workspace = codingbuddy_core::workspace_fs::WorkspaceFs::open(&self.workspace)?;
         for rel in manifest.files.keys() {
-            let full = self.workspace.join(rel);
-            let content = match fs::read_to_string(&full) {
+            let content = match workspace.read_to_string(Path::new(rel)) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -295,10 +293,8 @@ impl IndexService {
         scope: Option<&str>,
     ) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
+        let workspace = codingbuddy_core::workspace_fs::WorkspaceFs::open(&self.workspace)?;
         for path in workspace_file_paths(&self.workspace, true) {
-            if !path.is_file() {
-                continue;
-            }
             let rel_path = path.strip_prefix(&self.workspace)?;
             if has_ignored_component(rel_path) {
                 continue;
@@ -309,7 +305,7 @@ impl IndexService {
             {
                 continue;
             }
-            if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(content) = workspace.read_to_string(rel_path) {
                 for (idx, line) in content.lines().enumerate() {
                     if line.contains(q) {
                         results.push(QueryResult {

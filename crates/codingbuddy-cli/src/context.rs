@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
-    AppConfig, EventEnvelope, EventKind, Session, SessionBudgets, SessionState, runtime_dir,
+    AppConfig, EventEnvelope, EventKind, Session, SessionBudgets, SessionState,
 };
 use codingbuddy_store::Store;
 use serde_json::json;
@@ -258,20 +258,7 @@ pub(crate) fn selected_config(cwd: &Path, model: Option<&str>) -> Result<AppConf
 }
 
 pub(crate) fn read_session_events(cwd: &Path, session_id: Uuid) -> Result<Vec<EventEnvelope>> {
-    let path = runtime_dir(cwd).join("events.jsonl");
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let Ok(event) = codingbuddy_core::parse_event_envelope_compat(line) else {
-            continue;
-        };
-        if event.session_id == session_id {
-            out.push(event);
-        }
-    }
-    Ok(out)
+    Store::new(cwd)?.session_events(session_id)
 }
 
 pub(crate) fn append_control_event(cwd: &Path, kind: EventKind) -> Result<()> {
@@ -286,8 +273,8 @@ pub(crate) fn append_control_event_for_session(
     kind: EventKind,
 ) -> Result<()> {
     let store = Store::new(cwd)?;
-    let event = EventEnvelope {
-        seq_no: store.next_seq_no(session_id)?,
+    let event = codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: chrono::Utc::now(),
         session_id,
         kind,

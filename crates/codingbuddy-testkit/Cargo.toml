@@ -16,4 +16,5 @@ codingbuddy-agent = { path = "../codingbuddy-agent" }
 codingbuddy-llm = { path = "../codingbuddy-llm" }
 
 [dev-dependencies]
+codingbuddy-store = { path = "../codingbuddy-store" }
 reqwest = { workspace = true }

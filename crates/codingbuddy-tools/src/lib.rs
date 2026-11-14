@@ -20,8 +20,8 @@ use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use codingbuddy_core::{
-    AppConfig, ApprovedToolCall, EventEnvelope, EventKind, FunctionDefinition, ToolCall,
-    ToolDefinition, ToolHost, ToolProposal, ToolResult,
+    AppConfig, ApprovedToolCall, EventKind, FunctionDefinition, ToolCall, ToolDefinition, ToolHost,
+    ToolName, ToolProposal, ToolResult,
 };
 use codingbuddy_diff::PatchStore;
 use codingbuddy_hooks::{HookContext, HookRuntime};
@@ -46,6 +46,7 @@ use sha2::Digest;
 pub use shell::{
     PlatformShellRunner, ProgressCallback, PtyShellRunner, ShellRunResult, ShellRunner,
 };
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,7 +75,7 @@ pub use catalog::{
     AGENT_LEVEL_TOOLS, PLAN_MODE_TOOLS, filter_tool_definitions, map_tool_name, tool_definitions,
     tool_error_hint, validate_tool_args_schema,
 };
-pub use host::{LocalToolHost, McpExecutor};
+pub use host::{LocalToolHost, McpExecutor, batch_children};
 #[cfg(test)]
 pub(crate) use utils::{detect_diagnostics_command, parse_cargo_check_json, parse_tsc_output};
 

@@ -13,6 +13,7 @@ mod model_catalog;
 pub mod profiler;
 pub mod prompts;
 mod tool_metadata;
+pub mod workspace_fs;
 pub use llm_capabilities::{
     CapabilityOverride, CapabilityRegistryOverrides, CapabilityResolution, ModelCapabilities,
     ModelFamily, PreferredEditTool, ProviderKind, ThinkingCapability, detect_model_family,
@@ -1437,6 +1438,16 @@ impl EventKind {
 }
 
 pub trait ToolHost {
+    /// Validate execution preconditions before cached or live results can be returned.
+    fn validate(&self, _call: &ToolCall) -> Result<()> {
+        Ok(())
+    }
+
+    /// Include host-specific execution context in a read cache key.
+    fn cache_key(&self, call: &ToolCall) -> serde_json::Value {
+        call.args.clone()
+    }
+
     fn propose(&self, call: ToolCall) -> ToolProposal;
     fn execute(&self, approved: ApprovedToolCall) -> ToolResult;
 }

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use codingbuddy_agent::AgentEngine;
-use codingbuddy_core::{AppConfig, EventEnvelope, EventKind, runtime_dir};
+use codingbuddy_core::{AppConfig, EventKind, runtime_dir};
 use codingbuddy_store::{AutopilotRunRecord, BackgroundJobRecord, Store};
 use serde_json::json;
 use std::fs;
@@ -135,8 +135,8 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         started_at: started_at.clone(),
         updated_at: started_at.clone(),
     })?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::AutopilotRunStarted {
@@ -144,8 +144,8 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
             prompt: args.prompt.clone(),
         },
     })?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::BackgroundJobStarted {
@@ -197,8 +197,8 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         }),
     )?;
 
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::AutopilotRunHeartbeat {
@@ -279,8 +279,8 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
                     "pause_file": pause_file,
                 }),
             )?;
-            store.append_event(&EventEnvelope {
-                seq_no: store.next_seq_no(session.session_id)?,
+            store.append_event(&codingbuddy_store::NewEvent {
+                event_id: uuid::Uuid::now_v7(),
                 at: Utc::now(),
                 session_id: session.session_id,
                 kind: EventKind::AutopilotRunHeartbeat {
@@ -408,8 +408,8 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
             started_at: started_at.clone(),
             updated_at: Utc::now().to_rfc3339(),
         })?;
-        store.append_event(&EventEnvelope {
-            seq_no: store.next_seq_no(session.session_id)?,
+        store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::AutopilotRunHeartbeat {
@@ -478,8 +478,8 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         started_at: started_at.clone(),
         updated_at: Utc::now().to_rfc3339(),
     })?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::AutopilotRunStopped {
@@ -489,8 +489,8 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
             failed_iterations,
         },
     })?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::BackgroundJobStopped {

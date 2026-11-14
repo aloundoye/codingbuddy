@@ -82,6 +82,63 @@ impl ShellRunner for PlatformShellRunner {
     }
 }
 
+pub(crate) fn run_program(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<ShellRunResult> {
+    let child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_output(child, timeout)
+}
+
+fn wait_for_output(mut child: Child, timeout: Duration) -> Result<ShellRunResult> {
+    use std::io::Read;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing child stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("missing child stderr"))?;
+    std::thread::scope(|scope| {
+        let stdout = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes)?;
+            Ok::<_, std::io::Error>(bytes)
+        });
+        let stderr = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes)?;
+            Ok::<_, std::io::Error>(bytes)
+        });
+        let status = child.wait_timeout(timeout)?;
+        let timed_out = status.is_none();
+        let status = match status {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                child.wait()?
+            }
+        };
+        Ok(ShellRunResult {
+            status: status.code(),
+            stdout: String::from_utf8_lossy(&stdout.join().expect("stdout reader panicked")?)
+                .into_owned(),
+            stderr: String::from_utf8_lossy(&stderr.join().expect("stderr reader panicked")?)
+                .into_owned(),
+            timed_out,
+        })
+    })
+}
+
 /// PTY-aware shell runner. Programs see a real terminal (isatty() = true)
 /// so they emit colored output. Falls back to pipe-based execution on failure.
 #[derive(Debug, Default)]

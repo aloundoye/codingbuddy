@@ -1344,12 +1344,17 @@ mod tests {
         );
         assert!(r.is_ok(), "chat failed: {:?}", r.err());
         assert!(r.unwrap_or_default().contains("Mock response"));
-        // The non-edit analysis path no longer requires event journaling.
-        let events_path = dir.path().join(".codingbuddy/events.jsonl");
-        if events_path.exists() {
-            let contents = fs::read_to_string(&events_path).expect("read events");
-            assert!(!contents.trim().is_empty());
-        }
+        let store = codingbuddy_store::Store::new(dir.path()).expect("store");
+        let session = store
+            .load_latest_session()
+            .expect("session lookup")
+            .expect("session");
+        let events = store.session_events(session.session_id).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, codingbuddy_core::EventKind::ChatTurn { .. }))
+        );
     }
 
     #[test]

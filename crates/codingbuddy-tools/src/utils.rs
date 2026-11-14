@@ -97,9 +97,9 @@ pub(crate) fn collect_lines(
         .collect()
 }
 
-pub(crate) fn extract_pdf_text(path: &Path, pages: Option<&str>) -> Result<String> {
-    let full_text =
-        pdf_extract::extract_text(path).map_err(|e| anyhow!("PDF extraction failed: {e}"))?;
+pub(crate) fn extract_pdf_text(bytes: &[u8], pages: Option<&str>) -> Result<String> {
+    let full_text = pdf_extract::extract_text_from_mem(bytes)
+        .map_err(|e| anyhow!("PDF extraction failed: {e}"))?;
     match pages {
         None => Ok(full_text),
         Some(range) => {
@@ -472,7 +472,7 @@ pub(crate) fn maybe_run_auto_diagnostics(
     let Ok((cmd, source)) = detect_diagnostics_command(workspace, target) else {
         return;
     };
-    let Ok(diag_result) = runner.run(&cmd, workspace, Duration::from_secs(30)) else {
+    let Ok(diag_result) = run_diagnostics(runner, workspace, target, &cmd, source, 30) else {
         return;
     };
     let diagnostics = parse_diagnostics(&diag_result.stdout, &diag_result.stderr, source);
@@ -511,13 +511,39 @@ pub(crate) fn detect_diagnostics_command(
         return Ok(("npx tsc --noEmit --pretty false 2>&1".to_string(), "tsc"));
     }
     if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
-        let cmd = match target {
-            Some(path) => format!("ruff check {path} --output-format json 2>&1"),
-            None => "ruff check . --output-format json 2>&1".to_string(),
-        };
+        let cmd = format!(
+            "ruff check --output-format json -- {}",
+            target.unwrap_or(".")
+        );
         return Ok((cmd, "ruff"));
     }
     Err(anyhow!("no supported language project detected"))
+}
+
+pub(crate) fn run_diagnostics(
+    runner: &dyn ShellRunner,
+    workspace: &Path,
+    target: Option<&str>,
+    command: &str,
+    source: &str,
+    timeout: u64,
+) -> Result<ShellRunResult> {
+    let timeout = Duration::from_secs(timeout);
+    if source == "ruff" {
+        return crate::shell::run_program(
+            "ruff",
+            &[
+                "check".as_ref(),
+                "--output-format".as_ref(),
+                "json".as_ref(),
+                "--".as_ref(),
+                target.unwrap_or(".").as_ref(),
+            ],
+            workspace,
+            timeout,
+        );
+    }
+    runner.run(command, workspace, timeout)
 }
 
 pub(crate) fn parse_diagnostics(

@@ -1,6 +1,6 @@
 use super::*;
 use chrono::Utc;
-use codingbuddy_core::{EventEnvelope, Plan, PlanStep, Session, SessionBudgets, SessionState};
+use codingbuddy_core::{Plan, PlanStep, Session, SessionBudgets, SessionState};
 use codingbuddy_store::{
     BackgroundJobRecord, SessionTodoRecord, SubagentRunRecord, TaskQueueRecord,
 };
@@ -270,8 +270,8 @@ fn poll_session_lifecycle_notices_reports_background_task_completion() -> Result
         started_at: now.clone(),
         updated_at: now.clone(),
     })?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::TaskUpdated {
@@ -317,8 +317,8 @@ fn poll_session_lifecycle_notices_reports_background_job_stop() -> Result<()> {
         started_at: now.clone(),
         updated_at: now.clone(),
     })?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::BackgroundJobStopped {
@@ -381,14 +381,14 @@ fn poll_session_lifecycle_notices_reports_plan_review_summary() -> Result<()> {
         risk_notes: vec![],
     };
     store.save_plan(session.session_id, &plan)?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::PlanRevised { plan: plan.clone() },
     })?;
-    store.append_event(&EventEnvelope {
-        seq_no: store.next_seq_no(session.session_id)?,
+    store.append_event(&codingbuddy_store::NewEvent {
+        event_id: uuid::Uuid::now_v7(),
         at: Utc::now(),
         session_id: session.session_id,
         kind: EventKind::ExitPlanMode {

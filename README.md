@@ -159,7 +159,7 @@ Enable with: `cargo build --release --bin codingbuddy --features local-ml`
 | `codingbuddy-hooks` | 14 lifecycle events, hook runtime, permission decisions |
 | `codingbuddy-lsp` | Post-edit validation with timeout, command caching, per-language config |
 | `codingbuddy-local-ml` | Local ML: embeddings, completion, chunking, vector index, privacy router |
-| `codingbuddy-store` | Session persistence (JSONL + SQLite), persistent approvals |
+| `codingbuddy-store` | SQLite session persistence, legacy JSONL import, persistent approvals |
 | `codingbuddy-memory` | Long-term memory, shadow commits, checkpoints, auto-extraction |
 | `codingbuddy-index` | Full-text code index (Tantivy), RAG retrieval |
 | `codingbuddy-mcp` | MCP server management (JSON-RPC stdio/http/SSE) |
@@ -306,3 +306,12 @@ CODINGBUDDY_STARTUP_TRACE=1 codingbuddy chat
 ## License
 
 MIT
+
+
+### Upgrading session storage
+
+Stop older CodingBuddy processes before opening a workspace with the upgraded binary.
+Session events and their projections now commit together in SQLite. Existing SQLite
+history takes precedence during the upgrade. A workspace with only a legacy
+`.codingbuddy/events.jsonl` journal imports it once, and the original file remains
+available as an archive. Use `codingbuddy export` for portable transcripts.

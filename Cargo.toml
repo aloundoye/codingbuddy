@@ -31,6 +31,8 @@ authors = ["Alassane NDOYE"]
 
 [workspace.dependencies]
 anyhow = "1"
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
@@ -80,6 +82,10 @@ jsonschema = "0.27"
 shell-words = "1.1"
 strsim = "0.11"
 tiny_http = "0.12"
+
+# gemm-f16 0.19 requires inlining its FP16 assembly helpers on AArch64.
+[profile.dev.package.gemm-f16]
+opt-level = 1
 
 [profile.release]
 lto = "thin"

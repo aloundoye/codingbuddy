@@ -183,8 +183,11 @@ pub fn extract_modified_paths(api_name: &str, args_json: &str) -> Vec<std::path:
             }
         }
         "multi_edit" => {
-            // multi_edit has an array of edits, each with a "path"
-            if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+            if let Some(edits) = args
+                .get("files")
+                .or_else(|| args.get("edits"))
+                .and_then(|v| v.as_array())
+            {
                 for edit in edits {
                     if let Some(p) = edit.get("path").and_then(|v| v.as_str()) {
                         paths.push(std::path::PathBuf::from(p));

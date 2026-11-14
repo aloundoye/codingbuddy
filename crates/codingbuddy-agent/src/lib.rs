@@ -24,9 +24,9 @@ pub fn has_local_ml_feature() -> bool {
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use codingbuddy_core::{
-    AppConfig, ChatMessage, ChatRequest, DynamicToolTrust, EventEnvelope, EventKind,
-    RuntimeToolMetadata, Session, SessionBudgets, SessionState, StreamChunk, TaskPhase, ToolCall,
-    ToolChoice, ToolPermissionMatcher, ToolResultSizePolicy, UserQuestionHandler,
+    AppConfig, ChatMessage, ChatRequest, DynamicToolTrust, EventKind, RuntimeToolMetadata, Session,
+    SessionBudgets, SessionState, StreamChunk, TaskPhase, ToolCall, ToolChoice,
+    ToolPermissionMatcher, ToolResultSizePolicy, UserQuestionHandler,
 };
 use codingbuddy_hooks::{HookRuntime, HooksConfig};
 use codingbuddy_llm::{ApiClient, LlmClient};
@@ -1031,22 +1031,14 @@ impl AgentEngine {
         }
 
         loop_.set_event_callback(Arc::new({
-            let workspace = self.workspace.clone();
+            let store = self.store.clone();
             let session_id = session.session_id;
             move |kind| {
-                let Ok(store) = Store::new(&workspace) else {
-                    return;
-                };
-                let Ok(seq_no) = store.next_seq_no(session_id) else {
-                    return;
-                };
-                let event = EventEnvelope {
-                    seq_no,
-                    at: Utc::now(),
-                    session_id,
-                    kind,
-                };
-                let _ = store.append_event(&event);
+                if let Err(error) =
+                    store.append_event(&codingbuddy_store::NewEvent::new(session_id, kind))
+                {
+                    eprintln!("[agent] failed to persist tool event: {error}");
+                }
             }
         }));
 
@@ -1221,8 +1213,8 @@ impl AgentEngine {
             }
         }
         options.chat_history = projection.chat_messages;
-        self.store.append_event(&EventEnvelope {
-            seq_no: self.store.next_seq_no(session.session_id)?,
+        self.store.append_event(&codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::ProviderSelected {
@@ -1232,14 +1224,16 @@ impl AgentEngine {
             },
         })?;
 
-        self.append_event_best_effort_for_session(
-            Some(session.session_id),
-            EventKind::ChatTurn {
-                message: ChatMessage::User {
-                    content: prompt_enriched.clone(),
+        self.store
+            .append_event(&codingbuddy_store::NewEvent::new(
+                session.session_id,
+                EventKind::ChatTurn {
+                    message: ChatMessage::User {
+                        content: prompt_enriched.clone(),
+                    },
                 },
-            },
-        );
+            ))
+            .context("persist user turn")?;
 
         let result = if !options.tools {
             self.analyze_with_options(&prompt_enriched, options)
@@ -1251,19 +1245,21 @@ impl AgentEngine {
             self.run_tool_use_loop(&prompt_enriched, &options)
         };
 
-        if let Ok(text) = &result {
-            // Record Assistant Turn
-            self.append_event_best_effort_for_session(
-                Some(session.session_id),
-                EventKind::ChatTurn {
-                    message: ChatMessage::Assistant {
-                        content: Some(text.clone()),
-                        reasoning_content: None,
-                        tool_calls: vec![],
+        let result = result.and_then(|text| {
+            self.store
+                .append_event(&codingbuddy_store::NewEvent::new(
+                    session.session_id,
+                    EventKind::ChatTurn {
+                        message: ChatMessage::Assistant {
+                            content: Some(text.clone()),
+                            reasoning_content: None,
+                            tool_calls: vec![],
+                        },
                     },
-                },
-            );
-        }
+                ))
+                .context("persist assistant turn")?;
+            Ok(text)
+        });
 
         // Fire SessionEnd hook
         let ws = self.workspace.display().to_string();
@@ -1294,11 +1290,8 @@ impl AgentEngine {
         let Ok(session) = self.ensure_session_record_for(session_id) else {
             return;
         };
-        let Ok(seq_no) = self.store.next_seq_no(session.session_id) else {
-            return;
-        };
-        let event = EventEnvelope {
-            seq_no,
+        let event = codingbuddy_store::NewEvent {
+            event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
             session_id: session.session_id,
             kind,

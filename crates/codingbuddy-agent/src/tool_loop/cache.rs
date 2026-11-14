@@ -2,7 +2,7 @@
 //!
 //! Caches results of `fs_read`, `fs_grep`, `fs_glob`, `fs_list` to avoid
 //! redundant file I/O. Entries expire after a TTL and are invalidated when
-//! write tools modify cached paths.
+//! write tools may have changed the workspace.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -24,11 +24,9 @@ pub(crate) const CACHEABLE_TOOLS: &[&str] =
 pub(crate) struct CacheEntry {
     pub result: serde_json::Value,
     pub timestamp: Instant,
-    /// The raw `"tool_name:args"` string used for path-based invalidation.
-    pub raw_key: String,
 }
 
-/// Tool result cache with TTL, path invalidation, and size limits.
+/// Tool result cache with TTL and size limits.
 pub(crate) struct ToolCache {
     entries: HashMap<String, CacheEntry>,
 }
@@ -40,17 +38,8 @@ impl ToolCache {
         }
     }
 
-    /// Build the cache key and raw string from a tool call.
-    pub fn key_with_raw(tool_name: &str, args: &serde_json::Value) -> (String, String) {
-        use sha2::{Digest, Sha256};
-        let raw = format!("{}:{}", tool_name, args);
-        let hash = Sha256::digest(raw.as_bytes());
-        let bytes: [u8; 8] = hash[..8].try_into().expect("SHA-256 always >= 8 bytes");
-        (format!("{:016x}", u64::from_be_bytes(bytes)), raw)
-    }
-
     pub fn key(tool_name: &str, args: &serde_json::Value) -> String {
-        Self::key_with_raw(tool_name, args).0
+        format!("{tool_name}:{args}")
     }
 
     /// Check for a cached result. Returns `None` if expired or not found.
@@ -82,13 +71,12 @@ impl ToolCache {
         if !CACHEABLE_TOOLS.contains(&tool_name) {
             return;
         }
-        let (key, raw) = Self::key_with_raw(tool_name, args);
+        let key = Self::key(tool_name, args);
         self.entries.insert(
             key,
             CacheEntry {
                 result: result.clone(),
                 timestamp: Instant::now(),
-                raw_key: raw,
             },
         );
         if self.entries.len() > MAX_CACHE_ENTRIES
@@ -102,30 +90,9 @@ impl ToolCache {
         }
     }
 
-    /// Invalidate entries when a write tool modifies a path.
-    pub fn invalidate_path(&mut self, path: &str) {
-        let quoted = format!("\"{path}\"");
-        let parent_quoted = path
-            .rsplit_once('/')
-            .map(|(parent, _)| format!("\"{parent}\""));
-
-        self.entries.retain(|_key, entry| {
-            if entry.raw_key.starts_with("fs_glob:")
-                || entry.raw_key.starts_with("fs_list:")
-                || entry.raw_key.starts_with("index_query:")
-            {
-                return false;
-            }
-            if entry.raw_key.contains(&quoted) {
-                return false;
-            }
-            if let Some(ref pq) = parent_quoted
-                && entry.raw_key.contains(pq.as_str())
-            {
-                return false;
-            }
-            true
-        });
+    /// Invalidate reads after a tool may have modified the workspace.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 
     /// Number of cached entries.

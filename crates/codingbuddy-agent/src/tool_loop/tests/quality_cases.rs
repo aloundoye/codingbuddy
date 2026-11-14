@@ -234,52 +234,249 @@ fn hook_denial_blocks_tool_execution() {
             disabled: false,
         }],
     );
-    let hooks_config = HooksConfig { events };
-    let hooks = HookRuntime::new(dir.path(), hooks_config);
+    let read = |id: &str| LlmToolCall {
+        id: id.to_owned(),
+        name: "fs_read".to_owned(),
+        arguments: serde_json::json!({"path": "test.txt"}).to_string(),
+    };
+    let batch = LlmToolCall {
+        id: "batch-id".to_owned(),
+        name: "batch".to_owned(),
+        arguments: serde_json::json!({"tool_calls": [
+            {"tool": "fs.read", "parameters": {"path": "test.txt"}},
+        ]})
+        .to_string(),
+    };
+    let cases = [
+        (vec![read("single")], vec!["single"], false),
+        (
+            vec![read("first"), read("second")],
+            vec!["first", "second"],
+            false,
+        ),
+        (vec![batch], vec!["batch-id"], false),
+        (vec![read("cached")], vec!["cached"], true),
+    ];
+    for (calls, expected_ids, cached) in cases {
+        let llm = ScriptedLlm::new(vec![
+            make_tool_response(calls),
+            make_text_response("OK, I won't use that tool."),
+        ]);
+        let host = Arc::new(MockToolHost::new(vec![], true));
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            host.clone(),
+            ToolLoopConfig::default(),
+            "You are helpful.".to_owned(),
+            default_tools(),
+        );
+        let mut events = events.clone();
+        if expected_ids == ["batch-id"] {
+            events.get_mut(HookEvent::PreToolUse.as_str()).unwrap()[0].matcher =
+                Some("fs_read".to_owned());
+        }
+        loop_.set_hooks(HookRuntime::new(dir.path(), HooksConfig { events }));
+        if cached {
+            loop_.tool_cache.store(
+                "fs_read",
+                &serde_json::json!({"path": "test.txt"}),
+                &serde_json::json!("cached data"),
+            );
+        }
+        let result = loop_.run("Read test.txt").unwrap();
+        assert_eq!(host.executed_count(), 0);
+        assert_eq!(result.response, "OK, I won't use that tool.");
+        let messages: Vec<_> = loop_
+            .messages
+            .iter()
+            .filter_map(|msg| match msg {
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                    ..
+                } => Some((tool_call_id.as_str(), content)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|(_, content)| content.contains("blocked by pre-tool-use hook"))
+        );
+    }
+}
 
+#[cfg(unix)]
+#[test]
+fn blocking_permission_hook_stops_approval_and_execution() {
+    use codingbuddy_hooks::{HookDefinition, HookHandler, HookRuntime, HooksConfig};
+
+    let workspace = tempfile::tempdir().unwrap();
     let llm = ScriptedLlm::new(vec![
-        // LLM tries to call fs_read
         make_tool_response(vec![LlmToolCall {
-            id: "c1".to_string(),
-            name: "fs_read".to_string(),
-            arguments: serde_json::json!({"path": "test.txt"}).to_string(),
+            id: "read".to_owned(),
+            name: "fs_read".to_owned(),
+            arguments: r#"{"path":"test.txt"}"#.to_owned(),
         }]),
-        // After denial, LLM responds with text
-        make_text_response("OK, I won't use that tool."),
+        make_text_response("The read was denied."),
     ]);
-    let tool_host = Arc::new(MockToolHost::new(vec![], true));
-    let config = ToolLoopConfig::default();
+    let host = Arc::new(MockToolHost::new(vec![], false));
     let mut loop_ = ToolUseLoop::new(
         &llm,
-        tool_host.clone(),
-        config,
-        "You are helpful.".to_string(),
+        host.clone(),
+        ToolLoopConfig::default(),
+        "system".to_owned(),
         default_tools(),
     );
-    loop_.set_hooks(hooks);
+    let events = [(
+        HookEvent::PermissionRequest.as_str().to_owned(),
+        vec![HookDefinition {
+            matcher: None,
+            hooks: vec![HookHandler::Command {
+                command: "exit 2".to_owned(),
+                timeout: 5,
+            }],
+            once: false,
+            disabled: false,
+        }],
+    )]
+    .into_iter()
+    .collect();
+    loop_.set_hooks(HookRuntime::new(workspace.path(), HooksConfig { events }));
+    loop_.set_approval_callback(Arc::new(|_| panic!("blocked request reached approval")));
+    loop_.run("Read a file").unwrap();
+    assert_eq!(host.executed_count(), 0);
+}
 
-    let result = loop_.run("Read test.txt").unwrap();
+#[cfg(unix)]
+#[test]
+fn rewritten_tool_arguments_are_validated_and_approved() {
+    use codingbuddy_hooks::{HookDefinition, HookHandler, HookRuntime, HooksConfig};
+    let workspace = tempfile::tempdir().unwrap();
+    for (rewrite, expected_path) in [
+        (r#"{"path":"changed.txt"}"#, Some("changed.txt")),
+        (r#"{"path":false}"#, None),
+    ] {
+        let host = Arc::new(MockToolHost::new(vec![], false));
+        let llm = ScriptedLlm::new(vec![
+            make_tool_response(vec![LlmToolCall {
+                id: "read".to_owned(),
+                name: "fs_read".to_owned(),
+                arguments: r#"{"path":"first.txt"}"#.to_owned(),
+            }]),
+            make_text_response("Done."),
+        ]);
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            host.clone(),
+            ToolLoopConfig::default(),
+            "system".to_owned(),
+            default_tools(),
+        );
+        let events = [(
+            HookEvent::PreToolUse.as_str().to_owned(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: format!(r#"echo '{{"updatedInput":{rewrite}}}'"#),
+                    timeout: 5,
+                }],
+                once: false,
+                disabled: false,
+            }],
+        )]
+        .into_iter()
+        .collect();
+        loop_.set_hooks(HookRuntime::new(workspace.path(), HooksConfig { events }));
+        let approved = Arc::new(Mutex::new(None::<String>));
+        let captured = approved.clone();
+        loop_.set_approval_callback(Arc::new(move |call| {
+            *captured.lock().unwrap() = call.args["path"].as_str().map(str::to_owned);
+            Ok(true)
+        }));
+        loop_.run("Read a file").unwrap();
+        assert_eq!(approved.lock().unwrap().as_deref(), expected_path);
+        assert_eq!(host.executed_count(), usize::from(expected_path.is_some()));
+    }
+}
 
-    // The tool should NOT have been executed (host should have 0 calls)
-    assert_eq!(
-        tool_host.executed_count(),
-        0,
-        "tool should not be executed when hook blocks it"
-    );
+#[test]
+fn authorized_reads_overlap_and_preserve_response_order() {
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    // The LLM should have received a denial message and responded
-    assert_eq!(result.response, "OK, I won't use that tool.");
-
-    // Check that the denial message was added to the conversation
-    let has_denial = loop_.messages.iter().any(|m| {
-        if let ChatMessage::Tool { content, .. } = m {
-            content.contains("blocked by pre-tool-use hook")
-        } else {
-            false
+    struct ConcurrentHost {
+        sent: mpsc::Sender<()>,
+        received: Mutex<mpsc::Receiver<()>>,
+    }
+    impl ToolHost for ConcurrentHost {
+        fn propose(&self, call: ToolCall) -> ToolProposal {
+            ToolProposal {
+                invocation_id: uuid::Uuid::now_v7(),
+                call,
+                approved: true,
+            }
         }
+        fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
+            let path = approved.call.args["path"].clone();
+            let success = if path == "first.txt" {
+                self.received
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .is_ok()
+            } else {
+                self.sent.send(()).is_ok()
+            };
+            ToolResult {
+                invocation_id: approved.invocation_id,
+                success,
+                output: path,
+            }
+        }
+    }
+    let (sent, received) = mpsc::channel();
+    let host = Arc::new(ConcurrentHost {
+        sent,
+        received: Mutex::new(received),
     });
-    assert!(
-        has_denial,
-        "denial message should be in conversation history"
+    let llm = ScriptedLlm::new(vec![
+        make_tool_response(
+            ["first", "second"]
+                .into_iter()
+                .map(|id| LlmToolCall {
+                    id: id.to_owned(),
+                    name: "fs_read".to_owned(),
+                    arguments: serde_json::json!({"path": format!("{id}.txt")}).to_string(),
+                })
+                .collect(),
+        ),
+        make_text_response("Done."),
+    ]);
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        host,
+        ToolLoopConfig::default(),
+        "system".to_owned(),
+        default_tools(),
     );
+    let result = loop_.run("Read both files").unwrap();
+    assert!(result.tool_calls_made.iter().all(|record| record.success));
+    let messages: Vec<_> = result
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+                ..
+            } => Some((tool_call_id.as_str(), content.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages, [("first", "first.txt"), ("second", "second.txt")]);
 }

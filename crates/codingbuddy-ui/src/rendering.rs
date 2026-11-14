@@ -3,6 +3,34 @@ use super::*;
 use syntect::highlighting::{Theme as SyntectTheme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
+pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, cwd: &str) -> Rect {
+    let logo = Style::default()
+        .fg(Color::Blue)
+        .add_modifier(Modifier::BOLD);
+    let title = Span::styled("CodingBuddy", Style::default().add_modifier(Modifier::BOLD));
+    let version = Span::raw(concat!(" v", env!("CARGO_PKG_VERSION")));
+    let lines = if area.height >= 10 && area.width >= 32 {
+        vec![
+            Line::from(vec![Span::styled("     ▄         ", logo), title, version]),
+            Line::from(vec![Span::styled(" ▗▄▀ ● ▀▀▀▀▄   ", logo), Span::raw(cwd)]),
+            Line::from(Span::styled(" ▝▀▄▄▄▄▄▄▀▀▘", logo)),
+            Line::from(Span::styled("     ▀", logo)),
+        ]
+    } else {
+        vec![Line::from(vec![
+            Span::styled(" ▗▄▀ ", logo),
+            title,
+            version,
+        ])]
+    };
+    let height = lines.len() as u16;
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(area.x, area.y, area.width, height),
+    );
+    Rect::new(area.x, area.y + height, area.width, area.height - height)
+}
+
 struct SyntectAssets {
     syntax_set: SyntaxSet,
     theme: SyntectTheme,

@@ -31,7 +31,7 @@ bash scripts/runtime_conformance_scan.sh
 
 ## Workspace Overview
 
-20-crate Rust workspace. Edition 2024, rust-version 1.93, resolver v2.
+18-crate Rust workspace. Edition 2024, rust-version 1.94.1, resolver v2.
 
 **Core execution crates:**
 - `codingbuddy-cli` — CLI entry point, clap dispatch, 24 subcommand handlers in `src/commands/`
@@ -49,7 +49,7 @@ bash scripts/runtime_conformance_scan.sh
 - `codingbuddy-lsp` — Post-edit validation: runs language-specific checks (`cargo check`, `tsc`, `py_compile`, `go vet`) after file edits and feeds parsed diagnostics back to the LLM for self-correction.
 
 **Infrastructure crates:**
-- `codingbuddy-store` — Session persistence (JSONL event log + SQLite projections)
+- `codingbuddy-store` — Session persistence (SQLite events and projections, legacy JSONL archive)
 - `codingbuddy-memory` — Long-term memory, shadow commits, checkpoints
 - `codingbuddy-index` — Full-text code index (Tantivy), RAG retrieval
 - `codingbuddy-mcp` — MCP server management (JSON-RPC stdio/http), `list_prompts`, tool discovery
@@ -72,7 +72,7 @@ User → LLM (with tools) → Tool calls → Execute → Results → LLM → ...
 
 Key files:
 - `codingbuddy-agent/src/lib.rs` — `AgentEngine`, `ChatMode` routing, skill/subagent wiring, clone-then-call stream callback
-- `codingbuddy-agent/src/tool_loop.rs` — `ToolUseLoop::run()`, tool execution, security scanning, hook dispatch, phase transitions, LSP validation wiring
+- `codingbuddy-agent/src/tool_loop/mod.rs` — `ToolUseLoop::run()`, tool execution, security scanning, hook dispatch, phase transitions, LSP validation wiring
 - `codingbuddy-agent/src/tool_loop/phases.rs` — `TaskPhase` tool filtering (`EXPLORE_TOOLS`, `VERIFY_TOOLS`), phase transition detection, transition messages
 - `codingbuddy-agent/src/tool_bridge.rs` — Converts between LLM tool calls and internal `ToolCall`/`ToolResult`
 - `codingbuddy-agent/src/complexity.rs` — Simple decision-tree classifier (Simple/Medium/Complex), evidence-driven budget escalation with de-escalation
@@ -99,7 +99,7 @@ The loop uses `PolicyEngine` + `LocalToolHost` for approval-gated tool execution
 
 ## Architecture: Local ML (codingbuddy-local-ml)
 
-Feature-gated hybrid intelligence layer. `cargo test --workspace` works WITHOUT the `local-ml` feature — all tests use mock backends. Feature forwarding chain: `codingbuddy-cli` → `codingbuddy-agent` → `codingbuddy-local-ml` (each crate has `[features] local-ml = [...]` in Cargo.toml).
+Feature-gated hybrid intelligence layer. The CLI enables `local-ml` by default. Use `cargo test --workspace --no-default-features` to exercise the workspace with mock backends. Feature forwarding chain: `codingbuddy-cli` → `codingbuddy-agent` → `codingbuddy-local-ml` (each crate has `[features] local-ml = [...]` in Cargo.toml).
 
 - **Trait abstractions**: `EmbeddingsBackend`, `LocalGenBackend`, `VectorIndexBackend` — mock implementations always compiled, Candle backends behind `local-ml` feature
 - **Chunking**: `chunk_file()` / `chunk_workspace()` / `chunk_workspace_incremental()` with overlapping windows, gitignore-aware, SHA-256 change detection
@@ -119,7 +119,7 @@ Feature-gated hybrid intelligence layer. `cargo test --workspace` works WITHOUT 
 
 ## Architecture: Tool Loop Intelligence
 
-Production-ready enhancements in the tool-use loop (`codingbuddy-agent/src/tool_loop.rs`):
+Production-ready enhancements in the tool-use loop (`codingbuddy-agent/src/tool_loop/mod.rs`):
 
 - **JSON schema validation**: Tool arguments validated against `jsonschema` before execution. Field-level error messages for self-correction.
 - **Tool repair middleware**: `repair_tool_call()` in `tool_bridge.rs` — lowercase, `_`/`-` normalization, Levenshtein fuzzy matching (≤2). Invalid tools get helpful error listing available tools.

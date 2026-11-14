@@ -854,13 +854,14 @@ pub(super) fn handle_task_stop(
     store.upsert_subagent_run(&run)?;
 
     let event = |kind| {
-        let seq_no = store.next_seq_no(session_id)?;
-        store.append_event(&codingbuddy_core::EventEnvelope {
-            seq_no,
-            at: chrono::Utc::now(),
-            session_id,
-            kind,
-        })
+        store
+            .append_event(&codingbuddy_store::NewEvent {
+                event_id: uuid::Uuid::now_v7(),
+                at: chrono::Utc::now(),
+                session_id,
+                kind,
+            })
+            .map(drop)
     };
     event(EventKind::BackgroundJobStopped {
         job_id: background_job.job_id,

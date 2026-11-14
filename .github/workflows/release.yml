@@ -70,10 +70,9 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
-          targets: ${{ matrix.target }}
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2

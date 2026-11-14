@@ -188,6 +188,7 @@ where
     let mut pending_approval: Option<(String, String, mpsc::Sender<bool>)> = None;
     let mut cancelled = false;
     let mut transcript_scroll = 0usize;
+    let mut transcript_page = 1usize;
     let mut transcript_lines = Vec::new();
     let mut transcript_heights = Vec::new();
     let mut transcript_width = 0;
@@ -346,23 +347,10 @@ where
                 return;
             }
             let area = frame.area();
-            if area.width == 0 || area.height < 3 {
+            if area.width == 0 || area.height < 5 {
                 return;
             }
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        " CodingBuddy",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("  {}", status.working_directory)),
-                ])),
-                Rect::new(area.x, area.y, area.width, 1),
-            );
-            let area = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
-            if area.height < 3 {
-                return;
-            }
+            let area = render_header(frame, area, &status.working_directory);
             let width = area.width;
             let (prompt_str, prompt_style) = if vim_enabled {
                 match vim_mode {
@@ -415,6 +403,7 @@ where
             };
             let (stream_height, input_height) =
                 compute_inline_heights(area.height, desired_input_rows);
+            transcript_page = usize::from(stream_height.max(1));
             let stream_area = Rect::new(area.x, area.y, width, stream_height);
             let sep_area = Rect::new(area.x, area.y + stream_height, width, 1);
             let input_area = Rect::new(area.x, sep_area.y + 1, width, input_height);
@@ -1980,13 +1969,11 @@ where
                 continue;
             }
             KeyCode::PageUp => {
-                let page = usize::from(terminal.size()?.height.saturating_sub(5).max(1));
-                transcript_scroll = transcript_scroll.saturating_add(page);
+                transcript_scroll = transcript_scroll.saturating_add(transcript_page);
                 continue;
             }
             KeyCode::PageDown => {
-                let page = usize::from(terminal.size()?.height.saturating_sub(5).max(1));
-                transcript_scroll = transcript_scroll.saturating_sub(page);
+                transcript_scroll = transcript_scroll.saturating_sub(transcript_page);
                 continue;
             }
             KeyCode::Backspace => {
