@@ -161,7 +161,9 @@ impl LocalToolHost {
             sandbox_wrapper,
             runner,
             plugins: PluginManager::new(workspace).ok(),
-            hooks_enabled: cfg.plugins.enabled && cfg.plugins.enable_hooks,
+            hooks_enabled: codingbuddy_core::workspace_is_trusted(workspace)
+                && cfg.plugins.enabled
+                && cfg.plugins.enable_hooks,
             visual_verification_enabled: cfg.experiments.visual_verification,
             lint_after_edit,
             diagnostics_after_edit: cfg.tools.diagnostics_after_edit,
@@ -1587,6 +1589,7 @@ impl LocalToolHost {
 
 impl ToolHost for LocalToolHost {
     fn validate(&self, call: &ToolCall) -> Result<()> {
+        anyhow::ensure!(!self.policy.denies_tool(call), "tool denied by policy");
         let (key, default, allow_missing) = match call.name.as_str() {
             "fs.read" | "fs.edit" | "notebook.read" | "notebook.edit" | "lsp.hover"
             | "lsp.definition" | "lsp.references" | "lsp.symbols" => ("path", None, false),
@@ -1654,8 +1657,10 @@ impl ToolHost for LocalToolHost {
 
     fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
         let call = approved.call;
-        self.execute_hooks("pretooluse", Some(&call), None);
-        let (success, output) = match self.validate(&call).and_then(|()| self.run_tool(&call)) {
+        let (success, output) = match self.validate(&call).and_then(|()| {
+            self.execute_hooks("pretooluse", Some(&call), None);
+            self.run_tool(&call)
+        }) {
             Ok(output) => (true, output),
             Err(err) => {
                 let message = err.to_string();

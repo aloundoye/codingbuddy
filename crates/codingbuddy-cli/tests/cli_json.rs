@@ -63,6 +63,7 @@ fn ask_json_uses_workspace_local_api_key_when_env_missing() {
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
         .current_dir(workspace.path())
+        .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
         .env_remove("DEEPSEEK_API_KEY")
         .args(["--json", "ask", "hello"])
         .assert()
@@ -96,6 +97,7 @@ fn config_show_redacts_api_key_in_json_and_text_modes() {
 
     let json_out = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
         .current_dir(workspace.path())
+        .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
         .args(["--json", "config", "show"])
         .assert()
         .success()
@@ -107,6 +109,7 @@ fn config_show_redacts_api_key_in_json_and_text_modes() {
 
     let text_out = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
         .current_dir(workspace.path())
+        .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
         .args(["config", "show"])
         .assert()
         .success()
@@ -804,6 +807,7 @@ fn run_json_with_env(workspace: &Path, args: &[&str], envs: &[(&str, &str)]) -> 
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"));
     command
         .current_dir(workspace)
+        .env("CODINGBUDDY_TRUST_WORKSPACE", workspace)
         .env("DEEPSEEK_API_KEY", "test-api-key")
         .args(args);
     for (key, value) in envs {
@@ -985,6 +989,7 @@ fn explicit_model_checks_and_uses_only_the_selected_provider() {
     fs::write(&settings, serde_json::to_vec(&value).unwrap()).unwrap();
     let output = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
         .current_dir(workspace.path())
+        .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
         .env("HOME", user.path())
         .env("USERPROFILE", user.path())
         .env_remove("DEEPSEEK_API_KEY")
@@ -1014,6 +1019,7 @@ fn headless_resume_rejects_a_different_endpoint_before_reading_a_prompt() {
     let command = || {
         let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"));
         cmd.current_dir(workspace.path())
+            .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
             .env("HOME", user.path())
             .env("USERPROFILE", user.path())
             .env("DEEPSEEK_API_KEY", "fixture-credential");

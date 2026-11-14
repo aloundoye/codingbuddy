@@ -1230,6 +1230,13 @@ impl<'a> ToolUseLoop<'a> {
                 continue; // Retry the LLM call
             }
 
+            anyhow::ensure!(
+                response.tool_calls.is_empty()
+                    || matches!(response.finish_reason.as_str(), "stop" | "tool_calls"),
+                "Provider ended with '{}' before completing its tool calls",
+                response.finish_reason
+            );
+
             // No tool calls → return the text response (or nudge to use tools)
             if response.tool_calls.is_empty() {
                 let text = response.text.clone();

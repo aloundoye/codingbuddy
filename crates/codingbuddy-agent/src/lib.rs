@@ -141,7 +141,7 @@ impl AgentEngine {
         let llm = Box::new(ApiClient::new(cfg.llm.clone()).context("failed to create LLM client")?);
         prof.mark("llm_client");
 
-        let result = Self::new_with_components(workspace, cfg, llm);
+        let result = Self::new_with_config_and_llm(workspace, cfg, llm);
         prof.mark("engine_init");
         prof.finish();
 
@@ -150,10 +150,10 @@ impl AgentEngine {
 
     pub fn new_with_llm(workspace: &Path, llm: Box<dyn LlmClient + Send + Sync>) -> Result<Self> {
         let cfg = AppConfig::ensure(workspace)?;
-        Self::new_with_components(workspace, cfg, llm)
+        Self::new_with_config_and_llm(workspace, cfg, llm)
     }
 
-    fn new_with_components(
+    pub fn new_with_config_and_llm(
         workspace: &Path,
         mut cfg: AppConfig,
         llm: Box<dyn LlmClient + Send + Sync>,

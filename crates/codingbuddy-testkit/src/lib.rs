@@ -1213,6 +1213,13 @@ mod tests {
         );
     }
 
+    fn mock_engine(workspace: &Path, endpoint: &str) -> Result<AgentEngine> {
+        let mut config = codingbuddy_core::AppConfig::default();
+        config.llm.endpoint = endpoint.to_owned();
+        config.llm.api_key = Some("test-api-key".to_owned());
+        AgentEngine::new_with_config(workspace, config)
+    }
+
     #[test]
     fn replay_smoke() {
         let suffix = SystemTime::now()
@@ -1223,11 +1230,15 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace");
         let mock = start_mock_llm_server();
         configure_runtime_for_mock_llm(&workspace, &mock.endpoint);
-        // SAFETY: process-local env setup in test before engine creation.
-        unsafe {
-            std::env::set_var("DEEPSEEK_API_KEY", "test-api-key");
-        }
-        let result = run_replay_smoke(&workspace);
+        let result = mock_engine(&workspace, &mock.endpoint).and_then(|engine| {
+            engine.chat_with_options(
+                "replay test",
+                ChatOptions {
+                    tools: false,
+                    ..Default::default()
+                },
+            )
+        });
         assert!(result.is_ok(), "replay smoke failed: {:?}", result.err());
     }
 
@@ -1310,8 +1321,8 @@ mod tests {
 
     #[test]
     fn replay_deterministic_output() {
-        let (dir, _mock) = temp_workspace_with_mock();
-        let engine = AgentEngine::new(dir.path()).expect("engine");
+        let (dir, mock) = temp_workspace_with_mock();
+        let engine = mock_engine(dir.path(), &mock.endpoint).expect("engine");
         let r1 = engine.chat_with_options(
             "determinism test",
             ChatOptions {
@@ -1333,8 +1344,8 @@ mod tests {
 
     #[test]
     fn replay_with_tool_calls_journals_events() {
-        let (dir, _mock) = temp_workspace_with_mock();
-        let engine = AgentEngine::new(dir.path()).expect("engine");
+        let (dir, mock) = temp_workspace_with_mock();
+        let engine = mock_engine(dir.path(), &mock.endpoint).expect("engine");
         let r = engine.chat_with_options(
             "journal test",
             ChatOptions {

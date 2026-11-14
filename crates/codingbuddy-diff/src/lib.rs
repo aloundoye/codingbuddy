@@ -233,7 +233,7 @@ impl PatchStore {
         Ok(())
     }
 
-    fn read_patch(&self, patch_id: Uuid) -> Result<PatchSet> {
+    pub fn read_patch(&self, patch_id: Uuid) -> Result<PatchSet> {
         let path = self.root.join(format!("{}.json", patch_id));
         if !path.exists() {
             return Err(anyhow!("unknown patch_id {}", patch_id));

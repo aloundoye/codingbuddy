@@ -9,8 +9,19 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/rpc": "http://127.0.0.1:8199",
-      "/health": "http://127.0.0.1:8199",
+      "/rpc": {
+        target: "http://127.0.0.1:8199",
+        changeOrigin: true,
+        configure(proxy) {
+          proxy.on("proxyReq", (outbound, inbound) => {
+            const origin = inbound.headers.origin;
+            if (origin === `http://${inbound.headers.host}`) {
+              outbound.setHeader("Origin", "http://127.0.0.1:8199");
+            }
+          });
+        },
+      },
+      "/health": { target: "http://127.0.0.1:8199", changeOrigin: true },
     },
   },
 });

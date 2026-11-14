@@ -58,6 +58,22 @@ pub fn runtime_dir(workspace: &Path) -> PathBuf {
     workspace.join(".codingbuddy")
 }
 
+/// Explicit workspace trust comes from the launcher's environment, never project settings.
+pub fn workspace_is_trusted(workspace: &Path) -> bool {
+    let Some(trusted) = std::env::var_os("CODINGBUDDY_TRUST_WORKSPACE") else {
+        return false;
+    };
+    let trusted = Path::new(&trusted);
+    if !trusted.is_absolute() {
+        return false;
+    }
+    trusted
+        .canonicalize()
+        .ok()
+        .zip(workspace.canonicalize().ok())
+        .is_some_and(|(trusted, workspace)| trusted == workspace)
+}
+
 /// Actions available in the rewind picker menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RewindAction {
@@ -2343,6 +2359,10 @@ impl AppConfig {
 
     /// Load settings with the provenance needed by interactive provider selection.
     pub fn load_with_provider_origin(workspace: &Path) -> Result<(Self, bool)> {
+        Self::load_settings(workspace, workspace_is_trusted(workspace))
+    }
+
+    fn load_settings(workspace: &Path, trusted: bool) -> Result<(Self, bool)> {
         let mut explicit = false;
         let mut merged = serde_json::to_value(Self::default())?;
         if let Some(root) = merged.as_object_mut() {
@@ -2350,7 +2370,7 @@ impl AppConfig {
         }
 
         let legacy = Self::legacy_toml_path(workspace);
-        if legacy.exists() {
+        if trusted && legacy.exists() {
             let raw = fs::read_to_string(legacy)?;
             let legacy_cfg: toml::Value = toml::from_str(&raw)?;
             let value = serde_json::to_value(legacy_cfg)?;
@@ -2360,12 +2380,12 @@ impl AppConfig {
 
         let mut paths = Vec::new();
         if let Some(user) = Self::user_settings_path() {
-            paths.push(user);
+            paths.push((user, true));
         }
-        paths.push(Self::project_settings_path(workspace));
-        paths.push(Self::project_local_settings_path(workspace));
+        paths.push((Self::project_settings_path(workspace), trusted));
+        paths.push((Self::project_local_settings_path(workspace), trusted));
 
-        for path in paths {
+        for (path, trusted_source) in paths {
             if !path.exists() {
                 continue;
             }
@@ -2379,7 +2399,7 @@ impl AppConfig {
                     continue;
                 }
             };
-            let value: serde_json::Value = match serde_json::from_str(&raw) {
+            let mut value: serde_json::Value = match serde_json::from_str(&raw) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
@@ -2389,6 +2409,9 @@ impl AppConfig {
                     continue;
                 }
             };
+            if !trusted_source {
+                retain_safe_project_settings(&mut value);
+            }
             explicit |= value.pointer("/llm/provider").is_some();
             merge_llm_settings(&mut merged, &value);
         }
@@ -2444,6 +2467,17 @@ fn migrate_privacy_settings(settings: &mut serde_json::Value) {
 }
 
 // Legacy endpoint and key fields describe the provider selected by their settings layer.
+fn retain_safe_project_settings(value: &mut serde_json::Value) {
+    if let Some(settings) = value.as_object_mut() {
+        settings.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "theme" | "language" | "output_style" | "respect_gitignore"
+            )
+        });
+    }
+}
+
 fn merge_llm_settings(base: &mut serde_json::Value, overlay: &serde_json::Value) {
     let provider = base
         .pointer("/llm/provider")
@@ -4674,7 +4708,7 @@ mod tests {
                 settings["privacy"]["enabled"] = serde_json::json!(enabled);
             }
             fs::write(path, serde_json::to_vec(&settings)?)?;
-            let cfg = AppConfig::load(workspace.path())?;
+            let (cfg, _) = AppConfig::load_settings(workspace.path(), true)?;
             assert_eq!(cfg.privacy.enabled, expected);
             assert_eq!(cfg.privacy.policy, "block_cloud");
             assert_eq!(cfg.privacy.sensitive_regex, ["example-secret"]);

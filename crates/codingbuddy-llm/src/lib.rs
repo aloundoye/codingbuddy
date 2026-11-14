@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
     AppliedCompatibility, CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig,
@@ -1292,7 +1292,7 @@ impl ApiClient {
                         let mut completed_tool_calls: Vec<LlmToolCall> = Vec::new();
                         let mut has_structured_tool_calls = false;
                         let mut usage: Option<codingbuddy_core::TokenUsage> = None;
-                        let mut last_emitted_tool_index: u64 = 0;
+                        let mut saw_anthropic_stop = false;
 
                         // Native provider streaming state
                         let mut anthropic_event_type = String::new();
@@ -1329,13 +1329,19 @@ impl ApiClient {
                             }
                             let chunk = trimmed.trim_start_matches("data:").trim();
                             if chunk == "[DONE]" {
-                                cb(StreamChunk::Done { reason: None });
-                                break;
+                                if !is_native {
+                                    break;
+                                }
+                                return Err(anyhow!("Unexpected [DONE] in native provider stream"));
                             }
-                            let value: Value = match serde_json::from_str(chunk) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            };
+                            let value: Value = serde_json::from_str(chunk)
+                                .context("Malformed provider stream event")?;
+                            anyhow::ensure!(
+                                anthropic_event_type != "error"
+                                    && value.get("type").and_then(Value::as_str) != Some("error")
+                                    && value.get("error").is_none_or(Value::is_null),
+                                "Provider sent an error during the response stream"
+                            );
 
                             // ── Native Anthropic streaming ──
                             if chat_protocol == protocol::ChatProtocol::AnthropicMessages {
@@ -1347,27 +1353,20 @@ impl ApiClient {
                                 let raw =
                                     providers::anthropic::parse_streaming_event(evt_type, &value);
                                 let evt = providers::from_anthropic_event(raw);
-                                let done = native_state.handle_event(evt, &*cb);
-                                anthropic_event_type.clear();
-                                if done {
+                                if matches!(evt, providers::ProviderStreamEvent::Done) {
+                                    saw_anthropic_stop = true;
                                     break;
                                 }
+                                native_state.handle_event(evt, &*cb);
+                                anthropic_event_type.clear();
                                 continue;
                             }
 
                             // ── Native Google streaming ──
                             if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent {
                                 let raw = providers::google::parse_streaming_chunk(&value);
-                                let events = providers::from_google_event(raw);
-                                let mut done = false;
-                                for evt in events {
-                                    done = native_state.handle_event(evt, &*cb);
-                                    if done {
-                                        break;
-                                    }
-                                }
-                                if done {
-                                    break;
+                                for evt in providers::from_google_event(raw) {
+                                    native_state.handle_event(evt, &*cb);
                                 }
                                 continue;
                             }
@@ -1409,25 +1408,6 @@ impl ApiClient {
                                 {
                                     has_structured_tool_calls = true;
                                     merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
-                                    // Emit ToolCallReady for tool calls whose next index has started
-                                    if tool_call_parts.len() > 1 {
-                                        for (&idx, tc) in &tool_call_parts {
-                                            if idx >= last_emitted_tool_index
-                                                && idx
-                                                    < *tool_call_parts.keys().last().unwrap_or(&0)
-                                                && !tc.name.is_empty()
-                                            {
-                                                cb(StreamChunk::ToolCallReady {
-                                                    id: tc.id.clone().unwrap_or_else(|| {
-                                                        format!("tool_call_{}", idx + 1)
-                                                    }),
-                                                    name: tc.name.clone(),
-                                                    arguments: tc.arguments.clone(),
-                                                });
-                                                last_emitted_tool_index = idx + 1;
-                                            }
-                                        }
-                                    }
                                 }
                             }
                             if let Some(message) = choice.get("message") {
@@ -1452,6 +1432,21 @@ impl ApiClient {
                         if let Some(err) = last_err.take() {
                             return Err(err);
                         }
+
+                        self.check_cancellation()?;
+                        let finished = match chat_protocol {
+                            protocol::ChatProtocol::AnthropicMessages => {
+                                saw_anthropic_stop && native_state.finish_reason.is_some()
+                            }
+                            protocol::ChatProtocol::GeminiGenerateContent => {
+                                native_state.finish_reason.is_some()
+                            }
+                            _ => finish_reason.is_some(),
+                        };
+                        anyhow::ensure!(
+                            finished,
+                            "Provider stream ended before a terminal response"
+                        );
 
                         // If content text was streamed to the TUI but we also
                         // have structured tool calls, tell the TUI to clear the
@@ -1505,9 +1500,14 @@ impl ApiClient {
                             String::new()
                         };
 
+                        let reason = finish_reason
+                            .ok_or_else(|| anyhow!("Provider finish reason missing"))?;
+                        cb(StreamChunk::Done {
+                            reason: Some(reason.clone()),
+                        });
                         let response = LlmResponse {
                             text,
-                            finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
+                            finish_reason: reason,
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
