@@ -144,6 +144,7 @@ pub enum ConnectionError {
         variable: String,
     },
     RejectedCredential,
+    BillingRequired,
 }
 
 impl std::fmt::Display for ConnectionError {
@@ -160,6 +161,10 @@ impl std::fmt::Display for ConnectionError {
             Self::MissingCredential { provider, variable } => write!(
                 f,
                 "{variable} is required for {provider}. Set it or use /connect."
+            ),
+            Self::BillingRequired => write!(
+                f,
+                "Insufficient balance or billing issue (HTTP 402). Check your provider balance or switch providers with /connect."
             ),
             Self::RejectedCredential => write!(
                 f,
@@ -2071,9 +2076,7 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
             detail
         ),
         StatusCode::UNAUTHORIZED => ConnectionError::RejectedCredential.into(),
-        StatusCode::PAYMENT_REQUIRED => anyhow!(
-            "Insufficient balance or billing issue (HTTP 402). Check the active provider account."
-        ),
+        StatusCode::PAYMENT_REQUIRED => ConnectionError::BillingRequired.into(),
         StatusCode::UNPROCESSABLE_ENTITY => {
             let param = error_obj
                 .and_then(|e| e.get("param"))
@@ -3722,6 +3725,25 @@ mod tests {
         assert!(should_retry_status(StatusCode::SERVICE_UNAVAILABLE));
         assert!(!should_retry_status(StatusCode::UNAUTHORIZED));
         assert!(!should_retry_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn billing_error_remains_actionable_without_protocol_details() {
+        let error = with_compatibility_context(
+            format_api_error(StatusCode::PAYMENT_REQUIRED, "{}", 0, 0),
+            &AppliedCompatibility {
+                provider: "deepseek".into(),
+                family: "deepseek".into(),
+                transforms: vec!["protocol:openai-chat".into()],
+                degraded_inputs: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ConnectionError::BillingRequired)
+        ));
+        assert!(error.to_string().contains("/connect"));
+        assert!(!error.to_string().contains("transforms"));
     }
 
     #[test]

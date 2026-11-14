@@ -75,9 +75,13 @@ Copy-Item -Path $binary.FullName -Destination $destination -Force
 
 # Auto-add to user PATH
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($currentPath -notlike "*$InstallDir*") {
+if (($currentPath -split ";") -notcontains $InstallDir) {
   [Environment]::SetEnvironmentVariable("Path", "$InstallDir;$currentPath", "User")
   Write-Host "Added $InstallDir to user PATH."
+}
+
+if (($env:Path -split ";") -notcontains $InstallDir) {
+  $env:Path = "$InstallDir;$env:Path"
 }
 
 # Cleanup

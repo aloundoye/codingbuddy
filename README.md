@@ -26,18 +26,13 @@ curl -fsSL https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/
 irm https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.ps1 | iex
 ```
 
-The installer downloads the correct binary for your platform, verifies the SHA-256 checksum, and adds it to your PATH.
+The installers select a prebuilt binary for macOS, GNU/Linux, or Windows on x64 or ARM64. On macOS and Linux, open a new terminal after installation so your shell loads the updated PATH. On Windows, the installer also updates PATH in the PowerShell session that runs it.
 
 ### Other methods
 
-**npm** (any platform with Node.js):
+**npm** (macOS, GNU/Linux, or Windows with Node.js):
 ```bash
 npm install -g codingbuddy
-```
-
-**Homebrew** (macOS / Linux):
-```bash
-brew install aloundoye/tap/codingbuddy
 ```
 
 **From source** (requires Rust 1.94.1+):
@@ -120,7 +115,7 @@ model with `codingbuddy --model provider/model -p "Summarize this repo"`.
 - **Model picker**: `/model` with provider filtering, viewport scrolling, pricing display
 - **Session branching**: `/branch create <name>` forks session, `/branch list` shows branches
 - **Undo/redo**: `/undo` reverts last turn + file changes via checkpoint system
-- **Scroll mode**: PageUp pauses TUI for native terminal scrollback
+- **Conversation scrolling**: Page Up and Page Down scroll the full-screen transcript
 - **Vim mode**: Toggle with `/vim`, full normal/insert/visual mode
 - **Visual token budget**: `[████████░░] 78%` bar with theme-aware colors
 - **Real-time cost tracking**: Per-model pricing with running total in status bar

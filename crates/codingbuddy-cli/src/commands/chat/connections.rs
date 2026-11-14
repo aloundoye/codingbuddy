@@ -282,6 +282,13 @@ impl Menus {
                     self.discover(&mut state, llm);
                 }
             }
+            "retry-connection" => {
+                let llm = state
+                    .pending
+                    .clone()
+                    .ok_or_else(|| anyhow!("Choose a provider first"))?;
+                self.verify(&mut state, llm)?;
+            }
             "key-use" | "retry-models" => {
                 let llm = state
                     .pending
@@ -513,22 +520,36 @@ impl Menus {
                 && state.generation == generation
             {
                 if let Err(error) = result {
-                    let rejected = error
-                        .downcast_ref::<codingbuddy_llm::ConnectionError>()
-                        .is_some_and(|error| {
-                            matches!(error, codingbuddy_llm::ConnectionError::RejectedCredential)
-                        });
-                    let message = if rejected {
-                        "The provider rejected the API key."
-                    } else {
-                        "Could not verify the model. Details are in the chat."
+                    use codingbuddy_llm::ConnectionError;
+                    let (message, actions) = match error.downcast_ref::<ConnectionError>() {
+                        Some(ConnectionError::BillingRequired) => (
+                            "Insufficient balance. Top up your provider account.",
+                            vec![
+                                ("retry-connection", "Retry connection"),
+                                ("connect", "Switch provider"),
+                            ],
+                        ),
+                        Some(ConnectionError::RejectedCredential) => (
+                            "The provider rejected the API key.",
+                            vec![
+                                ("paste-key", "Enter a different API key"),
+                                ("connect", "Switch provider"),
+                            ],
+                        ),
+                        _ => {
+                            let mut actions = vec![("retry-models", "Choose another model")];
+                            if codingbuddy_llm::provider_requires_key(&llm) {
+                                actions.push(("paste-key", "Enter a different API key"));
+                            }
+                            (
+                                "Could not verify the model. Details are in the chat.",
+                                actions,
+                            )
+                        }
                     };
-                    controller.notify(error.to_string(), true);
-                    let mut actions = vec![("retry-models", "Choose another model")];
-                    if codingbuddy_llm::provider_requires_key(&llm) {
-                        actions.insert(0, ("paste-key", "Enter a different API key"));
-                    }
+                    let mut actions = actions;
                     actions.push(("cancel", "Return to chat"));
+                    controller.notify(error.to_string(), true);
                     state.pending = Some(llm);
                     controller.menu(TerminalMenu::actions(
                         "Connection failed",

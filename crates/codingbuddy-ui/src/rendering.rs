@@ -150,6 +150,7 @@ impl Drop for TerminalGuard {
         let _ = crossterm::execute!(
             io::stdout(),
             crossterm::event::DisableBracketedPaste,
+            crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show
         );
     }
@@ -777,6 +778,7 @@ pub(crate) const DIFF_CONTEXT_KEEP_TAIL: usize = 2;
 pub(crate) const INPUT_MIN_HEIGHT: u16 = 1;
 pub(crate) const INPUT_MAX_HEIGHT: u16 = 4;
 pub(crate) const STREAM_MIN_HEIGHT: u16 = 1;
+#[cfg(test)]
 pub(crate) const INLINE_VIEWPORT_HEIGHT: u16 = INPUT_MAX_HEIGHT + STREAM_MIN_HEIGHT + 3;
 
 pub(crate) fn flush_diff_context_run(
@@ -813,14 +815,10 @@ pub(crate) fn flush_diff_context_run(
     run.clear();
 }
 
-pub(crate) fn wrapped_line_height(line: &Line<'_>, width: u16) -> u16 {
-    if width == 0 {
-        return 0;
-    }
-    let width = width as usize;
-    let content_width = line.width().max(1);
-    let rows = (content_width.saturating_sub(1) / width) + 1;
-    u16::try_from(rows).unwrap_or(u16::MAX)
+pub(crate) fn wrapped_line_height(line: &Line<'_>, width: u16) -> usize {
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
 }
 
 pub(crate) fn wrapped_text_rows(text: &str, width: u16) -> usize {
@@ -1320,81 +1318,19 @@ pub(crate) fn is_plan_list_line(line: &str) -> bool {
     false
 }
 
-pub(crate) fn insert_wrapped_lines_above(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    lines: &[Line<'static>],
-) -> Result<()> {
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let viewport_width = terminal.size()?.width.max(1);
-    let height = lines
-        .iter()
-        .map(|line| wrapped_line_height(line, viewport_width) as u32)
-        .sum::<u32>()
-        .min(u16::MAX as u32) as u16;
-    if height == 0 {
-        return Ok(());
-    }
-    terminal.insert_before(height, |buf| {
-        let area = buf.area;
-        let bottom = area.y.saturating_add(area.height);
-        let mut y = area.y;
-        for line in lines {
-            if y >= bottom {
-                break;
-            }
-            let logical_height = wrapped_line_height(line, area.width).max(1);
-            let remaining = bottom.saturating_sub(y);
-            let render_height = logical_height.min(remaining);
-            if render_height == 0 {
-                break;
-            }
-            let line_area = Rect::new(area.x, y, area.width, render_height);
-            Paragraph::new(line.clone())
-                .wrap(Wrap { trim: false })
-                .render(line_area, buf);
-            y = y.saturating_add(logical_height);
-        }
-    })?;
-    Ok(())
-}
-
-/// Flush new transcript entries above the inline viewport into native terminal scrollback.
-pub(crate) fn flush_transcript_above(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    shell: &ChatShell,
-    last_printed_idx: &mut usize,
-    collapse_plan: bool,
-) -> Result<()> {
-    if *last_printed_idx >= shell.transcript.len() {
-        return Ok(());
-    }
-    let new_entries = &shell.transcript[*last_printed_idx..];
-    // Build styled lines for the new entries
-    let mut lines: Vec<Line<'static>> = Vec::new();
+/// Render the conversation using the same Markdown and diff styles as live output.
+pub(crate) fn render_transcript(shell: &ChatShell, collapse_plan: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     let mut in_code_block = false;
     let mut in_diff_block = false;
     let mut code_block_lang = String::new();
-    let mut diff_context_run: Vec<String> = Vec::new();
+    let mut diff_context_run = Vec::new();
     let mut collapsed_plan_lines = 0usize;
-    // Scan earlier entries to figure out if we're inside a code block
-    for entry in &shell.transcript[..*last_printed_idx] {
-        for sub in entry.text.split('\n') {
-            if entry.kind == MessageKind::Assistant && sub.starts_with("```") {
-                if !in_code_block {
-                    in_code_block = true;
-                    in_diff_block = code_fence_starts_diff(sub);
-                    code_block_lang = extract_fence_lang(sub).to_string();
-                } else {
-                    in_code_block = false;
-                    in_diff_block = false;
-                    code_block_lang.clear();
-                }
-            }
-        }
-    }
-    for entry in new_entries {
+    let streaming = (!shell.streaming_text.is_empty()).then(|| TranscriptEntry {
+        kind: MessageKind::Assistant,
+        text: shell.streaming_text.clone(),
+    });
+    for entry in shell.transcript.iter().chain(streaming.iter()) {
         let mut rendered_first_line = false;
         for sub_text in entry.text.split('\n') {
             let logical_lines = if entry.kind == MessageKind::Assistant && !in_code_block {
@@ -1487,108 +1423,5 @@ pub(crate) fn flush_transcript_above(
                 .add_modifier(Modifier::ITALIC),
         )]));
     }
-    *last_printed_idx = shell.transcript.len();
-    insert_wrapped_lines_above(terminal, &lines)
-}
-
-/// Flush complete lines from the streaming buffer into native scrollback.
-/// Returns the remaining partial line (text after the last `\n`).
-pub(crate) fn flush_streaming_lines(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    buffer: &mut String,
-    in_code_block: &mut bool,
-    in_diff_block: &mut bool,
-    code_block_lang: &mut String,
-    collapse_plan: bool,
-) -> Result<()> {
-    // Find the last newline — everything before it consists of complete lines.
-    let Some(last_nl) = buffer.rfind('\n') else {
-        return Ok(());
-    };
-    let complete = buffer[..last_nl].to_string();
-    let remaining = buffer[last_nl + 1..].to_string();
-    *buffer = remaining;
-
-    let lines_text: Vec<&str> = complete.split('\n').collect();
-    let mut styled_lines: Vec<Line<'static>> = Vec::with_capacity(lines_text.len());
-    let mut diff_context_run: Vec<String> = Vec::new();
-    let mut collapsed_plan_lines = 0usize;
-    for line_text in &lines_text {
-        let logical_lines = if !*in_code_block {
-            split_inline_markdown_blocks(line_text)
-        } else {
-            vec![(*line_text).to_string()]
-        };
-        for logical_text in logical_lines {
-            if collapse_plan && !*in_code_block && is_plan_list_line(&logical_text) {
-                collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
-                continue;
-            }
-            let is_fence = logical_text.starts_with("```");
-            if is_fence || !*in_code_block || !*in_diff_block {
-                flush_diff_context_run(
-                    &mut diff_context_run,
-                    &mut styled_lines,
-                    DIFF_CONTEXT_COLLAPSE_THRESHOLD,
-                    DIFF_CONTEXT_KEEP_HEAD,
-                    DIFF_CONTEXT_KEEP_TAIL,
-                );
-            }
-            if *in_code_block && *in_diff_block && logical_text.starts_with(' ') && !is_fence {
-                diff_context_run.push(logical_text);
-                continue;
-            }
-            if let Some(entry) = parse_stream_meta_entry(&logical_text) {
-                flush_diff_context_run(
-                    &mut diff_context_run,
-                    &mut styled_lines,
-                    DIFF_CONTEXT_COLLAPSE_THRESHOLD,
-                    DIFF_CONTEXT_KEEP_HEAD,
-                    DIFF_CONTEXT_KEEP_TAIL,
-                );
-                styled_lines.push(style_transcript_line(&entry, false, false, ""));
-                continue;
-            }
-            let entry = TranscriptEntry {
-                kind: MessageKind::Assistant,
-                text: logical_text,
-            };
-            if entry.text.starts_with("```") {
-                if !*in_code_block {
-                    *in_code_block = true;
-                    *in_diff_block = code_fence_starts_diff(&entry.text);
-                    *code_block_lang = extract_fence_lang(&entry.text).to_string();
-                } else {
-                    *in_code_block = false;
-                    *in_diff_block = false;
-                    code_block_lang.clear();
-                }
-            }
-            styled_lines.push(style_transcript_line(
-                &entry,
-                *in_code_block,
-                *in_diff_block,
-                code_block_lang,
-            ));
-        }
-    }
-    flush_diff_context_run(
-        &mut diff_context_run,
-        &mut styled_lines,
-        DIFF_CONTEXT_COLLAPSE_THRESHOLD,
-        DIFF_CONTEXT_KEEP_HEAD,
-        DIFF_CONTEXT_KEEP_TAIL,
-    );
-    if collapsed_plan_lines > 0 {
-        styled_lines.push(Line::from(vec![Span::styled(
-            format!(
-                "… {} streaming plan lines hidden (Ctrl+P to expand)",
-                collapsed_plan_lines
-            ),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )]));
-    }
-    insert_wrapped_lines_above(terminal, &styled_lines)
+    lines
 }

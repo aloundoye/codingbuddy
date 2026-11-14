@@ -143,7 +143,7 @@ MCP tools (`mcp__*`) always pass through regardless of profile.
 | **Shift+Enter** | Multiline input (newline without sending) |
 | **Ctrl+C** | Cancel current generation / exit |
 | **F1** | Help modal (keybindings, commands, tips) |
-| **PageUp** | Scroll mode (native terminal scrollback) |
+| **Page Up / Page Down** | Scroll the conversation while the prompt stays at the bottom |
 | **Ctrl+R** | Reverse history search |
 | **Shift+Tab** | Cycle agent profile (build→explore→plan→bash→general) |
 | **Tab** | Accept autocomplete / ghost text suggestion |
