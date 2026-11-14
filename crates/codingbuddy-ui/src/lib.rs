@@ -1,12 +1,12 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::widgets::{Paragraph, Wrap};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -123,57 +123,24 @@ where
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
         prev_hook(info);
     }));
 
-    // Clear terminal and print welcome banner so it feels like a fresh session.
-    {
-        use std::io::Write;
-        let mut out = io::stdout();
-        // Clear screen + move cursor home.
-        // Skip \x1b[3J (clear scrollback) — it's a non-standard xterm extension
-        // that causes issues in VS Code's integrated terminal and other emulators.
-        out.write_all(b"\x1b[2J\x1b[H")?;
-
-        // ASCII art logo + info
-        let version = env!("CARGO_PKG_VERSION");
-        let model = &status.model;
-        let cwd = &status.working_directory;
-
-        // Shark logo in blue, info text in white/gray
-        writeln!(out)?;
-        writeln!(
-            out,
-            "\x1b[1;34m        ▄       \x1b[0m \x1b[1mCodingBuddy\x1b[0m v{version}"
-        )?;
-        writeln!(
-            out,
-            "\x1b[1;34m    ▗▄▀ ● ▀▀▀▀▄ \x1b[0m \x1b[36m{model}\x1b[0m"
-        )?;
-        writeln!(
-            out,
-            "\x1b[1;34m    ▝▀▄▄▄▄▄▄▀▀▘ \x1b[0m \x1b[90m{cwd}\x1b[0m"
-        )?;
-        writeln!(out, "\x1b[1;34m        ▀        \x1b[0m")?;
-        writeln!(out)?;
-        out.flush()?;
-    }
-
     enable_raw_mode()?;
     let _guard = TerminalGuard;
-    crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
-    let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
-    // Inline viewport: bottom rows managed by ratatui
-    // (streaming partial line + separator + multi-line input + separator + status).
-    // Everything above is native terminal scrollback.
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
-        },
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste,
     )?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
 
     let workspace_path = PathBuf::from(status.working_directory.clone());
     let project_hash_cached = {
@@ -184,6 +151,7 @@ where
     };
     let app_cfg = codingbuddy_core::AppConfig::load(&workspace_path).unwrap_or_default();
     let ui_cfg = app_cfg.ui.clone();
+    let detailed_status = ui_cfg.statusline_mode == "detailed";
     let thinking_visibility = if ui_cfg.thinking_visibility.trim().is_empty() {
         "concise".to_string()
     } else {
@@ -203,8 +171,7 @@ where
     let mut cursor_pos: usize = 0;
     let mut history_cursor: Option<usize> = None;
     let mut saved_input = String::new();
-    let mut info_line =
-        String::from(" Ctrl+C exit | Tab autocomplete | Shift+Tab agent | / commands");
+    let mut info_line = String::new();
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
     let mut cursor_visible;
@@ -220,14 +187,12 @@ where
     let mut is_processing = false;
     let mut pending_approval: Option<(String, String, mpsc::Sender<bool>)> = None;
     let mut cancelled = false;
-    // Track the last transcript length so we only print new entries via insert_before.
-    let mut last_printed_idx: usize = 0;
-    // Buffer for streaming content — complete lines get flushed to scrollback,
-    // the partial (incomplete) last line is rendered in the viewport.
-    let mut streaming_buffer = String::new();
-    let mut streaming_in_code_block = false;
-    let mut streaming_in_diff_block = false;
-    let mut streaming_code_block_lang = String::new();
+    let mut transcript_scroll = 0usize;
+    let mut transcript_lines = Vec::new();
+    let mut transcript_heights = Vec::new();
+    let mut transcript_width = 0;
+    let mut transcript_rows = 0usize;
+    let mut transcript_key = (0, String::new(), String::new(), false);
     let mut mission_control_visible = false;
     let mut artifacts_visible = false;
     let mut plan_collapsed = false;
@@ -275,6 +240,7 @@ where
             };
             if cancelled && matches!(ev, TuiStreamEvent::Done(_) | TuiStreamEvent::Error(_)) {
                 is_processing = false;
+                shell.finalize_streaming("");
                 info_line = "Interrupted".into();
             }
             let Some(ev) = filter_stream_event(ev, &mut cancelled) else {
@@ -283,14 +249,10 @@ where
             let result = {
                 let mut state = StreamRuntimeState {
                     shell: &mut shell,
-                    streaming_buffer: &mut streaming_buffer,
                     active_phase: &mut active_phase,
                     pending_approval: &mut pending_approval,
                     info_line: &mut info_line,
                     is_processing: &mut is_processing,
-                    streaming_in_code_block: &mut streaming_in_code_block,
-                    streaming_in_diff_block: &mut streaming_in_diff_block,
-                    streaming_code_block_lang: &mut streaming_code_block_lang,
                 };
                 handle_stream_event(ev, &mut state)
             };
@@ -305,38 +267,9 @@ where
                         shell.push_thinking(summary);
                     }
                     shell.is_thinking = false;
-                    // Flush any remaining partial streaming line to scrollback.
-                    if !streaming_buffer.is_empty() {
-                        let remaining = std::mem::take(&mut streaming_buffer);
-                        let logical_lines = if streaming_in_code_block {
-                            vec![remaining]
-                        } else {
-                            split_inline_markdown_blocks(&remaining)
-                        };
-                        let mut styled_lines: Vec<Line<'static>> =
-                            Vec::with_capacity(logical_lines.len().max(1));
-                        for text in logical_lines {
-                            let entry = TranscriptEntry {
-                                kind: MessageKind::Assistant,
-                                text,
-                            };
-                            styled_lines.push(style_transcript_line(
-                                &entry,
-                                streaming_in_code_block,
-                                streaming_in_diff_block,
-                                &streaming_code_block_lang,
-                            ));
-                        }
-                        let _ = insert_wrapped_lines_above(&mut terminal, &styled_lines);
-                    }
                     shell.finalize_streaming(&output);
-                    // Skip re-printing entries that were already streamed.
-                    last_printed_idx = shell.transcript.len();
-                    streaming_in_code_block = false;
-                    streaming_in_diff_block = false;
-                    streaming_code_block_lang.clear();
                     active_phase = None;
-                    info_line = "ok".to_string();
+                    info_line.clear();
                     is_processing = false;
                     shell.active_tool = None;
                     if let Some(new_status) = refresh_status() {
@@ -388,18 +321,24 @@ where
             last_mission_refresh_at = Instant::now();
         }
 
-        // Print any new transcript entries above the inline viewport
-        // so they go into native terminal scrollback.
-        flush_transcript_above(&mut terminal, &shell, &mut last_printed_idx, plan_collapsed)?;
-        // Flush complete lines from the streaming buffer into scrollback.
-        flush_streaming_lines(
-            &mut terminal,
-            &mut streaming_buffer,
-            &mut streaming_in_code_block,
-            &mut streaming_in_diff_block,
-            &mut streaming_code_block_lang,
-            plan_collapsed,
-        )?;
+        let last_text = shell
+            .transcript
+            .last()
+            .map_or("", |entry| entry.text.as_str());
+        if transcript_key.0 != shell.transcript.len()
+            || transcript_key.1 != last_text
+            || transcript_key.2 != shell.streaming_text
+            || transcript_key.3 != plan_collapsed
+        {
+            transcript_lines = render_transcript(&shell, plan_collapsed);
+            transcript_width = 0;
+            transcript_key = (
+                shell.transcript.len(),
+                last_text.to_owned(),
+                shell.streaming_text.clone(),
+                plan_collapsed,
+            );
+        }
 
         terminal.draw(|frame| {
             if let Some(menu) = &menu {
@@ -410,12 +349,20 @@ where
             if area.width == 0 || area.height < 3 {
                 return;
             }
-            // Inline viewport rows:
-            //   Row 0..A: stream partial output
-            //   Row A+1: separator ─────
-            //   Row A+2..B: multi-line input prompt
-            //   Row B+1: separator ─────
-            //   Row B+2: status bar
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        " CodingBuddy",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("  {}", status.working_directory)),
+                ])),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+            let area = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+            if area.height < 3 {
+                return;
+            }
             let width = area.width;
             let (prompt_str, prompt_style) = if vim_enabled {
                 match vim_mode {
@@ -474,78 +421,9 @@ where
             let sep2_y = input_area.y + input_area.height;
             let status_y = sep2_y + 1;
 
-            // Row 0..A: current streaming partial line(s) (or blank when idle)
-            if let Some((tool_name, args_summary, _)) = pending_approval.as_ref() {
-                let explanation = approval_explanation(tool_name, args_summary);
-                let banner = format!(
-                    " !!! APPROVAL REQUIRED !!! {tool_name} | {} | Y approve | A always | N deny ",
-                    truncate_inline(&explanation, 90)
-                );
-                let bg = if approval_flash_on {
-                    Color::LightYellow
-                } else {
-                    Color::LightRed
-                };
+            if let Some(help) = &help_modal {
                 frame.render_widget(
-                    Paragraph::new(Line::from(vec![Span::styled(
-                        banner,
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                    .wrap(Wrap { trim: false }),
-                    stream_area,
-                );
-            } else if !streaming_buffer.is_empty() {
-                let styled = if let Some(meta) = parse_stream_meta_entry(&streaming_buffer) {
-                    style_transcript_line(&meta, false, false, "")
-                } else {
-                    let partial_entry = TranscriptEntry {
-                        kind: MessageKind::Assistant,
-                        text: streaming_buffer.clone(),
-                    };
-                    if streaming_in_code_block && streaming_in_diff_block {
-                        render_diff_line(&partial_entry.text)
-                    } else {
-                        render_assistant_markdown(&partial_entry.text)
-                    }
-                };
-                let scroll_y = scroll_to_keep_row_visible(
-                    wrapped_text_rows(&streaming_buffer, stream_area.width).saturating_sub(1),
-                    stream_area.height,
-                );
-                frame.render_widget(
-                    Paragraph::new(styled)
-                        .wrap(Wrap { trim: false })
-                        .scroll((scroll_y, 0)),
-                    stream_area,
-                );
-            } else if shell.is_thinking && !shell.thinking_buffer.is_empty() {
-                // Show the tail of the thinking buffer in the streaming area,
-                // styled as dimmed italic to distinguish from normal output.
-                let display = shell.thinking_buffer.clone();
-                let scroll_y = scroll_to_keep_row_visible(
-                    wrapped_text_rows(&display, stream_area.width).saturating_sub(1),
-                    stream_area.height,
-                );
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(
-                            "  \u{25cb} ",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::ITALIC),
-                        ),
-                        Span::styled(
-                            display,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        ),
-                    ]))
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll_y, 0)),
+                    Paragraph::new(help.visible_lines(usize::from(stream_height)).join("\n")),
                     stream_area,
                 );
             } else if mission_control_visible {
@@ -555,7 +433,39 @@ where
                     stream_area,
                 );
             } else {
-                frame.render_widget(Paragraph::new(Span::raw("")), stream_area);
+                if transcript_width != width {
+                    transcript_heights = transcript_lines
+                        .iter()
+                        .map(|line| wrapped_line_height(line, width))
+                        .collect();
+                    transcript_rows = transcript_heights.iter().sum();
+                    transcript_width = width;
+                }
+                let max_scroll = transcript_rows.saturating_sub(usize::from(stream_height));
+                transcript_scroll = transcript_scroll.min(max_scroll);
+                let mut skip = max_scroll - transcript_scroll;
+                let start = transcript_heights
+                    .iter()
+                    .position(|&rows| {
+                        if skip < rows {
+                            true
+                        } else {
+                            skip -= rows;
+                            false
+                        }
+                    })
+                    .unwrap_or(transcript_lines.len());
+                let visible = transcript_lines[start..]
+                    .iter()
+                    .take(usize::from(stream_height))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                frame.render_widget(
+                    Paragraph::new(visible)
+                        .wrap(Wrap { trim: false })
+                        .scroll((skip.min(u16::MAX as usize) as u16, 0)),
+                    stream_area,
+                );
             }
 
             // Row A+1: thin separator line
@@ -701,48 +611,35 @@ where
                     input_area,
                 );
             }
-            // Row N+1: always-visible operator summary (phase/todo/subagents/capabilities/counters)
-            let summary_area = Rect::new(area.x, sep2_y, width, 1);
-            let operator_summary = operator_summary_line(&status);
-            let operator_style = if status.failed_tasks > 0 || status.failed_subagents > 0 {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else if approval_alert_active {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![Span::styled(
-                    format!(
-                        " {}",
-                        truncate_inline(&operator_summary, width.saturating_sub(1) as usize)
-                    ),
-                    operator_style,
-                )])),
-                summary_area,
-            );
-
-            // Row N+2: compact status bar (model/mode/usage + dynamic notices)
             let status_area = Rect::new(area.x, status_y, width, 1);
-            let mut status_spans = render_statusline_spans(
-                &status,
-                if shell.is_thinking {
-                    None
-                } else {
-                    shell.active_tool.as_deref()
-                },
-                shell.spinner_frame(),
-                None,
-                if vim_enabled {
-                    Some(vim_mode.label())
-                } else {
-                    None
-                },
-                false,
-                shell.is_thinking,
-            );
+            let vim_mode_label = vim_enabled.then(|| vim_mode.label());
+            let active_tool = shell.active_tool.as_deref();
+            let mut status_spans = if detailed_status {
+                let summary_area = Rect::new(area.x, sep2_y, width, 1);
+                frame.render_widget(
+                    Paragraph::new(operator_summary_line(&status))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    summary_area,
+                );
+                render_statusline_spans(
+                    &status,
+                    active_tool,
+                    shell.spinner_frame(),
+                    None,
+                    vim_mode_label,
+                    false,
+                    shell.is_thinking,
+                )
+            } else {
+                statusline::render_minimal_statusline(
+                    &status,
+                    controls.needs_connection,
+                    active_tool,
+                    shell.spinner_frame(),
+                    vim_mode_label,
+                    shell.is_thinking,
+                )
+            };
             if mission_control_visible {
                 status_spans.push(Span::raw(" "));
                 status_spans.push(Span::styled(
@@ -773,34 +670,21 @@ where
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            if approval_alert_active {
-                let approval_bg = if approval_flash_on {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                };
-                status_spans.push(Span::raw(" "));
+            if !info_line.is_empty() && pending_approval.is_none() {
                 status_spans.push(Span::styled(
-                    " APPROVAL REQUIRED ".to_string(),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(approval_bg)
-                        .add_modifier(Modifier::BOLD),
+                    format!("  {info_line}"),
+                    Style::default().fg(Color::DarkGray),
                 ));
             }
-            status_spans.push(Span::styled(
-                format!(" {}", info_line),
-                if approval_alert_active {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            ));
             if let Some(dropdown) = &slash_dropdown {
-                frame.render_widget(ratatui::widgets::Clear, stream_area);
-                let rows = dropdown.display_lines(usize::from(stream_area.height));
+                let rows = dropdown.display_lines(usize::from(stream_area.height.min(6)));
+                let height = (rows.len() as u16).min(stream_area.height);
+                let dropdown_area = Rect::new(
+                    stream_area.x,
+                    stream_area.bottom().saturating_sub(height),
+                    width,
+                    height,
+                );
                 let lines: Vec<_> = rows
                     .into_iter()
                     .map(|row| {
@@ -811,7 +695,8 @@ where
                         }
                     })
                     .collect();
-                frame.render_widget(Paragraph::new(lines), stream_area);
+                frame.render_widget(ratatui::widgets::Clear, dropdown_area);
+                frame.render_widget(Paragraph::new(lines), dropdown_area);
                 status_spans = vec![Span::raw(
                     " ↑↓ Select · Enter Run · Tab Complete · Esc Dismiss",
                 )];
@@ -841,7 +726,6 @@ where
                     token.lock().unwrap().cancel();
                 }
                 cancelled = true;
-                streaming_buffer.clear();
                 shell.active_tool = None;
                 active_phase = None;
                 shell.is_thinking = false;
@@ -1086,7 +970,6 @@ where
                     token.lock().unwrap().cancel();
                 }
                 cancelled = true;
-                streaming_buffer.clear();
                 shell.active_tool = None;
                 shell.is_thinking = false;
                 shell.thinking_buffer.clear();
@@ -1782,6 +1665,8 @@ where
         // Ctrl+L — clear terminal screen
         if key == bindings.clear_screen {
             shell.transcript.clear();
+            shell.clear_streaming_text();
+            transcript_scroll = 0;
             info_line = "screen cleared".to_string();
             continue;
         }
@@ -2058,6 +1943,7 @@ where
             if history.len() > 100 {
                 let _ = history.pop_front();
             }
+            transcript_scroll = 0;
             shell.push_user(&prompt);
             input.clear();
             cursor_pos = 0;
@@ -2094,21 +1980,13 @@ where
                 continue;
             }
             KeyCode::PageUp => {
-                // Pause TUI so user can scroll in native terminal scrollback
-                disable_raw_mode()?;
-                {
-                    use std::io::Write;
-                    let mut out = io::stdout();
-                    let _ = write!(
-                        out,
-                        "\x1b[?25h\r\n\x1b[33m  ▲ Scroll mode — use terminal scroll. Press any key to return.\x1b[0m\r\n"
-                    );
-                    let _ = out.flush();
-                }
-                // Wait in cooked mode so terminal scroll works, then restore raw mode
-                let _ = event::read();
-                enable_raw_mode()?;
-                info_line = "returned from scroll mode".to_string();
+                let page = usize::from(terminal.size()?.height.saturating_sub(5).max(1));
+                transcript_scroll = transcript_scroll.saturating_add(page);
+                continue;
+            }
+            KeyCode::PageDown => {
+                let page = usize::from(terminal.size()?.height.saturating_sub(5).max(1));
+                transcript_scroll = transcript_scroll.saturating_sub(page);
                 continue;
             }
             KeyCode::Backspace => {
@@ -2156,8 +2034,7 @@ where
         }
     }
 
-    // TerminalGuard handles raw mode + alternate screen on drop.
-    // Show cursor and clear inline viewport before the guard runs.
+    // TerminalGuard restores the shell screen and input mode.
     terminal.show_cursor()?;
     drop(_guard);
     Ok(())

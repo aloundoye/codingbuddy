@@ -8,7 +8,7 @@
     "url": "https://github.com/aloundoye/codingbuddy"
   },
   "bin": {
-    "codingbuddy": "bin/codingbuddy"
+    "codingbuddy": "run.js"
   },
   "scripts": {
     "postinstall": "node install.js"
@@ -18,5 +18,5 @@
   "engines": {
     "node": ">=16"
   },
-  "files": ["bin/", "install.js", "README.md"]
+  "files": ["bin/", "install.js", "run.js", "README.md"]
 }

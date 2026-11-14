@@ -77,7 +77,7 @@ impl LspClient {
             return Ok(json!({"already_initialized": true}));
         }
 
-        let root_uri = format!("file://{}", self.workspace_root.display());
+        let root_uri = path_to_uri(&self.workspace_root);
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
@@ -319,7 +319,9 @@ fn path_to_uri(path: &Path) -> String {
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
     };
-    format!("file://{}", abs.display())
+    url::Url::from_file_path(&abs)
+        .map(String::from)
+        .unwrap_or_else(|()| format!("file://{}", abs.display()))
 }
 
 fn position_params(file_path: &Path, line: u32, col: u32) -> Value {
@@ -373,7 +375,11 @@ fn parse_locations(result: &Value) -> Vec<LspLocation> {
         .iter()
         .filter_map(|loc| {
             let uri = loc.get("uri")?.as_str()?;
-            let file = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+            let file = url::Url::parse(uri)
+                .ok()
+                .and_then(|uri| uri.to_file_path().ok())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| uri.to_owned());
             let range = loc.get("range")?;
             let start = range.get("start")?;
             let end = range.get("end");
@@ -516,8 +522,10 @@ mod tests {
 
     #[test]
     fn path_to_uri_absolute() {
-        let uri = path_to_uri(Path::new("/tmp/foo.rs"));
-        assert!(uri.starts_with("file:///tmp/foo.rs"));
+        let path = std::env::current_dir().unwrap().join("foo bar.rs");
+        let uri = path_to_uri(&path);
+        assert!(uri.ends_with("/foo%20bar.rs"));
+        assert_eq!(url::Url::parse(&uri).unwrap().to_file_path().unwrap(), path);
     }
 
     #[test]
@@ -534,8 +542,9 @@ mod tests {
 
     #[test]
     fn parse_single_location() {
+        let path = std::env::current_dir().unwrap().join("foo.rs");
         let result = json!({
-            "uri": "file:///tmp/foo.rs",
+            "uri": path_to_uri(&path),
             "range": {
                 "start": {"line": 9, "character": 4},
                 "end": {"line": 9, "character": 10}
@@ -543,20 +552,22 @@ mod tests {
         });
         let locs = parse_locations(&result);
         assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0].file, "/tmp/foo.rs");
+        assert_eq!(Path::new(&locs[0].file), path);
         assert_eq!(locs[0].line, 10);
         assert_eq!(locs[0].col, 5);
     }
 
     #[test]
     fn parse_location_array() {
+        let cwd = std::env::current_dir().unwrap();
+        let path = cwd.join("a.rs");
         let result = json!([
-            {"uri": "file:///a.rs", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}},
-            {"uri": "file:///b.rs", "range": {"start": {"line": 10, "character": 3}, "end": {"line": 10, "character": 8}}},
+            {"uri": path_to_uri(&path), "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}},
+            {"uri": path_to_uri(&cwd.join("b.rs")), "range": {"start": {"line": 10, "character": 3}, "end": {"line": 10, "character": 8}}},
         ]);
         let locs = parse_locations(&result);
         assert_eq!(locs.len(), 2);
-        assert_eq!(locs[0].file, "/a.rs");
+        assert_eq!(Path::new(&locs[0].file), path);
         assert_eq!(locs[1].line, 11);
     }
 

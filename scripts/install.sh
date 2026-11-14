@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INSTALL_DIR" ]]; then
-  if [[ -w "/usr/local/bin" ]]; then
+  if [[ -w "/usr/local/bin" && ":$PATH:" == *":/usr/local/bin:"* ]]; then
     INSTALL_DIR="/usr/local/bin"
   else
     INSTALL_DIR="$HOME/.local/bin"
@@ -160,20 +160,29 @@ if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]]; then
     *":$HOME/.local/bin:"*) ;;
     *)
       export_line='export PATH="$HOME/.local/bin:$PATH"'
-      shell_name="$(basename "$SHELL")"
+      shell_name="$(basename "${SHELL:-sh}")"
       profile=""
       case "$shell_name" in
-        zsh)  profile="$HOME/.zshrc" ;;
+        zsh)  profile="${ZDOTDIR:-$HOME}/.zshrc" ;;
+        fish)
+          profile="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+          export_line='fish_add_path "$HOME/.local/bin"'
+          ;;
         bash)
-          if [[ -f "$HOME/.bashrc" ]]; then
-            profile="$HOME/.bashrc"
-          else
-            profile="$HOME/.profile"
+          profile="$HOME/.bashrc"
+          for login_profile in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+            if [[ -f "$login_profile" ]]; then
+              break
+            fi
+          done
+          if ! grep -qxF "$export_line" "$login_profile" 2>/dev/null; then
+            printf '\n%s\n' "$export_line" >> "$login_profile"
           fi
           ;;
         *)    profile="$HOME/.profile" ;;
       esac
-      if [[ -n "$profile" ]] && ! grep -qF '.local/bin' "$profile" 2>/dev/null; then
+      if [[ -n "$profile" ]] && ! grep -qxF "$export_line" "$profile" 2>/dev/null; then
+        mkdir -p "$(dirname "$profile")"
         echo "" >> "$profile"
         echo "# Added by CodingBuddy installer" >> "$profile"
         echo "$export_line" >> "$profile"
@@ -184,6 +193,9 @@ if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]]; then
 fi
 
 echo ""
-echo "CodingBuddy installed! Run: codingbuddy"
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) echo "CodingBuddy installed! Run: codingbuddy" ;;
+  *) echo "CodingBuddy installed. Open a new terminal or run the binary at the location below." ;;
+esac
 echo "Location: $INSTALL_DIR/codingbuddy"
 echo "Uninstall: rm \"$INSTALL_DIR/codingbuddy\""

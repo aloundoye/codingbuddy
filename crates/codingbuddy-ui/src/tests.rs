@@ -1211,6 +1211,7 @@ fn extract_fence_lang_extracts_language() {
 fn wrapped_line_height_tracks_soft_wrapping() {
     let line = Line::from("abcdefghijklmnopqrstuvwxyz");
     assert_eq!(wrapped_line_height(&line, 10), 3);
+    assert_eq!(wrapped_line_height(&Line::from("abcd efgh ijkl"), 7), 3);
     assert_eq!(wrapped_line_height(&Line::from(""), 10), 1);
     assert_eq!(wrapped_line_height(&line, 0), 0);
 }
@@ -1727,6 +1728,47 @@ fn vim_insert_mode_toggle() {
     let mode = VimMode::Normal; // Esc pressed
     assert_eq!(mode.label(), "NORMAL");
     let _ = mode;
+}
+
+#[test]
+fn clearing_streamed_tool_preamble_preserves_completed_messages() {
+    let mut shell = ChatShell::default();
+    shell.push_transcript("Previous reply");
+    shell.append_streaming("Temporary preamble");
+    let render = |shell: &ChatShell| {
+        render_transcript(shell, false)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(render(&shell).contains("Temporary preamble"));
+    shell.clear_streaming_text();
+    assert!(!render(&shell).contains("Temporary preamble"));
+    shell.finalize_streaming("Final reply");
+    let transcript = render(&shell);
+    assert!(transcript.contains("Previous reply"));
+    assert!(transcript.contains("Final reply"));
+}
+
+#[test]
+fn minimal_statusline_omits_idle_diagnostics() {
+    let status = UiStatus {
+        model: "deepseek/deepseek-chat".into(),
+        provider: "deepseek".into(),
+        permission_mode: "ask".into(),
+        capability_summary: "internal capabilities".into(),
+        context_max_tokens: 128_000,
+        ..Default::default()
+    };
+    let text = |needs_connection| {
+        statusline::render_minimal_statusline(&status, needs_connection, None, "", None, false)
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>()
+    };
+    assert_eq!(text(true), " Enter to connect · /connect");
+    assert_eq!(text(false), " deepseek/deepseek-chat · Ask · / commands");
 }
 
 #[test]

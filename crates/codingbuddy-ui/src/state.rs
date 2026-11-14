@@ -39,6 +39,7 @@ impl VimMode {
 #[derive(Debug, Clone, Default)]
 pub struct ChatShell {
     pub transcript: Vec<TranscriptEntry>,
+    pub(crate) streaming_text: String,
     pub plan_lines: Vec<String>,
     pub tool_lines: Vec<String>,
     pub mission_control_lines: Vec<String>,
@@ -159,52 +160,23 @@ impl ChatShell {
         self.artifact_lines.push(line.into());
     }
 
-    /// Append text to the current streaming assistant response.
-    /// Creates a new assistant entry if none is in progress.
     pub fn append_streaming(&mut self, text: &str) {
-        if let Some(last) = self.transcript.last_mut()
-            && last.kind == MessageKind::Assistant
-        {
-            last.text.push_str(text);
-            return;
-        }
-        self.transcript.push(TranscriptEntry {
-            kind: MessageKind::Assistant,
-            text: text.to_string(),
-        });
+        self.streaming_text.push_str(text);
     }
 
-    /// Clear any partially streamed assistant text — used when the response turns out to
-    /// contain tool calls, making the interleaved text fragments visual noise.
     pub fn clear_streaming_text(&mut self) {
-        if let Some(last) = self.transcript.last_mut()
-            && last.kind == MessageKind::Assistant
-        {
-            last.text.clear();
-        }
+        self.streaming_text.clear();
     }
 
-    /// Finalize the streaming response — ensure the complete output is in the transcript.
-    /// If streaming deltas were received, replaces the partial entry with the final output.
-    /// If no streaming happened, pushes the full output as new transcript entries.
     pub fn finalize_streaming(&mut self, final_output: &str) {
-        if final_output.is_empty() {
-            return;
-        }
-        // Remove any partial streaming assistant entry built by append_streaming.
-        if self
-            .transcript
-            .last()
-            .is_some_and(|e| e.kind == MessageKind::Assistant)
-        {
-            self.transcript.pop();
-        }
-        // Push the complete output, one entry per line for proper rendering.
-        for line in final_output.lines() {
-            self.transcript.push(TranscriptEntry {
-                kind: MessageKind::Assistant,
-                text: line.to_string(),
-            });
+        let streamed = std::mem::take(&mut self.streaming_text);
+        let output = if final_output.is_empty() {
+            &streamed
+        } else {
+            final_output
+        };
+        if !output.is_empty() {
+            self.push_transcript(output);
         }
     }
 
@@ -836,7 +808,7 @@ impl HelpModalState {
             "│  KEYBINDINGS                                    │".to_string(),
             "│  Enter        Send message (Shift+Enter newline)│".to_string(),
             "│  Ctrl+C       Cancel / interrupt / exit         │".to_string(),
-            "│  PageUp       Scroll mode (native terminal)     │".to_string(),
+            "│  PgUp/PgDn    Scroll conversation               │".to_string(),
             "│  Tab/S-Tab    Autocomplete / cycle agent        │".to_string(),
             "│  Ctrl+R       Reverse search history            │".to_string(),
             "│  Ctrl+P       Toggle plan collapse              │".to_string(),

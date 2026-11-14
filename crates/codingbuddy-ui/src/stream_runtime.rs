@@ -1,4 +1,4 @@
-use crate::{ChatShell, TuiStreamEvent, display_image_inline, truncate_inline};
+use crate::{ChatShell, TuiStreamEvent, truncate_inline};
 use std::io;
 use std::sync::mpsc;
 
@@ -28,14 +28,10 @@ pub(crate) enum StreamEventResult {
 
 pub(crate) struct StreamRuntimeState<'a> {
     pub shell: &'a mut ChatShell,
-    pub streaming_buffer: &'a mut String,
     pub active_phase: &'a mut Option<(u64, String)>,
     pub pending_approval: &'a mut Option<(String, String, mpsc::Sender<bool>)>,
     pub info_line: &'a mut String,
     pub is_processing: &'a mut bool,
-    pub streaming_in_code_block: &'a mut bool,
-    pub streaming_in_diff_block: &'a mut bool,
-    pub streaming_code_block_lang: &'a mut String,
 }
 
 pub(crate) fn filter_stream_event(
@@ -71,7 +67,6 @@ pub(crate) fn handle_stream_event(
                 state.shell.is_thinking = false;
                 state.shell.thinking_buffer.clear();
             }
-            state.streaming_buffer.push_str(&text);
             state.shell.append_streaming(&text);
             StreamEventResult::Continue
         }
@@ -195,7 +190,7 @@ pub(crate) fn handle_stream_event(
             } else {
                 state.shell.push_system(line.clone());
             }
-            *state.info_line = truncate_inline(&line, 96);
+            state.info_line.clear();
             StreamEventResult::Continue
         }
         TuiStreamEvent::WatchTriggered { comment_count, .. } => {
@@ -206,17 +201,12 @@ pub(crate) fn handle_stream_event(
             StreamEventResult::Continue
         }
         TuiStreamEvent::ImageDisplay { data, label } => {
-            if !display_image_inline(&data) {
-                state
-                    .shell
-                    .push_system(format!("[image: {label} ({} bytes)]", data.len()));
-            } else {
-                state.shell.push_system(format!("[image: {label}]"));
-            }
+            state
+                .shell
+                .push_system(format!("[image: {label} ({} bytes)]", data.len()));
             StreamEventResult::Continue
         }
         TuiStreamEvent::ClearStreamingText => {
-            state.streaming_buffer.clear();
             state.shell.clear_streaming_text();
             StreamEventResult::Continue
         }
@@ -232,29 +222,7 @@ pub(crate) fn handle_stream_event(
             ));
             StreamEventResult::Continue
         }
-        TuiStreamEvent::UsageSummary {
-            input_tokens,
-            output_tokens,
-            cache_hit_tokens,
-            cost_usd,
-        } => {
-            let cache_part = if cache_hit_tokens > 0 {
-                format!(" cache:{cache_hit_tokens}")
-            } else {
-                String::new()
-            };
-            // Compact per-message cost line (Claude Code style)
-            state.shell.push_system(format!(
-                "\u{2500} ${:.4} \u{2502} {input_tokens}in {output_tokens}out{cache_part}",
-                cost_usd
-            ));
-            *state.info_line = format!(
-                "${:.4} | {}K tok | /model to switch",
-                cost_usd,
-                (input_tokens + output_tokens) / 1000
-            );
-            StreamEventResult::Continue
-        }
+        TuiStreamEvent::UsageSummary { .. } => StreamEventResult::Continue,
         TuiStreamEvent::RoleHeader { role, model } => {
             state.shell.push_system(format!(
                 "\u{2501}\u{2501} {} ({}) \u{2501}\u{2501}",
@@ -285,15 +253,12 @@ pub(crate) fn handle_stream_event(
             StreamEventResult::Continue
         }
         TuiStreamEvent::Error(msg) => {
-            state.streaming_buffer.clear();
-            *state.streaming_in_code_block = false;
-            *state.streaming_in_diff_block = false;
-            state.streaming_code_block_lang.clear();
             *state.active_phase = None;
             state.shell.is_thinking = false;
             state.shell.thinking_buffer.clear();
+            state.shell.finalize_streaming("");
             state.shell.push_error(&msg);
-            *state.info_line = format!("error: {msg}");
+            state.info_line.clear();
             *state.is_processing = false;
             state.shell.active_tool = None;
             StreamEventResult::Continue
@@ -419,24 +384,16 @@ mod tests {
     #[test]
     fn handle_stream_event_promotes_background_notice() {
         let mut shell = ChatShell::default();
-        let mut streaming_buffer = String::new();
         let mut active_phase = None;
         let mut pending_approval = None;
         let mut info_line = String::new();
         let mut is_processing = true;
-        let mut streaming_in_code_block = false;
-        let mut streaming_in_diff_block = false;
-        let mut streaming_code_block_lang = String::new();
         let mut state = StreamRuntimeState {
             shell: &mut shell,
-            streaming_buffer: &mut streaming_buffer,
             active_phase: &mut active_phase,
             pending_approval: &mut pending_approval,
             info_line: &mut info_line,
             is_processing: &mut is_processing,
-            streaming_in_code_block: &mut streaming_in_code_block,
-            streaming_in_diff_block: &mut streaming_in_diff_block,
-            streaming_code_block_lang: &mut streaming_code_block_lang,
         };
 
         let result = handle_stream_event(
@@ -450,6 +407,6 @@ mod tests {
         assert!(matches!(result, StreamEventResult::Continue));
         assert_eq!(state.shell.mission_control_lines.len(), 1);
         assert_eq!(state.shell.transcript.len(), 1);
-        assert!(state.info_line.contains("task completed"));
+        assert!(state.info_line.is_empty());
     }
 }

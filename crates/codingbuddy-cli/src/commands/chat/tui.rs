@@ -1250,7 +1250,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                     Ok(Err(e)) => {
                         let error = format!("{e:#}");
                         if e.downcast_ref::<codingbuddy_llm::ConnectionError>()
-                            .is_some()
+                            .is_some_and(|error| {
+                                !matches!(error, codingbuddy_llm::ConnectionError::BillingRequired)
+                            })
                             && let Ok(mut connection) = connection_for_turn.lock()
                         {
                             connection.ready = false;

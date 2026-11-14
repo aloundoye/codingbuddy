@@ -185,6 +185,69 @@ pub(crate) fn review_badge(status: &str) -> (&'static str, Color) {
     }
 }
 
+pub(crate) fn render_minimal_statusline(
+    status: &UiStatus,
+    needs_connection: bool,
+    active_tool: Option<&str>,
+    spinner: &str,
+    vim_mode: Option<&str>,
+    is_thinking: bool,
+) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::{style::Style, text::Span};
+
+    let theme = super::theme::theme();
+    if needs_connection {
+        return vec![Span::styled(
+            " Enter to connect · /connect",
+            Style::default().fg(theme.primary),
+        )];
+    }
+
+    let mut spans = Vec::new();
+    if is_thinking {
+        spans.push(Span::styled(
+            format!(" {spinner} Thinking ·"),
+            Style::default().fg(theme.thinking),
+        ));
+    } else if let Some(tool) = active_tool {
+        spans.push(Span::styled(
+            format!(" {spinner} {tool} ·"),
+            Style::default().fg(theme.tool_call),
+        ));
+    }
+
+    let model = if status.provider.is_empty()
+        || status.model.starts_with(&format!("{}/", status.provider))
+    {
+        status.model.clone()
+    } else {
+        format!("{}/{}", status.provider, status.model)
+    };
+    spans.push(Span::styled(
+        format!(" {model}"),
+        Style::default().fg(theme.primary),
+    ));
+    let permission = match status.permission_mode.as_str() {
+        "auto" => "Auto",
+        "plan" => "Plan",
+        "locked" => "Locked",
+        "bypassPermissions" => "Bypass",
+        _ => "Ask",
+    };
+    spans.push(Span::styled(
+        format!(" · {permission}"),
+        Style::default().fg(theme.muted),
+    ));
+    if let Some(mode) = vim_mode {
+        spans.push(Span::raw(format!(" · {mode}")));
+    }
+    spans.push(Span::styled(
+        " · / commands",
+        Style::default().fg(theme.muted),
+    ));
+    spans
+}
+
 pub(crate) fn render_statusline_spans(
     status: &UiStatus,
     active_tool: Option<&str>,
