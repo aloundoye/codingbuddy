@@ -49,7 +49,14 @@ impl LspClient {
         server_args: &[&str],
         workspace_root: &Path,
     ) -> Result<Self> {
-        let child = Command::new(server_command)
+        let mut command = Command::new(server_command);
+        codingbuddy_core::process_env::apply_for(
+            &mut command,
+            workspace_root,
+            "language_tools",
+            codingbuddy_core::process_env::Source::Project,
+        );
+        let child = command
             .args(server_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

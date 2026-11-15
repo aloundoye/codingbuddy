@@ -46,6 +46,21 @@ pub(crate) fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
             );
             let bind = SocketAddr::new(ip, args.port);
             let workspace = std::env::current_dir()?.canonicalize()?;
+            let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(&workspace)?;
+            for path in [
+                ".codingbuddy",
+                ".codingbuddy/store.sqlite",
+                ".codingbuddy/store.sqlite-shm",
+                ".codingbuddy/store.sqlite-wal",
+                ".codingbuddy/store.sqlite-journal",
+                ".codingbuddy/events.jsonl",
+            ] {
+                let relative = Path::new(path);
+                anyhow::ensure!(
+                    files.resolve(relative, true)? == relative,
+                    "HTTP runtime state must use its workspace path"
+                );
+            }
             let handler = codingbuddy_jsonrpc::IdeRpcHandler::new(&workspace)?;
             run_http_server(bind, &handler, args.web, json_mode)
         }
@@ -87,15 +102,18 @@ fn run_http_server(
     let dist_dir = if serve_web { resolve_web_dist() } else { None };
 
     for request in server.incoming_requests() {
-        let header = |name: &'static str| {
+        let headers = |name: &'static str| {
             request
                 .headers()
                 .iter()
-                .find(|header| header.field.equiv(name))
-                .map(|header| header.value.as_str())
+                .filter(move |h| h.field.equiv(name))
+                .map(|h| h.value.as_str())
         };
-        let valid_origin = header("Host") == Some(address.as_str())
-            && header("Origin").is_none_or(|value| value == origin);
+        let valid_host = headers("Host").eq([address.as_str()]);
+        let mut origins = headers("Origin");
+        let valid_origin =
+            origins.next().is_none_or(|value| value == origin) && origins.next().is_none();
+        let valid_origin = valid_host && valid_origin;
         if !valid_origin {
             let _ = request.respond(tiny_http::Response::empty(403));
             continue;
@@ -107,9 +125,9 @@ fn run_http_server(
         match (method.as_str(), url.as_str()) {
             ("POST", "/rpc") => {
                 use subtle::ConstantTimeEq;
-                let authorized = header("Authorization").is_some_and(|value| {
+                let authorized = headers("Authorization").next().is_some_and(|value| {
                     bool::from(value.as_bytes().ct_eq(authorization.as_bytes()))
-                });
+                }) && headers("Authorization").nth(1).is_none();
                 if authorized {
                     handle_rpc_request(request, handler);
                 } else {
@@ -176,9 +194,11 @@ fn handle_rpc_request(
 
     let response = match handler.handle_http(&rpc_req.method, rpc_req.params) {
         Ok(result) => JsonRpcResponse::success(rpc_req.id, result),
-        Err(e) => {
-            JsonRpcResponse::error(rpc_req.id, codingbuddy_jsonrpc::ERR_INTERNAL, e.to_string())
-        }
+        Err(error) => JsonRpcResponse::error(
+            rpc_req.id,
+            codingbuddy_jsonrpc::ERR_INTERNAL,
+            error.to_string(),
+        ),
     };
 
     let json = serde_json::to_string(&response).unwrap_or_default();

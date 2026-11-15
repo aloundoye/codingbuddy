@@ -147,7 +147,7 @@ impl PatchStore {
         patch.last_base_sha_match = Some(base_matches);
 
         let run_apply = |use_three_way: bool| -> Result<std::process::Output> {
-            let mut cmd = Command::new("git");
+            let mut cmd = codingbuddy_core::process_env::git_inspection(workspace);
             cmd.arg("apply");
             if use_three_way {
                 cmd.arg("--3way");
@@ -290,7 +290,7 @@ fn hash_workspace_state(workspace: &Path, files: &[String]) -> Result<String> {
 }
 
 fn checked_patch_paths(workspace: &Path, diff: &str) -> Result<Vec<String>> {
-    let mut command = Command::new("git");
+    let mut command = codingbuddy_core::process_env::git_inspection(workspace);
     command.args(["apply", "--numstat", "-z", "--allow-empty"]);
     let output = git_apply(command, workspace, diff)?;
     anyhow::ensure!(

@@ -269,6 +269,38 @@ CODINGBUDDY_TRUST_WORKSPACE="$(pwd -P)" codingbuddy chat
 
 Use the workspace's absolute path when launching from another directory or from an IDE. This setting also applies to headless launches. Put provider credentials in user settings, the keyring, or your environment. Sandbox configuration alone does not waive Bash approval.
 
+Shell commands in untrusted workspaces need approval for each invocation.
+Headless sessions without an approval handler decline them. Automatic builds,
+diagnostics and worktrees that execute workspace code require workspace trust.
+
+Workspace subprocesses start with a minimal environment. If an integration
+previously relied on inherited variables, grant only the names it needs in
+`~/.codingbuddy/settings.json` or the managed settings file.
+
+```json
+{
+  "process_env": {
+    "grants": [
+      {
+        "consumer": "mcp:issue-tracker",
+        "source": "project",
+        "workspace": "/absolute/path/to/project",
+        "variables": ["ISSUE_TRACKER_TOKEN"]
+      }
+    ]
+  }
+}
+```
+
+Consumer names are `mcp:<server-id>`, `hook:<event>:<definition-index>:<handler-index>`
+(zero-based), `plugin_hook:<workspace-relative-path>`, `shell`, `language_tools`,
+`git_worktree`, and `git_checkpoint`.
+Use `"source": "project"` and an exact workspace path for project consumers.
+For user or managed hooks and servers, use `"user"` or `"managed"` and optionally
+pin the workspace. An explicit managed grant list replaces the user list.
+MCP interpolation uses the same allowed variables. A literal fallback in
+`${VAR:-fallback}` can still be used when the variable is unavailable.
+
 ## Development
 
 ```bash

@@ -99,6 +99,9 @@ impl EditValidator {
     /// Returns an empty vec if the language is disabled, the tool is not installed,
     /// or the file extension is not recognized.
     pub fn check_file(&self, path: &Path) -> Result<Vec<Diagnostic>> {
+        if !codingbuddy_core::workspace_is_trusted(&self.workspace) {
+            return Ok(Vec::new());
+        }
         let Some(language) = detect_language(path) else {
             return Ok(Vec::new());
         };
@@ -134,6 +137,12 @@ impl EditValidator {
 
     /// Run a command with timeout. Returns stdout+stderr or empty on failure/timeout.
     fn run_with_timeout(&self, mut cmd: Command) -> (String, String) {
+        codingbuddy_core::process_env::apply_for(
+            &mut cmd,
+            &self.workspace,
+            "language_tools",
+            codingbuddy_core::process_env::Source::Project,
+        );
         let mut child = match cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -250,18 +259,9 @@ pub fn detect_language(path: &Path) -> Option<&'static str> {
 
 /// Check whether a command is available on the system PATH.
 ///
-/// Uses `which` on Unix-like systems and `where` on Windows.
 pub fn is_command_available(cmd: &str) -> bool {
-    #[cfg(unix)]
-    let check = Command::new("which").arg(cmd).output();
-
-    #[cfg(windows)]
-    let check = Command::new("where").arg(cmd).output();
-
-    match check {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
-    }
+    use codingbuddy_core::process_env::{Source, find_program, variables};
+    find_program(cmd, &variables(Path::new("."), "", Source::Project)).is_some()
 }
 
 #[cfg(test)]

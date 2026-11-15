@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::Utc;
+use codingbuddy_core::process_env::{self, Source};
 use codingbuddy_store::{McpServerRecord, McpToolCacheRecord, Store};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,8 @@ pub struct McpServer {
     pub metadata: serde_json::Value,
     /// Custom headers for HTTP/SSE transport (e.g. authorization).
     pub headers: Vec<(String, String)>,
+    #[serde(skip)]
+    pub child_env: process_env::Variables,
 }
 
 impl Default for McpServer {
@@ -52,6 +55,7 @@ impl Default for McpServer {
             enabled: true,
             metadata: serde_json::Value::Null,
             headers: Vec::new(),
+            child_env: Default::default(),
         }
     }
 }
@@ -121,10 +125,14 @@ pub struct McpManager {
 
 impl McpManager {
     pub fn new(workspace: &Path) -> Result<Self> {
+        Self::with_trust(workspace, codingbuddy_core::workspace_is_trusted(workspace))
+    }
+
+    pub fn with_trust(workspace: &Path, trusted_workspace: bool) -> Result<Self> {
         Ok(Self {
             workspace: workspace.to_path_buf(),
             store: Store::new(workspace)?,
-            trusted_workspace: codingbuddy_core::workspace_is_trusted(workspace),
+            trusted_workspace,
         })
     }
 
@@ -164,33 +172,42 @@ impl McpManager {
     }
 
     pub fn list_servers(&self) -> Result<Vec<McpServer>> {
-        let mut merged = Vec::new();
-        // Managed config has highest priority (cannot be overridden)
+        let mut candidates = Vec::new();
+        let mut append = |config: McpConfig, source| {
+            candidates.extend(config.servers.into_iter().map(|server| (server, source)));
+        };
         if let Some(managed) = Self::load_managed_mcp_config() {
-            merged.extend(managed.servers);
+            append(managed, Source::Managed);
         }
-        if let Some(path) = Self::user_config_path() {
-            merged.extend(load_config_if_exists(&path)?.servers);
-        }
-        if let Some(path) = Self::user_local_config_path() {
-            merged.extend(load_config_if_exists(&path)?.servers);
+        for path in [Self::user_config_path(), Self::user_local_config_path()]
+            .into_iter()
+            .flatten()
+        {
+            append(load_config_if_exists(&path)?, Source::User);
         }
         if self.trusted_workspace {
-            merged.extend(self.load_project_config()?.servers);
+            append(self.load_project_config()?, Source::Project);
+        } else if self.project_config_path().is_file() {
+            eprintln!("[trust] Ignored project MCP configuration");
         }
-        if let Some(managed) = codingbuddy_policy::load_managed_settings() {
-            merged.retain(|server| codingbuddy_policy::is_mcp_server_allowed(&server.id, &managed));
-        }
-        // P5-13: Expand environment variables in all server configs
-        for server in &mut merged {
-            if let Err(e) = expand_server_env_vars(server) {
-                eprintln!("[mcp] {e}");
+        let mut seen = BTreeSet::new();
+        let mut servers = Vec::new();
+        for (mut server, source) in candidates {
+            if !seen.insert(server.id.clone()) || !server_allowed(&server) {
                 continue;
             }
+            server.child_env =
+                process_env::variables(&self.workspace, &format!("mcp:{}", server.id), source);
+            if expand_server_env_vars(&mut server).is_err() {
+                eprintln!(
+                    "[mcp] Skipped server with invalid configuration or unauthorized environment reference"
+                );
+                continue;
+            }
+            servers.push(server);
         }
-        merged.sort_by(|a, b| a.id.cmp(&b.id));
-        merged.dedup_by(|a, b| a.id == b.id); // first wins (managed > user > project)
-        Ok(merged)
+        servers.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(servers)
     }
 
     /// Check whether a server ID comes from managed (enterprise) config.
@@ -412,6 +429,7 @@ impl McpManager {
         let server = self
             .get_server(server_id)?
             .ok_or_else(|| anyhow!("MCP server not found: {server_id}"))?;
+        ensure_server_enabled(&server)?;
 
         match server.transport {
             McpTransport::Http | McpTransport::Sse => {
@@ -722,6 +740,7 @@ impl McpManager {
         let server = self
             .get_server(server_id)?
             .ok_or_else(|| anyhow!("MCP server '{server_id}' not found"))?;
+        ensure_server_enabled(&server)?;
         let params = json!({
             "name": prompt_name,
             "arguments": arguments,
@@ -925,18 +944,60 @@ fn contains_path_traversal(s: &str) -> bool {
 pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
     use codingbuddy_policy::shell_parse::contains_shell_injection_chars;
 
-    let expanded_id = expand_env_vars(&server.id);
-    let expanded_name = expand_env_vars(&server.name);
-    let expanded_cmd = server.command.as_ref().map(|cmd| expand_env_vars(cmd));
-    let expanded_args: Vec<String> = server.args.iter().map(|a| expand_env_vars(a)).collect();
-    let expanded_url = server.url.as_ref().map(|url| expand_env_vars(url));
+    anyhow::ensure!(
+        !server.id.contains("${") && !server.name.contains("${"),
+        "MCP IDs and names must be literal"
+    );
+    let baseline;
+    let vars = if server.child_env.is_empty() {
+        baseline = process_env::variables(Path::new("."), "", Source::User);
+        &baseline
+    } else {
+        &server.child_env
+    };
+    let expand = |input: &str| -> Result<String> {
+        let mut rest = input;
+        let mut output = String::new();
+        while let Some((before, after)) = rest.split_once("${") {
+            let (expression, tail) = after
+                .split_once('}')
+                .ok_or_else(|| anyhow!("invalid MCP environment reference"))?;
+            let (name, fallback) = expression
+                .split_once(":-")
+                .map_or((expression, None), |(name, fallback)| {
+                    (name, Some(fallback))
+                });
+            let value = process_env::lookup(vars, name).and_then(|value| value.to_str());
+            let value = value
+                .filter(|value| !value.is_empty())
+                .or(fallback)
+                .or(value)
+                .ok_or_else(|| anyhow!("unauthorized or unavailable MCP environment variable"))?;
+            output.push_str(before);
+            output.push_str(value);
+            rest = tail;
+        }
+        output.push_str(rest);
+        Ok(output)
+    };
+    let expanded_cmd = server.command.as_deref().map(expand).transpose()?;
+    let expanded_args = server
+        .args
+        .iter()
+        .map(|arg| expand(arg))
+        .collect::<Result<Vec<_>>>()?;
+    let expanded_url = server.url.as_deref().map(expand).transpose()?;
+    for (key, value) in &mut server.headers {
+        anyhow::ensure!(!key.contains("${"), "MCP header names must be literal");
+        *value = expand(value)?;
+    }
 
     // Validate expanded values don't contain path traversal
     if let Some(ref cmd) = expanded_cmd
         && contains_path_traversal(cmd)
     {
         return Err(anyhow!(
-            "MCP server '{}': expanded command contains path traversal: {cmd}",
+            "MCP server '{}': expanded command contains path traversal",
             server.id
         ));
     }
@@ -944,14 +1005,14 @@ pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
         && contains_path_traversal(url)
     {
         return Err(anyhow!(
-            "MCP server '{}': expanded url contains path traversal: {url}",
+            "MCP server '{}': expanded URL contains path traversal",
             server.id
         ));
     }
     for (i, arg) in expanded_args.iter().enumerate() {
         if contains_path_traversal(arg) {
             return Err(anyhow!(
-                "MCP server '{}': expanded arg[{i}] contains path traversal: {arg}",
+                "MCP server '{}': expanded arg[{i}] contains path traversal",
                 server.id
             ));
         }
@@ -961,21 +1022,19 @@ pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
         && contains_shell_injection_chars(cmd)
     {
         return Err(anyhow!(
-            "MCP server '{}': expanded command contains shell metacharacters: {cmd}",
+            "MCP server '{}': expanded command contains shell metacharacters",
             server.id
         ));
     }
     for arg in &expanded_args {
         if contains_shell_injection_chars(arg) {
             return Err(anyhow!(
-                "MCP server '{}': expanded arg contains shell metacharacters: {arg}",
+                "MCP server '{}': expanded argument contains shell metacharacters",
                 server.id
             ));
         }
     }
 
-    server.id = expanded_id;
-    server.name = expanded_name;
     server.command = expanded_cmd;
     server.args = expanded_args;
     server.url = expanded_url;
@@ -1033,6 +1092,7 @@ pub fn import_from_claude_desktop() -> Result<Vec<McpServer>> {
             enabled: true,
             metadata: entry.get("env").cloned().unwrap_or(serde_json::Value::Null),
             headers: Vec::new(),
+            child_env: Default::default(),
         });
     }
     Ok(servers)
@@ -1124,7 +1184,56 @@ pub fn enforce_mcp_token_limit(output: &str, limits: &McpTokenLimits) -> (String
     }
 }
 
+fn server_allowed(server: &McpServer) -> bool {
+    codingbuddy_policy::load_managed_settings()
+        .is_none_or(|settings| codingbuddy_policy::is_mcp_server_allowed(&server.id, &settings))
+}
+
+fn ensure_server_enabled(server: &McpServer) -> Result<()> {
+    anyhow::ensure!(
+        server.enabled && server_allowed(server),
+        "MCP server disabled or denied by policy"
+    );
+    Ok(())
+}
+
+fn stdio_fingerprint(server: &McpServer) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+    struct DigestHasher(Sha256);
+    impl Hasher for DigestHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.update(bytes);
+        }
+    }
+    let mut hash = DigestHasher(Sha256::new());
+    (&server.command, &server.args, &server.child_env).hash(&mut hash);
+    hash.0.finalize().into()
+}
+
+fn stdio_command(server: &McpServer) -> Result<Command> {
+    ensure_server_enabled(server)?;
+    let executable = server
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow!("stdio transport requires command"))?;
+    let mut command = Command::new(executable);
+    let baseline;
+    let vars = if server.child_env.is_empty() {
+        baseline = process_env::variables(Path::new("."), "", Source::User);
+        &baseline
+    } else {
+        &server.child_env
+    };
+    process_env::apply(&mut command, vars);
+    command.args(&server.args);
+    Ok(command)
+}
+
 fn discover_server_tools(server: &McpServer) -> Result<Vec<McpTool>> {
+    ensure_server_enabled(server)?;
     if let Some(list) = server.metadata.get("tools").and_then(|v| v.as_array()) {
         let tools = parse_tools_array(&server.id, list);
         if !tools.is_empty() {
@@ -1203,17 +1312,12 @@ fn parse_sse_tools(server_id: &str, sse_text: &str) -> Result<Vec<McpTool>> {
 }
 
 fn discover_stdio_tools(server: &McpServer) -> Result<Vec<McpTool>> {
-    let command = server
-        .command
-        .as_deref()
-        .ok_or_else(|| anyhow!("stdio transport requires command"))?;
-    let mut child = Command::new(command)
-        .args(&server.args)
+    let mut child = stdio_command(server)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("failed to start MCP stdio command: {command}"))?;
+        .context("failed to start MCP stdio server")?;
 
     let mut stdin = child
         .stdin
@@ -1281,6 +1385,7 @@ struct PooledConnection {
     rx: mpsc::Receiver<serde_json::Value>,
     _reader_handle: Option<thread::JoinHandle<()>>,
     last_used: Instant,
+    launch_fingerprint: [u8; 32],
     next_request_id: u64,
 }
 
@@ -1312,7 +1417,9 @@ impl McpConnectionPool {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value> {
+        ensure_server_enabled(server)?;
         let key = server.id.clone();
+        let fingerprint = stdio_fingerprint(server);
         let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
 
         // Evict idle connections
@@ -1322,7 +1429,9 @@ impl McpConnectionPool {
         // release the lock before performing I/O.
         let existing = if let Some(mut conn) = pool.remove(&key) {
             // Health check: try_wait returns Some if process exited
-            if conn.child.try_wait().ok().flatten().is_some() {
+            if conn.launch_fingerprint != fingerprint
+                || conn.child.try_wait().ok().flatten().is_some()
+            {
                 let _ = conn.child.kill();
                 let _ = conn.child.wait();
                 None
@@ -1387,17 +1496,12 @@ impl McpConnectionPool {
 
     /// Create a new pooled connection: spawn process, initialize MCP protocol.
     fn create_connection(&self, server: &McpServer) -> Result<PooledConnection> {
-        let command = server
-            .command
-            .as_deref()
-            .ok_or_else(|| anyhow!("stdio transport requires command"))?;
-        let mut child = Command::new(command)
-            .args(&server.args)
+        let mut child = stdio_command(server)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to start MCP stdio command: {command}"))?;
+            .context("failed to start MCP stdio server")?;
 
         let mut stdin = child
             .stdin
@@ -1439,6 +1543,7 @@ impl McpConnectionPool {
             rx,
             _reader_handle: Some(reader_handle),
             last_used: Instant::now(),
+            launch_fingerprint: stdio_fingerprint(server),
             next_request_id: 100, // Start after init
         })
     }
@@ -1477,17 +1582,12 @@ pub fn execute_mcp_stdio_request(
     request_id: u64,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
-    let command = server
-        .command
-        .as_deref()
-        .ok_or_else(|| anyhow!("stdio transport requires command"))?;
-    let mut child = Command::new(command)
-        .args(&server.args)
+    let mut child = stdio_command(server)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("failed to start MCP stdio command: {command}"))?;
+        .context("failed to start MCP stdio server")?;
 
     let mut stdin = child
         .stdin
@@ -2359,6 +2459,50 @@ mod tests {
     }
 
     #[test]
+    fn p0_mcp_project_activation_and_environment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = Uuid::now_v7().to_string();
+        let server = McpServer {
+            id: id.clone(),
+            name: "fixture".into(),
+            command: Some("fixture-executable".into()),
+            ..Default::default()
+        };
+        let manager = McpManager::with_trust(workspace.path(), false).unwrap();
+        manager
+            .save_project_config(&McpConfig {
+                servers: vec![server.clone()],
+            })
+            .unwrap();
+        assert!(manager.get_server(&id).unwrap().is_none());
+
+        let manager = McpManager::with_trust(workspace.path(), true).unwrap();
+        let mut server = manager.get_server(&id).unwrap().unwrap();
+        server.args = vec!["${P0_PRIVATE_VALUE}".into()];
+        assert!(expand_server_env_vars(&mut server).is_err());
+        server
+            .child_env
+            .insert("P0_PRIVATE_VALUE".into(), "synthetic-value".into());
+        expand_server_env_vars(&mut server).unwrap();
+        assert_eq!(server.args, ["synthetic-value"]);
+
+        let command = stdio_command(&server).unwrap();
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "P0_PRIVATE_VALUE" && value.is_some_and(|value| value == "synthetic-value")
+        }));
+        let other = McpServer {
+            command: Some("fixture-executable".into()),
+            ..Default::default()
+        };
+        assert!(
+            stdio_command(&other)
+                .unwrap()
+                .get_envs()
+                .all(|(name, _)| name != "P0_PRIVATE_VALUE")
+        );
+    }
+
+    #[test]
     fn add_list_remove_server_round_trip() {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-mcp-test-{}", Uuid::now_v7()));
@@ -2376,6 +2520,7 @@ mod tests {
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name":"hello","description":"test"}]}),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -2407,6 +2552,7 @@ mod tests {
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name":"a"},{"name":"b"}]}),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -2432,6 +2578,7 @@ mod tests {
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name":"b"},{"name":"c"}]}),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("replace");
 
@@ -2613,6 +2760,7 @@ mod tests {
             enabled: true,
             metadata: serde_json::Value::Null,
             headers: vec![],
+            child_env: Default::default(),
         };
         expand_server_env_vars(&mut server).unwrap();
         assert_eq!(server.command.as_deref(), Some("node"));
@@ -2631,6 +2779,7 @@ mod tests {
             enabled: true,
             metadata: serde_json::Value::Null,
             headers: vec![],
+            child_env: Default::default(),
         };
         let result = expand_server_env_vars(&mut server);
         assert!(
@@ -2724,6 +2873,7 @@ mod tests {
                     ]
                 }),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -2753,6 +2903,7 @@ mod tests {
                 enabled: true,
                 metadata: serde_json::Value::Null,
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -2783,6 +2934,7 @@ mod tests {
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name": "remote_tool", "description": "A remote tool"}]}),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add http server");
 
@@ -2839,6 +2991,7 @@ mod tests {
                     {"name":"t2","description":"tool 2"}
                 ]}),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -2870,6 +3023,7 @@ mod tests {
                     {"name":"b","description":"beta"}
                 ]}),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -2899,6 +3053,7 @@ mod tests {
                     {"name":"read","description":"read tool"}
                 ]}),
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -3066,6 +3221,7 @@ data: {"other":"ignored"}
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name":"sse_tool"}]}),
                 headers: vec![("Authorization".to_string(), "Bearer tok".to_string())],
+                child_env: Default::default(),
             })
             .expect("add sse server");
 
@@ -3111,6 +3267,7 @@ data: {"other":"ignored"}
                 enabled: true,
                 metadata: serde_json::Value::Null,
                 headers: vec![],
+                child_env: Default::default(),
             })
             .expect("add");
 
@@ -3181,7 +3338,9 @@ data: {"other":"ignored"}
             enabled: true,
             metadata: serde_json::Value::Null,
             headers: vec![],
+            child_env: Default::default(),
         };
+        server.child_env.insert("HOME".into(), home.clone().into());
         expand_server_env_vars(&mut server).unwrap();
         let expected_url = format!("https://api.example.com/{home}");
         assert_eq!(server.url.as_deref(), Some(expected_url.as_str()));

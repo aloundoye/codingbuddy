@@ -392,7 +392,7 @@ impl WorktreeIsolation {
         let base_commit = git_stdout(workspace, &["rev-parse", "HEAD"])
             .context("failed to get HEAD commit for worktree")?;
 
-        let output = std::process::Command::new("git")
+        let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
             .arg("-C")
             .arg(workspace)
             .args(["worktree", "add", "--detach"])
@@ -430,7 +430,7 @@ impl WorktreeIsolation {
         if !self.created {
             return Ok(());
         }
-        let output = std::process::Command::new("git")
+        let output = codingbuddy_core::process_env::git_command(&self.workspace, "git_worktree")
             .arg("-C")
             .arg(&self.workspace)
             .args(["worktree", "remove", "--force"])
@@ -457,7 +457,7 @@ impl Drop for WorktreeIsolation {
 }
 
 fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new("git")
+    let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .args(args)
         .current_dir(workspace)
         .output()

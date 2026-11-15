@@ -19,7 +19,11 @@ pub struct WatchDigest {
 /// Scans a workspace for TODO(ai)/FIXME(ai)/AI: comments using ripgrep.
 /// Returns None if no comments found or rg not available.
 pub fn watch_scan(workspace: &Path) -> Option<WatchDigest> {
-    let output = std::process::Command::new("rg")
+    use codingbuddy_core::process_env::{Source, apply, find_program, variables};
+    let env = variables(workspace, "", Source::Project);
+    let mut command = std::process::Command::new(find_program("rg", &env)?);
+    apply(&mut command, &env);
+    let output = command
         .args([
             "-n",
             "--hidden",

@@ -231,7 +231,13 @@ pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde
             if command_line.is_empty() {
                 return Err(anyhow!("background run-shell command is empty"));
             }
-            let (shell_label, command) = build_background_shell_command(&command_line);
+            let (shell_label, mut command) = build_background_shell_command(&command_line);
+            codingbuddy_core::process_env::apply_for(
+                &mut command,
+                cwd,
+                "shell",
+                codingbuddy_core::process_env::Source::Project,
+            );
             spawn_background_process(
                 cwd,
                 "shell",
@@ -251,14 +257,14 @@ pub(crate) fn build_background_shell_command(command_line: &str) -> (String, Com
     {
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
         let mut command = Command::new(&shell);
-        command.arg("/C").arg(command_line);
+        command.args(["/D", "/C"]).arg(command_line);
         (shell, command)
     }
     #[cfg(not(windows))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut command = Command::new(&shell);
-        command.arg("-lc").arg(command_line);
+        command.arg("-c").arg(command_line);
         (shell, command)
     }
 }

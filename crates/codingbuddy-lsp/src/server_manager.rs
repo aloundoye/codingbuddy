@@ -133,6 +133,9 @@ impl LspServerManager {
     }
 
     fn ensure_server_for_file(&self, file_path: &Path) -> Result<Option<String>> {
+        if !codingbuddy_core::workspace_is_trusted(&self.workspace) {
+            return Ok(None);
+        }
         let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let entry = match language_map::lookup_extension(ext) {

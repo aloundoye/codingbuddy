@@ -10,6 +10,7 @@ pub mod config_watcher;
 pub mod cost;
 mod llm_capabilities;
 mod model_catalog;
+pub mod process_env;
 pub mod profiler;
 pub mod prompts;
 mod tool_metadata;
@@ -1454,6 +1455,10 @@ impl EventKind {
 }
 
 pub trait ToolHost {
+    fn requires_explicit_approval(&self, _call: &ToolCall) -> bool {
+        false
+    }
+
     /// Validate execution preconditions before cached or live results can be returned.
     fn validate(&self, _call: &ToolCall) -> Result<()> {
         Ok(())
@@ -2154,6 +2159,10 @@ pub struct FimRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
+    #[serde(skip)]
+    pub workspace_trust: Option<bool>,
+    #[serde(skip)]
+    pub hook_sources: std::collections::BTreeMap<String, process_env::Source>,
     pub llm: LlmConfig,
     pub agent_loop: AgentLoopConfig,
     pub git: GitWorkflowConfig,
@@ -2364,28 +2373,41 @@ impl AppConfig {
 
     fn load_settings(workspace: &Path, trusted: bool) -> Result<(Self, bool)> {
         let mut explicit = false;
+        let mut hook_sources = std::collections::BTreeMap::new();
         let mut merged = serde_json::to_value(Self::default())?;
         if let Some(root) = merged.as_object_mut() {
             root.remove("privacy");
         }
 
         let legacy = Self::legacy_toml_path(workspace);
+        if !trusted && legacy.is_file() {
+            eprintln!("[trust] Ignored legacy project runtime settings");
+        }
         if trusted && legacy.exists() {
             let raw = fs::read_to_string(legacy)?;
             let legacy_cfg: toml::Value = toml::from_str(&raw)?;
             let value = serde_json::to_value(legacy_cfg)?;
             explicit |= value.pointer("/llm/provider").is_some();
+            record_hook_sources(&mut hook_sources, &value, process_env::Source::Project);
             merge_llm_settings(&mut merged, &value);
         }
 
         let mut paths = Vec::new();
         if let Some(user) = Self::user_settings_path() {
-            paths.push((user, true));
+            paths.push((user, true, process_env::Source::User));
         }
-        paths.push((Self::project_settings_path(workspace), trusted));
-        paths.push((Self::project_local_settings_path(workspace), trusted));
+        paths.push((
+            Self::project_settings_path(workspace),
+            trusted,
+            process_env::Source::Project,
+        ));
+        paths.push((
+            Self::project_local_settings_path(workspace),
+            trusted,
+            process_env::Source::Project,
+        ));
 
-        for (path, trusted_source) in paths {
+        for (path, trusted_source, source) in paths {
             if !path.exists() {
                 continue;
             }
@@ -2409,15 +2431,18 @@ impl AppConfig {
                     continue;
                 }
             };
-            if !trusted_source {
-                retain_safe_project_settings(&mut value);
+            if !trusted_source && retain_safe_project_settings(&mut value) {
+                eprintln!("[trust] Ignored runtime settings from {}", path.display());
             }
+            record_hook_sources(&mut hook_sources, &value, source);
             explicit |= value.pointer("/llm/provider").is_some();
             merge_llm_settings(&mut merged, &value);
         }
 
         migrate_privacy_settings(&mut merged);
         let mut cfg: Self = serde_json::from_value(merged)?;
+        cfg.workspace_trust = Some(trusted);
+        cfg.hook_sources = hook_sources;
         // Older generated settings wrote the implicit DeepSeek URL for every provider.
         if cfg.llm.provider != "deepseek"
             && cfg.llm.endpoint == "https://api.deepseek.com/chat/completions"
@@ -2467,14 +2492,29 @@ fn migrate_privacy_settings(settings: &mut serde_json::Value) {
 }
 
 // Legacy endpoint and key fields describe the provider selected by their settings layer.
-fn retain_safe_project_settings(value: &mut serde_json::Value) {
+fn retain_safe_project_settings(value: &mut serde_json::Value) -> bool {
     if let Some(settings) = value.as_object_mut() {
+        let before = settings.len();
         settings.retain(|key, _| {
             matches!(
                 key.as_str(),
                 "theme" | "language" | "output_style" | "respect_gitignore"
             )
         });
+        return before != settings.len();
+    }
+    false
+}
+
+fn record_hook_sources(
+    sources: &mut std::collections::BTreeMap<String, process_env::Source>,
+    settings: &serde_json::Value,
+    source: process_env::Source,
+) {
+    if let Some(hooks) = settings.get("hooks").and_then(serde_json::Value::as_object) {
+        for event in hooks.keys() {
+            sources.insert(event.clone(), source);
+        }
     }
 }
 

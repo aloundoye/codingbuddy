@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codingbuddy_core::process_env::{self, Source};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write;
@@ -344,6 +345,7 @@ pub struct HookContext {
 pub struct HookRuntime {
     workspace: PathBuf,
     config: HooksConfig,
+    sources: std::collections::BTreeMap<String, Source>,
     /// Tracks hooks that have `once: true` and have already run.
     #[allow(dead_code)]
     once_fired: Mutex<HashSet<String>>,
@@ -354,8 +356,29 @@ impl HookRuntime {
         Self {
             workspace: workspace.to_path_buf(),
             config,
+            sources: Default::default(),
             once_fired: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn from_app_config(workspace: &Path, config: &codingbuddy_core::AppConfig) -> Self {
+        let mut effective =
+            serde_json::from_value::<HooksConfig>(config.hooks.clone()).unwrap_or_default();
+        let mut sources = config.hook_sources.clone();
+        if let Some(managed) = codingbuddy_policy::load_managed_settings() {
+            if managed.allow_managed_hooks_only {
+                effective.events.clear();
+                sources.clear();
+            }
+            let hooks = serde_json::from_value::<HooksConfig>(managed.hooks).unwrap_or_default();
+            for (event, definitions) in hooks.events {
+                sources.insert(event.clone(), Source::Managed);
+                effective.events.insert(event, definitions);
+            }
+        }
+        let mut runtime = Self::new(workspace, effective);
+        runtime.sources = sources;
+        runtime
     }
 
     /// Fire hooks for an event with the given input context.
@@ -407,8 +430,16 @@ impl HookRuntime {
                 }
             }
 
-            for handler in &def.hooks {
-                let run = self.execute_handler(handler, input);
+            for (handler_idx, handler) in def.hooks.iter().enumerate() {
+                let consumer = format!("hook:{event_key}:{def_idx}:{handler_idx}");
+                let source = self.sources.get(event_key).copied().unwrap_or(Source::User);
+                if source != Source::Managed
+                    && codingbuddy_policy::load_managed_settings()
+                        .is_some_and(|settings| settings.allow_managed_hooks_only)
+                {
+                    continue;
+                }
+                let run = self.execute_handler(handler, input, &consumer, source);
                 if run.blocked && event.supports_blocking() {
                     result.blocked = true;
                     result.block_reason = run
@@ -448,17 +479,32 @@ impl HookRuntime {
     }
 
     /// Execute a single hook handler.
-    fn execute_handler(&self, handler: &HookHandler, input: &HookInput) -> HookRun {
+    fn execute_handler(
+        &self,
+        handler: &HookHandler,
+        input: &HookInput,
+        consumer: &str,
+        source: Source,
+    ) -> HookRun {
         match handler {
             HookHandler::Command { command, timeout } => {
-                self.run_command_handler(command, input, *timeout)
+                self.run_command_handler(command, input, *timeout, consumer, source)
             }
-            HookHandler::Async { command, timeout } => self.run_async_handler(command, *timeout),
+            HookHandler::Async { command, timeout } => {
+                self.run_async_handler(command, *timeout, consumer, source)
+            }
             HookHandler::Prompt {
                 prompt,
                 model,
                 schema,
-            } => self.run_prompt_handler(prompt, model.as_deref(), schema.as_ref(), input),
+            } => self.run_prompt_handler(
+                prompt,
+                model.as_deref(),
+                schema.as_ref(),
+                input,
+                consumer,
+                source,
+            ),
             HookHandler::Agent {
                 agent,
                 model,
@@ -468,7 +514,13 @@ impl HookRuntime {
     }
 
     /// Fire-and-forget a command in the background. Never blocks the main loop.
-    fn run_async_handler(&self, command: &str, timeout_secs: u64) -> HookRun {
+    fn run_async_handler(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+        consumer: &str,
+        source: Source,
+    ) -> HookRun {
         let shell = if cfg!(target_os = "windows") {
             "cmd"
         } else {
@@ -481,6 +533,9 @@ impl HookRuntime {
         };
 
         let mut cmd = Command::new(shell);
+        if cfg!(windows) {
+            cmd.arg("/D");
+        }
         cmd.arg(shell_flag)
             .arg(command)
             .current_dir(&self.workspace)
@@ -488,6 +543,7 @@ impl HookRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
+        process_env::apply_for(&mut cmd, &self.workspace, consumer, source);
         let spawn_result = cmd.spawn();
         let spawned = spawn_result.is_ok();
 
@@ -525,6 +581,8 @@ impl HookRuntime {
         _model: Option<&str>,
         _schema: Option<&serde_json::Value>,
         input: &HookInput,
+        consumer: &str,
+        source: Source,
     ) -> HookRun {
         // Expand template variables with shell escaping to prevent injection.
         let context_json = serde_json::to_string(input).unwrap_or_default();
@@ -534,7 +592,7 @@ impl HookRuntime {
 
         // For now, treat the expanded prompt as a shell command that outputs HookOutput JSON.
         // In production, this would call the LLM API.
-        self.run_command_handler(&expanded, input, default_timeout())
+        self.run_command_handler(&expanded, input, default_timeout(), consumer, source)
     }
 
     /// Agent-based hook: delegates to a named subagent for evaluation.
@@ -569,7 +627,14 @@ impl HookRuntime {
     }
 
     /// Run a command hook handler: pipe JSON on stdin, parse stdout JSON for decisions.
-    fn run_command_handler(&self, command: &str, input: &HookInput, timeout_secs: u64) -> HookRun {
+    fn run_command_handler(
+        &self,
+        command: &str,
+        input: &HookInput,
+        timeout_secs: u64,
+        consumer: &str,
+        source: Source,
+    ) -> HookRun {
         // Reject commands with embedded newlines (command injection vector)
         if command.contains('\n') || command.contains('\r') {
             return HookRun {
@@ -620,6 +685,9 @@ impl HookRuntime {
         };
 
         let mut cmd = Command::new(shell);
+        if cfg!(windows) {
+            cmd.arg("/D");
+        }
         cmd.arg(shell_flag);
         cmd.arg(command);
         cmd.current_dir(&self.workspace);
@@ -627,6 +695,7 @@ impl HookRuntime {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::null());
 
+        process_env::apply_for(&mut cmd, &self.workspace, consumer, source);
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(_e) => {
@@ -708,6 +777,12 @@ impl HookRuntime {
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
+            let relative = path.strip_prefix(&ctx.workspace).unwrap_or(path);
+            let consumer = format!(
+                "plugin_hook:{}",
+                relative.to_string_lossy().replace('\\', "/")
+            );
+            process_env::apply_for(&mut cmd, &ctx.workspace, &consumer, Source::Project);
             cmd.env("CODINGBUDDY_HOOK_PHASE", &ctx.phase);
             cmd.env(
                 "CODINGBUDDY_WORKSPACE",

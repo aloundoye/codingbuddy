@@ -23,7 +23,7 @@ use codingbuddy_core::{
     SessionBudgets, SessionState, StreamChunk, TaskPhase, ToolCall, ToolChoice,
     ToolPermissionMatcher, ToolResultSizePolicy, UserQuestionHandler,
 };
-use codingbuddy_hooks::{HookRuntime, HooksConfig};
+use codingbuddy_hooks::HookRuntime;
 use codingbuddy_llm::{ApiClient, LlmClient};
 use codingbuddy_mcp::McpManager;
 mod observe;
@@ -47,8 +47,29 @@ use uuid::Uuid;
 pub type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send + Sync>;
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
-fn runtime_tool_definitions(workspace: &Path) -> Vec<codingbuddy_core::ToolDefinition> {
+fn install_mcp_executor(host: &mut LocalToolHost, manager: Arc<McpManager>) {
+    host.set_mcp_executor(Arc::new(move |server_id, tool_name, args| {
+        let server = manager
+            .get_server(server_id)?
+            .ok_or_else(|| anyhow!("MCP server unavailable"))?;
+        codingbuddy_mcp::execute_mcp_stdio_request(
+            &server,
+            "tools/call",
+            serde_json::json!({"name": tool_name, "arguments": args}),
+            1,
+            Duration::from_secs(30),
+        )
+    }));
+}
+
+fn runtime_tool_definitions(
+    workspace: &Path,
+    trusted: bool,
+) -> Vec<codingbuddy_core::ToolDefinition> {
     let mut tools = tool_definitions();
+    if !trusted {
+        return tools;
+    }
     tools.extend(plugin_tool_definitions(workspace));
     tools.extend(codingbuddy_tools::custom_tools::custom_tool_definitions(
         workspace,
@@ -117,7 +138,7 @@ pub struct AgentEngine {
     user_question_handler: Mutex<Option<UserQuestionHandler>>,
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
     pub(crate) hooks: HookRuntime,
-    mcp: Option<McpManager>,
+    mcp: Option<Arc<McpManager>>,
     /// Watches settings files for hot-reload. The background thread keeps the watch alive;
     /// poll via `config_watcher.as_ref().and_then(|w| w.poll_change())`.
     config_watcher: Option<codingbuddy_core::config_watcher::ConfigWatcher>,
@@ -158,6 +179,10 @@ impl AgentEngine {
         mut cfg: AppConfig,
         llm: Box<dyn LlmClient + Send + Sync>,
     ) -> Result<Self> {
+        let trusted = cfg
+            .workspace_trust
+            .unwrap_or_else(|| codingbuddy_core::workspace_is_trusted(workspace));
+        cfg.workspace_trust = Some(trusted);
         // Apply managed settings overrides (enterprise/team constraints)
         if let Some(managed) = codingbuddy_policy::load_managed_settings() {
             managed.apply_to_config(&mut cfg);
@@ -167,7 +192,8 @@ impl AgentEngine {
 
         // Spawn MCP discovery after Store init to avoid SQLite migration races.
         let mcp_workspace = workspace.to_path_buf();
-        let mcp_handle = std::thread::spawn(move || McpManager::new(&mcp_workspace).ok());
+        let mcp_handle =
+            std::thread::spawn(move || McpManager::with_trust(&mcp_workspace, trusted).ok());
 
         let observer = Observer::new(workspace, &cfg.telemetry)?;
         let mut policy = PolicyEngine::from_app_config(&cfg.policy);
@@ -189,33 +215,16 @@ impl AgentEngine {
             }
         }
 
-        let mut tool_host = LocalToolHost::new(workspace, policy.clone())?;
+        let mut tool_host = LocalToolHost::with_config(
+            workspace,
+            policy.clone(),
+            Arc::new(codingbuddy_tools::PtyShellRunner),
+            &cfg,
+        )?;
 
-        let mcp = mcp_handle.join().ok().flatten();
-        if let Some(mcp_mgr) = &mcp {
-            let servers = mcp_mgr.list_servers().unwrap_or_default();
-            if !servers.is_empty() {
-                let servers = std::sync::Arc::new(servers);
-                tool_host.set_mcp_executor(std::sync::Arc::new(
-                    move |server_id, tool_name, args| {
-                        let server = servers
-                            .iter()
-                            .find(|s| s.id == server_id)
-                            .ok_or_else(|| anyhow!("MCP server '{server_id}' not found"))?;
-                        let params = serde_json::json!({
-                            "name": tool_name,
-                            "arguments": args,
-                        });
-                        codingbuddy_mcp::execute_mcp_stdio_request(
-                            server,
-                            "tools/call",
-                            params,
-                            1,
-                            std::time::Duration::from_secs(30),
-                        )
-                    },
-                ));
-            }
+        let mcp = mcp_handle.join().ok().flatten().map(Arc::new);
+        if let Some(manager) = &mcp {
+            install_mcp_executor(&mut tool_host, manager.clone());
         }
 
         let tool_host = Arc::new(tool_host);
@@ -226,9 +235,7 @@ impl AgentEngine {
             let _ = mem.cleanup_old_checkpoints(cfg.cleanup_period_days);
         }
 
-        let hooks_config: HooksConfig =
-            serde_json::from_value(cfg.hooks.clone()).unwrap_or_default();
-        let hooks = HookRuntime::new(workspace, hooks_config);
+        let hooks = HookRuntime::from_app_config(workspace, &cfg);
 
         Ok(Self {
             workspace: workspace.to_path_buf(),
@@ -358,9 +365,18 @@ impl AgentEngine {
     }
 
     pub fn set_permission_mode(&mut self, mode: &str) {
-        self.policy = PolicyEngine::from_mode(mode);
-        match LocalToolHost::new(&self.workspace, self.policy.clone()) {
-            Ok(host) => {
+        self.policy
+            .set_permission_mode(codingbuddy_policy::PermissionMode::from_str_lossy(mode));
+        match LocalToolHost::with_config(
+            &self.workspace,
+            self.policy.clone(),
+            Arc::new(codingbuddy_tools::PtyShellRunner),
+            &self.cfg,
+        ) {
+            Ok(mut host) => {
+                if let Some(manager) = &self.mcp {
+                    install_mcp_executor(&mut host, manager.clone());
+                }
                 self.tool_host = Arc::new(host);
             }
             Err(e) => {
@@ -718,7 +734,7 @@ impl AgentEngine {
             .and_then(|mm| mm.read_combined_memory().ok());
 
         // Build workspace context for environment section in system prompt
-        let git_branch = std::process::Command::new("git")
+        let git_branch = codingbuddy_core::process_env::git_inspection(&self.workspace)
             .args(["branch", "--show-current"])
             .current_dir(&self.workspace)
             .output()
@@ -887,6 +903,7 @@ impl AgentEngine {
             subagent_worker: self.build_subagent_worker(),
             skill_runner: self.build_skill_runner(),
             workspace: Some(self.workspace.clone()),
+            trusted_workspace: self.cfg.workspace_trust == Some(true),
             privacy_router: build_privacy_router(&cfg),
             images: options.images.clone(),
             initial_context,
@@ -894,7 +911,7 @@ impl AgentEngine {
             phase_loop_enabled: cfg.agent_loop.phase_loop_enabled,
             initial_phase,
             session_id: Some(session.session_id),
-            edit_validator: if cfg.lsp.enabled {
+            edit_validator: if self.cfg.workspace_trust == Some(true) && cfg.lsp.enabled {
                 Some(std::sync::Arc::new(codingbuddy_lsp::EditValidator::new(
                     self.workspace.clone(),
                     codingbuddy_lsp::LspConfig {
@@ -909,7 +926,8 @@ impl AgentEngine {
         };
 
         // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.
-        let builtin_tools = runtime_tool_definitions(&self.workspace);
+        let builtin_tools =
+            runtime_tool_definitions(&self.workspace, self.cfg.workspace_trust == Some(true));
         let signals = detect_signals(prompt, &self.workspace);
         let (tiered_tools, mut discoverable_tools) =
             tiered_tool_definitions(builtin_tools, &signals);
@@ -1036,13 +1054,7 @@ impl AgentEngine {
             }
         }));
 
-        // Wire hooks — create a new runtime with the same config for the loop
-        {
-            let hooks_config: codingbuddy_hooks::HooksConfig =
-                serde_json::from_value(self.cfg.hooks.clone()).unwrap_or_default();
-            let hooks = codingbuddy_hooks::HookRuntime::new(&self.workspace, hooks_config);
-            loop_.set_hooks(hooks);
-        }
+        loop_.set_hooks(HookRuntime::from_app_config(&self.workspace, &self.cfg));
 
         loop_.cancellation = options.cancellation.clone();
 
@@ -1053,15 +1065,15 @@ impl AgentEngine {
 
         // Wire checkpoint callback — prefers git shadow commits, falls back to file snapshots
         let ws = self.workspace.clone();
+        let trusted = self.cfg.workspace_trust == Some(true);
         loop_.set_checkpoint_callback(Arc::new(move |reason, modified_files| {
             if let Ok(mm) = codingbuddy_memory::MemoryManager::new(&ws) {
                 // Try shadow commit first (lightweight git-based checkpoint)
-                match mm.create_shadow_commit(reason) {
-                    Ok(sc) if sc.git_backed => {
-                        // Shadow commit succeeded — no file copy needed
-                        return Ok(());
-                    }
-                    _ => {}
+                if trusted
+                    && let Ok(sc) = mm.create_shadow_commit(reason)
+                    && sc.git_backed
+                {
+                    return Ok(());
                 }
                 // Fall back to file-based checkpoint
                 if modified_files.is_empty() {
@@ -1467,7 +1479,7 @@ fn should_run_team_orchestration(
     prompt: &str,
     options: &ChatOptions,
 ) -> bool {
-    if options.disable_team_orchestration {
+    if engine.cfg.workspace_trust != Some(true) || options.disable_team_orchestration {
         return false;
     }
 
@@ -1702,7 +1714,7 @@ mod tests {
         let manager = codingbuddy_tools::PluginManager::new(&workspace).expect("plugin manager");
         manager.install(&plugin_src).expect("install plugin");
 
-        let defs = runtime_tool_definitions(&workspace);
+        let defs = runtime_tool_definitions(&workspace, true);
         assert!(
             defs.iter()
                 .any(|def| def.function.name == "plugin__phase_c_plugin__review"),

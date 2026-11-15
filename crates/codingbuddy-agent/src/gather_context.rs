@@ -4,7 +4,6 @@ use codingbuddy_core::AppConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const HEAVY_DIRS: &[&str] = &[
     ".git",
@@ -392,7 +391,7 @@ fn resolve_repo_root(workspace: &Path, repo_root_override: Option<&Path>) -> Opt
         return None;
     }
 
-    let output = Command::new("git")
+    let output = codingbuddy_core::process_env::git_inspection(workspace)
         .arg("-C")
         .arg(workspace)
         .args(["rev-parse", "--show-toplevel"])
@@ -992,10 +991,10 @@ fn is_likely_text_file(path: &str) -> bool {
 }
 
 fn git_status_snapshot(workspace: &Path) -> String {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = codingbuddy_core::process_env::git_inspection(workspace)
         .arg("-C")
         .arg(workspace)
-        .args(["status", "--porcelain", "-b"])
+        .args(["status", "--porcelain", "-b", "--ignore-submodules=all"])
         .output()
     else {
         return "not a git workspace or git unavailable".to_string();
@@ -1014,10 +1013,10 @@ fn git_status_snapshot(workspace: &Path) -> String {
 }
 
 fn changed_files(workspace: &Path) -> Vec<String> {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = codingbuddy_core::process_env::git_inspection(workspace)
         .arg("-C")
         .arg(workspace)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--ignore-submodules=all"])
         .output()
     else {
         return Vec::new();
@@ -1039,7 +1038,7 @@ fn changed_files(workspace: &Path) -> Vec<String> {
 }
 
 fn git_churn(workspace: &Path, max_commits: usize) -> Vec<(String, usize)> {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = codingbuddy_core::process_env::git_inspection(workspace)
         .arg("-C")
         .arg(workspace)
         .args([

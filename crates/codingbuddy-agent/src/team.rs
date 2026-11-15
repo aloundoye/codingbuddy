@@ -11,7 +11,6 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::thread;
 use uuid::Uuid;
 
@@ -529,7 +528,7 @@ fn keyword_lane_groups(prompt: &str) -> BTreeMap<String, BTreeSet<String>> {
 }
 
 fn is_git_workspace(workspace: &Path) -> bool {
-    Command::new("git")
+    codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(workspace)
         .output()
@@ -539,7 +538,7 @@ fn is_git_workspace(workspace: &Path) -> bool {
 
 fn add_worktree(workspace: &Path, lane_path: &Path, base_commit: &str) -> Result<()> {
     let lane_path_str = lane_path.to_string_lossy().to_string();
-    let output = Command::new("git")
+    let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .arg("-C")
         .arg(workspace)
         .args(["worktree", "add", "--detach"])
@@ -558,7 +557,7 @@ fn add_worktree(workspace: &Path, lane_path: &Path, base_commit: &str) -> Result
 
 fn remove_worktree(workspace: &Path, lane_path: &Path) -> Result<()> {
     let lane_path_str = lane_path.to_string_lossy().to_string();
-    let output = Command::new("git")
+    let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .arg("-C")
         .arg(workspace)
         .args(["worktree", "remove", "--force"])
@@ -575,7 +574,7 @@ fn remove_worktree(workspace: &Path, lane_path: &Path) -> Result<()> {
 }
 
 fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .args(args)
         .current_dir(workspace)
         .output()

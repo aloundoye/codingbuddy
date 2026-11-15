@@ -6,7 +6,6 @@
 use crate::repo_map;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Build a repo-map string for the given workspace.
 ///
@@ -82,7 +81,7 @@ pub fn build_repo_map(
 }
 
 fn tracked_files(workspace: &Path) -> Vec<String> {
-    let output = Command::new("git")
+    let output = codingbuddy_core::process_env::git_inspection(workspace)
         .arg("-C")
         .arg(workspace)
         .arg("ls-files")
@@ -126,10 +125,10 @@ fn list_files(root: &Path, workspace: Option<&Path>) -> Vec<String> {
 }
 
 fn changed_files(workspace: &Path) -> HashSet<String> {
-    let output = Command::new("git")
+    let output = codingbuddy_core::process_env::git_inspection(workspace)
         .arg("-C")
         .arg(workspace)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--ignore-submodules=all"])
         .output();
     let mut set = HashSet::new();
     if let Ok(out) = output

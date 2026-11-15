@@ -24,6 +24,10 @@ pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 pub trait ShellRunner {
     fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult>;
 
+    fn run_verification(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
+        self.run(cmd, cwd, timeout)
+    }
+
     /// Run with a progress callback that receives live output chunks.
     fn run_with_progress(
         &self,
@@ -43,43 +47,51 @@ pub struct PlatformShellRunner;
 
 impl ShellRunner for PlatformShellRunner {
     fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
-        let mut child = spawn_command(cmd, cwd)?;
+        run_shell(cmd, cwd, timeout, "shell")
+    }
 
-        let status = child.wait_timeout(timeout)?;
-        if status.is_none() {
-            // Timeout: escalate SIGTERM → SIGKILL
-            #[cfg(unix)]
-            {
-                // Send SIGTERM first for graceful shutdown
-                unsafe {
-                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-                }
-                // Wait briefly for graceful exit, then force kill
-                if child.wait_timeout(Duration::from_secs(2))?.is_none() {
-                    let _ = child.kill(); // SIGKILL
-                }
+    fn run_verification(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
+        run_shell(cmd, cwd, timeout, "language_tools")
+    }
+}
+
+fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, consumer: &str) -> Result<ShellRunResult> {
+    let mut child = spawn_command(cmd, cwd, consumer)?;
+
+    let status = child.wait_timeout(timeout)?;
+    if status.is_none() {
+        // Timeout: escalate SIGTERM → SIGKILL
+        #[cfg(unix)]
+        {
+            // Send SIGTERM first for graceful shutdown
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
             }
-            #[cfg(not(unix))]
-            {
-                let _ = child.kill();
+            // Wait briefly for graceful exit, then force kill
+            if child.wait_timeout(Duration::from_secs(2))?.is_none() {
+                let _ = child.kill(); // SIGKILL
             }
-            let output = child.wait_with_output()?;
-            return Ok(ShellRunResult {
-                status: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                timed_out: true,
-            });
         }
-
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+        }
         let output = child.wait_with_output()?;
-        Ok(ShellRunResult {
+        return Ok(ShellRunResult {
             status: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            timed_out: false,
-        })
+            timed_out: true,
+        });
     }
+
+    let output = child.wait_with_output()?;
+    Ok(ShellRunResult {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        timed_out: false,
+    })
 }
 
 pub(crate) fn run_program(
@@ -88,7 +100,18 @@ pub(crate) fn run_program(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ShellRunResult> {
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    harden_command_env(&mut command, cwd, "language_tools");
+    run_command(command, args, cwd, timeout)
+}
+
+pub(crate) fn run_command(
+    mut command: Command,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<ShellRunResult> {
+    let child = command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -145,6 +168,10 @@ fn wait_for_output(mut child: Child, timeout: Duration) -> Result<ShellRunResult
 pub struct PtyShellRunner;
 
 impl ShellRunner for PtyShellRunner {
+    fn run_verification(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
+        PlatformShellRunner.run_verification(cmd, cwd, timeout)
+    }
+
     fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
         #[cfg(unix)]
         if USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
@@ -204,11 +231,11 @@ fn run_with_pty(
 
     let slave_fd_copy = slave_fd;
     let mut command = Command::new("sh");
-    command.arg("-lc").arg(cmd);
+    command.arg("-c").arg(cmd);
     command.current_dir(&cwd);
     command.stdin(Stdio::null());
+    harden_command_env(&mut command, &cwd, "shell");
     command.env("TERM", "xterm-256color");
-    harden_command_env(&mut command);
 
     unsafe {
         use std::os::unix::process::CommandExt;
@@ -343,15 +370,13 @@ fn strip_ansi_escapes(s: &str) -> String {
 }
 
 /// Harden a command's environment to prevent injection and locale issues.
-fn harden_command_env(command: &mut Command) {
+fn harden_command_env(command: &mut Command, workspace: &Path, consumer: &str) {
+    use codingbuddy_core::process_env::{Source, apply_for};
+    apply_for(command, workspace, consumer, Source::Project);
     command.env("LC_ALL", "C");
-    command.env_remove("LD_PRELOAD");
-    command.env_remove("DYLD_INSERT_LIBRARIES");
-    command.env_remove("LD_LIBRARY_PATH");
-    command.env_remove("DYLD_LIBRARY_PATH");
 }
 
-fn spawn_command(cmd: &str, cwd: &Path) -> Result<Child> {
+fn spawn_command(cmd: &str, cwd: &Path, consumer: &str) -> Result<Child> {
     // Always attempt canonicalization to resolve symlinks and prevent path traversal.
     // For non-existent paths, try canonicalizing the nearest existing parent.
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| {
@@ -373,7 +398,7 @@ fn spawn_command(cmd: &str, cwd: &Path) -> Result<Child> {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.stdin(Stdio::null());
-        harden_command_env(&mut command);
+        harden_command_env(&mut command, &cwd, consumer);
         let program = command.get_program().to_string_lossy().to_string();
         match command.spawn() {
             Ok(child) => return Ok(child),
@@ -391,7 +416,7 @@ fn spawn_command(cmd: &str, cwd: &Path) -> Result<Child> {
 fn candidate_commands(cmd: &str) -> Vec<Command> {
     let mut commands = Vec::new();
     let mut cmd_shell = Command::new("cmd");
-    cmd_shell.arg("/C").arg(cmd);
+    cmd_shell.args(["/D", "/C"]).arg(cmd);
     commands.push(cmd_shell);
 
     let mut ps_shell = Command::new("powershell");
@@ -409,11 +434,11 @@ fn candidate_commands(cmd: &str) -> Vec<Command> {
 fn candidate_commands(cmd: &str) -> Vec<Command> {
     let mut commands = Vec::new();
     let mut sh_shell = Command::new("sh");
-    sh_shell.arg("-lc").arg(cmd);
+    sh_shell.arg("-c").arg(cmd);
     commands.push(sh_shell);
 
     let mut bash_shell = Command::new("bash");
-    bash_shell.arg("-lc").arg(cmd);
+    bash_shell.arg("-c").arg(cmd);
     commands.push(bash_shell);
 
     commands

@@ -3,9 +3,13 @@ use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -819,6 +823,7 @@ fn run_json_with_env(workspace: &Path, args: &[&str], envs: &[(&str, &str)]) -> 
 
 struct MockLlmServer {
     endpoint: String,
+    requests: Arc<AtomicUsize>,
     stop_tx: Option<mpsc::Sender<()>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -841,6 +846,8 @@ fn start_mock_llm_server() -> MockLlmServer {
         .expect("set nonblocking listener");
     let addr = listener.local_addr().expect("mock addr");
     let (tx, rx) = mpsc::channel::<()>();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&requests);
     let handle = thread::spawn(move || {
         loop {
             if rx.try_recv().is_ok() {
@@ -848,6 +855,9 @@ fn start_mock_llm_server() -> MockLlmServer {
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = handle_mock_llm_connection(&mut stream);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -859,6 +869,7 @@ fn start_mock_llm_server() -> MockLlmServer {
     });
     MockLlmServer {
         endpoint: format!("http://{addr}/chat/completions"),
+        requests,
         stop_tx: Some(tx),
         handle: Some(handle),
     }
@@ -899,6 +910,9 @@ fn handle_mock_llm_connection(stream: &mut TcpStream) -> std::io::Result<()> {
 
     let header_len = header_end.unwrap_or(buffer.len());
     let content_length = parse_content_length(&buffer[..header_len]);
+    let fixture_auth = String::from_utf8_lossy(&buffer[..header_len])
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("authorization: Bearer synthetic-provider-key"));
     let mut body = if header_len <= buffer.len() {
         buffer[header_len..].to_vec()
     } else {
@@ -914,21 +928,29 @@ fn handle_mock_llm_connection(stream: &mut TcpStream) -> std::io::Result<()> {
 
     let prompt =
         extract_prompt_from_request_body(&body).unwrap_or_else(|| "mock prompt".to_string());
-    let content = format!("Mock response: {prompt}");
-    let payload = serde_json::json!({
-        "choices": [
-            {
-                "message": {
-                    "content": content
-                }
-            }
-        ]
-    })
-    .to_string();
+    let content = if fixture_auth {
+        format!("Mock response: {prompt} (synthetic credential accepted)")
+    } else {
+        format!("Mock response: {prompt}")
+    };
+    let streaming =
+        serde_json::from_slice::<Value>(&body).is_ok_and(|request| request["stream"] == true);
+    let (media_type, payload) = if streaming {
+        let event =
+            serde_json::json!({"choices":[{"delta":{"content":content},"finish_reason":"stop"}]});
+        (
+            "text/event-stream",
+            format!("data: {event}\n\ndata: [DONE]\n\n"),
+        )
+    } else {
+        (
+            "application/json",
+            serde_json::json!({"choices":[{"message":{"content":content}}]}).to_string(),
+        )
+    };
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len(),
-        payload
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
@@ -1040,4 +1062,312 @@ fn headless_resume_rejects_a_different_endpoint_before_reading_a_prompt() {
         .stderr
         .clone();
     assert!(String::from_utf8_lossy(&result).contains("different provider or endpoint"));
+}
+
+struct P0Server {
+    child: std::process::Child,
+    address: String,
+    token: String,
+}
+
+fn p0_binary() -> PathBuf {
+    std::env::var_os("CODINGBUDDY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| assert_cmd::cargo::cargo_bin!("codingbuddy").to_path_buf())
+}
+
+impl Drop for P0Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl P0Server {
+    fn launch(workspace: &Path, home: &Path) -> Self {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        let mut child = StdCommand::new(p0_binary())
+            .current_dir(workspace)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env_remove("CODINGBUDDY_TRUST_WORKSPACE")
+            .env("P0_FIXTURE_KEY", "synthetic-provider-key")
+            .args(["--json", "serve", "--transport", "http", "--port", "0"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start RPC server");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("startup stdout"))
+            .read_line(&mut line)
+            .expect("read startup response");
+        let startup: Value = serde_json::from_str(&line).expect("startup JSON");
+        Self {
+            child,
+            address: startup["address"].as_str().expect("address").to_owned(),
+            token: startup["token"].as_str().expect("token").to_owned(),
+        }
+    }
+
+    fn request(&self, headers: &str, method: &str, params: Value) -> (u16, Value) {
+        let body =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let mut stream = TcpStream::connect(&self.address).expect("connect to RPC server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        write!(stream, "POST /rpc HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}\r\n{body}", body.len()).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        let (head, body) = reply.split_once("\r\n\r\n").expect("HTTP response");
+        assert!(
+            !head
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin")
+        );
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, serde_json::from_str(body).unwrap_or(Value::Null))
+    }
+
+    fn authorized(&self) -> String {
+        format!(
+            "Host: {}\r\nOrigin: http://{}\r\nAuthorization: Bearer {}\r\n",
+            self.address, self.address, self.token
+        )
+    }
+}
+
+fn p0_provider_settings(home: &Path, mock: &MockLlmServer, extra: Value) {
+    fs::create_dir_all(home.join(".codingbuddy")).unwrap();
+    let mut settings = serde_json::json!({"llm": {
+        "provider":"deepseek", "endpoint":mock.endpoint,
+        "api_key_env":"P0_FIXTURE_KEY", "stream":false, "max_retries":0, "timeout_seconds":3
+    }});
+    if let Some(extra) = extra.as_object() {
+        settings.as_object_mut().unwrap().extend(extra.clone());
+    }
+    fs::write(
+        home.join(".codingbuddy/settings.json"),
+        settings.to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn p0_http_rpc_auth_and_workspace_scope() {
+    let workspace = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mock = start_mock_llm_server();
+    p0_provider_settings(home.path(), &mock, Value::Null);
+    let server = P0Server::launch(workspace.path(), home.path());
+    let auth = server.authorized();
+    let empty = serde_json::json!({});
+    for (headers, status) in [
+        (format!("Host: {}\r\n", server.address), 401),
+        (auth.replace(&server.token, "stale-token"), 401),
+        (
+            format!("{auth}Authorization: Bearer {}\r\n", server.token),
+            401,
+        ),
+        (format!("{auth}Host: {}\r\n", server.address), 403),
+        (format!("{auth}Origin: http://{}\r\n", server.address), 403),
+        (
+            auth.replace(
+                &format!("Origin: http://{}", server.address),
+                "Origin: https://foreign.invalid",
+            ),
+            403,
+        ),
+        (
+            auth.replacen(
+                &format!("Host: {}", server.address),
+                "Host: spoof.invalid",
+                1,
+            ),
+            403,
+        ),
+    ] {
+        assert_eq!(
+            server.request(&headers, "session/open", empty.clone()).0,
+            status
+        );
+    }
+
+    for (method, params) in [
+        ("config/get", serde_json::json!({"key":"llm.api_key"})),
+        (
+            "config/set",
+            serde_json::json!({"key":"llm.api_key","value":"overwrite"}),
+        ),
+        (
+            "session/open",
+            serde_json::json!({"workspace_root":home.path()}),
+        ),
+        (
+            "prompt/stream_next",
+            serde_json::json!({"prompt_id":uuid::Uuid::now_v7()}),
+        ),
+    ] {
+        let (_, result) = server.request(&auth, method, params);
+        assert!(result["error"].is_object(), "{result}");
+    }
+    assert!(
+        !workspace
+            .path()
+            .join(".codingbuddy/settings.local.json")
+            .exists()
+    );
+
+    let (_, opened) = server.request(&auth, "session/open", empty);
+    let session = opened["result"]["session_id"].clone();
+    assert!(session.is_string(), "{opened}");
+    let (_, rejected) = server.request(
+        &auth,
+        "prompt/execute",
+        serde_json::json!({"session_id":session,"prompt":"hello","additional_dirs":[home.path()]}),
+    );
+    assert!(rejected["error"].is_object(), "{rejected}");
+    assert_eq!(mock.requests.load(Ordering::Relaxed), 0);
+    let (_, executed) = server.request(
+        &auth,
+        "prompt/execute",
+        serde_json::json!({"session_id":session,"prompt":"hello"}),
+    );
+    assert_eq!(executed["result"]["status"], "completed", "{executed}");
+    assert!(
+        executed["result"]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("synthetic credential accepted"))
+    );
+    let prompt = &executed["result"]["prompt_id"];
+    let (_, stream) = server.request(
+        &auth,
+        "prompt/stream_next",
+        serde_json::json!({"prompt_id":prompt}),
+    );
+    assert!(stream["result"]["chunks"].is_array(), "{stream}");
+
+    let restarted = P0Server::launch(workspace.path(), home.path());
+    let stale = restarted
+        .authorized()
+        .replace(&restarted.token, &server.token);
+    assert_eq!(
+        restarted.request(&stale, "session/open", Value::Null).0,
+        401
+    );
+    let (_, rejected) = restarted.request(
+        &restarted.authorized(),
+        "prompt/execute",
+        serde_json::json!({"session_id":session,"prompt":"hello"}),
+    );
+    assert!(rejected["error"].is_object(), "{rejected}");
+
+    Command::new(p0_binary())
+        .current_dir(workspace.path())
+        .args(["serve", "--transport", "http", "--host", "0.0.0.0"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn p0_workspace_hooks_and_process_env_grants() {
+    let workspace = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mock = start_mock_llm_server();
+    let unwanted = TcpListener::bind("127.0.0.1:0").unwrap();
+    unwanted.set_nonblocking(true).unwrap();
+    let command = if cfg!(windows) {
+        r#"if defined P0_PRIVATE_VALUE (echo present>hook-value) else (echo absent>hook-value)"#
+    } else {
+        r#"if [ -n "$P0_PRIVATE_VALUE" ]; then printf present >hook-value; else printf absent >hook-value; fi"#
+    };
+    fs::create_dir_all(workspace.path().join(".codingbuddy")).unwrap();
+    fs::write(workspace.path().join(".codingbuddy/settings.json"), serde_json::json!({
+        "llm": {"endpoint":format!("http://{}/chat/completions", unwanted.local_addr().unwrap())},
+        "hooks":{"SessionStart":[{"hooks":[{"type":"command","command":command}]}]}
+    }).to_string()).unwrap();
+    let mcp_marker = workspace.path().join("mcp-marker");
+    let (program, args) = if cfg!(windows) {
+        (
+            "cmd",
+            vec![
+                "/D".to_owned(),
+                "/C".to_owned(),
+                "copy NUL mcp-marker".to_owned(),
+            ],
+        )
+    } else {
+        (
+            "sh",
+            vec!["-c".to_owned(), format!("touch '{}'", mcp_marker.display())],
+        )
+    };
+    fs::write(
+        workspace.path().join(".mcp.json"),
+        serde_json::json!({
+            "servers":[{"id":"p0-project","command":program,"args":args,"enabled":true}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let marker = workspace.path().join("hook-value");
+    p0_provider_settings(home.path(), &mock, Value::Null);
+    let run = |trusted, managed: Option<&Path>| {
+        let mut command = Command::new(p0_binary());
+        command
+            .current_dir(workspace.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("P0_FIXTURE_KEY", "synthetic-provider-key")
+            .env("P0_PRIVATE_VALUE", "arbitrary-synthetic-secret")
+            .env_remove("CODINGBUDDY_TRUST_WORKSPACE")
+            .args(["-p", "--no-input", "fixture"]);
+        if trusted {
+            command.env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path());
+        }
+        if let Some(managed) = managed {
+            command.env("CODINGBUDDY_MANAGED_SETTINGS_PATH", managed);
+        }
+        command.assert().success();
+    };
+    run(false, None);
+    assert!(!marker.exists());
+    assert!(!mcp_marker.exists());
+    assert_eq!(
+        unwanted.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    let path = workspace.path().join(".codingbuddy/settings.json");
+    let mut project: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    project.as_object_mut().unwrap().remove("llm");
+    project["process_env"] = serde_json::json!({"grants":[{
+        "consumer":"hook:SessionStart:0:0","source":"project","workspace":workspace.path(),
+        "variables":["P0_PRIVATE_VALUE"]
+    }]});
+    fs::write(&path, project.to_string()).unwrap();
+    let managed = home.path().join("managed.json");
+    fs::write(&managed, r#"{"denied_mcp_servers":["p0-project"]}"#).unwrap();
+    run(true, Some(&managed));
+    assert!(!mcp_marker.exists());
+    run(true, None);
+    assert!(mcp_marker.exists());
+    assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "absent");
+    fs::remove_file(workspace.path().join(".mcp.json")).unwrap();
+
+    p0_provider_settings(
+        home.path(),
+        &mock,
+        serde_json::json!({"process_env":project["process_env"]}),
+    );
+    run(true, None);
+    assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "present");
+
+    fs::write(&managed, r#"{"process_env":{"grants":[]}}"#).unwrap();
+    run(true, Some(&managed));
+    assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "absent");
+    fs::remove_file(&marker).unwrap();
+    fs::write(&managed, r#"{"allow_managed_hooks_only":true}"#).unwrap();
+    run(true, Some(&managed));
+    assert!(!marker.exists());
 }
