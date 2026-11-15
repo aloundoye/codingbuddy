@@ -106,8 +106,10 @@ pub struct LocalToolHost {
     workspace: PathBuf,
     files: WorkspaceFs,
     policy: PolicyEngine,
+    trusted_workspace: bool,
     sandbox_mode: String,
     sandbox_wrapper: Option<String>,
+    sandbox: codingbuddy_core::SandboxConfig,
     patches: PatchStore,
     index: IndexService,
     store: Store,
@@ -135,8 +137,22 @@ impl LocalToolHost {
         policy: PolicyEngine,
         runner: Arc<dyn ShellRunner + Send + Sync>,
     ) -> Result<Self> {
-        let files = WorkspaceFs::open(workspace)?;
         let cfg = AppConfig::load(workspace).unwrap_or_default();
+        Self::with_config(workspace, policy, runner, &cfg)
+    }
+
+    pub fn with_config(
+        workspace: &Path,
+        policy: PolicyEngine,
+        runner: Arc<dyn ShellRunner + Send + Sync>,
+        cfg: &AppConfig,
+    ) -> Result<Self> {
+        let files = WorkspaceFs::open(workspace)?;
+        let trusted_workspace = cfg
+            .workspace_trust
+            .unwrap_or_else(|| codingbuddy_core::workspace_is_trusted(workspace));
+        let managed_hooks_only = codingbuddy_policy::load_managed_settings()
+            .is_some_and(|settings| settings.allow_managed_hooks_only);
         let sandbox_mode = policy.sandbox_mode().to_ascii_lowercase();
         let sandbox_wrapper = cfg
             .policy
@@ -157,16 +173,21 @@ impl LocalToolHost {
             index: IndexService::new(workspace)?,
             store: Store::new(workspace)?,
             policy,
+            trusted_workspace,
             sandbox_mode,
             sandbox_wrapper,
+            sandbox: cfg.policy.sandbox.clone(),
             runner,
-            plugins: PluginManager::new(workspace).ok(),
-            hooks_enabled: codingbuddy_core::workspace_is_trusted(workspace)
+            plugins: trusted_workspace
+                .then(|| PluginManager::new(workspace).ok())
+                .flatten(),
+            hooks_enabled: trusted_workspace
+                && !managed_hooks_only
                 && cfg.plugins.enabled
                 && cfg.plugins.enable_hooks,
             visual_verification_enabled: cfg.experiments.visual_verification,
-            lint_after_edit,
-            diagnostics_after_edit: cfg.tools.diagnostics_after_edit,
+            lint_after_edit: lint_after_edit.filter(|_| trusted_workspace),
+            diagnostics_after_edit: trusted_workspace && cfg.tools.diagnostics_after_edit,
             review_mode: false,
             mcp_executor: None,
             progress_callback: std::sync::Mutex::new(None),
@@ -565,10 +586,11 @@ impl LocalToolHost {
 
                 // Auto-lint after edit (lint-fix loop)
                 let lint_output = if let Some(ref lint_cmd) = self.lint_after_edit {
-                    match self
-                        .runner
-                        .run(lint_cmd, &self.workspace, Duration::from_secs(30))
-                    {
+                    match self.runner.run_verification(
+                        lint_cmd,
+                        &self.workspace,
+                        Duration::from_secs(30),
+                    ) {
                         Ok(result) => {
                             if result.status.unwrap_or(1) != 0 {
                                 Some(json!({
@@ -649,8 +671,15 @@ impl LocalToolHost {
                 }
                 Ok(json!({"matches": matches}))
             }
-            "git.status" => self.run_cmd("git status --short", DEFAULT_TIMEOUT_SECONDS),
-            "git.diff" => self.run_cmd("git diff", DEFAULT_TIMEOUT_SECONDS),
+            "git.status" => {
+                self.run_git_inspection(&["status", "--short", "--ignore-submodules=all"])
+            }
+            "git.diff" => self.run_git_inspection(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=all",
+            ]),
             "git.show" => {
                 let spec = call
                     .args
@@ -663,7 +692,11 @@ impl LocalToolHost {
                 ]) {
                     return Err(anyhow!("git.show: spec contains forbidden characters"));
                 }
-                self.run_cmd(&format!("git show {spec}"), DEFAULT_TIMEOUT_SECONDS)
+                anyhow::ensure!(
+                    !spec.starts_with('-'),
+                    "git.show requires a revision or object"
+                );
+                self.run_git_inspection(&["show", "--no-ext-diff", "--no-textconv", spec, "--"])
             }
             "index.query" => {
                 let q = call
@@ -1179,10 +1212,11 @@ impl LocalToolHost {
 
                 // Run lint once after all edits
                 let lint_output = if let Some(ref lint_cmd) = self.lint_after_edit {
-                    match self
-                        .runner
-                        .run(lint_cmd, &self.workspace, Duration::from_secs(30))
-                    {
+                    match self.runner.run_verification(
+                        lint_cmd,
+                        &self.workspace,
+                        Duration::from_secs(30),
+                    ) {
                         Ok(result) => {
                             if result.status.unwrap_or(1) != 0 {
                                 Some(json!({
@@ -1423,6 +1457,19 @@ impl LocalToolHost {
         }
     }
 
+    fn run_git_inspection(&self, args: &[&str]) -> Result<serde_json::Value> {
+        let command = codingbuddy_core::process_env::git_inspection(&self.workspace);
+        let result = super::shell::run_command(
+            command,
+            args,
+            &self.workspace,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
+        )?;
+        Ok(
+            json!({"status": result.status, "stdout": result.stdout, "stderr": result.stderr, "timed_out": result.timed_out}),
+        )
+    }
+
     fn run_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
         let timeout = Duration::from_secs(timeout_secs);
         let cb = self.progress_callback.lock().ok().and_then(|g| g.clone());
@@ -1447,11 +1494,7 @@ impl LocalToolHost {
             return self.run_cmd_in_isolated_sandbox(cmd, timeout_secs);
         }
         // Apply OS-level sandbox if enabled
-        let sandbox_cfg = AppConfig::load(&self.workspace)
-            .unwrap_or_default()
-            .policy
-            .sandbox;
-        let sandboxed_cmd = sandbox_wrap_command(&self.workspace, cmd, &sandbox_cfg);
+        let sandboxed_cmd = sandbox_wrap_command(&self.workspace, cmd, &self.sandbox);
         self.run_cmd(&sandboxed_cmd, timeout_secs)
     }
 
@@ -1588,8 +1631,24 @@ impl LocalToolHost {
 }
 
 impl ToolHost for LocalToolHost {
+    fn requires_explicit_approval(&self, call: &ToolCall) -> bool {
+        !self.trusted_workspace
+            && (matches!(call.name.as_str(), "bash.run" | "bash_run")
+                || call.name.starts_with("github.")
+                || call.name.starts_with("github_"))
+    }
+
     fn validate(&self, call: &ToolCall) -> Result<()> {
         anyhow::ensure!(!self.policy.denies_tool(call), "tool denied by policy");
+        anyhow::ensure!(
+            self.trusted_workspace
+                || !(call.name.starts_with("plugin__")
+                    || call.name.starts_with("custom__")
+                    || call.name.starts_with("lsp.")
+                    || call.name.starts_with("lsp_")
+                    || call.name == "diagnostics.check"),
+            "tool requires workspace trust"
+        );
         let (key, default, allow_missing) = match call.name.as_str() {
             "fs.read" | "fs.edit" | "notebook.read" | "notebook.edit" | "lsp.hover"
             | "lsp.definition" | "lsp.references" | "lsp.symbols" => ("path", None, false),
@@ -1649,7 +1708,8 @@ impl ToolHost for LocalToolHost {
     fn propose(&self, call: ToolCall) -> ToolProposal {
         ToolProposal {
             invocation_id: Uuid::now_v7(),
-            approved: !self.policy.requires_approval(&call)
+            approved: !self.requires_explicit_approval(&call)
+                && !self.policy.requires_approval(&call)
                 && !self.resolved_path_requires_approval(&call),
             call,
         }
@@ -1698,7 +1758,10 @@ impl LocalToolHost {
         call: Option<&ToolCall>,
         result: Option<&serde_json::Value>,
     ) {
-        if !self.hooks_enabled {
+        if !self.hooks_enabled
+            || codingbuddy_policy::load_managed_settings()
+                .is_some_and(|settings| settings.allow_managed_hooks_only)
+        {
             return;
         }
         let Some(manager) = &self.plugins else {

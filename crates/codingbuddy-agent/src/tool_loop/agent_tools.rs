@@ -69,6 +69,11 @@ pub(super) fn handle_agent_level_tool(
         "task_list" => handle_task_list(tool_loop)?,
         "task_output" => handle_task_output(tool_loop, &args)?,
         "task_stop" => handle_task_stop(tool_loop, &args)?,
+        "spawn_task" | "enter_worktree" | "exit_worktree"
+            if !tool_loop.config.trusted_workspace =>
+        {
+            "This tool requires a trusted workspace.".to_string()
+        }
         "spawn_task" => handle_spawn_task(tool_loop, &args)?,
         "send_message" => handle_send_message(tool_loop, &args)?,
         "enter_plan_mode" => handle_enter_plan_mode(tool_loop)?,
@@ -1458,7 +1463,7 @@ pub(super) fn handle_exit_worktree(
             } else {
                 // After .take(), workspace_path() returns the original workspace
                 let original = tool_loop.workspace_path();
-                let apply = std::process::Command::new("git")
+                let apply = codingbuddy_core::process_env::git_inspection(original)
                     .arg("-C")
                     .arg(original)
                     .args(["apply", "--3way", "-"])

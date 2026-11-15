@@ -8,7 +8,7 @@ use codingbuddy_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -171,6 +171,9 @@ struct HandoffDescriptor {
 /// Full-featured IDE handler backed by a `Store`.
 pub struct IdeRpcHandler {
     store: Arc<Store>,
+    http_workspace: Option<PathBuf>,
+    http_sessions: Mutex<HashSet<Uuid>>,
+    http_prompts: Mutex<HashSet<Uuid>>,
     /// Per-session pending tool approvals.
     approvals: Mutex<HashMap<Uuid, PendingToolApproval>>,
     /// Per-session conversation histories (for prompt/execute streaming).
@@ -199,6 +202,9 @@ impl IdeRpcHandler {
 
         Ok(Self {
             store: Arc::new(store),
+            http_workspace: Some(workspace.canonicalize()?),
+            http_sessions: Mutex::new(HashSet::new()),
+            http_prompts: Mutex::new(HashSet::new()),
             approvals: Mutex::new(HashMap::new()),
             conversations: Mutex::new(HashMap::new()),
             prompt_streams: Mutex::new(HashMap::new()),
@@ -210,6 +216,9 @@ impl IdeRpcHandler {
     pub fn from_store(store: Arc<Store>) -> Self {
         Self {
             store,
+            http_workspace: None,
+            http_sessions: Mutex::new(HashSet::new()),
+            http_prompts: Mutex::new(HashSet::new()),
             approvals: Mutex::new(HashMap::new()),
             conversations: Mutex::new(HashMap::new()),
             prompt_streams: Mutex::new(HashMap::new()),
@@ -220,33 +229,87 @@ impl IdeRpcHandler {
 
     /// Browser transport exposes only the operations used by the bundled client.
     pub fn handle_http(&self, method: &str, params: Value) -> Result<Value> {
+        let workspace = self
+            .http_workspace
+            .as_ref()
+            .ok_or_else(|| anyhow!("HTTP workspace unavailable"))?;
+        let allowed: &[&str] = match method {
+            "session/open" => &["workspace_root"],
+            "prompt/execute" => &["session_id", "prompt", "include_partial_messages"],
+            "prompt/stream_next" => &["prompt_id", "cursor", "max_chunks"],
+            _ => return Err(anyhow!("method unavailable over HTTP")),
+        };
+        anyhow::ensure!(
+            params.is_null()
+                || params.as_object().is_some_and(|fields| {
+                    fields.keys().all(|key| allowed.contains(&key.as_str()))
+                }),
+            "unsupported HTTP RPC parameters"
+        );
+
         match method {
-            "session/open" => self.handle_session_open(serde_json::json!({
-                "workspace_root": self.workspace_path().canonicalize()?
-            })),
+            "session/open" => {
+                if let Some(root) = params.get("workspace_root") {
+                    anyhow::ensure!(
+                        root.as_str().is_some_and(|root| {
+                            root == "."
+                                || Path::new(root).is_absolute()
+                                    && Path::new(root)
+                                        .canonicalize()
+                                        .is_ok_and(|path| path == *workspace)
+                        }),
+                        "workspace does not match the launch workspace"
+                    );
+                }
+                let response =
+                    self.handle_session_open(serde_json::json!({"workspace_root": workspace}))?;
+                self.http_sessions
+                    .lock()
+                    .expect("HTTP sessions lock")
+                    .insert(require_uuid(&response, "session_id")?);
+                Ok(response)
+            }
             "prompt/execute" => {
                 let session_id = require_uuid(&params, "session_id")?;
+                anyhow::ensure!(
+                    self.http_sessions
+                        .lock()
+                        .expect("HTTP sessions lock")
+                        .contains(&session_id),
+                    "session was not opened by this HTTP server"
+                );
                 let session = self
                     .store
                     .load_session(session_id)?
-                    .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+                    .ok_or_else(|| anyhow!("session not found"))?;
                 anyhow::ensure!(
-                    Path::new(&session.workspace_root).canonicalize()?
-                        == self.workspace_path().canonicalize()?,
-                    "session belongs to another workspace"
+                    Path::new(&session.workspace_root) == workspace
+                        && workspace.canonicalize()? == *workspace,
+                    "workspace changed since session creation"
                 );
                 let prompt = params
                     .get("prompt")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("missing 'prompt' parameter"))?;
-                self.handle_prompt_execute(serde_json::json!({
-                    "session_id": session_id,
-                    "prompt": prompt,
-                    "include_partial_messages": true
-                }))
+                let result = self.handle_prompt_execute(serde_json::json!({
+                    "session_id": session_id, "prompt": prompt, "include_partial_messages": true
+                }))?;
+                self.http_prompts
+                    .lock()
+                    .expect("HTTP prompts lock")
+                    .insert(require_uuid(&result, "prompt_id")?);
+                Ok(result)
             }
-            "prompt/stream_next" => self.handle_prompt_stream_next(params),
-            _ => Err(anyhow!("method unavailable over HTTP: {method}")),
+            _ => {
+                let prompt_id = require_uuid(&params, "prompt_id")?;
+                let mut prompts = self.http_prompts.lock().expect("HTTP prompts lock");
+                anyhow::ensure!(prompts.contains(&prompt_id), "prompt is unavailable");
+                let response = self.handle_prompt_stream_next(params)?;
+                if response["done"] == true {
+                    prompts.remove(&prompt_id);
+                }
+                Ok(response)
+            }
         }
     }
 

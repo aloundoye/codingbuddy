@@ -986,7 +986,17 @@ impl PolicyEngine {
     }
 
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
-        self.permission_mode = mode;
+        let managed = load_managed_settings();
+        self.permission_mode = managed
+            .as_ref()
+            .and_then(|settings| settings.permission_mode.as_deref())
+            .map(PermissionMode::from_str_lossy)
+            .unwrap_or(mode);
+        if self.permission_mode == PermissionMode::BypassPermissions
+            && managed.is_some_and(|settings| settings.disable_bypass_permissions_mode)
+        {
+            self.permission_mode = PermissionMode::Ask;
+        }
     }
 
     pub fn sandbox_mode(&self) -> &str {
@@ -1352,6 +1362,7 @@ pub struct ManagedSettings {
     pub allow_managed_permission_rules_only: bool,
     /// Only allow hooks defined in managed settings.
     pub allow_managed_hooks_only: bool,
+    pub hooks: serde_json::Value,
     /// Allowlist of MCP server IDs (empty = all allowed).
     pub allowed_mcp_servers: Vec<String>,
     /// Denylist of MCP server IDs (checked after allowlist).
@@ -1378,44 +1389,7 @@ pub struct ManagedSettings {
 
 /// Platform-specific path for managed settings.
 pub fn managed_settings_path() -> Option<std::path::PathBuf> {
-    // Check environment override first
-    if let Ok(path) = std::env::var("CODINGBUDDY_MANAGED_SETTINGS_PATH") {
-        let path = path.trim().to_string();
-        if !path.is_empty() {
-            return Some(std::path::PathBuf::from(path));
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let path = std::path::PathBuf::from(
-            "/Library/Application Support/CodingBuddyCLI/managed-settings.json",
-        );
-        return Some(path);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let path = std::path::PathBuf::from("/etc/codingbuddy-cli/managed-settings.json");
-        return Some(path);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(program_data) = std::env::var("ProgramData") {
-            return Some(
-                std::path::PathBuf::from(program_data)
-                    .join("CodingBuddyCLI")
-                    .join("managed-settings.json"),
-            );
-        }
-        return Some(std::path::PathBuf::from(
-            "C:\\ProgramData\\CodingBuddyCLI\\managed-settings.json",
-        ));
-    }
-
-    #[allow(unreachable_code)]
-    None
+    codingbuddy_core::process_env::managed_path()
 }
 
 /// Load managed settings from the platform-specific path.

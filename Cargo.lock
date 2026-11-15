@@ -640,6 +640,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "codingbuddy-core",
  "codingbuddy-policy",
  "serde",
  "serde_json",
@@ -701,6 +702,7 @@ name = "codingbuddy-lsp"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "codingbuddy-core",
  "regex",
  "serde",
  "serde_json",
@@ -723,6 +725,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "uuid",
 ]
 
@@ -780,6 +783,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "codingbuddy-core",
  "codingbuddy-policy",
  "serde",
  "serde_json",

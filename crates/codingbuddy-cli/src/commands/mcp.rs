@@ -28,6 +28,7 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
                 enabled: args.enabled,
                 metadata,
                 headers: Vec::new(),
+                child_env: Default::default(),
             };
             let endpoint = server
                 .command

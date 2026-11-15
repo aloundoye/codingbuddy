@@ -70,7 +70,11 @@ fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
             compatibility: None,
         },
     ]));
-    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    let cfg = codingbuddy_core::AppConfig {
+        workspace_trust: Some(true),
+        ..Default::default()
+    };
+    let mut engine = AgentEngine::new_with_config_and_llm(dir.path(), cfg, llm)?;
     engine.set_permission_mode("bypassPermissions");
 
     let output = engine.chat_with_options(

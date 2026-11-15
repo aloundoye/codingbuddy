@@ -673,7 +673,7 @@ impl MemoryManager {
         let workspace = &self.workspace;
 
         // Check if we're in a git repo
-        let git_status = std::process::Command::new("git")
+        let git_status = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args(["rev-parse", "--git-dir"])
             .current_dir(workspace)
             .output();
@@ -691,7 +691,7 @@ impl MemoryManager {
         }
 
         // Stage all tracked + untracked files to a temporary index
-        let stash_result = std::process::Command::new("git")
+        let stash_result = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args(["stash", "create"])
             .current_dir(workspace)
             .output()?;
@@ -702,14 +702,14 @@ impl MemoryManager {
                 .trim()
                 .to_string();
             // Get the tree from the stash commit
-            let tree_out = std::process::Command::new("git")
+            let tree_out = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
                 .args(["rev-parse", &format!("{stash_sha}^{{tree}}")])
                 .current_dir(workspace)
                 .output()?;
             String::from_utf8_lossy(&tree_out.stdout).trim().to_string()
         } else {
             // No changes — use HEAD tree
-            let head_tree = std::process::Command::new("git")
+            let head_tree = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
                 .args(["rev-parse", "HEAD^{tree}"])
                 .current_dir(workspace)
                 .output()?;
@@ -723,7 +723,7 @@ impl MemoryManager {
 
         // Create a commit object from the tree
         let commit_msg = format!("codingbuddy shadow: {reason} [{commit_id}]");
-        let commit_out = std::process::Command::new("git")
+        let commit_out = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args(["commit-tree", &tree_sha, "-m", &commit_msg])
             .current_dir(workspace)
             .output()?;
@@ -740,7 +740,7 @@ impl MemoryManager {
             .to_string();
 
         // Create the hidden ref
-        let ref_result = std::process::Command::new("git")
+        let ref_result = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args(["update-ref", &ref_name, &commit_sha])
             .current_dir(workspace)
             .output()?;
@@ -768,7 +768,7 @@ impl MemoryManager {
         let workspace = &self.workspace;
 
         // Check if the ref exists
-        let verify = std::process::Command::new("git")
+        let verify = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args(["rev-parse", "--verify", &ref_name])
             .current_dir(workspace)
             .output()?;
@@ -782,7 +782,7 @@ impl MemoryManager {
         let commit_sha = String::from_utf8_lossy(&verify.stdout).trim().to_string();
 
         // Restore files: checkout tree from shadow commit
-        let checkout = std::process::Command::new("git")
+        let checkout = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args(["checkout", &commit_sha, "--", "."])
             .current_dir(workspace)
             .output()?;
@@ -795,7 +795,7 @@ impl MemoryManager {
         }
 
         // Unstage the checkout so working tree is clean but not committed
-        let _ = std::process::Command::new("git")
+        let _ = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args(["reset", "HEAD", "."])
             .current_dir(workspace)
             .output();
@@ -806,7 +806,7 @@ impl MemoryManager {
     /// List all shadow commit refs.
     pub fn list_shadow_commits(&self) -> Result<Vec<ShadowCommit>> {
         let workspace = &self.workspace;
-        let output = std::process::Command::new("git")
+        let output = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
             .args([
                 "for-each-ref",
                 "--format=%(refname)\t%(subject)\t%(creatordate:iso-strict)",

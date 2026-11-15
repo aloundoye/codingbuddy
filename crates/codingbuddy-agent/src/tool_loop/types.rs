@@ -123,6 +123,7 @@ pub struct ToolLoopConfig {
     pub skill_runner: Option<SkillRunner>,
     /// Workspace root path (for subagent spawning).
     pub workspace: Option<PathBuf>,
+    pub trusted_workspace: bool,
     /// Optional privacy router for scanning tool outputs before appending to messages.
     pub privacy_router: Option<Arc<codingbuddy_policy::privacy::PrivacyRouter>>,
     /// Images to include with the LLM request (multimodal).
@@ -167,6 +168,7 @@ impl Default for ToolLoopConfig {
             subagent_worker: None,
             skill_runner: None,
             workspace: None,
+            trusted_workspace: false,
             privacy_router: None,
             images: vec![],
             initial_context: vec![],

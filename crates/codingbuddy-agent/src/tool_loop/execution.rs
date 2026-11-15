@@ -300,7 +300,9 @@ impl ToolUseLoop<'_> {
 
             let approved = if hook_decision == Some(codingbuddy_hooks::PermissionDecision::Deny) {
                 false
-            } else if hook_decision == Some(codingbuddy_hooks::PermissionDecision::Allow) {
+            } else if hook_decision == Some(codingbuddy_hooks::PermissionDecision::Allow)
+                && !self.tool_host.requires_explicit_approval(&proposal.call)
+            {
                 true
             } else if let Some(ref cb) = self.approval_cb {
                 match cb(&proposal.call) {

@@ -3,7 +3,6 @@ use crate::context::tags::{TagExtractor, tags_to_symbol_hints};
 use codingbuddy_index::IndexService;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone)]
@@ -220,10 +219,10 @@ fn symbol_hints_for_file(path: &Path) -> Vec<String> {
 }
 
 fn changed_files(workspace: &Path) -> Vec<String> {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = codingbuddy_core::process_env::git_inspection(workspace)
         .arg("-C")
         .arg(workspace)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--ignore-submodules=all"])
         .output()
     else {
         return Vec::new();

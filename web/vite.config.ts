@@ -14,9 +14,12 @@ export default defineConfig({
         changeOrigin: true,
         configure(proxy) {
           proxy.on("proxyReq", (outbound, inbound) => {
-            const origin = inbound.headers.origin;
-            if (origin === `http://${inbound.headers.host}`) {
+            const hosts = inbound.headersDistinct.host ?? [];
+            const origins = inbound.headersDistinct.origin ?? [];
+            if (hosts.length === 1 && origins.length === 1 && origins[0] === `http://${hosts[0]}`) {
               outbound.setHeader("Origin", "http://127.0.0.1:8199");
+            } else if (hosts.length !== 1 || origins.length > 0) {
+              outbound.setHeader("Origin", "null");
             }
           });
         },

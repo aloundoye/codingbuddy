@@ -71,6 +71,12 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Focused trust-boundary regressions
+        run: |
+          cargo test --locked -p codingbuddy-cli --test cli_json p0_
+          cargo test --locked -p codingbuddy-agent --test tool_use_default p0_
+          cargo test --locked -p codingbuddy-mcp --lib p0_
+
       - name: "tests (workspace split: core)"
         run: cargo test --workspace --all-targets --exclude codingbuddy-agent --exclude codingbuddy-cli --exclude codingbuddy-ui
 

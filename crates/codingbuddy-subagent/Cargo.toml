@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+codingbuddy-core = { path = "../codingbuddy-core" }
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true

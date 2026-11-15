@@ -543,7 +543,7 @@ pub(crate) fn run_diagnostics(
             timeout,
         );
     }
-    runner.run(command, workspace, timeout)
+    runner.run_verification(command, workspace, timeout)
 }
 
 pub(crate) fn parse_diagnostics(

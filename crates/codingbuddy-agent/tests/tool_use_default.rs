@@ -85,6 +85,7 @@ fn init_workspace(path: &Path) -> Result<()> {
 fn phase_loop_config() -> AppConfig {
     let mut config = AppConfig::default();
     config.agent_loop.phase_loop_enabled = true;
+    config.workspace_trust = Some(true);
     config
 }
 
@@ -1599,5 +1600,103 @@ fn ollama_surface_clamps_request_tool_count() -> Result<()> {
         assert!(!tool_names.contains(&"patch_direct"));
     }
     assert!(tool_names.len() <= capabilities.max_safe_tool_count);
+    Ok(())
+}
+
+#[test]
+fn p0_untrusted_shell_needs_an_explicit_approval() -> Result<()> {
+    for approved in [false, true] {
+        let workspace = tempfile::tempdir()?;
+        init_workspace(workspace.path())?;
+        let config = AppConfig {
+            workspace_trust: Some(false),
+            hooks: serde_json::json!({"PermissionRequest":[{"hooks":[{"type":"command",
+                "command":if cfg!(windows) { r#"echo {"permissionDecision":"allow"}"# }
+                    else { r#"printf '%s' '{"permissionDecision":"allow"}'"# }
+            }]}]}),
+            ..Default::default()
+        };
+        let call = serde_json::json!({"command": "git status"});
+        let llm = Box::new(ScriptedLlm::new(vec![
+            tool_call_response(vec![("p0-command", "bash_run", &call.to_string())]),
+            text_response("The approval fixture is complete."),
+        ]));
+        let mut engine = AgentEngine::new_with_config_and_llm(workspace.path(), config, llm)?;
+        engine.set_permission_mode("bypassPermissions");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if approved {
+            let count = count.clone();
+            engine.set_approval_handler(Box::new(move |_| {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(true)
+            }));
+        }
+        engine.chat_with_options(
+            "Run the requested approval fixture.",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        )?;
+        let store = Store::new(workspace.path())?;
+        let session = store.load_latest_session()?.expect("session");
+        let projection = store.rebuild_from_events(session.session_id)?;
+        assert_eq!(projection.approved_invocations.len(), usize::from(approved));
+        assert_eq!(projection.denied_invocations.len(), usize::from(!approved));
+        let results = store.session_events(session.session_id)?.into_iter()
+            .filter(|event| matches!(&event.kind, codingbuddy_core::EventKind::ToolResult { result } if result.success))
+            .count();
+        assert_eq!(results, usize::from(approved));
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            usize::from(approved)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn p0_untrusted_edit_skips_automatic_verification() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    init_workspace(workspace.path())?;
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"verification-fixture\"\nversion = \"0.1.0\"\n",
+    )?;
+    fs::write(
+        workspace.path().join("build.rs"),
+        r#"fn main() { std::fs::write("build-marker", "ran").unwrap(); }"#,
+    )?;
+    let mut config = AppConfig {
+        workspace_trust: Some(false),
+        ..Default::default()
+    };
+    config.policy.lint_after_edit = Some(if cfg!(windows) {
+        "echo ran>lint-marker".into()
+    } else {
+        "touch lint-marker".into()
+    });
+    config.tools.diagnostics_after_edit = true;
+    config.lsp.enabled = true;
+    let llm = Box::new(ScriptedLlm::new(vec![
+        tool_call_response(vec![(
+            "p0-edit",
+            "fs_edit",
+            r#"{"path":"src/main.rs","search":"fn main() {}","replace":"fn main() { println!(\"edited\"); }"}"#,
+        )]),
+        text_response("The edit fixture is complete."),
+    ]));
+    let mut engine = AgentEngine::new_with_config_and_llm(workspace.path(), config, llm)?;
+    engine.set_permission_mode("bypassPermissions");
+    engine.chat_with_options(
+        "Make the fixture edit.",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(fs::read_to_string(workspace.path().join("src/main.rs"))?.contains("edited"));
+    assert!(!workspace.path().join("build-marker").exists());
+    assert!(!workspace.path().join("lint-marker").exists());
     Ok(())
 }

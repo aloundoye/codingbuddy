@@ -19,3 +19,6 @@ keyring.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-policy = { path = "../codingbuddy-policy" }
 codingbuddy-store = { path = "../codingbuddy-store" }
+
+[dev-dependencies]
+tempfile.workspace = true
