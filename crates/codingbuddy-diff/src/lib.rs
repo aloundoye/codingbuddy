@@ -572,7 +572,8 @@ mod tests {
                 .apply_for_session(&journal, session, patch.patch_id, |_| Ok(()))
                 .is_err()
         );
-        assert_eq!(fs::read_to_string(root.join("renamed"))?, "one\n");
+        let renamed = fs::read(root.join("renamed"))?;
+        assert!(matches!(renamed.as_slice(), b"one\n" | b"one\r\n"));
         assert!(!root.join("original").exists() && !root.join("removed").exists());
         assert!(journal.session_events(session)?.is_empty());
         journal
@@ -587,6 +588,7 @@ mod tests {
                 .apply_for_session(&journal, session, patch.patch_id, |_| Ok(()))?
                 .0
         );
+        assert_eq!(fs::read(root.join("renamed"))?, renamed);
         assert_eq!(journal.session_events(session)?.len(), 1);
         Ok(())
     }
@@ -602,6 +604,8 @@ mod tests {
                     diff --git a/second b/second\n--- a/second\n+++ b/second\n@@ -1 +1 @@\n-before\n+after\n";
         let staged = store.stage(diff, &[])?;
         assert!(store.apply(root, staged.patch_id)?.0);
+        let first = fs::read(root.join("first"))?;
+        assert!(matches!(first.as_slice(), b"after\n" | b"after\r\n"));
         let mut interrupted = store.read_patch(staged.patch_id)?;
         interrupted.applied = false;
         interrupted.recovery_status = Some("pending".into());
@@ -624,7 +628,7 @@ mod tests {
                 .as_deref(),
             Some("ambiguous")
         );
-        assert_eq!(fs::read_to_string(root.join("first"))?, "after\n");
+        assert_eq!(fs::read(root.join("first"))?, first);
         Ok(())
     }
 
