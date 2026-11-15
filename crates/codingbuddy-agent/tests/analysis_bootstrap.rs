@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
-    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback,
+    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, StreamChunk,
 };
 use codingbuddy_llm::LlmClient;
 use std::collections::VecDeque;
@@ -68,12 +68,15 @@ impl LlmClient for CapturingLlm {
 
     fn complete_chat_streaming(
         &self,
-        _req: &ChatRequest,
-        _cb: StreamCallback,
+        req: &ChatRequest,
+        cb: StreamCallback,
     ) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_chat_streaming() not used in analysis bootstrap tests"
-        ))
+        let response = self.complete_chat(req)?;
+        cb(StreamChunk::ContentDelta(response.text.clone()));
+        cb(StreamChunk::Done {
+            reason: Some(response.finish_reason.clone()),
+        });
+        Ok(response)
     }
 
     fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> anyhow::Result<LlmResponse> {
