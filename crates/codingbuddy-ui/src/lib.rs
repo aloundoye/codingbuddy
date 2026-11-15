@@ -643,11 +643,13 @@ where
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            if pending_approval.is_some() {
-                status_spans = vec![Span::styled(
-                    " [y] Allow · [a] Always · [n] Deny · Esc cancel",
-                    Style::default().fg(chrome.warning),
-                )];
+            if let Some((_, args, _)) = pending_approval.as_ref() {
+                let actions = if fresh_approval(args) {
+                    " [y] Allow once · [n] Deny · Esc cancel"
+                } else {
+                    " [y] Allow · [a] Always · [n] Deny · Esc cancel"
+                };
+                status_spans = vec![Span::styled(actions, Style::default().fg(chrome.warning))];
             }
             if let Some(dropdown) = &slash_dropdown {
                 let lines =
@@ -678,8 +680,13 @@ where
         // Handle pending approval prompts via keyboard
         if let Some((ref tool_name, ref args_summary, _)) = pending_approval {
             let explanation = approval_explanation(tool_name, args_summary);
+            let actions = if fresh_approval(args_summary) {
+                "[Y=approve once / N=deny]"
+            } else {
+                "[Y=approve / A=always allow / N=deny]"
+            };
             info_line = format!(
-                "ACTION REQUIRED: `{tool_name}` {} [Y=approve / A=always allow / N=deny]",
+                "ACTION REQUIRED: `{tool_name}` {} {actions}",
                 truncate_inline(&explanation, 96)
             );
         }
@@ -956,7 +963,7 @@ where
             let always = matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'));
             if let Some((tool_name, args_summary, response_tx)) = pending_approval.take() {
                 let _ = response_tx.send(approved);
-                if always && approved {
+                if always && approved && !fresh_approval(&args_summary) {
                     let pattern = derive_approval_pattern(&tool_name, &args_summary);
                     let persisted = codingbuddy_store::Store::new(&workspace_path)
                         .and_then(|store| {
@@ -1976,6 +1983,11 @@ where
     terminal.show_cursor()?;
     drop(_guard);
     Ok(())
+}
+
+fn fresh_approval(args: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(args)
+        .is_ok_and(|value| value["fresh_approval"] == true)
 }
 
 /// Derive a glob pattern from a tool name and args for persistent approval.

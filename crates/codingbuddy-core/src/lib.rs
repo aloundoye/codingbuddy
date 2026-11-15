@@ -616,6 +616,22 @@ pub struct ToolProposal {
     pub approved: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum ToolPermission {
+    Deny {
+        source: &'static str,
+        reason: String,
+        target: Option<String>,
+    },
+    Ask {
+        source: &'static str,
+        reason: String,
+        fresh: bool,
+    },
+    Allow,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovedToolCall {
     pub invocation_id: Uuid,
@@ -1455,8 +1471,26 @@ impl EventKind {
 }
 
 pub trait ToolHost {
-    fn requires_explicit_approval(&self, _call: &ToolCall) -> bool {
-        false
+    fn approval_details(&self, _invocation: Uuid) -> Option<String> {
+        None
+    }
+
+    fn discard_proposal(&self, _invocation: Uuid) {}
+
+    fn propose_with_permission(&self, call: ToolCall) -> (ToolProposal, ToolPermission) {
+        let permission = self.permission(&call);
+        (self.propose(call), permission)
+    }
+
+    fn permission(&self, call: &ToolCall) -> ToolPermission {
+        match self.validate(call) {
+            Ok(()) => ToolPermission::Allow,
+            Err(error) => ToolPermission::Deny {
+                source: "tool host",
+                reason: error.to_string(),
+                target: None,
+            },
+        }
     }
 
     /// Validate execution preconditions before cached or live results can be returned.
@@ -2374,6 +2408,7 @@ impl AppConfig {
     fn load_settings(workspace: &Path, trusted: bool) -> Result<(Self, bool)> {
         let mut explicit = false;
         let mut hook_sources = std::collections::BTreeMap::new();
+        let mut configured_denials = std::collections::BTreeMap::new();
         let mut merged = serde_json::to_value(Self::default())?;
         if let Some(root) = merged.as_object_mut() {
             root.remove("privacy");
@@ -2389,6 +2424,11 @@ impl AppConfig {
             let value = serde_json::to_value(legacy_cfg)?;
             explicit |= value.pointer("/llm/provider").is_some();
             record_hook_sources(&mut hook_sources, &value, process_env::Source::Project);
+            record_configured_denials(
+                &mut configured_denials,
+                &value,
+                process_env::Source::Project,
+            );
             merge_llm_settings(&mut merged, &value);
         }
 
@@ -2435,6 +2475,7 @@ impl AppConfig {
                 eprintln!("[trust] Ignored runtime settings from {}", path.display());
             }
             record_hook_sources(&mut hook_sources, &value, source);
+            record_configured_denials(&mut configured_denials, &value, source);
             explicit |= value.pointer("/llm/provider").is_some();
             merge_llm_settings(&mut merged, &value);
         }
@@ -2443,6 +2484,7 @@ impl AppConfig {
         let mut cfg: Self = serde_json::from_value(merged)?;
         cfg.workspace_trust = Some(trusted);
         cfg.hook_sources = hook_sources;
+        cfg.policy.configured_denials = configured_denials;
         // Older generated settings wrote the implicit DeepSeek URL for every provider.
         if cfg.llm.provider != "deepseek"
             && cfg.llm.endpoint == "https://api.deepseek.com/chat/completions"
@@ -2514,6 +2556,25 @@ fn record_hook_sources(
     if let Some(hooks) = settings.get("hooks").and_then(serde_json::Value::as_object) {
         for event in hooks.keys() {
             sources.insert(event.clone(), source);
+        }
+    }
+}
+
+fn record_configured_denials(
+    denials: &mut std::collections::BTreeMap<String, process_env::Source>,
+    settings: &serde_json::Value,
+    source: process_env::Source,
+) {
+    if let Some(rules) = settings
+        .pointer("/policy/permission_rules")
+        .and_then(serde_json::Value::as_array)
+    {
+        for rule in rules {
+            if rule["decision"] == "deny"
+                && let Some(pattern) = rule["rule"].as_str()
+            {
+                denials.entry(pattern.to_owned()).or_insert(source);
+            }
         }
     }
 }
@@ -3593,6 +3654,8 @@ pub struct PolicyConfig {
     /// Examples: `[{"rule": "Bash(cargo *)", "decision": "allow"}]`
     #[serde(default)]
     pub permission_rules: Vec<PermissionRuleConfig>,
+    #[serde(skip)]
+    pub configured_denials: std::collections::BTreeMap<String, process_env::Source>,
 }
 
 /// A permission rule from user configuration.
@@ -3638,6 +3701,7 @@ impl Default for PolicyConfig {
             sandbox: SandboxConfig::default(),
             review_mode: ReviewMode::Off,
             permission_rules: vec![],
+            configured_denials: Default::default(),
         }
     }
 }

@@ -965,6 +965,21 @@ impl AgentEngine {
             }
         }
 
+        let visible = |tool: &codingbuddy_core::ToolDefinition| {
+            let name = &tool.function.name;
+            let internal = codingbuddy_tools::map_tool_name(name);
+            // Resource-specific rules are checked against each actual tool call.
+            self.policy
+                .denial(&codingbuddy_core::ToolCall {
+                    name: internal.to_owned(),
+                    args: serde_json::Value::Null,
+                    requires_approval: false,
+                })
+                .is_none()
+        };
+        tools.retain(visible);
+        discoverable_tools.retain(visible);
+
         // Apply agent profile tool filtering
         if let Some(p) = profile {
             tools =

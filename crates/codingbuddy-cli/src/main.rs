@@ -1070,6 +1070,8 @@ enum PermissionsCmd {
 #[derive(Args)]
 struct PermissionsDryRunArgs {
     tool_name: String,
+    #[arg(long = "args-json")]
+    args_json: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]

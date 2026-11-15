@@ -1700,3 +1700,65 @@ fn p0_untrusted_edit_skips_automatic_verification() -> Result<()> {
     assert!(!workspace.path().join("lint-marker").exists());
     Ok(())
 }
+
+#[test]
+fn delivery_zero_explicit_deny_survives_bypass_and_hooks() -> Result<()> {
+    for rewrite in [false, true] {
+        let workspace = tempfile::tempdir()?;
+        init_workspace(workspace.path())?;
+        let mut config = AppConfig {
+            workspace_trust: Some(true),
+            ..Default::default()
+        };
+        let output = if rewrite {
+            r#"{"updatedInput":{"command":"git status"}}"#
+        } else {
+            r#"{"permissionDecision":"allow"}"#
+        };
+        let hook = if cfg!(windows) {
+            format!("echo {output}")
+        } else {
+            format!("printf '%s' '{output}'")
+        };
+        let event = if rewrite {
+            "PreToolUse"
+        } else {
+            "PermissionRequest"
+        };
+        config.hooks = serde_json::json!({
+            (event): [{"hooks":[{"type":"command","command":hook}]}]
+        });
+        config.policy.allowlist = vec!["git status".into(), "git diff".into()];
+        config
+            .policy
+            .permission_rules
+            .push(codingbuddy_core::PermissionRuleConfig {
+                rule: "Bash(git status)".into(),
+                decision: "deny".into(),
+            });
+        let command = if rewrite { "git diff" } else { "git status" };
+        let arguments = serde_json::json!({"command":command}).to_string();
+        let llm = Box::new(ScriptedLlm::new(vec![
+            tool_call_response(vec![("delivery-zero-shell", "bash_run", &arguments)]),
+            text_response("The permission fixture is complete."),
+        ]));
+        let mut engine = AgentEngine::new_with_config_and_llm(workspace.path(), config, llm)?;
+        engine.set_permission_mode("bypassPermissions");
+        engine.set_approval_handler(Box::new(|_| {
+            panic!("denied tool opened an approval prompt")
+        }));
+        engine.chat_with_options(
+            "Run the permission fixture.",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        )?;
+        let store = Store::new(workspace.path())?;
+        let session = store.load_latest_session()?.expect("session");
+        let projection = store.rebuild_from_events(session.session_id)?;
+        assert_eq!(projection.denied_invocations.len(), 1);
+        assert!(projection.approved_invocations.is_empty());
+    }
+    Ok(())
+}

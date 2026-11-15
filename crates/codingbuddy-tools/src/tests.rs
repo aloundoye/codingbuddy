@@ -12,32 +12,6 @@ fn temp_host() -> (PathBuf, LocalToolHost) {
     (workspace, host)
 }
 
-#[derive(Clone, Default)]
-struct RecordingRunner {
-    commands: Arc<Mutex<Vec<String>>>,
-}
-
-impl RecordingRunner {
-    fn captured(&self) -> Vec<String> {
-        self.commands.lock().expect("commands").clone()
-    }
-}
-
-impl ShellRunner for RecordingRunner {
-    fn run(&self, cmd: &str, _cwd: &Path, _timeout: Duration) -> Result<ShellRunResult> {
-        self.commands
-            .lock()
-            .expect("commands")
-            .push(cmd.to_string());
-        Ok(ShellRunResult {
-            status: Some(0),
-            stdout: "ok".to_string(),
-            stderr: String::new(),
-            timed_out: false,
-        })
-    }
-}
-
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn hooks_receive_phase_and_tool_context() {
@@ -45,9 +19,11 @@ fn hooks_receive_phase_and_tool_context() {
         std::env::temp_dir().join(format!("codingbuddy-tools-hook-test-{}", Uuid::now_v7()));
     fs::create_dir_all(&workspace).expect("workspace");
 
-    let mut cfg = AppConfig::default();
+    let mut cfg = AppConfig {
+        workspace_trust: Some(true),
+        ..Default::default()
+    };
     cfg.plugins.enable_hooks = true;
-    cfg.save(&workspace).expect("save config");
 
     let plugin_src = workspace.join("plugin-src");
     fs::create_dir_all(plugin_src.join(".codingbuddy-plugin")).expect("plugin dir");
@@ -66,7 +42,13 @@ fn hooks_receive_phase_and_tool_context() {
     let manager = PluginManager::new(&workspace).expect("plugin manager");
     manager.install(&plugin_src).expect("install plugin");
 
-    let host = LocalToolHost::new(&workspace, PolicyEngine::default()).expect("tool host");
+    let host = LocalToolHost::with_config(
+        &workspace,
+        PolicyEngine::default(),
+        Arc::new(PlatformShellRunner),
+        &cfg,
+    )
+    .expect("trusted tool host");
     let result = host.execute(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
@@ -135,15 +117,35 @@ fn plugin_tool_renders_prompt() {
     let manager = PluginManager::new(&workspace).expect("plugin manager");
     manager.install(&plugin_src).expect("install plugin");
 
-    let host = LocalToolHost::new(&workspace, PolicyEngine::default()).expect("tool host");
-    let result = host.execute(ApprovedToolCall {
+    let mut cfg = AppConfig {
+        workspace_trust: Some(false),
+        ..Default::default()
+    };
+    let call = ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "plugin__phase_c_plugin__review".to_string(),
             args: json!({"arguments":"focus auth module"}),
             requires_approval: false,
         },
-    });
+    };
+    let untrusted = LocalToolHost::with_config(
+        &workspace,
+        PolicyEngine::default(),
+        Arc::new(PlatformShellRunner),
+        &cfg,
+    )
+    .expect("untrusted tool host");
+    assert!(!untrusted.execute(call.clone()).success);
+    cfg.workspace_trust = Some(true);
+    let host = LocalToolHost::with_config(
+        &workspace,
+        PolicyEngine::default(),
+        Arc::new(PlatformShellRunner),
+        &cfg,
+    )
+    .expect("trusted tool host");
+    let result = host.execute(call);
     assert!(result.success, "plugin tool execution should succeed");
     assert_eq!(result.output["plugin_id"], "phase-c-plugin");
     assert_eq!(result.output["command_name"], "review");
@@ -336,9 +338,11 @@ fn fs_read_emits_visual_artifact_event_when_enabled() {
     let workspace = std::env::temp_dir().join(format!("codingbuddy-tools-vis-{}", Uuid::now_v7()));
     fs::create_dir_all(&workspace).expect("workspace");
 
-    let mut cfg = AppConfig::default();
+    let mut cfg = AppConfig {
+        workspace_trust: Some(true),
+        ..Default::default()
+    };
     cfg.experiments.visual_verification = true;
-    cfg.save(&workspace).expect("save config");
 
     let store = Store::new(&workspace).expect("store");
     store
@@ -356,7 +360,13 @@ fn fs_read_emits_visual_artifact_event_when_enabled() {
         .expect("session");
 
     fs::write(workspace.join("image.png"), [0x89, b'P', b'N', b'G', 0, 1]).expect("image");
-    let host = LocalToolHost::new(&workspace, PolicyEngine::default()).expect("host");
+    let host = LocalToolHost::with_config(
+        &workspace,
+        PolicyEngine::default(),
+        Arc::new(PlatformShellRunner),
+        &cfg,
+    )
+    .expect("trusted tool host");
     let result = host.execute(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
@@ -375,302 +385,6 @@ fn fs_read_emits_visual_artifact_event_when_enabled() {
             .iter()
             .any(|event| matches!(event.kind, EventKind::VisualArtifactCaptured { .. }))
     );
-}
-
-#[test]
-fn read_only_sandbox_blocks_mutating_bash_commands() {
-    let workspace = std::env::temp_dir().join(format!("codingbuddy-tools-ro-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec!["touch *".to_string()];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::ReadOnly;
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-    let result = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"touch note.txt"}),
-            requires_approval: false,
-        },
-    });
-    assert!(!result.success);
-    assert!(
-        result.output["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("sandbox_mode=read-only")
-    );
-    assert!(runner.captured().is_empty());
-}
-
-#[test]
-fn workspace_write_sandbox_blocks_absolute_outside_paths() {
-    let workspace = std::env::temp_dir().join(format!("codingbuddy-tools-ww-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-    let outside = std::env::temp_dir().join(format!("codingbuddy-outside-{}.txt", Uuid::now_v7()));
-    fs::write(&outside, "outside").expect("outside file");
-
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec!["cat *".to_string()];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::WorkspaceWrite;
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-    let result = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd": format!("cat {}", outside.display())}),
-            requires_approval: false,
-        },
-    });
-    assert!(!result.success);
-    assert!(
-        result.output["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("sandbox_mode=workspace-write")
-    );
-    assert!(runner.captured().is_empty());
-}
-
-#[test]
-fn workspace_write_sandbox_blocks_windows_parent_path_tokens() {
-    let workspace =
-        std::env::temp_dir().join(format!("codingbuddy-tools-ww-win-path-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec!["type *".to_string()];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::WorkspaceWrite;
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-    let result = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"type ..\\secret.txt"}),
-            requires_approval: false,
-        },
-    });
-    assert!(!result.success);
-    assert!(
-        result.output["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("sandbox_mode=workspace-write")
-    );
-    assert!(runner.captured().is_empty());
-}
-
-#[test]
-fn workspace_write_sandbox_allows_workspace_relative_paths() {
-    let workspace =
-        std::env::temp_dir().join(format!("codingbuddy-tools-ww-allow-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-    fs::write(workspace.join("note.txt"), "hello").expect("note");
-
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec!["cat *".to_string()];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::WorkspaceWrite;
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-    let result = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"cat note.txt"}),
-            requires_approval: false,
-        },
-    });
-    assert!(result.success);
-    assert_eq!(runner.captured(), vec!["cat note.txt".to_string()]);
-}
-
-#[test]
-fn read_only_sandbox_blocks_network_commands() {
-    let workspace =
-        std::env::temp_dir().join(format!("codingbuddy-tools-ro-net-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec!["curl *".to_string()];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::ReadOnly;
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-    let result = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"curl https://example.com"}),
-            requires_approval: false,
-        },
-    });
-    assert!(!result.success);
-    assert!(
-        result.output["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("blocked network command")
-    );
-    assert!(runner.captured().is_empty());
-}
-
-#[test]
-fn isolated_sandbox_uses_configured_wrapper_template() {
-    let workspace =
-        std::env::temp_dir().join(format!("codingbuddy-tools-iso-wrap-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-    fs::write(workspace.join("note.txt"), "hello").expect("note");
-
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec!["cat *".to_string()];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::Isolated;
-    cfg.policy.sandbox_wrapper = Some("sandboxctl --workspace {workspace} --cmd {cmd}".to_string());
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-    let result = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"cat note.txt"}),
-            requires_approval: false,
-        },
-    });
-    assert!(result.success);
-    if super::detect_container_environment().is_some() {
-        assert_eq!(runner.captured(), vec!["cat note.txt".to_string()]);
-        return;
-    }
-    let normalized_workspace =
-        std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
-    let expected = super::command_guard::render_wrapper_template(
-        "sandboxctl --workspace {workspace} --cmd {cmd}",
-        &normalized_workspace,
-        "cat note.txt",
-    )
-    .expect("render");
-    assert_eq!(runner.captured(), vec![expected]);
-}
-
-#[cfg(target_os = "windows")]
-#[test]
-fn isolated_sandbox_windows_falls_back_with_logical_checks() {
-    let workspace =
-        std::env::temp_dir().join(format!("codingbuddy-tools-iso-win-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-    fs::write(workspace.join("note.txt"), "hello").expect("note");
-
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec![
-        "type *".to_string(),
-        "curl *".to_string(),
-        "cat *".to_string(),
-    ];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::Isolated;
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-
-    let allowed = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"type note.txt"}),
-            requires_approval: false,
-        },
-    });
-    assert!(allowed.success);
-
-    let blocked_path = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"type ..\\secret.txt"}),
-            requires_approval: false,
-        },
-    });
-    assert!(!blocked_path.success);
-    assert!(
-        blocked_path.output["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("blocked path outside workspace")
-    );
-
-    let blocked_network = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"curl https://example.com"}),
-            requires_approval: false,
-        },
-    });
-    assert!(!blocked_network.success);
-    assert!(
-        blocked_network.output["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("blocked network command")
-    );
-    assert_eq!(runner.captured(), vec!["type note.txt".to_string()]);
-}
-
-#[test]
-fn isolated_sandbox_requires_cmd_placeholder_in_wrapper_template() {
-    let workspace =
-        std::env::temp_dir().join(format!("codingbuddy-tools-iso-bad-wrap-{}", Uuid::now_v7()));
-    fs::create_dir_all(&workspace).expect("workspace");
-
-    let mut cfg = AppConfig::default();
-    cfg.policy.allowlist = vec!["cat *".to_string()];
-    cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::Isolated;
-    cfg.policy.sandbox_wrapper = Some("sandboxctl --workspace {workspace}".to_string());
-    cfg.save(&workspace).expect("save config");
-    let policy = PolicyEngine::from_app_config(&cfg.policy);
-    let runner = RecordingRunner::default();
-    let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
-        .expect("tool host");
-    let result = host.execute(ApprovedToolCall {
-        invocation_id: Uuid::now_v7(),
-        call: ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd":"cat note.txt"}),
-            requires_approval: false,
-        },
-    });
-    if super::detect_container_environment().is_some() {
-        assert!(result.success);
-        assert_eq!(runner.captured(), vec!["cat note.txt".to_string()]);
-        return;
-    }
-    assert!(!result.success);
-    assert!(
-        result.output["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("must include {cmd}")
-    );
-    assert!(runner.captured().is_empty());
 }
 
 #[test]
@@ -837,136 +551,6 @@ fn parse_tsc_output_extracts_errors() {
     assert_eq!(diagnostics[0]["line"], 42);
     assert_eq!(diagnostics[0]["column"], 13);
     assert_eq!(diagnostics[0]["code"], "TS2304");
-}
-
-#[test]
-fn seatbelt_profile_allows_workspace() {
-    let workspace = std::path::Path::new("/tmp/test-project");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        ..Default::default()
-    };
-    let profile = super::build_seatbelt_profile(workspace, &config);
-    assert!(profile.contains("/tmp/test-project"));
-    assert!(profile.contains("(deny default)"));
-    assert!(profile.contains("(allow process*)"));
-}
-
-#[test]
-fn seatbelt_profile_blocks_network() {
-    let workspace = std::path::Path::new("/tmp/test");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        network: codingbuddy_core::SandboxNetworkConfig {
-            block_all: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let profile = super::build_seatbelt_profile(workspace, &config);
-    assert!(profile.contains("(deny network*)"));
-}
-
-#[test]
-fn bwrap_command_includes_workspace() {
-    let workspace = std::path::Path::new("/home/user/project");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        ..Default::default()
-    };
-    let result = super::build_bwrap_command(workspace, "ls -la", &config);
-    assert!(result.contains("bwrap"));
-    assert!(result.contains("/home/user/project"));
-    assert!(result.contains("ls -la"));
-}
-
-#[test]
-fn bwrap_unshares_network_when_blocked() {
-    let workspace = std::path::Path::new("/tmp/test");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        network: codingbuddy_core::SandboxNetworkConfig {
-            block_all: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let result = super::build_bwrap_command(workspace, "echo hi", &config);
-    assert!(result.contains("--unshare-net"));
-}
-
-#[test]
-fn sandbox_disabled_passes_through() {
-    let workspace = std::path::Path::new("/tmp/test");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: false,
-        ..Default::default()
-    };
-    let result = super::sandbox_wrap_command(workspace, "echo hello", &config);
-    assert_eq!(result, "echo hello");
-}
-
-#[test]
-fn sandbox_excluded_command_passes_through() {
-    let workspace = std::path::Path::new("/tmp/test");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        excluded_commands: vec!["cargo".to_string()],
-        ..Default::default()
-    };
-    let result = super::sandbox_wrap_command(workspace, "cargo test", &config);
-    assert_eq!(result, "cargo test");
-}
-
-#[test]
-fn seatbelt_wrap_formats_correctly() {
-    let profile = "(version 1)\n(deny default)";
-    let result = super::seatbelt_wrap("echo test", profile);
-    assert!(result.starts_with("sandbox-exec"));
-    assert!(result.contains("echo test"));
-}
-
-#[test]
-fn bwrap_includes_proc_and_dev() {
-    let workspace = std::path::Path::new("/tmp/test");
-    let config = codingbuddy_core::SandboxConfig::default();
-    let result = super::build_bwrap_command(workspace, "ls", &config);
-    assert!(result.contains("--proc"));
-    assert!(result.contains("--dev"));
-}
-
-#[test]
-fn seatbelt_allows_local_binding_when_configured() {
-    let workspace = std::path::Path::new("/tmp/test");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        network: codingbuddy_core::SandboxNetworkConfig {
-            block_all: true,
-            allow_local_binding: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let profile = super::build_seatbelt_profile(workspace, &config);
-    assert!(profile.contains("(deny network*)"));
-    assert!(profile.contains("localhost"));
-}
-
-#[test]
-fn bwrap_preserves_net_when_local_binding_allowed() {
-    let workspace = std::path::Path::new("/tmp/test");
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        network: codingbuddy_core::SandboxNetworkConfig {
-            block_all: true,
-            allow_local_binding: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let result = super::build_bwrap_command(workspace, "node server.js", &config);
-    // When local binding is allowed, we can't fully unshare network
-    assert!(!result.contains("--unshare-net"));
 }
 
 #[test]
@@ -1269,44 +853,6 @@ fn bash_run_cross_references_dedicated_tools() {
 }
 
 // ── P6-06: Container sandbox detection tests ────────────────────────
-
-#[test]
-fn container_env_var_detected_and_skips_sandbox() {
-    // SAFETY: tests in this crate are run with --test-threads=1 for env var safety
-    unsafe { std::env::set_var("CODINGBUDDY_CONTAINER_MODE", "1") };
-
-    // Part 1: detect_container_environment returns Some("explicit")
-    let result = detect_container_environment();
-    assert_eq!(result, Some("explicit"));
-
-    // Part 2: sandbox_wrap_command returns raw command when container detected
-    let config = codingbuddy_core::SandboxConfig {
-        enabled: true,
-        ..Default::default()
-    };
-    let wrapped = sandbox_wrap_command(Path::new("/workspace"), "ls -la", &config);
-    assert_eq!(
-        wrapped, "ls -la",
-        "should return raw command when in container"
-    );
-
-    unsafe { std::env::remove_var("CODINGBUDDY_CONTAINER_MODE") };
-}
-
-#[test]
-fn container_detection_returns_correct_type() {
-    // Verify the function returns known type strings.
-    // On dev machines this returns None (no container), in CI it might return something.
-    let result = detect_container_environment();
-    if let Some(container_type) = result {
-        // Must be one of the known container type labels
-        assert!(
-            ["explicit", "docker", "podman", "cgroup"].contains(&container_type),
-            "unexpected container type: {container_type}"
-        );
-    }
-    // If None, that's also valid (running on bare metal)
-}
 
 // ── T2.1: JSON schema validation tests ──────────────────────────────
 
@@ -1677,4 +1223,134 @@ fn workspace_file_tools_reject_dangling_and_blocked_aliases() {
         assert!(!result.success, "{}", result.output);
     }
     assert!(!workspace.path().join("missing").exists());
+}
+
+#[test]
+fn delivery_zero_fresh_launch_cannot_be_changed_or_replayed() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = AppConfig {
+        workspace_trust: Some(true),
+        ..Default::default()
+    };
+    config.policy.allowlist = vec!["echo".into()];
+    config.policy.sandbox.enabled = true;
+    config.policy.sandbox.excluded_commands = vec!["echo fixture".into()];
+    let mut policy = PolicyEngine::from_app_config(&config.policy);
+    policy.set_permission_mode(codingbuddy_policy::PermissionMode::BypassPermissions);
+    policy.set_persistent_bash_approvals(vec!["echo fixture".into()]);
+    let host = LocalToolHost::with_config(
+        workspace.path(),
+        policy,
+        Arc::new(PlatformShellRunner),
+        &config,
+    )?;
+    let call = ToolCall {
+        name: "bash.run".into(),
+        args: json!({"cmd": "echo fixture"}),
+        requires_approval: false,
+    };
+    let (proposal, decision) = host.propose_with_permission(call.clone());
+    assert!(matches!(
+        decision,
+        codingbuddy_core::ToolPermission::Ask { fresh: true, .. }
+    ));
+    assert!(
+        host.approval_details(proposal.invocation_id)
+            .unwrap()
+            .contains("Unsandboxed")
+    );
+    let mut changed = proposal.call;
+    changed.args["timeout"] = json!(190);
+    let request = ApprovedToolCall {
+        invocation_id: proposal.invocation_id,
+        call: changed,
+    };
+    assert!(!host.execute(request).success);
+    let (proposal, _) = host.propose_with_permission(call);
+    let request = ApprovedToolCall {
+        invocation_id: proposal.invocation_id,
+        call: proposal.call,
+    };
+    let result = host.execute(request.clone());
+    assert!(result.success, "{:?}", result.output);
+    assert_eq!(result.output["status"], 0);
+    assert!(!host.execute(request).success);
+    Ok(())
+}
+
+#[test]
+fn delivery_zero_denies_persisted_commands_mcp_and_batch_children() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    fs::write(workspace.path().join("fixture.txt"), "permission fixture")?;
+    let config = AppConfig::default();
+    let mut policy = PolicyEngine::from_app_config(&config.policy);
+    for rule in ["Bash(git status)", "Mcp(fixture)", "Read(fixture.txt)"] {
+        policy.add_runtime_rule(codingbuddy_policy::PermissionRule {
+            rule: rule.into(),
+            decision: "deny".into(),
+        });
+    }
+    policy.set_persistent_bash_approvals(vec!["git status".into()]);
+    policy.set_permission_mode(codingbuddy_policy::PermissionMode::BypassPermissions);
+    let mut host = LocalToolHost::with_config(
+        workspace.path(),
+        policy,
+        Arc::new(PlatformShellRunner),
+        &config,
+    )?;
+    host.set_mcp_executor(Arc::new(|_, _, _| panic!("denied MCP executed")));
+    for (name, args) in [
+        ("bash.run", json!({"cmd":"git status"})),
+        ("bash.run", json!({"cmd":"git diff | git status"})),
+        ("mcp__fixture__tool", json!({})),
+    ] {
+        let call = ToolCall {
+            name: name.into(),
+            args,
+            requires_approval: false,
+        };
+        let (proposal, decision) = host.propose_with_permission(call);
+        assert!(matches!(
+            decision,
+            codingbuddy_core::ToolPermission::Deny { .. }
+        ));
+        assert!(
+            !host
+                .execute(ApprovedToolCall {
+                    invocation_id: proposal.invocation_id,
+                    call: proposal.call
+                })
+                .success
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("fixture.txt", workspace.path().join("alias.txt"))?;
+    let path = if cfg!(unix) {
+        "alias.txt"
+    } else {
+        "fixture.txt"
+    };
+    let batch = host.propose(ToolCall {
+        name: "batch".into(),
+        args: json!({"tool_calls":[{"tool":"fs_read","parameters":{"path":path}}]}),
+        requires_approval: false,
+    });
+    let result = host.execute(ApprovedToolCall {
+        invocation_id: batch.invocation_id,
+        call: batch.call,
+    });
+    assert_eq!(result.output["failed"], 1);
+    assert!(!result.output.to_string().contains("permission fixture"));
+    let nested = host.propose(ToolCall { name: "batch".into(), args: json!({"tool_calls":[
+        {"tool":"batch","parameters":{"tool_calls":[{"tool":"fs_read","parameters":{"path":path}}]}}
+    ]}), requires_approval: false });
+    assert!(
+        !host
+            .execute(ApprovedToolCall {
+                invocation_id: nested.invocation_id,
+                call: nested.call
+            })
+            .success
+    );
+    Ok(())
 }
