@@ -122,6 +122,7 @@ pub fn analyze(
         {
             messages.push(ChatMessage::Assistant {
                 content: Some(response.text),
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![],
             });
@@ -140,6 +141,7 @@ pub fn analyze(
         reasoning_content: String::new(),
         tool_calls: vec![],
         usage: None,
+        transport_parts: Vec::new(),
         compatibility: None,
     })
 }

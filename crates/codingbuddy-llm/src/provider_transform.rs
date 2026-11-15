@@ -62,6 +62,7 @@ pub(crate) fn preflight_chat_messages(
                 content,
                 reasoning_content,
                 tool_calls,
+                ..
             } => {
                 let mut msg = json!({"role": "assistant"});
                 let mut has_visible_content = false;
@@ -241,32 +242,18 @@ pub(crate) fn postprocess_chat_response(
 
 pub(crate) fn postprocess_chat_response_with_compatibility(
     mut response: LlmResponse,
-    capabilities: &ModelCapabilities,
+    _capabilities: &ModelCapabilities,
     available_tools: &[ToolDefinition],
     compatibility: AppliedCompatibility,
 ) -> LlmResponse {
     let mut applied = compatibility;
-    if response.text.trim().is_empty() && !response.reasoning_content.trim().is_empty() {
-        response.text = response.reasoning_content.clone();
-        applied
-            .transforms
-            .push("reasoning->text-fallback".to_string());
-    }
 
-    for (idx, tool_call) in response.tool_calls.iter_mut().enumerate() {
+    for tool_call in &mut response.tool_calls {
         if let Some(repaired_name) = repair_tool_api_name(&tool_call.name, available_tools)
             && repaired_name != tool_call.name
         {
             applied.transforms.push("tool-name-repair".to_string());
             tool_call.name = repaired_name;
-        }
-
-        if capabilities.normalize_tool_call_ids {
-            let normalized = normalize_tool_call_id(&tool_call.id, idx + 1, true);
-            if normalized != tool_call.id {
-                applied.transforms.push("tool-id-normalization".to_string());
-                tool_call.id = normalized;
-            }
         }
     }
 
@@ -1011,6 +998,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some(" ".to_string()),
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![],
             },
@@ -1030,6 +1018,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some(" ".to_string()),
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![],
             },
@@ -1049,6 +1038,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![LlmToolCall {
                     id: " 123 bad id ".to_string(),
@@ -1115,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn response_postprocess_falls_back_to_reasoning_and_normalizes_usage() {
+    fn response_postprocess_preserves_private_reasoning_and_normalizes_usage() {
         let (_, caps) = req_for(ProviderKind::Ollama, "qwen2.5-coder:7b");
         let response = LlmResponse {
             text: String::new(),
@@ -1133,12 +1123,14 @@ mod tests {
                 prompt_cache_miss_tokens: 100,
                 reasoning_tokens: 1,
             }),
+            transport_parts: Vec::new(),
             compatibility: None,
         };
 
         let normalized = postprocess_chat_response(response, &caps, &[]);
-        assert_eq!(normalized.text, "thoughts");
-        assert_eq!(normalized.tool_calls[0].id, "bad");
+        assert!(normalized.text.is_empty());
+        assert_eq!(normalized.reasoning_content, "thoughts");
+        assert_eq!(normalized.tool_calls[0].id, "%bad");
         assert_eq!(
             normalized
                 .usage
@@ -1170,6 +1162,7 @@ mod tests {
                 arguments: "{}".to_string(),
             }],
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         };
 
@@ -1191,6 +1184,7 @@ mod tests {
                 arguments: "{}".to_string(),
             }],
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         };
 
@@ -1210,6 +1204,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![LlmToolCall {
                     id: "call_1".to_string(),
@@ -1251,6 +1246,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("answer".to_string()),
+                native_parts: None,
                 reasoning_content: Some("hidden reasoning".to_string()),
                 tool_calls: vec![],
             },
@@ -1275,6 +1271,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![LlmToolCall {
                     id: "call_1".to_string(),
@@ -1339,6 +1336,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![LlmToolCall {
                     id: "bad id".to_string(),
@@ -1372,6 +1370,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![LlmToolCall {
                     id: "bad-id!?".to_string(),
@@ -1471,6 +1470,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![LlmToolCall {
                     id: "call_1".to_string(),

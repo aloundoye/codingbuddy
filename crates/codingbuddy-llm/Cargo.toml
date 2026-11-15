@@ -16,3 +16,10 @@ codingbuddy-core = { path = "../codingbuddy-core" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "time", "net"]
+
+[dependencies.ring]
+version = "0.17"

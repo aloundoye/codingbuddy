@@ -253,7 +253,12 @@ impl LocalToolHost {
         self.policy.ensure_allowed(&target)
     }
 
-    fn run_tool(&self, call: &ToolCall, shell: Option<ShellLaunch>) -> Result<serde_json::Value> {
+    fn run_tool(
+        &self,
+        call: &ToolCall,
+        shell: Option<ShellLaunch>,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> Result<serde_json::Value> {
         // Enforce review mode: block all non-read tools
         if self.review_mode && is_review_blocked(&call.name) {
             return Err(anyhow!(
@@ -567,6 +572,7 @@ impl LocalToolHost {
 
                 let diff = generate_unified_diff(path, &before, &after);
                 let checkpoint = self.create_checkpoint("fs_edit")?;
+                self.record_file_receipt(context, &full, after.as_bytes())?;
                 self.files.write(&full, after.as_bytes(), false)?;
                 let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                 let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
@@ -730,12 +736,10 @@ impl LocalToolHost {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("patch_id missing"))?;
                 let patch_id = Uuid::parse_str(id)?;
-                let (applied, conflicts) =
-                    self.patches
-                        .apply_checked(&self.workspace, patch_id, |path| {
-                            self.policy.check_patch_target(&self.files, path)
-                        })?;
-                Ok(json!({"patch_id": id, "applied": applied, "conflicts": conflicts}))
+                let (applied, conflicts, recovery_status) = self.apply_patch(context, patch_id)?;
+                Ok(
+                    json!({"patch_id": id, "applied": applied, "conflicts": conflicts, "recovery_status": recovery_status}),
+                )
             }
             "patch.direct" => {
                 // Single-step: stage + apply in one call. Ideal for DeepSeek-reasoner
@@ -748,11 +752,8 @@ impl LocalToolHost {
                 let patch = self
                     .patches
                     .stage_checked(diff, &[], |path| self.resolve_path(path, true).map(drop))?;
-                let (applied, conflicts) =
-                    self.patches
-                        .apply_checked(&self.workspace, patch.patch_id, |path| {
-                            self.policy.check_patch_target(&self.files, path)
-                        })?;
+                let (applied, conflicts, recovery_status) =
+                    self.apply_patch(context, patch.patch_id)?;
                 let mut result = if applied {
                     json!({
                         "applied": true,
@@ -767,6 +768,7 @@ impl LocalToolHost {
                         "files": patch.target_files,
                     })
                 };
+                result["recovery_status"] = json!(recovery_status);
                 // Auto-diagnostics after patch application
                 if applied && self.diagnostics_after_edit {
                     maybe_run_auto_diagnostics(
@@ -791,6 +793,7 @@ impl LocalToolHost {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("content missing"))?;
                 let checkpoint = self.create_checkpoint("fs_write")?;
+                self.record_file_receipt(context, &full, content.as_bytes())?;
                 self.files.write(&full, content.as_bytes(), true)?;
                 Ok(json!({
                     "written": true,
@@ -834,6 +837,7 @@ impl LocalToolHost {
                             .lock()
                             .ok()
                             .and_then(|callback| callback.clone()),
+                        context.cancellation,
                     )?;
                 let mut result = json!({"status": launched.status, "stdout": launched.stdout,
                     "stderr": launched.stderr, "timed_out": launched.timed_out});
@@ -1452,6 +1456,53 @@ impl LocalToolHost {
         }
     }
 
+    fn record_file_receipt(
+        &self,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+        path: &Path,
+        content: &[u8],
+    ) -> Result<()> {
+        if let (Some(session), Some(id)) = (context.session_id, context.invocation_id) {
+            self.store.record_invocation_receipt(
+                session,
+                id,
+                &codingbuddy_store::InvocationReceipt::File {
+                    path: self.files.relative(path)?.to_owned(),
+                    postimage_sha256: format!("{:x}", sha2::Sha256::digest(content)),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_patch(
+        &self,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+        patch_id: Uuid,
+    ) -> Result<(bool, Vec<String>, Option<String>)> {
+        let check = |path: &Path| self.policy.check_patch_target(&self.files, path);
+        if let Some(session) = context.session_id {
+            if let Some(id) = context.invocation_id {
+                self.store.record_invocation_receipt(
+                    session,
+                    id,
+                    &codingbuddy_store::InvocationReceipt::Patch { patch_id },
+                )?;
+            }
+            return self
+                .patches
+                .apply_for_session(&self.store, session, patch_id, check);
+        }
+        let (applied, conflicts) = self
+            .patches
+            .apply_checked(&self.workspace, patch_id, check)?;
+        Ok((
+            applied,
+            conflicts,
+            self.patches.read_patch(patch_id)?.recovery_status,
+        ))
+    }
+
     fn run_git_inspection(&self, args: &[&str]) -> Result<serde_json::Value> {
         let command = codingbuddy_core::process_env::git_inspection(&self.workspace);
         let result = super::shell::run_command(
@@ -1683,6 +1734,14 @@ impl ToolHost for LocalToolHost {
     }
 
     fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
+        self.execute_with_context(approved, Default::default())
+    }
+
+    fn execute_with_context(
+        &self,
+        approved: ApprovedToolCall,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> ToolResult {
         let call = approved.call;
         let shell = self
             .shell_launches
@@ -1718,7 +1777,7 @@ impl ToolHost for LocalToolHost {
                 output: json!({"error": error.to_string()}),
             };
         }
-        let execution = self.run_tool(&call, shell.map(|(_, launch)| launch));
+        let execution = self.run_tool(&call, shell.map(|(_, launch)| launch), context);
         let (success, output) = match execution {
             Ok(output) => (call.name != "bash.run" || output["status"] == 0, output),
             Err(err) => {
@@ -1727,10 +1786,15 @@ impl ToolHost for LocalToolHost {
                 (false, payload)
             }
         };
-        if success {
-            self.execute_hooks("posttooluse", Some(&call), Some(&output));
-        } else {
-            self.execute_hooks("posttooluse_failure", Some(&call), Some(&output));
+        if !context
+            .cancellation
+            .is_some_and(codingbuddy_core::CancellationToken::is_cancelled)
+        {
+            if success {
+                self.execute_hooks("posttooluse", Some(&call), Some(&output));
+            } else {
+                self.execute_hooks("posttooluse_failure", Some(&call), Some(&output));
+            }
         }
         ToolResult {
             invocation_id: approved.invocation_id,

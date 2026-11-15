@@ -203,6 +203,7 @@ fn anthropic_payload_converts_tool_results_to_tool_result_blocks() {
                     name: "fs_read".to_string(),
                     arguments: r#"{"path":"src/main.rs"}"#.to_string(),
                 }],
+                native_parts: None,
                 reasoning_content: None,
             },
             ChatMessage::Tool {
@@ -251,12 +252,20 @@ fn gemini_round_trips_thought_signature_with_the_function_result() {
             "candidates": [{"content": {"parts": [{
                 "functionCall": {"name": "fs_read", "args": {"path": "main.rs"}},
                 "thoughtSignature": "opaque-provider-signature"
-            }]}}]
+            }]},"finishReason":"STOP"}]
         })
         .to_string(),
     )
     .unwrap();
     let id = response.tool_calls[0].id.clone();
+    assert!(!id.contains("opaque-provider-signature"));
+    let native = response
+        .transport_parts
+        .into_iter()
+        .find_map(|part| match part {
+            codingbuddy_core::TransportPart::Native(native) => Some(native),
+            _ => None,
+        });
     let request = make_request(
         "gemini-test",
         vec![
@@ -265,6 +274,7 @@ fn gemini_round_trips_thought_signature_with_the_function_result() {
             },
             ChatMessage::Assistant {
                 content: None,
+                native_parts: native,
                 reasoning_content: None,
                 tool_calls: response.tool_calls,
             },
@@ -415,4 +425,267 @@ fn cancellation_releases_the_turn_while_waiting_for_response_headers() {
             .to_string()
             .contains("interrupted")
     );
+}
+
+#[test]
+fn delivery_one_requires_complete_calls_and_preserves_interleaving() {
+    use codingbuddy_core::TransportPart;
+    use codingbuddy_llm::{ApiClient, LlmClient};
+
+    let valid = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"before\",\"tool_calls\":[{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"fs_read\",\"arguments\":\"{\"}}]}}]}\n\n",
+        "data: {\"choices\":[\n",
+        "data: {\"delta\":{\"content\":\"between\",\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"fs_read\",\"arguments\":\"{}\"}},{\"index\":1,\"function\":{\"arguments\":\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let broken = [
+        (
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "terminal response",
+        ),
+        ("data: {invalid}\n\n", "Malformed provider stream event"),
+        (
+            "event: error\ndata: {\"error\":{\"message\":\"fixture\"}}\n\n",
+            "error during the response stream",
+        ),
+        (
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"fs_read\",\"arguments\":\"{\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "malformed tool arguments",
+        ),
+    ];
+    for (events, failure) in std::iter::once((valid, "")).chain(broken) {
+        let (endpoint, server) = delivery_one_loopback(events);
+        let mut cfg = codingbuddy_core::LlmConfig::default();
+        cfg.select_provider("ollama");
+        cfg.providers.get_mut("ollama").unwrap().base_url = endpoint;
+        cfg.max_retries = 0;
+        let request = make_request(
+            &cfg.active_base_model(),
+            vec![ChatMessage::User {
+                content: "test".into(),
+            }],
+            vec![sample_tool()],
+        );
+        let result = ApiClient::new(cfg)
+            .unwrap()
+            .complete_chat_streaming(&request, std::sync::Arc::new(|_| {}));
+        server.join().unwrap();
+        if !failure.is_empty() {
+            assert!(
+                format!("{:#}", result.unwrap_err()).contains(failure),
+                "{failure}"
+            );
+            continue;
+        }
+        let response = result.unwrap();
+        assert_eq!(
+            response
+                .tool_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert!(matches!(response.transport_parts.as_slice(), [
+            TransportPart::Text(before), TransportPart::Call(b), TransportPart::Text(between), TransportPart::Call(a)
+        ] if before == "before" && b == "b" && between == "between" && a == "a"));
+    }
+}
+
+fn delivery_one_loopback(events: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        reader.read_exact(&mut vec![0; length]).unwrap();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+    });
+    (endpoint, worker)
+}
+
+#[test]
+fn delivery_one_cancellation_closes_a_stalled_response_body() {
+    use codingbuddy_llm::{ApiClient, LlmClient};
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        time::Duration,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        reader.read_exact(&mut vec![0; length]).unwrap();
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n", event.len()).unwrap();
+        closed_tx
+            .send(matches!(stream.read(&mut [0; 1]), Ok(0)))
+            .unwrap();
+    });
+    let token = codingbuddy_core::CancellationToken::new();
+    let mut cfg = codingbuddy_core::LlmConfig::default();
+    cfg.select_provider("ollama");
+    cfg.providers.get_mut("ollama").unwrap().base_url = endpoint;
+    let request = make_request(
+        &cfg.active_base_model(),
+        vec![ChatMessage::User {
+            content: "test".into(),
+        }],
+        vec![],
+    );
+    let mut client = ApiClient::new(cfg).unwrap();
+    client.set_cancel_token(token.clone());
+    let response = client.complete_chat_streaming(
+        &request,
+        std::sync::Arc::new(move |chunk| {
+            if matches!(chunk, codingbuddy_core::StreamChunk::ContentDelta(_)) {
+                token.cancel();
+            }
+        }),
+    );
+    assert!(format!("{:#}", response.unwrap_err()).contains("Turn interrupted"));
+    assert!(closed_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    server.join().unwrap();
+}
+
+#[test]
+fn delivery_one_route_scopes_endpoint_model_and_account() {
+    use codingbuddy_llm::session_route;
+    let mut config = codingbuddy_core::LlmConfig::default();
+    let key = b"workspace-only-random-route-key-fixture";
+    let model = config.active_base_model();
+    config.api_key = Some("fixture-first-credential".into());
+    let first = session_route(&config, &model, key).unwrap();
+    config.api_key = Some("fixture-rotated-credential".into());
+    assert_ne!(first, session_route(&config, &model, key).unwrap());
+
+    config.providers.get_mut("deepseek").unwrap().account_id =
+        Some("fixture-stable-account".into());
+    let pinned = session_route(&config, &model, key).unwrap();
+    config.api_key = Some("fixture-third-credential".into());
+    assert_eq!(pinned, session_route(&config, &model, key).unwrap());
+    assert_ne!(
+        pinned,
+        session_route(&config, "different-model", key).unwrap()
+    );
+    config.endpoint = "http://127.0.0.1:8761/v1/chat/completions".into();
+    assert_ne!(pinned, session_route(&config, &model, key).unwrap());
+}
+
+#[test]
+fn delivery_one_anthropic_replays_signed_interleaved_blocks() {
+    use codingbuddy_core::TransportPart;
+    use codingbuddy_llm::{ApiClient, LlmClient};
+    let events = concat!(
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private-fixture\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque-fixture\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"fs_read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"fs_read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"b\\\"}\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a\\\"}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (endpoint, server) = delivery_one_loopback(events);
+    let mut config = codingbuddy_core::LlmConfig::default();
+    config.select_provider("anthropic");
+    config.providers.get_mut("anthropic").unwrap().base_url = endpoint;
+    config.api_key = Some("fixture-key".into());
+    let model = config.active_base_model();
+    let user = ChatMessage::User {
+        content: "Test".into(),
+    };
+    let request = make_request(&model, vec![user.clone()], vec![sample_tool()]);
+    let response = ApiClient::new(config)
+        .unwrap()
+        .complete_chat_streaming(&request, std::sync::Arc::new(|_| {}))
+        .unwrap();
+    server.join().unwrap();
+    assert!(response.text.is_empty());
+    assert_eq!(response.tool_calls[0].arguments, r#"{"path":"a"}"#);
+    assert_eq!(response.tool_calls[1].arguments, r#"{"path":"b"}"#);
+    let native_parts = response
+        .transport_parts
+        .into_iter()
+        .find_map(|part| match part {
+            TransportPart::Native(native) => Some(native),
+            _ => None,
+        });
+    let assistant = ChatMessage::Assistant {
+        content: None,
+        reasoning_content: None,
+        native_parts,
+        tool_calls: response.tool_calls,
+    };
+    assert!(
+        !serde_json::to_string(&assistant)
+            .unwrap()
+            .contains("opaque-fixture")
+    );
+    let next = make_request(
+        &model,
+        vec![
+            user,
+            assistant,
+            ChatMessage::Tool {
+                tool_call_id: "a".into(),
+                tool_name: None,
+                content: "result-a".into(),
+            },
+            ChatMessage::Tool {
+                tool_call_id: "b".into(),
+                tool_name: None,
+                content: "result-b".into(),
+            },
+        ],
+        vec![sample_tool()],
+    );
+    let payload = anthropic::build_payload(&next, 1024).unwrap();
+    assert_eq!(
+        payload["messages"][1]["content"][0]["signature"],
+        "opaque-fixture"
+    );
+    assert_eq!(payload["messages"][2]["content"][0]["tool_use_id"], "a");
+    assert_eq!(payload["messages"][2]["content"][1]["tool_use_id"], "b");
 }

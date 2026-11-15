@@ -538,6 +538,7 @@ fn content_filter_returns_error() {
         reasoning_content: String::new(),
         tool_calls: vec![],
         usage: None,
+        transport_parts: Vec::new(),
         compatibility: None,
     }]);
 

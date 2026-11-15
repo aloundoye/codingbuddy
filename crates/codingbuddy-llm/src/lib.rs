@@ -1,9 +1,11 @@
+mod chat_transport;
+mod native_parts;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
     AppliedCompatibility, CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig,
     LlmRequest, LlmResponse, LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
-    max_output_tokens_for_model,
+    TransportPart, max_output_tokens_for_model,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -54,6 +56,11 @@ pub trait LlmClient {
     fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback)
     -> Result<LlmResponse>;
 
+    /// Return the actual route of a client whose credential may already be cached.
+    fn pinned_session_route(&self, _model: &str, _local_key: &[u8]) -> Option<Result<String>> {
+        None
+    }
+
     /// Discover available models from the provider's API.
     /// Default: returns empty (no discovery support).
     fn list_models(&self) -> Vec<String> {
@@ -67,7 +74,7 @@ pub trait LlmClient {
     fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiClient {
     cfg: LlmConfig,
     client: Client,
@@ -77,6 +84,15 @@ pub struct ApiClient {
     /// Cached API key resolved eagerly at construction time.
     /// Avoids env var races when the key is cleared during logout.
     api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiClient")
+            .field("provider", &self.cfg.provider)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Resolve an explicit credential, an environment key, or a saved key.
@@ -201,6 +217,55 @@ pub fn check_provider(cfg: &LlmConfig) -> Result<()> {
     Ok(())
 }
 
+/// Stable workspace-keyed identity for replay. Credentials and the route key are never emitted.
+pub fn session_route(cfg: &LlmConfig, model: &str, local_key: &[u8]) -> Result<String> {
+    session_route_with_credential(cfg, model, local_key, || resolve_key_from_config(cfg))
+}
+
+fn session_route_with_credential(
+    cfg: &LlmConfig,
+    model: &str,
+    local_key: &[u8],
+    credential: impl FnOnce() -> Option<String>,
+) -> Result<String> {
+    let provider = cfg.active_provider();
+    let kind = cfg
+        .active_provider_kind()
+        .unwrap_or(ProviderKind::OpenAiCompatible);
+    let chat_protocol = protocol::select_chat_protocol(&provider, kind);
+    let auth = protocol::select_auth_strategy(&provider, kind, chat_protocol);
+    let account = provider
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let credential = if account.is_none() && auth != protocol::AuthStrategy::None {
+        credential()
+    } else {
+        None
+    };
+    let endpoint = if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent {
+        providers::google::endpoint(&provider.base_url, model, false)
+    } else {
+        resolved_endpoint(cfg, true, false, false)
+    };
+    let route = serde_json::to_vec(&(
+        cfg.provider.as_str(),
+        chat_protocol.as_key(),
+        endpoint,
+        model,
+        account,
+        credential,
+        &provider.headers,
+    ))?;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, local_key);
+    Ok(ring::hmac::sign(&key, &route)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 pub fn validate_base_url(value: &str) -> Result<String> {
     let url =
         reqwest::Url::parse(value).map_err(|_| anyhow!("Enter a valid HTTP or HTTPS base URL"))?;
@@ -269,29 +334,6 @@ impl ApiClient {
     /// in case the key was rotated or refreshed since construction.
     pub fn refresh_api_key(&mut self) {
         self.api_key = resolve_key_from_config(&self.cfg);
-    }
-
-    fn with_chat_cancellation(
-        &self,
-        operation: impl FnOnce(ApiClient) -> Result<LlmResponse> + Send + 'static,
-    ) -> Result<LlmResponse> {
-        let Some(token) = &self.cancel_token else {
-            return operation(self.clone());
-        };
-        anyhow::ensure!(!token.is_cancelled(), "Turn interrupted");
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let client = self.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(operation(client));
-        });
-        loop {
-            anyhow::ensure!(!token.is_cancelled(), "Turn interrupted");
-            match rx.recv_timeout(Duration::from_millis(40)) {
-                Ok(result) => return result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
     }
 
     fn check_cancellation(&self) -> Result<()> {
@@ -501,56 +543,7 @@ impl ApiClient {
     }
 
     fn resolved_endpoint(&self, is_chat: bool, is_fim: bool, is_strict_tools: bool) -> String {
-        if !self.cfg.endpoint.is_empty() {
-            return self.cfg.endpoint.clone();
-        }
-        let provider = self.provider_config();
-        let base = provider.base_url.trim_end_matches('/');
-        let prefix = if provider.openai_compat_prefix && !base.ends_with("/v1") {
-            "/v1"
-        } else {
-            ""
-        };
-        let path = match self.provider_kind().unwrap_or(ProviderKind::Deepseek) {
-            ProviderKind::Deepseek => {
-                if is_fim || is_strict_tools {
-                    format!("{prefix}/beta/completions")
-                } else if is_chat {
-                    format!("{prefix}/chat/completions")
-                } else {
-                    format!("{prefix}/completions")
-                }
-            }
-            ProviderKind::Anthropic => {
-                return format!("{base}/v1/messages");
-            }
-            ProviderKind::Google => {
-                // Google uses model-specific URLs; handled separately in build/send
-                // Return a placeholder that gets replaced in complete_chat_inner
-                if is_chat {
-                    return format!("{base}/v1beta/openai/chat/completions");
-                }
-                return format!("{base}/v1beta/openai/completions");
-            }
-            ProviderKind::OpenAiCompatible
-            | ProviderKind::Groq
-            | ProviderKind::OpenRouter
-            | ProviderKind::Ollama
-            | ProviderKind::Azure
-            | ProviderKind::Bedrock
-            | ProviderKind::Vertex
-            | ProviderKind::MistralApi
-            | ProviderKind::Xai
-            | ProviderKind::Together
-            | ProviderKind::Copilot => {
-                if is_chat {
-                    format!("{prefix}/chat/completions")
-                } else {
-                    format!("{prefix}/completions")
-                }
-            }
-        };
-        format!("{base}{path}")
+        resolved_endpoint(&self.cfg, is_chat, is_fim, is_strict_tools)
     }
 
     fn complete_inner(&self, req: &LlmRequest, api_key: Option<&str>) -> Result<LlmResponse> {
@@ -967,21 +960,27 @@ impl ApiClient {
             _ => self.resolved_endpoint(true, false, false),
         };
 
+        let transport = chat_transport::ChatTransport::new(
+            Duration::from_secs(self.cfg.timeout_seconds),
+            self.cancel_token.clone(),
+        )?;
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             self.check_cancellation()?;
-            let builder = self
+            let request = self
                 .apply_auth_for_protocol(self.client.post(&endpoint), api_key, chat_protocol)
-                .json(&prepared.payload);
-            let response = builder.send();
+                .build()
+                .map_err(reqwest::Error::without_url)?;
+            let response =
+                transport.post(&endpoint, request.headers().clone(), &prepared.payload)?;
 
             match response {
                 Ok(resp) => {
                     let status = resp.status();
                     // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
                     let retry_after = parse_retry_after(resp.headers());
-                    let body = resp.text().map_err(reqwest::Error::without_url)?;
+                    let body = transport.text(resp)?;
                     if status.is_success() {
                         let response = match chat_protocol {
                             protocol::ChatProtocol::AnthropicMessages => {
@@ -1187,6 +1186,7 @@ impl ApiClient {
                                 reasoning_content: String::new(),
                                 tool_calls: vec![],
                                 usage,
+                                transport_parts: Vec::new(),
                                 compatibility: None,
                             });
                         }
@@ -1269,14 +1269,23 @@ impl ApiClient {
             _ => self.resolved_endpoint(true, false, false),
         };
 
+        let transport = chat_transport::ChatTransport::new(
+            Duration::from_secs(self.cfg.timeout_seconds),
+            self.cancel_token.clone(),
+        )?;
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             self.check_cancellation()?;
-            let builder = self
+            let request = self
                 .apply_auth_for_protocol(self.client.post(&stream_endpoint), api_key, chat_protocol)
-                .json(&prepared.payload);
-            let response = builder.send();
+                .build()
+                .map_err(reqwest::Error::without_url)?;
+            let response = transport.post(
+                &stream_endpoint,
+                request.headers().clone(),
+                &prepared.payload,
+            )?;
 
             match response {
                 Ok(resp) => {
@@ -1290,44 +1299,18 @@ impl ApiClient {
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
                         let mut completed_tool_calls: Vec<LlmToolCall> = Vec::new();
-                        let mut has_structured_tool_calls = false;
+                        let mut order = Vec::new();
                         let mut usage: Option<codingbuddy_core::TokenUsage> = None;
                         let mut saw_anthropic_stop = false;
-
-                        // Native provider streaming state
-                        let mut anthropic_event_type = String::new();
                         let mut native_state = providers::NativeStreamState::default();
-
-                        let reader = std::io::BufReader::new(resp);
-                        for line_result in reader.lines() {
-                            if let Some(ref ct) = self.cancel_token
-                                && ct.is_cancelled()
-                            {
-                                cb(StreamChunk::Done {
-                                    reason: Some("cancelled".to_string()),
-                                });
-                                break;
-                            }
-                            let line = match line_result {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    last_err = Some(anyhow!("stream read error: {e}"));
-                                    break;
-                                }
-                            };
-                            let trimmed = line.trim();
-
-                            // Anthropic SSE uses "event:" prefix lines before "data:" lines
-                            if trimmed.starts_with("event:") {
-                                anthropic_event_type =
-                                    trimmed.trim_start_matches("event:").trim().to_string();
-                                continue;
-                            }
-
-                            if !trimmed.starts_with("data:") {
-                                continue;
-                            }
-                            let chunk = trimmed.trim_start_matches("data:").trim();
+                        let mut anthropic_blocks = native_parts::AnthropicBlocks::default();
+                        let mut gemini_blocks = Vec::new();
+                        let mut reader = std::io::BufReader::new(transport.reader(resp));
+                        while let Some(frame) = chat_transport::next_frame(&mut reader)
+                            .context("Provider stream read failed")?
+                        {
+                            let anthropic_event_type = frame.event;
+                            let chunk = frame.data.as_str();
                             if chunk == "[DONE]" {
                                 if !is_native {
                                     break;
@@ -1350,6 +1333,7 @@ impl ApiClient {
                                 } else {
                                     &anthropic_event_type
                                 };
+                                anthropic_blocks.frame(evt_type, &value)?;
                                 let raw =
                                     providers::anthropic::parse_streaming_event(evt_type, &value);
                                 let evt = providers::from_anthropic_event(raw);
@@ -1358,12 +1342,17 @@ impl ApiClient {
                                     break;
                                 }
                                 native_state.handle_event(evt, &*cb);
-                                anthropic_event_type.clear();
                                 continue;
                             }
 
                             // ── Native Google streaming ──
                             if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent {
+                                if let Some(parts) = value
+                                    .pointer("/candidates/0/content/parts")
+                                    .and_then(Value::as_array)
+                                {
+                                    gemini_blocks.extend(parts.iter().cloned());
+                                }
                                 let raw = providers::google::parse_streaming_chunk(&value);
                                 for evt in providers::from_google_event(raw) {
                                     native_state.handle_event(evt, &*cb);
@@ -1393,44 +1382,84 @@ impl ApiClient {
                                 if let Some(content) = delta.get("content").and_then(|v| v.as_str())
                                 {
                                     content_out.push_str(content);
-                                    if !has_structured_tool_calls {
-                                        cb(StreamChunk::ContentDelta(content.to_string()));
-                                    }
+                                    order.push(Ok::<_, u64>(TransportPart::Text(
+                                        content.to_owned(),
+                                    )));
+                                    cb(StreamChunk::ContentDelta(content.to_string()));
                                 }
                                 if let Some(reasoning) =
                                     delta.get("reasoning_content").and_then(|v| v.as_str())
                                 {
                                     reasoning_out.push_str(reasoning);
-                                    cb(StreamChunk::ReasoningDelta(reasoning.to_string()));
                                 }
                                 if let Some(tool_calls) =
                                     delta.get("tool_calls").and_then(|v| v.as_array())
                                 {
-                                    has_structured_tool_calls = true;
-                                    merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
+                                    for (position, item) in tool_calls.iter().enumerate() {
+                                        let id = item["id"].as_str();
+                                        let index = item["index"]
+                                            .as_u64()
+                                            .or_else(|| {
+                                                id.and_then(|id| {
+                                                    tool_call_parts.iter().find_map(
+                                                        |(index, entry)| {
+                                                            (entry.id.as_deref() == Some(id))
+                                                                .then_some(*index)
+                                                        },
+                                                    )
+                                                })
+                                            })
+                                            .unwrap_or(position as u64);
+                                        let entry =
+                                            tool_call_parts.entry(index).or_insert_with(|| {
+                                                order.push(Err(index));
+                                                StreamToolCall::default()
+                                            });
+                                        if let Some(id) = id {
+                                            anyhow::ensure!(
+                                                entry
+                                                    .id
+                                                    .as_deref()
+                                                    .is_none_or(|previous| previous == id),
+                                                "Provider changed a tool call ID"
+                                            );
+                                            entry.id = Some(id.into());
+                                        }
+                                        if let Some(name) =
+                                            item.pointer("/function/name").and_then(Value::as_str)
+                                        {
+                                            anyhow::ensure!(
+                                                entry.name.is_empty() || entry.name == name,
+                                                "Provider changed a tool call name"
+                                            );
+                                            entry.name = name.into();
+                                        }
+                                        if let Some(args) = item
+                                            .pointer("/function/arguments")
+                                            .and_then(Value::as_str)
+                                        {
+                                            entry.arguments.push_str(args);
+                                        }
+                                    }
                                 }
                             }
                             if let Some(message) = choice.get("message") {
-                                if let Some(content) =
-                                    message.get("content").and_then(|v| v.as_str())
-                                {
+                                if let Some(content) = message["content"].as_str() {
                                     content_out.push_str(content);
+                                    order.push(Ok(TransportPart::Text(content.into())));
                                     cb(StreamChunk::ContentDelta(content.to_string()));
                                 }
-                                if let Some(reasoning) =
-                                    message.get("reasoning_content").and_then(|v| v.as_str())
-                                {
+                                if let Some(reasoning) = message["reasoning_content"].as_str() {
                                     reasoning_out.push_str(reasoning);
-                                    cb(StreamChunk::ReasoningDelta(reasoning.to_string()));
                                 }
-                                if let Some(tool_calls) = message.get("tool_calls") {
-                                    completed_tool_calls.extend(parse_tool_calls_array(tool_calls));
-                                }
+                                let calls = parse_completed_calls(message.get("tool_calls"))?;
+                                order.extend(
+                                    calls
+                                        .iter()
+                                        .map(|call| Ok(TransportPart::Call(call.id.clone()))),
+                                );
+                                completed_tool_calls.extend(calls);
                             }
-                        }
-
-                        if let Some(err) = last_err.take() {
-                            return Err(err);
                         }
 
                         self.check_cancellation()?;
@@ -1448,57 +1477,48 @@ impl ApiClient {
                             "Provider stream ended before a terminal response"
                         );
 
-                        // If content text was streamed to the TUI but we also
-                        // have structured tool calls, tell the TUI to clear the
-                        // noise text fragments that appeared before/between
-                        // tool calls.
-                        if has_structured_tool_calls && !content_out.is_empty() {
-                            cb(StreamChunk::ClearStreamingText);
-                        }
-
-                        let mut tool_calls: Vec<LlmToolCall> = tool_call_parts
-                            .into_iter()
-                            .filter_map(|(index, value)| {
-                                if value.name.trim().is_empty() {
-                                    return None;
+                        let mut tool_calls = Vec::new();
+                        let mut transport_parts = Vec::new();
+                        for part in order {
+                            match part {
+                                Ok(part) => transport_parts.push(part),
+                                Err(index) => {
+                                    let call = tool_call_parts
+                                        .remove(&index)
+                                        .expect("reserved tool index");
+                                    let id = call.id.unwrap_or_default();
+                                    transport_parts.push(TransportPart::Call(id.clone()));
+                                    tool_calls.push(LlmToolCall {
+                                        id,
+                                        name: call.name,
+                                        arguments: call.arguments,
+                                    });
                                 }
-                                Some(LlmToolCall {
-                                    id: value
-                                        .id
-                                        .unwrap_or_else(|| format!("tool_call_{}", index + 1)),
-                                    name: value.name,
-                                    arguments: value.arguments,
-                                })
-                            })
-                            .collect();
-                        if !completed_tool_calls.is_empty() {
-                            tool_calls.extend(completed_tool_calls);
+                            }
                         }
-
-                        // Merge native provider state into the response
+                        tool_calls.extend(completed_tool_calls);
                         if is_native {
-                            if !native_state.content.is_empty() {
-                                content_out = native_state.content;
-                            }
-                            if !native_state.reasoning.is_empty() {
-                                reasoning_out = native_state.reasoning;
-                            }
-                            tool_calls.extend(native_state.tool_calls);
-                            if native_state.finish_reason.is_some() {
-                                finish_reason = native_state.finish_reason;
-                            }
-                            if native_state.usage.is_some() {
-                                usage = native_state.usage;
-                            }
+                            let (protocol, blocks) = match chat_protocol {
+                                protocol::ChatProtocol::AnthropicMessages => {
+                                    (native_parts::ANTHROPIC, anthropic_blocks.finish()?)
+                                }
+                                _ => (native_parts::GEMINI, gemini_blocks),
+                            };
+                            (transport_parts, tool_calls) =
+                                native_parts::native_response(protocol, blocks)?;
+                            content_out = transport_parts
+                                .iter()
+                                .filter_map(|part| match part {
+                                    TransportPart::Text(text) => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            reasoning_out = native_state.reasoning;
+                            finish_reason = native_state.finish_reason;
+                            usage = native_state.usage;
                         }
-
-                        let text = if !content_out.is_empty() {
-                            content_out
-                        } else if !reasoning_out.is_empty() {
-                            reasoning_out.clone()
-                        } else {
-                            String::new()
-                        };
+                        validate_completed_calls(&tool_calls)?;
+                        let text = content_out;
 
                         let reason = finish_reason
                             .ok_or_else(|| anyhow!("Provider finish reason missing"))?;
@@ -1511,6 +1531,7 @@ impl ApiClient {
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
+                            transport_parts,
                             compatibility: Some(prepared.compatibility.clone()),
                         };
                         // Native providers handle their own format; OpenAI-compat needs postprocessing
@@ -1527,7 +1548,7 @@ impl ApiClient {
                         );
                     }
 
-                    let body = resp.text().unwrap_or_default();
+                    let body = transport.text(resp)?;
                     last_err = Some(with_compatibility_context(
                         format_api_error(
                             status,
@@ -1874,6 +1895,7 @@ impl ApiClient {
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
+                            transport_parts: Vec::new(),
                             compatibility: None,
                         };
                         if !prepared.compatibility.transforms.is_empty()
@@ -1933,6 +1955,15 @@ impl ApiClient {
 // annotate_cache_control / apply_cache_annotations / payload_rejects_cache_control removed in P9.
 
 impl LlmClient for ApiClient {
+    fn pinned_session_route(&self, model: &str, local_key: &[u8]) -> Option<Result<String>> {
+        Some(session_route_with_credential(
+            &self.cfg,
+            model,
+            local_key,
+            || self.resolve_api_key(),
+        ))
+    }
+
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
@@ -1956,9 +1987,7 @@ impl LlmClient for ApiClient {
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.validate_chat_request_contract(&normalized_req)?;
         self.validate_thinking_params(&normalized_req)?;
-        self.with_chat_cancellation(move |client| {
-            client.complete_chat_inner(&normalized_req, key.as_deref())
-        })
+        self.complete_chat_inner(&normalized_req, key.as_deref())
     }
 
     fn complete_chat_streaming(
@@ -1972,15 +2001,17 @@ impl LlmClient for ApiClient {
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.validate_chat_request_contract(&normalized_req)?;
         self.validate_thinking_params(&normalized_req)?;
-        self.with_chat_cancellation(move |client| {
-            let token = client.cancel_token.clone();
-            let guarded = std::sync::Arc::new(move |chunk| {
-                if !token.as_ref().is_some_and(CancellationToken::is_cancelled) {
-                    cb(chunk);
-                }
+        if !self.cfg.stream {
+            let response = self.complete_chat_inner(&normalized_req, key.as_deref())?;
+            if !response.text.is_empty() {
+                cb(StreamChunk::ContentDelta(response.text.clone()));
+            }
+            cb(StreamChunk::Done {
+                reason: Some(response.finish_reason.clone()),
             });
-            client.complete_chat_streaming_inner(&normalized_req, key.as_deref(), guarded)
-        })
+            return Ok(response);
+        }
+        self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
     fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
@@ -2226,6 +2257,64 @@ fn parse_retry_after_http_date(value: &str) -> Option<u64> {
     Some(delta.max(0) as u64)
 }
 
+fn resolved_endpoint(
+    cfg: &LlmConfig,
+    is_chat: bool,
+    is_fim: bool,
+    is_strict_tools: bool,
+) -> String {
+    if !cfg.endpoint.is_empty() {
+        return cfg.endpoint.clone();
+    }
+    let provider = cfg.active_provider();
+    let base = provider.base_url.trim_end_matches('/');
+    let prefix = if provider.openai_compat_prefix && !base.ends_with("/v1") {
+        "/v1"
+    } else {
+        ""
+    };
+    let path = match cfg.active_provider_kind().unwrap_or(ProviderKind::Deepseek) {
+        ProviderKind::Deepseek => {
+            if is_fim || is_strict_tools {
+                format!("{prefix}/beta/completions")
+            } else if is_chat {
+                format!("{prefix}/chat/completions")
+            } else {
+                format!("{prefix}/completions")
+            }
+        }
+        ProviderKind::Anthropic => {
+            return format!("{base}/v1/messages");
+        }
+        ProviderKind::Google => {
+            // Google uses model-specific URLs; handled separately in build/send
+            // Return a placeholder that gets replaced in complete_chat_inner
+            if is_chat {
+                return format!("{base}/v1beta/openai/chat/completions");
+            }
+            return format!("{base}/v1beta/openai/completions");
+        }
+        ProviderKind::OpenAiCompatible
+        | ProviderKind::Groq
+        | ProviderKind::OpenRouter
+        | ProviderKind::Ollama
+        | ProviderKind::Azure
+        | ProviderKind::Bedrock
+        | ProviderKind::Vertex
+        | ProviderKind::MistralApi
+        | ProviderKind::Xai
+        | ProviderKind::Together
+        | ProviderKind::Copilot => {
+            if is_chat {
+                format!("{prefix}/chat/completions")
+            } else {
+                format!("{prefix}/completions")
+            }
+        }
+    };
+    format!("{base}{path}")
+}
+
 /// Compute retry delay with jitter.
 /// Priority: `retry-after-ms` header > `Retry-After` header > exponential backoff.
 /// Backoff is capped at 30s; header values are respected as-is.
@@ -2265,6 +2354,7 @@ fn parse_fim_non_streaming_payload(body: &str) -> Result<LlmResponse> {
         .to_string();
     let usage = parse_usage_object(value.get("usage"));
     Ok(LlmResponse {
+        transport_parts: Vec::new(),
         text,
         finish_reason,
         reasoning_content: String::new(),
@@ -2276,6 +2366,10 @@ fn parse_fim_non_streaming_payload(body: &str) -> Result<LlmResponse> {
 
 fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
     let value: Value = serde_json::from_str(body)?;
+    anyhow::ensure!(
+        value.get("error").is_none_or(Value::is_null),
+        "Provider sent a completion error"
+    );
     let choice = value
         .get("choices")
         .and_then(|v| v.as_array())
@@ -2288,7 +2382,7 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
     let finish_reason = choice
         .get("finish_reason")
         .and_then(|v| v.as_str())
-        .unwrap_or("stop")
+        .unwrap_or("missing_terminal")
         .to_string();
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
     let content = message
@@ -2301,24 +2395,26 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let tool_calls = message
-        .get("tool_calls")
-        .map(parse_tool_calls_array)
-        .unwrap_or_default();
+    let tool_calls = parse_completed_calls(message.get("tool_calls"))?;
     if content.is_empty() && reasoning_content.is_empty() && tool_calls.is_empty() {
         return Err(anyhow!(
             "unexpected non-streaming payload: missing message.content/reasoning_content/tool_calls"
         ));
     }
-    let text = if content.is_empty() {
-        reasoning_content.clone()
-    } else {
-        content
-    };
+    anyhow::ensure!(
+        finish_reason != "missing_terminal" || tool_calls.is_empty(),
+        "Provider completion missing its terminal status"
+    );
+    let text = content;
     let usage = parse_usage_object(value.get("usage"));
     Ok(LlmResponse {
+        transport_parts: Vec::new(),
         text,
-        finish_reason,
+        finish_reason: if finish_reason == "missing_terminal" {
+            "stop".into()
+        } else {
+            finish_reason
+        },
         reasoning_content,
         tool_calls,
         usage,
@@ -2446,6 +2542,7 @@ fn parse_streaming_payload(body: &str) -> Result<LlmResponse> {
             reasoning_content: reasoning_out,
             tool_calls,
             usage,
+            transport_parts: Vec::new(),
             compatibility: None,
         })
     } else {
@@ -2483,6 +2580,54 @@ fn merge_stream_tool_calls(chunks: &[Value], out: &mut BTreeMap<u64, StreamToolC
             }
         }
     }
+}
+
+fn validate_completed_calls(calls: &[LlmToolCall]) -> Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    for call in calls {
+        anyhow::ensure!(
+            !call.id.trim().is_empty() && !call.name.trim().is_empty() && ids.insert(&call.id),
+            "Provider returned an incomplete or duplicate tool call"
+        );
+        let arguments: Value = serde_json::from_str(&call.arguments)
+            .context("Provider returned malformed tool arguments")?;
+        anyhow::ensure!(
+            arguments.is_object(),
+            "Provider tool arguments must be an object"
+        );
+    }
+    Ok(())
+}
+
+fn parse_completed_calls(value: Option<&Value>) -> Result<Vec<LlmToolCall>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let calls = value.as_array().context("Malformed provider tool calls")?;
+    let parsed = calls
+        .iter()
+        .map(|call| {
+            let id = call["id"].as_str().unwrap_or_default().into();
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into();
+            let args = call
+                .pointer("/function/arguments")
+                .context("Provider tool arguments missing")?;
+            let arguments = args
+                .as_str()
+                .map_or_else(|| args.to_string(), str::to_owned);
+            Ok(LlmToolCall {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_completed_calls(&parsed)?;
+    Ok(parsed)
 }
 
 fn parse_tool_calls_array(value: &Value) -> Vec<LlmToolCall> {
@@ -3317,6 +3462,7 @@ mod tests {
                 },
                 ChatMessage::Assistant {
                     content: None,
+                    native_parts: None,
                     reasoning_content: None,
                     tool_calls: vec![codingbuddy_core::LlmToolCall {
                         id: "call_1".to_string(),

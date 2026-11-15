@@ -30,6 +30,7 @@ fn privacy_router_redacts_in_tool_loop() {
                 arguments: r#"{"path": "secret.txt"}"#.to_string(),
             }],
             usage: Some(TokenUsage::default()),
+            transport_parts: Vec::new(),
             compatibility: None,
         },
         // Second response: text reply

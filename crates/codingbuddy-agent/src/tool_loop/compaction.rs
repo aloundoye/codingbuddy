@@ -322,6 +322,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("I'll fix it".to_string()),
+                native_parts: None,
                 reasoning_content: None,
                 tool_calls: vec![codingbuddy_core::LlmToolCall {
                     id: "tc1".to_string(),

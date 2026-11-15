@@ -28,6 +28,7 @@ fn compaction_preserves_tool_result_pairing() {
     for i in 0..5 {
         loop_.messages.push(ChatMessage::Assistant {
             content: None,
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![LlmToolCall {
                 id: format!("call_{i}"),
@@ -46,6 +47,7 @@ fn compaction_preserves_tool_result_pairing() {
     });
     loop_.messages.push(ChatMessage::Assistant {
         content: Some("Here is what I found.".to_string()),
+        native_parts: None,
         reasoning_content: None,
         tool_calls: vec![],
     });
@@ -91,6 +93,7 @@ fn compaction_respects_target_tokens() {
         });
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("Answer {i}: {}", "y".repeat(200))),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });
@@ -172,6 +175,7 @@ fn compaction_appends_at_most_one_followup_user_prompt() {
     for i in 0..4 {
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("assistant-{i}: {}", "x".repeat(220))),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });
@@ -182,6 +186,7 @@ fn compaction_appends_at_most_one_followup_user_prompt() {
     for i in 4..10 {
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("assistant-{i}: {}", "x".repeat(220))),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });
@@ -221,6 +226,7 @@ fn compaction_followup_replays_last_actionable_user_prompt() {
     for i in 0..4 {
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("step-{i}: {}", "y".repeat(180))),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });
@@ -231,6 +237,7 @@ fn compaction_followup_replays_last_actionable_user_prompt() {
     for i in 4..12 {
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("step-{i}: {}", "y".repeat(180))),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });
@@ -345,6 +352,7 @@ fn compaction_injects_active_work_state_snapshot() {
     for i in 0..4 {
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("work-{i}: {}", "z".repeat(200))),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });
@@ -355,6 +363,7 @@ fn compaction_injects_active_work_state_snapshot() {
     for i in 4..12 {
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("work-{i}: {}", "z".repeat(200))),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });

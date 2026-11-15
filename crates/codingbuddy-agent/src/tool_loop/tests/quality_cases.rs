@@ -167,6 +167,7 @@ fn test_compaction_validation_catches_empty_summary() {
             reasoning_content: String::new(),
             tool_calls: vec![],
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         },
     ]);
@@ -192,6 +193,7 @@ fn test_compaction_validation_catches_empty_summary() {
         });
         loop_.messages.push(ChatMessage::Assistant {
             content: Some(format!("a{i}")),
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![],
         });

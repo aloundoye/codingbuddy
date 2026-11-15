@@ -59,9 +59,13 @@ pub(crate) fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<
     })?;
     let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(cwd)?;
 
+    let ledger = codingbuddy_store::Store::new(cwd)?;
+    let session = ensure_session_record(cwd, &ledger)?;
+    let _lease = ledger.session_lease(session.session_id)?;
     let checkpoint = MemoryManager::new(cwd)?.create_checkpoint("patch_apply")?;
-    append_control_event(
+    append_control_event_for_session(
         cwd,
+        session.session_id,
         EventKind::CheckpointCreated {
             checkpoint_id: checkpoint.checkpoint_id,
             reason: checkpoint.reason.clone(),
@@ -70,14 +74,16 @@ pub(crate) fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<
         },
     )?;
 
-    let (applied, conflicts) = store.apply_checked(cwd, patch.patch_id, |path| {
-        policy.check_patch_target(&files, path)
-    })?;
+    let (applied, conflicts, recovery_status) =
+        store.apply_for_session(&ledger, session.session_id, patch.patch_id, |path| {
+            policy.check_patch_target(&files, path)
+        })?;
     if json_mode {
         print_json(&json!({
             "patch_id": patch.patch_id,
             "applied": applied,
             "conflicts": conflicts,
+            "recovery_status": recovery_status,
             "checkpoint_id": checkpoint.checkpoint_id
         }))?;
         return Ok(());

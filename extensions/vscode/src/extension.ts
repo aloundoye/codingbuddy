@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { ChildProcessWithoutNullStreams, spawn } from "child_process";
 import * as path from "path";
@@ -36,7 +37,8 @@ class DeepSeekRpcClient {
     this.output.appendLine(`Starting ${binaryPath} serve --transport stdio`);
 
     this.process = spawn(binaryPath, ["serve", "--transport", "stdio"], {
-      stdio: "pipe"
+      stdio: "pipe",
+      cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
     });
 
     this.process.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk.toString("utf8")));
@@ -84,8 +86,16 @@ class DeepSeekRpcClient {
     return this.request("session/list", {});
   }
 
-  async promptExecute(sessionId: string, prompt: string): Promise<JsonRpcResponse> {
-    return this.request("prompt/execute", { session_id: sessionId, prompt });
+  async promptExecute(sessionId: string, prompt: string, requestId: string): Promise<JsonRpcResponse> {
+    return this.request("prompt/start", { session_id: sessionId, prompt, request_id: requestId });
+  }
+
+  async promptEvents(promptId: string, cursor: number): Promise<JsonRpcResponse> {
+    return this.request("prompt/events", { prompt_id: promptId, cursor });
+  }
+
+  async promptCancel(promptId: string): Promise<JsonRpcResponse> {
+    return this.request("prompt/cancel", { prompt_id: promptId });
   }
 
   async toolApprove(sessionId: string, invocationId: string): Promise<JsonRpcResponse> {
@@ -178,6 +188,13 @@ interface ChatEntry {
   content: string;
 }
 
+type PendingPrompt = { session: string; text: string; request: string };
+type ResumeResult = {
+  session_id: string;
+  history?: ChatEntry[];
+  latest_prompt?: { prompt_id: string; status: string };
+};
+
 class DeepSeekChatPanel {
   private static panels = new Map<string, DeepSeekChatPanel>();
   private readonly panel: vscode.WebviewPanel;
@@ -187,10 +204,11 @@ class DeepSeekChatPanel {
   private autoAccept: boolean;
 
   static create(
-    extensionUri: vscode.Uri,
+    state: vscode.Memento,
     client: DeepSeekRpcClient,
     title: string,
     autoAccept: boolean,
+    sessionId?: string,
   ): DeepSeekChatPanel {
     const panel = vscode.window.createWebviewPanel(
       "deepseekChat",
@@ -198,7 +216,7 @@ class DeepSeekChatPanel {
       vscode.ViewColumn.Beside,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    const chatPanel = new DeepSeekChatPanel(panel, client, autoAccept);
+    const chatPanel = new DeepSeekChatPanel(panel, client, autoAccept, state, sessionId);
     DeepSeekChatPanel.panels.set(title, chatPanel);
     panel.onDidDispose(() => DeepSeekChatPanel.panels.delete(title));
     return chatPanel;
@@ -208,33 +226,56 @@ class DeepSeekChatPanel {
     panel: vscode.WebviewPanel,
     client: DeepSeekRpcClient,
     autoAccept: boolean,
+    private readonly state: vscode.Memento,
+    initialSession?: string,
   ) {
     this.panel = panel;
     this.client = client;
     this.autoAccept = autoAccept;
+    this.sessionId = initialSession ?? state.get<string>("codingbuddy.session") ?? null;
     this.panel.webview.html = this.getHtml();
     this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
   }
 
+  private activePrompt: string | null = null;
+
   private async onMessage(msg: { type: string; text?: string; invocationId?: string; patchId?: string }): Promise<void> {
     switch (msg.type) {
-      case "send": {
-        if (!msg.text) return;
-        await this.ensureSession();
-        this.addEntry({ role: "user", content: msg.text });
+      case "ready": {
+        if (!this.sessionId) return;
         try {
-          const resp = await this.client.promptExecute(this.sessionId!, msg.text);
-          if (resp.error) {
-            this.addEntry({ role: "assistant", content: `Error: ${resp.error.message}` });
-          } else {
-            const result = resp.result as { prompt_id: string; status: string };
-            this.addEntry({ role: "assistant", content: `[Prompt queued: ${result.prompt_id}]` });
+          const response = await this.client.sessionResume(this.sessionId);
+          if (response.error) throw new Error(response.error.message);
+          const session = response.result as ResumeResult;
+          await this.state.update("codingbuddy.session", session.session_id);
+          for (const entry of session.history ?? []) this.addEntry(entry);
+          const pending = this.state.get<PendingPrompt>("codingbuddy.pendingPrompt");
+          if (pending?.session === session.session_id) {
+            await this.startPrompt(pending);
+          } else if (session.latest_prompt && session.latest_prompt.status !== "completed") {
+            await this.replayPrompt(session.latest_prompt.prompt_id);
           }
-        } catch (e) {
-          this.addEntry({ role: "assistant", content: `Error: ${e instanceof Error ? e.message : String(e)}` });
+        } catch (error) {
+          this.addEntry({ role: "assistant", content: String(error) });
         }
         break;
       }
+      case "send": {
+        if (!msg.text || this.activePrompt) return;
+        try {
+          await this.ensureSession();
+          this.addEntry({ role: "user", content: msg.text });
+          const pending = { session: this.sessionId!, request: randomUUID(), text: msg.text };
+          await this.state.update("codingbuddy.pendingPrompt", pending);
+          await this.startPrompt(pending);
+        } catch (error) {
+          this.addEntry({ role: "assistant", content: String(error) });
+        }
+        break;
+      }
+      case "cancel":
+        if (this.activePrompt) await this.client.promptCancel(this.activePrompt);
+        break;
       case "approve":
         if (msg.invocationId) {
           await this.client.toolApprove(this.sessionId!, msg.invocationId);
@@ -355,13 +396,52 @@ class DeepSeekChatPanel {
     }
   }
 
+  private async startPrompt(pending: PendingPrompt): Promise<void> {
+    const response = await this.client.promptExecute(pending.session, pending.text, pending.request);
+    if (response.error) throw new Error(response.error.message);
+    const result = response.result as { prompt_id: string; status: string };
+    if (result.status !== "completed") await this.replayPrompt(result.prompt_id);
+    await this.state.update("codingbuddy.pendingPrompt", undefined);
+  }
+
+  private async replayPrompt(id: string): Promise<void> {
+    this.activePrompt = id;
+    let cursor = 0;
+    let text = "";
+    try {
+      while (true) {
+        const response = await this.client.promptEvents(id, cursor);
+        if (response.error) throw new Error(response.error.message);
+        const page = response.result as {
+          events: { event: { type: string; text?: string } }[];
+          next_cursor: number; done: boolean; status: string; output?: string; error?: string;
+        };
+        for (const { event } of page.events) {
+          if (event.type === "content_delta" && event.text) text += event.text;
+          if (event.type === "clear_streaming_text") text = "";
+        }
+        cursor = page.next_cursor;
+        this.panel.webview.postMessage({ type: "promptProgress", text });
+        if (page.done) {
+          this.addEntry({ role: "assistant", content: page.status === "completed"
+            ? (page.output ?? text) : (page.error ?? page.status) });
+          return;
+        }
+        if (page.events.length === 0) await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    } finally {
+      this.activePrompt = null;
+      this.panel.webview.postMessage({ type: "promptProgress", text: "" });
+    }
+  }
+
   private async ensureSession(): Promise<void> {
     if (this.sessionId) return;
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ".";
     const resp = await this.client.sessionOpen(workspaceRoot);
-    if (resp.result) {
-      this.sessionId = (resp.result as { session_id: string }).session_id;
-    }
+    if (resp.error) throw new Error(resp.error.message);
+    this.sessionId = (resp.result as ResumeResult).session_id;
+    await this.state.update("codingbuddy.session", this.sessionId);
   }
 
   private addEntry(entry: ChatEntry): void {
@@ -525,7 +605,9 @@ class DeepSeekChatPanel {
   <div id="chat"></div>
   <div id="input-area">
     <input id="prompt" type="text" placeholder="Ask DeepSeek..." />
+    <pre id="livePrompt"></pre>
     <button onclick="send()">Send</button>
+    <button onclick="vscode.postMessage({ type: 'cancel' })">Cancel</button>
   </div>
   <script>
     const vscode = acquireVsCodeApi();
@@ -584,6 +666,9 @@ class DeepSeekChatPanel {
 
     window.addEventListener("message", (event) => {
       const msg = event.data;
+      if (msg.type === "promptProgress") {
+        document.getElementById("livePrompt").textContent = msg.text;
+      }
       if (msg.type === "addEntry") {
         addEntry(msg.entry);
       }
@@ -599,6 +684,7 @@ class DeepSeekChatPanel {
     function escapeHtml(s) {
       return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
+      vscode.postMessage({ type: "ready" });
   </script>
 </body>
 </html>`;
@@ -642,7 +728,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("deepseek.openChat", () => {
       const cfg = vscode.workspace.getConfiguration("deepseek.ide");
       const autoAccept = cfg.get<boolean>("autoAcceptEdits", false);
-      DeepSeekChatPanel.create(context.extensionUri, rpcClient, "DeepSeek Chat", autoAccept);
+      DeepSeekChatPanel.create(context.workspaceState, rpcClient, "DeepSeek Chat", autoAccept);
     })
   );
 
@@ -666,8 +752,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }));
         const selected = await vscode.window.showQuickPick(items, { placeHolder: "Select a session to resume" });
         if (selected) {
-          await rpcClient.sessionResume(selected.label);
-          vscode.window.showInformationMessage(`Resumed session ${selected.label}`);
+          const cfg = vscode.workspace.getConfiguration("deepseek.ide");
+          DeepSeekChatPanel.create(context.workspaceState, rpcClient, "DeepSeek Chat",
+            cfg.get<boolean>("autoAcceptEdits", false), selected.label);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

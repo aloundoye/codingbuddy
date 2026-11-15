@@ -120,6 +120,15 @@ impl ToolUseLoop<'_> {
                 };
                 return Ok(records);
             }
+            if let Err(error) = self.validate_tool_input(&llm_call.name, &call.args) {
+                let ToolPreparation::Complete(records) =
+                    self.reject_tool_call(llm_call, Instant::now(), "invalid args", &error)
+                else {
+                    unreachable!("rejected call cannot be ready")
+                };
+                return Ok(records);
+            }
+            self.dispatch_durable_invocation(None)?;
             return self.handle_agent_level_tool(llm_call);
         }
         let prepared = match self.prepare_tool_call(llm_call, batch_child)? {
@@ -136,12 +145,56 @@ impl ToolUseLoop<'_> {
                 .discard_proposal(prepared.approved.invocation_id);
             return Err(error);
         }
+        if !batch_child {
+            self.dispatch_durable_invocation(Some(&prepared.approved.call))?;
+        }
         let result = if prepared.approved.call.name == "batch" {
             self.execute_batch(&prepared.approved)?
         } else {
-            self.tool_host.execute(prepared.approved.clone())
+            self.tool_host.execute_with_context(
+                prepared.approved.clone(),
+                codingbuddy_core::ToolExecutionContext {
+                    session_id: self.durable_session.as_ref().map(|(_, session)| *session),
+                    invocation_id: if batch_child {
+                        None
+                    } else {
+                        self.durable_invocation.map(|(id, _)| id)
+                    },
+                    cancellation: self.cancellation.as_ref(),
+                },
+            )
         };
+        self.check_cancellation()?;
+        if let (Some((store, _)), Some((id, _))) = (&self.durable_session, self.durable_invocation)
+            && (result.output["recovery_status"] == "ambiguous"
+                || (!result.success
+                    && matches!(
+                        store.invocation_receipt(id)?,
+                        Some(codingbuddy_store::InvocationReceipt::File { .. })
+                    )))
+        {
+            anyhow::bail!(
+                "Invocation {id} may have changed the workspace. Resolve it locally before continuing."
+            );
+        }
         self.finish_tool_call(*prepared, result, batch_child)
+    }
+
+    fn dispatch_durable_invocation(
+        &mut self,
+        call: Option<&codingbuddy_core::ToolCall>,
+    ) -> Result<()> {
+        if let (Some((store, session)), Some((id, dispatched))) =
+            (&self.durable_session, &mut self.durable_invocation)
+        {
+            if !*dispatched {
+                store.dispatch_tool_invocation(*session, *id, call)?;
+                *dispatched = true;
+            } else if let Some(call) = call {
+                store.record_invocation_request(*session, *id, call)?;
+            }
+        }
+        Ok(())
     }
 
     fn prepare_tool_call(
@@ -223,6 +276,13 @@ impl ToolUseLoop<'_> {
         }
 
         // Fire PreToolUse hook
+        if self
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.has_handlers(HookEvent::PreToolUse))
+        {
+            self.dispatch_durable_invocation(None)?;
+        }
         if let Some(ref hooks) = self.hooks {
             let input = HookInput {
                 event: HookEvent::PreToolUse.as_str().to_string(),
@@ -306,6 +366,13 @@ impl ToolUseLoop<'_> {
         if !proposal.approved {
             // Check PermissionRequest hooks — can auto-approve matching patterns
             let mut hook_decision = None;
+            if self
+                .hooks
+                .as_ref()
+                .is_some_and(|hooks| hooks.has_handlers(HookEvent::PermissionRequest))
+            {
+                self.dispatch_durable_invocation(None)?;
+            }
             if let Some(ref hooks) = self.hooks {
                 let perm_input = HookInput {
                     event: HookEvent::PermissionRequest.as_str().to_string(),

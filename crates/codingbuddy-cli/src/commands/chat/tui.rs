@@ -979,18 +979,15 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 return;
             }
 
-            let (llm_config, allow_history_transfer) = {
-                let mut state = connection.lock().unwrap();
+            let llm_config = {
+                let state = connection.lock().unwrap();
                 if !state.ready {
                     let _ = tx.send(TuiStreamEvent::Error(
                         "Connect a provider with /connect.".into(),
                     ));
                     return;
                 }
-                (
-                    state.llm.clone(),
-                    std::mem::take(&mut state.allow_history_transfer),
-                )
+                state.llm.clone()
             };
             let token = turn_cancellation.lock().unwrap().clone();
             // Agent prompt — expand @file mentions and set stream callback.
@@ -1172,7 +1169,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             session_id: session_id_for_turn,
                             llm_config: Some(llm_config),
                             cancellation: Some(token),
-                            allow_history_transfer,
                             ..Default::default()
                         },
                     )

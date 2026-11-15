@@ -749,6 +749,9 @@ struct ServeArgs {
     /// Serve embedded web UI at / (only with --transport http).
     #[arg(long)]
     web: bool,
+    /// Expose one saved session to the authenticated browser for this launch.
+    #[arg(long)]
+    expose_session: Option<uuid::Uuid>,
 }
 
 #[derive(Args)]

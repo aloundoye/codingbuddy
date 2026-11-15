@@ -39,6 +39,7 @@ fn tool_call_response(calls: Vec<(&str, &str, &str)>) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
@@ -54,6 +55,7 @@ fn text_response(text: &str) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
@@ -881,6 +883,15 @@ fn tool_loop_with_thinking_mode() -> Result<()> {
 
 // ── spawn_task tests ──
 
+fn build_trusted_engine(path: &Path, responses: Vec<LlmResponse>) -> Result<AgentEngine> {
+    let cfg = AppConfig {
+        workspace_trust: Some(true),
+        ..AppConfig::default()
+    };
+    let llm = Box::new(ScriptedLlm::new(responses));
+    AgentEngine::new_with_config_and_llm(path, cfg, llm)
+}
+
 /// When spawn_task is called with a worker, the worker is invoked.
 #[test]
 fn spawn_task_calls_worker() -> Result<()> {
@@ -890,7 +901,7 @@ fn spawn_task_calls_worker() -> Result<()> {
     let worker_called = Arc::new(Mutex::new(false));
     let worker_called_clone = worker_called.clone();
 
-    let engine = build_engine(
+    let engine = build_trusted_engine(
         temp.path(),
         vec![
             // Turn 1: LLM calls spawn_task
@@ -933,7 +944,7 @@ fn spawn_task_without_worker_falls_back() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
 
-    let engine = build_engine(
+    let engine = build_trusted_engine(
         temp.path(),
         vec![
             // Turn 1: LLM calls spawn_task (no worker wired)
@@ -969,7 +980,7 @@ fn spawn_task_role_maps_correctly() -> Result<()> {
     let captured_role = Arc::new(Mutex::new(String::new()));
     let captured_role_clone = captured_role.clone();
 
-    let engine = build_engine(
+    let engine = build_trusted_engine(
         temp.path(),
         vec![
             tool_call_response(vec![(
@@ -1008,7 +1019,7 @@ fn spawn_task_persists_child_session_and_run_metadata() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
 
-    let engine = build_engine(
+    let engine = build_trusted_engine(
         temp.path(),
         vec![
             tool_call_response(vec![(
@@ -1065,7 +1076,7 @@ fn spawn_task_background_keeps_task_running() -> Result<()> {
     init_workspace(temp.path())?;
 
     let job_id = Uuid::now_v7();
-    let engine = build_engine(
+    let engine = build_trusted_engine(
         temp.path(),
         vec![
             tool_call_response(vec![(
@@ -1524,11 +1535,10 @@ fn openai_compatible_surface_prefers_patch_direct_in_requests() -> Result<()> {
     init_workspace(temp.path())?;
     let mut cfg = AppConfig::default();
     cfg.llm.provider = "openai-compatible".to_string();
-    cfg.save(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![text_response("Surface ready.")]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
-    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+    let engine = AgentEngine::new_with_config_and_llm(temp.path(), cfg, llm)?;
 
     let _output = engine.chat_with_options(
         "Fix a bug in src/main.rs.",
@@ -1557,11 +1567,10 @@ fn ollama_surface_clamps_request_tool_count() -> Result<()> {
     init_workspace(temp.path())?;
     let mut cfg = AppConfig::default();
     cfg.llm.provider = "ollama".to_string();
-    cfg.save(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![text_response("Surface ready.")]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
-    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+    let engine = AgentEngine::new_with_config_and_llm(temp.path(), cfg.clone(), llm)?;
 
     let _output = engine.chat_with_options(
         "Refactor src/main.rs and add verification.",

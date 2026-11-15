@@ -894,7 +894,7 @@ impl PolicyEngine {
         if self.permission_mode == PermissionMode::Locked && self.is_blocked_in_locked_mode(call) {
             return Some(why(
                 "permission mode",
-                "locked mode blocks this tool".into(),
+                "locked mode blocks all non-read operations".into(),
             ));
         }
         let mcp_id = call
@@ -940,10 +940,6 @@ impl PolicyEngine {
                 });
             }
             return false;
-        }
-
-        if self.permission_mode == PermissionMode::Locked && self.is_blocked_in_locked_mode(call) {
-            return true;
         }
 
         if let Some(decision) = evaluate_permission_rules(&self.cfg.permission_rules, call) {
@@ -1059,15 +1055,8 @@ impl PolicyEngine {
         }
         match self.permission_mode {
             PermissionMode::BypassPermissions => PermissionDryRunResult::AutoApproved,
-            PermissionMode::Locked => {
-                if is_read_only_tool(&call.name) {
-                    PermissionDryRunResult::Allowed
-                } else {
-                    PermissionDryRunResult::Denied(
-                        "locked mode blocks all non-read operations".to_string(),
-                    )
-                }
-            }
+            // Locked-mode denials are handled by denial() above.
+            PermissionMode::Locked => PermissionDryRunResult::Allowed,
             PermissionMode::DontAsk => {
                 if is_read_only_tool(&call.name) {
                     PermissionDryRunResult::Allowed

@@ -113,6 +113,7 @@ pub struct ChatOptions {
     pub chat_history: Vec<ChatMessage>,
     /// Optional explicit session target, used for child-session delegation.
     pub session_id: Option<Uuid>,
+    pub prompt_id: Option<Uuid>,
     /// Manual profile override from `/agent <name>`. When set, overrides auto-selection.
     pub profile_override: Option<String>,
     /// Optional `provider/model` selector applied to this turn without mutating persisted config.
@@ -120,7 +121,7 @@ pub struct ChatOptions {
     /// Effective connection for this turn, including session-only credentials.
     pub llm_config: Option<codingbuddy_core::LlmConfig>,
     pub cancellation: Option<codingbuddy_core::CancellationToken>,
-    pub allow_history_transfer: bool,
+    pub session_lease: Option<Arc<codingbuddy_store::SessionLease>>,
 }
 
 pub struct AgentEngine {
@@ -653,11 +654,7 @@ impl AgentEngine {
         };
         // Grab a clone of the stream callback (if any) to pass to analyze().
         // complete_chat_streaming will fire ContentDelta per-token in real-time.
-        let stream_cb = self
-            .stream_callback
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
+        let stream_cb = self.prompt_stream_callback(options.prompt_id);
 
         let response = analysis::analyze(
             llm,
@@ -686,6 +683,15 @@ impl AgentEngine {
             );
         }
 
+        if let (Some(session), Some(prompt)) = (options.session_id, options.prompt_id) {
+            self.store.model_step(
+                session,
+                Some(prompt),
+                Some(response.text.clone()),
+                &[],
+                &response.transport_parts,
+            )?;
+        }
         // If we streamed token-by-token, complete_chat_streaming already emitted Done.
         // Only emit bulk ContentDelta + Done for the non-streaming fallback path.
         if stream_cb.is_none() {
@@ -1009,24 +1015,15 @@ impl AgentEngine {
         loop_.set_discoverable_tools(discoverable_tools);
         loop_.extend_tool_metadata(runtime_tool_metadata);
 
-        // Wire stream callback
-        {
-            let guard = self
-                .stream_callback
-                .lock()
-                .map_err(|_| anyhow!("stream callback mutex poisoned"))?;
-            if let Some(ref cb) = *guard {
-                loop_.set_stream_callback(cb.clone());
-                // Wire bash progress → ToolProgress stream chunk
-                let stream_cb = cb.clone();
-                self.tool_host
-                    .set_progress_callback(Arc::new(move |data: &str| {
-                        stream_cb(codingbuddy_core::StreamChunk::ToolProgress {
-                            tool_name: "bash_run".to_string(),
-                            data: data.to_string(),
-                        });
-                    }));
-            }
+        if let Some(cb) = self.prompt_stream_callback(options.prompt_id) {
+            loop_.set_stream_callback(cb.clone());
+            self.tool_host
+                .set_progress_callback(Arc::new(move |data: &str| {
+                    cb(StreamChunk::ToolProgress {
+                        tool_name: "bash_run".to_string(),
+                        data: data.to_string(),
+                    });
+                }));
         }
 
         // Wire approval handler (clone Arc — engine stays reusable across run() calls)
@@ -1057,6 +1054,8 @@ impl AgentEngine {
             }
         }
 
+        loop_.durable_session = Some((self.store.clone(), session.session_id));
+        loop_.durable_prompt = options.prompt_id;
         loop_.set_event_callback(Arc::new({
             let store = self.store.clone();
             let session_id = session.session_id;
@@ -1173,7 +1172,263 @@ impl AgentEngine {
         }]
     }
 
+    fn prompt_stream_callback(
+        &self,
+        prompt_id: Option<Uuid>,
+    ) -> Option<codingbuddy_core::StreamCallback> {
+        let callback = self
+            .stream_callback
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if callback.is_none() && prompt_id.is_none() {
+            return None;
+        }
+        let store = self.store.clone();
+        Some(Arc::new(move |chunk: StreamChunk| {
+            if matches!(chunk, StreamChunk::ReasoningDelta(_)) {
+                return;
+            }
+            if let Some(id) = prompt_id
+                && matches!(
+                    chunk,
+                    StreamChunk::ContentDelta(_) | StreamChunk::ClearStreamingText
+                )
+                && let Err(error) = store
+                    .append_prompt_event(id, &codingbuddy_core::stream_chunk_to_event_json(&chunk))
+            {
+                eprintln!("[agent] failed to persist prompt event: {error}");
+            }
+            if let Some(callback) = &callback {
+                callback(chunk);
+            }
+        }))
+    }
+
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
+        let session = self.ensure_session_record_for(options.session_id)?;
+        options.session_id = Some(session.session_id);
+        let owned_prompt = options.session_lease.is_none();
+        let lease = match options.session_lease.take() {
+            Some(lease) => {
+                anyhow::ensure!(
+                    lease.matches(&self.store, session.session_id)?,
+                    "invalid session lease"
+                );
+                lease
+            }
+            None => Arc::new(self.store.session_lease(session.session_id)?),
+        };
+        if !owned_prompt {
+            return self.execute_session_prompt(prompt, options, session, &lease);
+        }
+        let id = self.store.start_prompt(
+            &lease,
+            session.session_id,
+            Uuid::now_v7(),
+            &serde_json::json!({"prompt": prompt}),
+        )?;
+        options.prompt_id = Some(id);
+        let cancellation = options.cancellation.clone();
+        let result = self.execute_session_prompt(prompt, options, session, &lease);
+        let output = result.as_ref().ok().map(String::as_str);
+        let error = result.as_ref().err().map(|error| format!("{error:#}"));
+        let status = if result.is_ok() {
+            "completed"
+        } else if cancellation.is_some_and(|token| token.is_cancelled()) {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        self.store
+            .finish_prompt(id, status, output, error.as_deref())?;
+        result
+    }
+
+    pub fn retry_interrupted_tool(
+        &self,
+        session: Uuid,
+        previous: Uuid,
+    ) -> Result<(Uuid, codingbuddy_core::ToolResult)> {
+        use codingbuddy_core::{ApprovedToolCall, ToolExecutionContext, ToolHost, ToolPermission};
+        self.ensure_session_record_for(Some(session))?;
+        let lease = self.store.session_lease(session)?;
+        let call = self.store.interrupted_tool_request(session, previous)?;
+        anyhow::ensure!(
+            call.name != "batch",
+            "Retry the individual tool operations from a new prompt"
+        );
+        let (proposal, permission) = self.tool_host.propose_with_permission(call);
+        if let ToolPermission::Deny { reason, .. } = permission {
+            self.tool_host.discard_proposal(proposal.invocation_id);
+            self.store.append_event(&codingbuddy_store::NewEvent::new(
+                session,
+                EventKind::ToolDenied {
+                    invocation_id: proposal.invocation_id,
+                    tool_name: proposal.call.name,
+                    reason: reason.clone(),
+                },
+            ))?;
+            anyhow::bail!("{reason}");
+        }
+        let invocation = self
+            .store
+            .retry_invocation(&lease, session, previous, &proposal.call)?;
+        let result = self.tool_host.execute_with_context(
+            ApprovedToolCall {
+                invocation_id: proposal.invocation_id,
+                call: proposal.call,
+            },
+            ToolExecutionContext {
+                session_id: Some(session),
+                invocation_id: Some(invocation.id),
+                cancellation: None,
+            },
+        );
+        anyhow::ensure!(
+            result.output["recovery_status"] != "ambiguous",
+            "Retry invocation {} may have changed the workspace. Resolve it locally before continuing.",
+            invocation.id
+        );
+        let (message, _) = tool_bridge::tool_result_to_message(
+            &invocation.provider_call_id,
+            &invocation.name,
+            &result,
+            Some(&codingbuddy_policy::output_scanner::OutputScanner::new()),
+        );
+        self.store
+            .settle_invocation(session, invocation.id, message, "running")?;
+        Ok((invocation.id, result))
+    }
+
+    fn reconcile_session_invocations(
+        &self,
+        lease: &codingbuddy_store::SessionLease,
+        session: Uuid,
+    ) -> Result<()> {
+        use codingbuddy_store::InvocationReceipt;
+        use sha2::{Digest, Sha256};
+        let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(&self.workspace)?;
+        for invocation in self.store.interrupted_invocations(lease, session)? {
+            let result = match self.store.invocation_receipt(invocation.id)? {
+                Some(InvocationReceipt::File {
+                    path,
+                    postimage_sha256,
+                }) => files
+                    .resolve(&path, false)
+                    .ok()
+                    .and_then(|path| files.read(&path).ok())
+                    .filter(|bytes| format!("{:x}", Sha256::digest(bytes)) == postimage_sha256)
+                    .map(
+                        |_| serde_json::json!({"path":path,"recovery_status":"verified_postimage"}),
+                    ),
+                Some(InvocationReceipt::Patch { patch_id }) => {
+                    let patches = codingbuddy_diff::PatchStore::new(&self.workspace)?;
+                    if patches.verify_postimage(patch_id).unwrap_or(false) {
+                        self.store
+                            .record_patch_application(session, patch_id, true, Vec::new())?;
+                        Some(
+                            serde_json::json!({"patch_id":patch_id,"applied":true,"recovery_status":"verified_postimage"}),
+                        )
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            if let Some(content) = result {
+                self.store.settle_invocation(
+                    session,
+                    invocation.id,
+                    ChatMessage::Tool {
+                        tool_call_id: invocation.provider_call_id,
+                        tool_name: Some(invocation.name),
+                        content: content.to_string(),
+                    },
+                    "running",
+                )?;
+            } else {
+                anyhow::bail!(
+                    "Session paused. Invocation {} ({}) may have had side effects. Resolve it locally before continuing.",
+                    invocation.id,
+                    invocation.name
+                );
+            }
+        }
+        // Earlier ambiguous invocations can delay settlement of later, never-dispatched calls.
+        self.store.interrupted_invocations(lease, session)?;
+        Ok(())
+    }
+
+    fn execute_session_prompt(
+        &self,
+        prompt: &str,
+        mut options: ChatOptions,
+        session: Session,
+        lease: &codingbuddy_store::SessionLease,
+    ) -> Result<String> {
+        self.reconcile_session_invocations(lease, session.session_id)?;
+        let mut effective = self.effective_config(&options);
+        let uses_routed_client = options.llm_config.is_some()
+            || options.model_spec.is_some()
+            || options.cancellation.is_some();
+        if uses_routed_client {
+            effective.llm.api_key = codingbuddy_llm::resolve_key_from_config(&effective.llm);
+            options.llm_config = Some(effective.llm.clone());
+        }
+        let model = if !options.tools && options.force_max_think {
+            effective.llm.active_reasoner_model()
+        } else {
+            effective.llm.active_base_model()
+        };
+        let destination = effective.llm.connection_id();
+        let projection = self.store.rebuild_from_events(session.session_id)?;
+        if !projection.chat_messages.is_empty()
+            && self.store.pinned_route(session.session_id)?.is_none()
+        {
+            let changed =
+                projection
+                    .provider_selection
+                    .as_ref()
+                    .is_some_and(|(provider, _, previous)| {
+                        provider != &effective.llm.provider
+                            || previous
+                                .as_ref()
+                                .is_some_and(|previous| previous != &destination)
+                    });
+            if changed {
+                return Err(anyhow!(
+                    "Conversation belongs to a different provider or endpoint. Use session portable-fork to preview and transfer history."
+                ));
+            }
+        }
+        let local_key = self.store.route_key()?;
+        let route = if uses_routed_client {
+            codingbuddy_llm::session_route(&effective.llm, &model, &local_key)?
+        } else {
+            self.llm
+                .pinned_session_route(&model, &local_key)
+                .unwrap_or_else(|| {
+                    codingbuddy_llm::session_route(&effective.llm, &model, &local_key)
+                })?
+        };
+        if projection.legacy_tool_history
+            && effective.llm.active_provider_kind().is_some_and(|kind| {
+                matches!(
+                    codingbuddy_llm::protocol::select_chat_protocol(
+                        &effective.llm.active_provider(),
+                        kind
+                    ),
+                    codingbuddy_llm::protocol::ChatProtocol::AnthropicMessages
+                        | codingbuddy_llm::protocol::ChatProtocol::GeminiGenerateContent
+                )
+            })
+        {
+            anyhow::bail!(
+                "Legacy session lacks provider continuation data. Use session portable-fork to preview and continue with its redacted text history."
+            );
+        }
+        let projection = self.store.provider_history(session.session_id, &route)?;
         // Fire SessionStart hook
         let ws = self.workspace.display().to_string();
         let session_start_input =
@@ -1210,29 +1465,6 @@ impl AgentEngine {
         }
 
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
-        let session = self.ensure_session_record_for(options.session_id)?;
-        options.session_id = Some(session.session_id);
-        let effective = self.effective_config(&options);
-        let model = effective.llm.active_base_model();
-        let destination = effective.llm.connection_id();
-        let projection = self.store.rebuild_from_events(session.session_id)?;
-        if !projection.chat_messages.is_empty() && !options.allow_history_transfer {
-            let changed =
-                projection
-                    .provider_selection
-                    .as_ref()
-                    .is_some_and(|(provider, _, previous)| {
-                        provider != &effective.llm.provider
-                            || previous
-                                .as_ref()
-                                .is_some_and(|previous| previous != &destination)
-                    });
-            if changed {
-                return Err(anyhow!(
-                    "Conversation belongs to a different provider or endpoint. Resume interactively to choose whether to share it."
-                ));
-            }
-        }
         options.chat_history = projection.chat_messages;
         self.store.append_event(&codingbuddy_store::NewEvent {
             event_id: uuid::Uuid::now_v7(),
@@ -1256,23 +1488,34 @@ impl AgentEngine {
             ))
             .context("persist user turn")?;
 
+        let analyze = !options.tools;
+        let tool_loop = options.tools
+            && (options.cancellation.is_some()
+                || !should_run_team_orchestration(self, &prompt_enriched, &options));
         let result = if !options.tools {
             self.analyze_with_options(&prompt_enriched, options)
-        } else if options.cancellation.is_none()
-            && should_run_team_orchestration(self, &prompt_enriched, &options)
-        {
+        } else if !tool_loop {
             team::run(self, &prompt_enriched, &options)
         } else {
             self.run_tool_use_loop(&prompt_enriched, &options)
         };
 
         let result = result.and_then(|text| {
+            if analyze || tool_loop {
+                return Ok(text);
+            }
+            if self.store.rebuild_from_events(session.session_id)?.chat_messages.last().is_some_and(
+                |message| matches!(message, ChatMessage::Assistant { content: Some(content), tool_calls, .. } if content == &text && tool_calls.is_empty())
+            ) {
+                return Ok(text);
+            }
             self.store
                 .append_event(&codingbuddy_store::NewEvent::new(
                     session.session_id,
                     EventKind::ChatTurn {
                         message: ChatMessage::Assistant {
                             content: Some(text.clone()),
+                            native_parts: None,
                             reasoning_content: None,
                             tool_calls: vec![],
                         },
@@ -1643,6 +1886,59 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_one_reconciles_local_writes_and_pauses_external_effects() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let workspace = tempfile::tempdir()?;
+        let root = workspace.path();
+        let engine = AgentEngine::new_with_config(root, AppConfig::default())?;
+        let session = engine.ensure_session_record_for(None)?.session_id;
+        let store = Store::new(root)?;
+        let lease = store.session_lease(session)?;
+        let calls = [
+            codingbuddy_core::LlmToolCall {
+                id: "write".into(),
+                name: "fs_write".into(),
+                arguments: "{}".into(),
+            },
+            codingbuddy_core::LlmToolCall {
+                id: "external".into(),
+                name: "external".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let ids = store.model_step(session, None, None, &calls, &[])?;
+        store.dispatch_invocation(session, ids[0])?;
+        store.record_invocation_receipt(
+            session,
+            ids[0],
+            &codingbuddy_store::InvocationReceipt::File {
+                path: "marker".into(),
+                postimage_sha256: format!("{:x}", Sha256::digest(b"expected")),
+            },
+        )?;
+        std::fs::write(root.join("marker"), b"expected")?;
+        store.dispatch_invocation(session, ids[1])?;
+        drop(lease);
+        drop(engine);
+        let resumed = AgentEngine::new_with_config(root, AppConfig::default())?;
+        let lease = store.session_lease(session)?;
+        let error = resumed
+            .reconcile_session_invocations(&lease, session)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&ids[1].to_string()));
+        let unresolved = store.interrupted_invocations(&lease, session)?;
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].id, ids[1]);
+        let transcript = store.rebuild_from_events(session)?;
+        assert!(
+            matches!(&transcript.chat_messages[1], ChatMessage::Tool { tool_call_id, content, .. }
+            if tool_call_id == "write" && content.contains("verified_postimage"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn extract_urls_handles_punctuation_and_dedup() {

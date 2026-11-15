@@ -93,6 +93,7 @@ pub fn scripted_text_response(text: &str) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
@@ -109,6 +110,7 @@ pub fn scripted_tool_response(calls: Vec<LlmToolCall>) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
@@ -1024,8 +1026,10 @@ fn handle_mock_llm_connection(
         body.extend_from_slice(&chunk[..read]);
     }
 
-    // Build the response based on the scenario
-    match scenario {
+    let streaming = serde_json::from_slice::<serde_json::Value>(&body)
+        .is_ok_and(|request| request["stream"] == true);
+    // Build the response based on the scenario.
+    let payload = match scenario {
         Some(Scenario::HttpError(code)) => {
             let status_text = match code {
                 400 => "Bad Request",
@@ -1045,7 +1049,7 @@ fn handle_mock_llm_connection(
             name,
             arguments,
         }) => {
-            let payload = serde_json::json!({
+            serde_json::json!({
                 "choices": [{
                     "finish_reason": "tool_calls",
                     "message": {
@@ -1061,8 +1065,6 @@ fn handle_mock_llm_connection(
                     }
                 }]
             })
-            .to_string();
-            write_http_response(stream, 200, &payload)?;
         }
         Some(Scenario::MultiToolCall(specs)) => {
             let tool_calls: Vec<serde_json::Value> = specs
@@ -1078,7 +1080,7 @@ fn handle_mock_llm_connection(
                     })
                 })
                 .collect();
-            let payload = serde_json::json!({
+            serde_json::json!({
                 "choices": [{
                     "finish_reason": "tool_calls",
                     "message": {
@@ -1087,14 +1089,12 @@ fn handle_mock_llm_connection(
                     }
                 }]
             })
-            .to_string();
-            write_http_response(stream, 200, &payload)?;
         }
         Some(Scenario::ReasonerResponse {
             reasoning_content,
             text,
         }) => {
-            let payload = serde_json::json!({
+            serde_json::json!({
                 "choices": [{
                     "finish_reason": "stop",
                     "message": {
@@ -1103,11 +1103,9 @@ fn handle_mock_llm_connection(
                     }
                 }]
             })
-            .to_string();
-            write_http_response(stream, 200, &payload)?;
         }
         Some(Scenario::TextResponse(text)) => {
-            let payload = serde_json::json!({
+            serde_json::json!({
                 "choices": [{
                     "finish_reason": "stop",
                     "message": {
@@ -1115,8 +1113,6 @@ fn handle_mock_llm_connection(
                     }
                 }]
             })
-            .to_string();
-            write_http_response(stream, 200, &payload)?;
         }
         None => {
             // Default: extract prompt and return text response
@@ -1127,7 +1123,7 @@ fn handle_mock_llm_connection(
             } else {
                 format!("Mock response: {prompt}")
             };
-            let payload = serde_json::json!({
+            serde_json::json!({
                 "choices": [{
                     "finish_reason": "stop",
                     "message": {
@@ -1135,20 +1131,40 @@ fn handle_mock_llm_connection(
                     }
                 }]
             })
-            .to_string();
-            write_http_response(stream, 200, &payload)?;
         }
-    }
-    Ok(())
+    };
+    write_chat_response(stream, payload, streaming)
 }
 
-fn write_http_response(stream: &mut TcpStream, status: u16, payload: &str) -> std::io::Result<()> {
-    let status_text = match status {
-        200 => "OK",
-        _ => "Error",
+fn write_chat_response(
+    stream: &mut TcpStream,
+    mut completion: serde_json::Value,
+    streaming: bool,
+) -> std::io::Result<()> {
+    let (content_type, payload) = if streaming {
+        let choice = &mut completion["choices"][0];
+        let mut delta = choice["message"].take();
+        if let Some(calls) = delta["tool_calls"].as_array_mut() {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = index.into();
+            }
+        }
+        let event = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": choice["finish_reason"]
+            }]
+        });
+        (
+            "text/event-stream",
+            format!("data: {event}\n\ndata: [DONE]\n\n"),
+        )
+    } else {
+        ("application/json", completion.to_string())
     };
     let response = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
     stream.write_all(response.as_bytes())?;

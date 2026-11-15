@@ -30,6 +30,24 @@ pub struct PatchSet {
     pub last_base_sha_match: Option<bool>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    workspace_preimage: Option<Vec<Option<FileImage>>>,
+    #[serde(default)]
+    apply_images: Option<ApplyImages>,
+    #[serde(default)]
+    pub recovery_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileImage {
+    digest: String,
+    mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApplyImages {
+    before: Vec<Option<FileImage>>,
+    after: Vec<Option<FileImage>>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,9 +58,9 @@ pub struct PatchStore {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitApplyStrategy {
-    /// Try plain apply first, then fallback to 3-way merge.
+    /// Verify a clean application against the staged workspace state.
     Auto,
-    /// Use git's 3-way strategy directly.
+    /// Legacy three-way selection. Patches requiring a merge must be resolved and staged again.
     ThreeWay,
 }
 
@@ -83,11 +101,14 @@ impl PatchStore {
             created_at: Utc::now().to_rfc3339(),
             applied: false,
             conflicts: Vec::new(),
+            workspace_preimage: Some(workspace_images(&self.workspace, &target_files)?),
             target_files,
             apply_attempts: 0,
             last_base_sha256: None,
             last_base_sha_match: None,
             last_error: None,
+            apply_images: None,
+            recovery_status: None,
         };
         self.write_patch(&patch)?;
         Ok(patch)
@@ -128,6 +149,37 @@ impl PatchStore {
         self.apply_with_check(workspace, patch_id, GitApplyStrategy::ThreeWay, check)
     }
 
+    pub fn apply_for_session(
+        &self,
+        store: &codingbuddy_store::Store,
+        session: Uuid,
+        patch_id: Uuid,
+        check: impl Fn(&Path) -> Result<()>,
+    ) -> Result<(bool, Vec<String>, Option<String>)> {
+        let _lease = self.patch_lease()?;
+        let was_applied = self.read_patch(patch_id)?.applied;
+        let (applied, conflicts) =
+            self.apply_locked(&self.workspace, patch_id, GitApplyStrategy::ThreeWay, check)?;
+        let recorded =
+            store.record_patch_application(session, patch_id, applied, conflicts.clone())?;
+        let recovery_status = if was_applied && applied && recorded {
+            Some("reconciled".into())
+        } else {
+            self.read_patch(patch_id)?.recovery_status
+        };
+        Ok((applied, conflicts, recovery_status))
+    }
+
+    pub fn verify_postimage(&self, patch_id: Uuid) -> Result<bool> {
+        let patch = self.read_patch(patch_id)?;
+        let Some(images) = &patch.apply_images else {
+            return Ok(false);
+        };
+        let paths = checked_patch_paths(&self.workspace, &patch.unified_diff)?;
+        Ok(paths == patch.target_files
+            && workspace_images(&self.workspace, &paths)? == images.after)
+    }
+
     pub fn apply_with_check(
         &self,
         workspace: &Path,
@@ -135,76 +187,155 @@ impl PatchStore {
         strategy: GitApplyStrategy,
         check: impl Fn(&Path) -> Result<()>,
     ) -> Result<(bool, Vec<String>)> {
+        let _lease = self.patch_lease()?;
+        self.apply_locked(workspace, patch_id, strategy, check)
+    }
+
+    fn patch_lease(&self) -> Result<fs::File> {
+        let lease = WorkspaceFs::open(&self.root)?
+            .open_lock_file(Path::new("apply.lock"))?
+            .into_std();
+        lease
+            .try_lock()
+            .map_err(|error| anyhow!("patch application is busy: {error}"))?;
+        Ok(lease)
+    }
+
+    fn apply_locked(
+        &self,
+        workspace: &Path,
+        patch_id: Uuid,
+        strategy: GitApplyStrategy,
+        check: impl Fn(&Path) -> Result<()>,
+    ) -> Result<(bool, Vec<String>)> {
+        anyhow::ensure!(
+            workspace.canonicalize()? == self.workspace.canonicalize()?,
+            "patch workspace does not match its store"
+        );
         let mut patch = self.read_patch(patch_id)?;
         patch.target_files = checked_patch_paths(workspace, &patch.unified_diff)?;
         for path in &patch.target_files {
             check(Path::new(path))?;
         }
-        patch.apply_attempts = patch.apply_attempts.saturating_add(1);
-        let current_base_sha = hash_workspace_state(workspace, &patch.target_files)?;
-        let base_matches = current_base_sha == patch.base_sha256;
-        patch.last_base_sha256 = Some(current_base_sha.clone());
-        patch.last_base_sha_match = Some(base_matches);
-
-        let run_apply = |use_three_way: bool| -> Result<std::process::Output> {
-            let mut cmd = codingbuddy_core::process_env::git_inspection(workspace);
-            cmd.arg("apply");
-            if use_three_way {
-                cmd.arg("--3way");
-            }
-            git_apply(cmd, workspace, &patch.unified_diff)
-        };
-
-        let output = match strategy {
-            GitApplyStrategy::ThreeWay => run_apply(true)?,
-            GitApplyStrategy::Auto => {
-                let plain = run_apply(false)?;
-                if plain.status.success() {
-                    plain
-                } else {
-                    let fallback = run_apply(true)?;
-                    if fallback.status.success() {
-                        fallback
-                    } else {
-                        let mut merged = fallback;
-                        if !plain.stderr.is_empty() {
-                            let mut stderr = String::from_utf8_lossy(&plain.stderr).to_string();
-                            if !stderr.ends_with('\n') {
-                                stderr.push('\n');
-                            }
-                            stderr.push_str("--- fallback --3way failed ---\n");
-                            stderr.push_str(&String::from_utf8_lossy(&merged.stderr));
-                            merged.stderr = stderr.into_bytes();
-                        }
-                        merged
-                    }
+        let current = workspace_images(workspace, &patch.target_files)?;
+        if let Some(images) = &patch.apply_images {
+            if current == images.after {
+                if !patch.applied {
+                    patch.applied = true;
+                    patch.conflicts.clear();
+                    patch.last_error = None;
+                    patch.recovery_status = Some("reconciled".into());
+                    self.write_patch(&patch)?;
                 }
+                return Ok((true, Vec::new()));
             }
-        };
-
-        if output.status.success() {
-            patch.applied = true;
-            patch.conflicts.clear();
-            patch.last_error = None;
-            self.write_patch(&patch)?;
-            return Ok((true, vec![]));
+            if patch.applied || current != images.before {
+                return self.apply_failure(
+                    &mut patch,
+                    "ambiguous",
+                    "The workspace differs from the recorded patch images",
+                );
+            }
+            return self.apply_failure(&mut patch, "interrupted", "The patch was interrupted before any recorded file changed. Stage it again to retry.");
         }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let mut conflicts: Vec<String> = stderr.lines().map(ToString::to_string).collect();
-        if !base_matches {
-            conflicts.insert(
-                0,
-                format!(
-                    "base-sha mismatch: expected={} actual={}",
-                    patch.base_sha256, current_base_sha
-                ),
+        if patch.applied {
+            return self.apply_failure(
+                &mut patch,
+                "unverified",
+                "This previously applied patch has no verification record",
             );
         }
-        patch.applied = false;
-        patch.conflicts = conflicts;
-        patch.last_error = Some(stderr);
+        patch.apply_attempts = patch.apply_attempts.saturating_add(1);
+        let current_base = hash_workspace_state(workspace, &patch.target_files)?;
+        patch.last_base_sha_match = Some(patch.base_sha256 == current_base);
+        patch.last_base_sha256 = Some(current_base.clone());
+        let stale = patch.workspace_preimage.as_ref().map_or_else(
+            || patch.base_sha256 != current_base,
+            |expected| expected != &current,
+        );
+        if stale {
+            return self.apply_failure(
+                &mut patch,
+                "stale_preimage",
+                "The workspace changed since this patch was staged",
+            );
+        }
+
+        let scratch = tempfile::tempdir()?;
+        let files = WorkspaceFs::open(workspace)?;
+        for (path, image) in patch.target_files.iter().zip(&current) {
+            if image.is_some() {
+                let dest = scratch.path().join(path);
+                fs::create_dir_all(dest.parent().context("patch path has no parent")?)?;
+                let mut input = files.open_file(Path::new(path))?.into_std();
+                let mut output = fs::File::create(dest)?;
+                std::io::copy(&mut input, &mut output)?;
+                output.set_permissions(input.metadata()?.permissions())?;
+            }
+        }
+        let preview = apply_plain(scratch.path(), &patch.unified_diff)?;
+        if !preview.status.success() {
+            let diagnostic = String::from_utf8_lossy(&preview.stderr);
+            let summary = if strategy == GitApplyStrategy::ThreeWay {
+                format!(
+                    "Patch needs a manually resolved preimage to verify its postimage.\n{diagnostic}"
+                )
+            } else {
+                diagnostic.into_owned()
+            };
+            return self.apply_failure(&mut patch, "conflict", &summary);
+        }
+        let after = workspace_images(scratch.path(), &patch.target_files)?;
+        patch.apply_images = Some(ApplyImages {
+            before: current.clone(),
+            after: after.clone(),
+        });
+        patch.recovery_status = Some("pending".into());
         self.write_patch(&patch)?;
+        for path in &patch.target_files {
+            check(Path::new(path))?;
+        }
+        if workspace_images(workspace, &patch.target_files)? != current {
+            return self.apply_failure(
+                &mut patch,
+                "ambiguous",
+                "The workspace changed before applying the patch",
+            );
+        }
+        let output = apply_plain(workspace, &patch.unified_diff)?;
+        let settled = workspace_images(workspace, &patch.target_files)?;
+        if settled != after {
+            return self.apply_failure(
+                &mut patch,
+                "ambiguous",
+                "Patch application did not produce the expected workspace state",
+            );
+        }
+        patch.applied = true;
+        patch.conflicts.clear();
+        patch.last_error = None;
+        patch.recovery_status = Some(
+            if output.status.success() {
+                "applied"
+            } else {
+                "reconciled"
+            }
+            .into(),
+        );
+        self.write_patch(&patch)?;
+        Ok((true, Vec::new()))
+    }
+
+    fn apply_failure(
+        &self,
+        patch: &mut PatchSet,
+        status: &str,
+        message: &str,
+    ) -> Result<(bool, Vec<String>)> {
+        patch.recovery_status = Some(status.into());
+        patch.last_error = Some(message.into());
+        patch.conflicts = message.lines().map(str::to_owned).collect();
+        self.write_patch(patch)?;
         Ok((false, patch.conflicts.clone()))
     }
 
@@ -228,8 +359,13 @@ impl PatchStore {
     fn write_patch(&self, patch: &PatchSet) -> Result<()> {
         let json_path = self.root.join(format!("{}.json", patch.patch_id));
         let diff_path = self.root.join(format!("{}.diff", patch.patch_id));
-        fs::write(&json_path, serde_json::to_vec_pretty(patch)?)?;
-        fs::write(diff_path, &patch.unified_diff)?;
+        let mut metadata = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer_pretty(&mut metadata, patch)?;
+        metadata.as_file().sync_all()?;
+        metadata.persist(json_path)?;
+        if !diff_path.exists() {
+            fs::write(diff_path, &patch.unified_diff)?;
+        }
         Ok(())
     }
 
@@ -240,6 +376,45 @@ impl PatchStore {
         }
         Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
     }
+}
+
+fn apply_plain(workspace: &Path, diff: &str) -> Result<std::process::Output> {
+    let mut command = codingbuddy_core::process_env::git_inspection(workspace);
+    command.args(["apply", "--whitespace=nowarn"]);
+    git_apply(command, workspace, diff)
+}
+
+fn workspace_images(workspace: &Path, paths: &[String]) -> Result<Vec<Option<FileImage>>> {
+    let workspace = WorkspaceFs::open(workspace)?;
+    paths
+        .iter()
+        .map(|path| {
+            let path = Path::new(path);
+            anyhow::ensure!(
+                workspace.resolve(path, true)? == path,
+                "patch targets through symbolic links are unsupported"
+            );
+            let mut file = match workspace.open_file(path) {
+                Ok(file) => file.into_std(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = file.metadata()?;
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o7777
+            };
+            #[cfg(not(unix))]
+            let mode = u32::from(metadata.permissions().readonly());
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(Some(FileImage {
+                digest: format!("{:x}", digest.finalize()),
+                mode,
+            }))
+        })
+        .collect()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -375,6 +550,87 @@ fn decode_git_path(path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_one_retries_patch_settlement_without_reapplying_the_patch() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let patches = PatchStore::new(root)?;
+        let journal = codingbuddy_store::Store::new(root)?;
+        let session = Uuid::now_v7();
+        fs::write(root.join("original"), "one\n")?;
+        fs::write(root.join("removed"), "two\n")?;
+        let diff = "diff --git a/original b/renamed\nsimilarity index 100%\nrename from original\nrename to renamed\n\
+            diff --git a/removed b/removed\ndeleted file mode 100644\n--- a/removed\n+++ /dev/null\n@@ -1 +0,0 @@\n-two\n";
+        let patch = patches.stage(diff, &[])?;
+        journal.db()?.execute_batch(
+            "CREATE TRIGGER suppress_applied BEFORE INSERT ON events
+            WHEN NEW.kind='PatchApplied@v1' BEGIN SELECT RAISE(ABORT,'fixture interruption'); END;",
+        )?;
+        assert!(
+            patches
+                .apply_for_session(&journal, session, patch.patch_id, |_| Ok(()))
+                .is_err()
+        );
+        let renamed = fs::read(root.join("renamed"))?;
+        assert!(matches!(renamed.as_slice(), b"one\n" | b"one\r\n"));
+        assert!(!root.join("original").exists() && !root.join("removed").exists());
+        assert!(journal.session_events(session)?.is_empty());
+        journal
+            .db()?
+            .execute_batch("DROP TRIGGER suppress_applied;")?;
+        let (applied, _, status) =
+            patches.apply_for_session(&journal, session, patch.patch_id, |_| Ok(()))?;
+        assert!(applied);
+        assert_eq!(status.as_deref(), Some("reconciled"));
+        assert!(
+            patches
+                .apply_for_session(&journal, session, patch.patch_id, |_| Ok(()))?
+                .0
+        );
+        assert_eq!(fs::read(root.join("renamed"))?, renamed);
+        assert_eq!(journal.session_events(session)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn delivery_one_reconciles_verified_postimage_and_pauses_on_mixed_state() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let root = workspace.path();
+        let store = PatchStore::new(root)?;
+        fs::write(root.join("first"), "before\n")?;
+        fs::write(root.join("second"), "before\n")?;
+        let diff = "diff --git a/first b/first\n--- a/first\n+++ b/first\n@@ -1 +1 @@\n-before\n+after\n\
+                    diff --git a/second b/second\n--- a/second\n+++ b/second\n@@ -1 +1 @@\n-before\n+after\n";
+        let staged = store.stage(diff, &[])?;
+        assert!(store.apply(root, staged.patch_id)?.0);
+        let first = fs::read(root.join("first"))?;
+        assert!(matches!(first.as_slice(), b"after\n" | b"after\r\n"));
+        let mut interrupted = store.read_patch(staged.patch_id)?;
+        interrupted.applied = false;
+        interrupted.recovery_status = Some("pending".into());
+        store.write_patch(&interrupted)?;
+        assert!(store.apply(root, staged.patch_id)?.0);
+        assert_eq!(
+            store
+                .read_patch(staged.patch_id)?
+                .recovery_status
+                .as_deref(),
+            Some("reconciled")
+        );
+        store.write_patch(&interrupted)?;
+        fs::write(root.join("second"), "before\n")?;
+        assert!(!store.apply(root, staged.patch_id)?.0);
+        assert_eq!(
+            store
+                .read_patch(staged.patch_id)?
+                .recovery_status
+                .as_deref(),
+            Some("ambiguous")
+        );
+        assert_eq!(fs::read(root.join("first"))?, first);
+        Ok(())
+    }
 
     #[test]
     fn stage_tracks_target_files_and_base_hash() {

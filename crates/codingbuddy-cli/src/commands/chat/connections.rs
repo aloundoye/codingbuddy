@@ -28,11 +28,11 @@ pub(super) fn detect(llm: &LlmConfig) -> Vec<String> {
 pub(super) struct Connection {
     pub llm: LlmConfig,
     pub ready: bool,
-    pub allow_history_transfer: bool,
     configured: bool,
     pending: Option<LlmConfig>,
     connections: std::collections::HashMap<String, LlmConfig>,
     history_choice: Option<LlmConfig>,
+    history_preview: Option<(Uuid, Vec<codingbuddy_core::ChatMessage>)>,
     generation: u64,
     save_key: bool,
 }
@@ -44,10 +44,10 @@ impl Connection {
             llm,
             ready,
             configured,
-            allow_history_transfer: false,
             pending: None,
             connections,
             history_choice: None,
+            history_preview: None,
             generation: 0,
             save_key: false,
         }
@@ -105,10 +105,10 @@ impl Menus {
         state.generation += 1;
         match id {
             "cancel" | "cancel-close" => {
-                state.allow_history_transfer = false;
                 let _ = self.tx.send(TuiStreamEvent::Menu(None));
                 state.pending = None;
                 state.history_choice = None;
+                state.history_preview = None;
                 state.save_key = false;
             }
             "commands" => self.menu(TerminalMenu::choices(
@@ -206,6 +206,7 @@ impl Menus {
                         openai_compat_prefix: false,
                         chat_protocol: None,
                         auth_strategy: None,
+                        account_id: None,
                         headers: Default::default(),
                         discovery: Default::default(),
                         payload_options: Default::default(),
@@ -364,17 +365,61 @@ impl Menus {
                 self.changed(&state, None);
                 self.notify("Default provider and model saved.".into(), false);
             }
+            "history-preview" => {
+                let source =
+                    (*self.session.lock().unwrap()).ok_or_else(|| anyhow!("No source session"))?;
+                let store = Store::new(&self.cwd)?;
+                let _lease = store.session_lease(source)?;
+                let history =
+                    crate::commands::session::portable_history(&self.cwd, &store, source)?;
+                for message in &history {
+                    match message {
+                        codingbuddy_core::ChatMessage::User { content } => {
+                            self.notify(format!("User — {content}"), false)
+                        }
+                        codingbuddy_core::ChatMessage::Assistant {
+                            content: Some(content),
+                            ..
+                        } => self.notify(format!("Assistant — {content}"), false),
+                        _ => {}
+                    }
+                }
+                state.history_preview = Some((source, history));
+                self.menu(TerminalMenu::choices(
+                    "Confirm redacted fork",
+                    "Review the history in the transcript before continuing.",
+                    choices(&[
+                        ("history-share", "Create linked fork"),
+                        ("cancel-close", "Cancel"),
+                    ]),
+                ));
+            }
             "history-new" | "history-share" => {
                 let llm = state
                     .history_choice
-                    .take()
+                    .clone()
                     .ok_or_else(|| anyhow!("Choose a model first"))?;
-                if id == "history-new" {
-                    *self.session.lock().unwrap() = Some(self.create_session()?);
+                let selected = if id == "history-new" {
+                    self.create_session()?
                 } else {
-                    // The agent records the chosen destination when the next turn starts.
-                    state.allow_history_transfer = true;
-                }
+                    let (source, preview) = state
+                        .history_preview
+                        .take()
+                        .ok_or_else(|| anyhow!("Preview the redacted history first"))?;
+                    let store = Store::new(&self.cwd)?;
+                    let _lease = store.session_lease(source)?;
+                    let history =
+                        crate::commands::session::portable_history(&self.cwd, &store, source)?;
+                    anyhow::ensure!(
+                        serde_json::to_value(&preview)? == serde_json::to_value(&history)?,
+                        "History changed. Preview the redacted history again."
+                    );
+                    store
+                        .fork_session_with_messages(source, &history)?
+                        .session_id
+                };
+                *self.session.lock().unwrap() = Some(selected);
+                state.history_choice = None;
                 self.activate(&mut state, llm)?;
             }
             id if id.starts_with("theme:") => {
@@ -572,8 +617,9 @@ impl Menus {
             !history.chat_messages.is_empty()
                 && history.provider_selection.as_ref().map_or_else(
                     || state.llm.connection_id() != llm.connection_id(),
-                    |(provider, _, destination)| {
+                    |(provider, model, destination)| {
                         provider != &llm.provider
+                            || model != &llm.active_base_model()
                             || destination
                                 .as_ref()
                                 .is_some_and(|id| id != &llm.connection_id())
@@ -594,10 +640,10 @@ impl Menus {
     pub fn history_menu(&self) {
         self.menu(TerminalMenu::choices(
             "Change conversation provider",
-            "Continue sends previous messages to this provider.",
+            "Choose a fresh session or preview a linked fork.",
             choices(&[
                 ("history-new", "Start fresh"),
-                ("history-share", "Continue and share history"),
+                ("history-preview", "Preview redacted history"),
                 ("cancel-close", "Cancel"),
             ]),
         ));
@@ -632,13 +678,13 @@ impl Menus {
 
     pub fn review_resume(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.allow_history_transfer = false;
         if let Some(session) = *self.session.lock().unwrap() {
             let projection = Store::new(&self.cwd)?.rebuild_from_events(session)?;
             if !projection.chat_messages.is_empty()
                 && projection.provider_selection.as_ref().is_some_and(
-                    |(provider, _, destination)| {
+                    |(provider, model, destination)| {
                         provider != &state.llm.provider
+                            || model != &state.llm.active_base_model()
                             || destination
                                 .as_ref()
                                 .is_some_and(|id| id != &state.llm.connection_id())

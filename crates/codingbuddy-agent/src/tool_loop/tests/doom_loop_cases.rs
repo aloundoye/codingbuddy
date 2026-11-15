@@ -111,6 +111,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             }],
             finish_reason: "tool_calls".to_string(),
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         },
         // Turn 2: same call
@@ -124,6 +125,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             }],
             finish_reason: "tool_calls".to_string(),
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         },
         // Turn 3: same call — should trigger doom loop gate and STOP
@@ -137,6 +139,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             }],
             finish_reason: "tool_calls".to_string(),
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         },
         // Turn 4: should NEVER be reached — doom loop gate terminates the loop
@@ -146,6 +149,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             tool_calls: vec![],
             finish_reason: "stop".to_string(),
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         },
     ];

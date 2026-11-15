@@ -229,6 +229,7 @@ fn compaction_summary_lists_modified_files() {
     let messages = vec![
         ChatMessage::Assistant {
             content: None,
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![LlmToolCall {
                 id: "c1".to_string(),
@@ -243,6 +244,7 @@ fn compaction_summary_lists_modified_files() {
         },
         ChatMessage::Assistant {
             content: None,
+            native_parts: None,
             reasoning_content: None,
             tool_calls: vec![LlmToolCall {
                 id: "c2".to_string(),
@@ -296,6 +298,7 @@ fn compaction_summary_captures_errors() {
 fn compaction_summary_tool_counts() {
     let messages = vec![ChatMessage::Assistant {
         content: None,
+        native_parts: None,
         reasoning_content: None,
         tool_calls: vec![
             LlmToolCall {
@@ -426,6 +429,7 @@ fn compaction_preserves_key_decisions() {
     let decision_text = "I'll modify the authentication module to use JWT tokens instead of session cookies because the API is stateless.";
     let messages = vec![ChatMessage::Assistant {
         content: Some(decision_text.to_string()),
+        native_parts: None,
         reasoning_content: None,
         tool_calls: vec![],
     }];

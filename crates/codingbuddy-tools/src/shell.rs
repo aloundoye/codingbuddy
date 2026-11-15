@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use codingbuddy_core::CancellationToken;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -112,13 +113,14 @@ pub(crate) fn run_command(
     timeout: Duration,
 ) -> Result<ShellRunResult> {
     command.args(args);
-    spawn_piped(command, cwd, timeout, false)
+    spawn_piped(command, cwd, timeout, false, None)
 }
 
 pub(crate) fn run_shell_launch(
     mut command: Command,
     cwd: &Path,
     timeout: Duration,
+    cancellation: Option<&CancellationToken>,
     #[cfg(unix)] on_progress: Option<ProgressCallback>,
 ) -> Result<ShellRunResult> {
     #[cfg(unix)]
@@ -127,11 +129,11 @@ pub(crate) fn run_shell_launch(
         if let Some(callback) = on_progress
             && USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
         {
-            return run_prepared_with_pty(command, cwd, timeout, Some(callback));
+            return run_prepared_with_pty(command, cwd, timeout, Some(callback), cancellation);
         }
         command.process_group(0);
     }
-    spawn_piped(command, cwd, timeout, cfg!(unix))
+    spawn_piped(command, cwd, timeout, cfg!(unix), cancellation)
 }
 
 fn spawn_piped(
@@ -139,6 +141,7 @@ fn spawn_piped(
     cwd: &Path,
     timeout: Duration,
     process_group: bool,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ShellRunResult> {
     let child = command
         .current_dir(cwd)
@@ -146,13 +149,14 @@ fn spawn_piped(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    wait_for_output(child, timeout, process_group)
+    wait_for_output(child, timeout, process_group, cancellation)
 }
 
 fn wait_for_output(
     mut child: Child,
     timeout: Duration,
     process_group: bool,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ShellRunResult> {
     use std::io::Read;
     let mut stdout = child
@@ -174,7 +178,22 @@ fn wait_for_output(
             stderr.read_to_end(&mut bytes)?;
             Ok::<_, std::io::Error>(bytes)
         });
-        let status = child.wait_timeout(timeout)?;
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break None;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let interval = if cancellation.is_some() {
+                remaining.min(Duration::from_millis(30))
+            } else {
+                remaining
+            };
+            let status = child.wait_timeout(interval)?;
+            if status.is_some() || remaining <= interval {
+                break status;
+            }
+        };
         #[cfg(unix)]
         if process_group {
             unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
@@ -250,7 +269,7 @@ fn run_with_pty(
     command.arg("-c").arg(cmd);
     harden_command_env(&mut command, cwd, "shell");
     command.env("TERM", "xterm-256color");
-    run_prepared_with_pty(command, cwd, timeout, on_progress)
+    run_prepared_with_pty(command, cwd, timeout, on_progress, None)
 }
 
 #[cfg(unix)]
@@ -259,6 +278,7 @@ fn run_prepared_with_pty(
     cwd: &Path,
     timeout: Duration,
     on_progress: Option<ProgressCallback>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ShellRunResult> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
@@ -325,12 +345,13 @@ fn run_prepared_with_pty(
 
     let mut timed_out = false;
     loop {
-        if std::time::Instant::now() >= deadline {
+        if cancellation.is_some_and(CancellationToken::is_cancelled)
+            || std::time::Instant::now() >= deadline
+        {
             timed_out = true;
             unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
             }
-            std::thread::sleep(Duration::from_millis(100));
             let _ = child.kill();
             break;
         }

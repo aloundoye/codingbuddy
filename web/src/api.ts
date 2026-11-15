@@ -43,55 +43,39 @@ export async function rpc<T = unknown>(
 export interface SessionOpenResult {
   session_id: string;
   status: string;
+  history?: { role: "user" | "assistant"; content: string }[];
+  latest_prompt?: PromptResult;
 }
 
 export interface PromptResult {
   prompt_id: string;
   session_id: string;
   status: string;
+}
+
+export interface PromptEvents {
+  events: { seq: number; event: { type: string; text?: string } }[];
+  next_cursor: number;
+  status: string;
   output: string | null;
   error: string | null;
-  stream: { prompt_id: string; cursor: number } | null;
-}
-
-export interface StreamChunk {
-  cursor: number;
-  type?: string;
-  delta?: string;
-  event: Record<string, unknown>;
-}
-
-export interface StreamNextResult {
-  prompt_id: string;
-  chunks: StreamChunk[];
-  next_cursor: number;
   done: boolean;
 }
 
-export function openSession(workspace = "."): Promise<SessionOpenResult> {
-  return rpc("session/open", { workspace_root: workspace });
+export function openSession(sessionId?: string | null): Promise<SessionOpenResult> {
+  return rpc("session/open", { workspace_root: ".", session_id: sessionId ?? undefined });
 }
 
-export function executePrompt(
-  sessionId: string,
-  prompt: string,
-): Promise<PromptResult> {
-  return rpc("prompt/execute", {
-    session_id: sessionId,
-    prompt,
-    include_partial_messages: true,
-  });
+export function executePrompt(sessionId: string, prompt: string, requestId: string): Promise<PromptResult> {
+  return rpc("prompt/start", { session_id: sessionId, prompt, request_id: requestId });
 }
 
-export function pollStream(
-  promptId: string,
-  cursor: number,
-): Promise<StreamNextResult> {
-  return rpc("prompt/stream_next", {
-    prompt_id: promptId,
-    cursor,
-    max_chunks: 32,
-  });
+export function pollStream(promptId: string, cursor: number): Promise<PromptEvents> {
+  return rpc("prompt/events", { prompt_id: promptId, cursor });
+}
+
+export function cancelPrompt(promptId: string): Promise<PromptResult> {
+  return rpc("prompt/cancel", { prompt_id: promptId });
 }
 
 export function health(): Promise<{ status: string }> {

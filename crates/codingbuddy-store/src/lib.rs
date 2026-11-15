@@ -1,9 +1,13 @@
+mod steps;
+pub use steps::{InvocationReceipt, PendingInvocation};
+mod prompt;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use codingbuddy_core::{
     ChatMessage, EventEnvelope, EventKind, Plan, Session, SessionState,
     parse_event_envelope_compat, parse_event_kind_compat, runtime_dir,
 };
+pub use prompt::{PromptState, SessionLease};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -737,6 +741,9 @@ impl Store {
             events_path,
         };
         store.init_db()?;
+        let db = store.db()?;
+        Self::init_prompts(&db)?;
+        Self::init_steps(&db)?;
         Ok(store)
     }
 
@@ -2397,6 +2404,14 @@ impl Store {
     // --- Session Forking ---
 
     pub fn fork_session(&self, from_session_id: Uuid) -> Result<Session> {
+        self.fork_session_with_messages(from_session_id, &[])
+    }
+
+    pub fn fork_session_with_messages(
+        &self,
+        from_session_id: Uuid,
+        messages: &[ChatMessage],
+    ) -> Result<Session> {
         let source = self
             .load_session(from_session_id)?
             .ok_or_else(|| anyhow::anyhow!("session not found: {from_session_id}"))?;
@@ -2418,6 +2433,17 @@ impl Store {
         };
         Self::append_event_row(&tx, &NewEvent::new(from_session_id, kind.clone()))?;
         Self::append_event_row(&tx, &NewEvent::new(new_id, kind))?;
+        for message in messages {
+            Self::append_event_row(
+                &tx,
+                &NewEvent::new(
+                    new_id,
+                    EventKind::ChatTurn {
+                        message: message.clone(),
+                    },
+                ),
+            )?;
+        }
         tx.commit()?;
         Ok(forked)
     }
@@ -2855,7 +2881,7 @@ impl Store {
                 session_id,
                 seq_no: u64::try_from(row.get::<_, i64>(0)?)?,
                 at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(1)?)?.to_utc(),
-                kind: parse_event_kind_compat(&row.get::<_, String>(2)?)?,
+                kind: public_event(parse_event_kind_compat(&row.get::<_, String>(2)?)?),
             });
         }
         Ok(events)
@@ -2893,11 +2919,18 @@ impl Store {
         let mut rows = statement.query(parameters)?;
         let mut events = Vec::new();
         while let Some(row) = rows.next()? {
+            let kind: String = row.get(2)?;
+            let body: String = row.get(3)?;
+            let payload = if kind.starts_with("ChatTurn") {
+                serde_json::to_value(public_event(parse_event_kind_compat(&body)?))?
+            } else {
+                serde_json::from_str(&body)?
+            };
             events.push(StoredEvent {
                 seq_no: u64::try_from(row.get::<_, i64>(0)?)?,
                 at: row.get(1)?,
-                kind: row.get(2)?,
-                payload: serde_json::from_str(&row.get::<_, String>(3)?)?,
+                kind,
+                payload,
             });
         }
         Ok(events)
@@ -3658,13 +3691,19 @@ impl Store {
             stmt.query_map([cutoff], |row| row.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
+        let mut leases = Vec::new();
         for id in &ids {
+            let Ok(lease) = self.session_lease(Uuid::parse_str(id)?) else {
+                continue;
+            };
+            leases.push(lease);
+            Self::delete_session_runtime(&tx, id)?;
             tx.execute("DELETE FROM events WHERE session_id = ?1", [id])?;
             tx.execute("DELETE FROM plans WHERE session_id = ?1", [id])?;
             tx.execute("DELETE FROM sessions WHERE session_id = ?1", [id])?;
         }
         tx.commit()?;
-        Ok(ids.len() as u64)
+        Ok(leases.len() as u64)
     }
 
     /// Return total database file size in bytes.
@@ -3708,6 +3747,8 @@ pub struct RebuildProjection {
     pub transcript: Vec<String>,
     /// Structured chat messages for accurate session resume (from ChatTurn events).
     pub chat_messages: Vec<ChatMessage>,
+    pub legacy_tool_history: bool,
+    model_steps: Vec<(Uuid, usize)>,
     pub provider_selection: Option<(String, String, Option<String>)>,
     pub latest_plan: Option<Plan>,
     pub step_status: Vec<(Uuid, bool, String)>,
@@ -3734,6 +3775,37 @@ pub struct RebuildProjection {
     pub last_provider_compatibility: Option<codingbuddy_core::AppliedCompatibility>,
 }
 
+fn portable_call_id(id: &str) -> &str {
+    if let Some(rest) = id.strip_prefix("gemini:")
+        && let Some((position, _)) = rest.split_once(':')
+    {
+        return position;
+    }
+    id
+}
+
+fn public_event(mut kind: EventKind) -> EventKind {
+    if let EventKind::ChatTurn { message } = &mut kind {
+        match message {
+            ChatMessage::Assistant {
+                reasoning_content,
+                tool_calls,
+                ..
+            } => {
+                *reasoning_content = None;
+                for call in tool_calls {
+                    call.id = portable_call_id(&call.id).to_owned();
+                }
+            }
+            ChatMessage::Tool { tool_call_id, .. } => {
+                *tool_call_id = portable_call_id(tool_call_id).to_owned();
+            }
+            _ => {}
+        }
+    }
+    kind
+}
+
 fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
     match &event.kind {
         EventKind::ProviderSelected {
@@ -3748,14 +3820,47 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
             proj.transcript.push(format!("{role}: {content}"))
         }
         EventKind::ChatTurn { message } => {
+            if matches!(message, ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+            {
+                proj.legacy_tool_history = true;
+            }
             proj.chat_messages.push(message.clone());
         }
+        EventKind::ModelStep { step_id, parts } => {
+            proj.model_steps.push((*step_id, proj.chat_messages.len()));
+            let mut text = String::new();
+            let mut calls = Vec::new();
+            for part in parts {
+                match part {
+                    codingbuddy_core::ModelPart::Text { text: value } => text.push_str(value),
+                    codingbuddy_core::ModelPart::Call {
+                        provider_call_id,
+                        name,
+                        arguments,
+                        ..
+                    } => calls.push(codingbuddy_core::LlmToolCall {
+                        id: provider_call_id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.to_string(),
+                    }),
+                }
+            }
+            proj.chat_messages.push(ChatMessage::Assistant {
+                content: (!text.is_empty()).then_some(text),
+                native_parts: None,
+                reasoning_content: None,
+                tool_calls: calls,
+            });
+        }
+        EventKind::ModelToolResult { message, .. } => proj.chat_messages.push(message.clone()),
         EventKind::TurnReverted { turns_dropped } => {
             let keep_chat = proj
                 .chat_messages
                 .len()
                 .saturating_sub(*turns_dropped as usize);
             proj.chat_messages.truncate(keep_chat);
+            proj.model_steps
+                .retain(|(_, position)| *position < keep_chat);
             let keep_transcript = proj
                 .transcript
                 .len()
@@ -3778,7 +3883,17 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
                 proj.applied_patches.push(*patch_id)
             }
         }
-        EventKind::ToolProposed { proposal } => proj.tool_invocations.push(proposal.invocation_id),
+        EventKind::ToolProposed { proposal } => {
+            if proj.model_steps.is_empty()
+                && proj
+                    .chat_messages
+                    .iter()
+                    .any(|message| matches!(message, ChatMessage::User { .. }))
+            {
+                proj.legacy_tool_history = true;
+            }
+            proj.tool_invocations.push(proposal.invocation_id);
+        }
         EventKind::ToolApproved { invocation_id } => proj.approved_invocations.push(*invocation_id),
         EventKind::ToolDenied { invocation_id, .. } => proj.denied_invocations.push(*invocation_id),
         EventKind::SessionStateChanged { to, .. } => proj.state = Some(to.clone()),
@@ -3840,6 +3955,8 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::TurnAdded { .. } => "TurnAdded@v1",
         EventKind::ChatTurn { .. } => "ChatTurn@v1",
+        EventKind::ModelStep { .. } => "ModelStep@v1",
+        EventKind::ModelToolResult { .. } => "ModelToolResult@v1",
         EventKind::TurnReverted { .. } => "TurnReverted@v1",
         EventKind::SessionStateChanged { .. } => "SessionStateChanged@v1",
         EventKind::RunStarted { .. } => "RunStarted@v1",

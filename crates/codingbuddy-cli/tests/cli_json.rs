@@ -1085,18 +1085,25 @@ impl Drop for P0Server {
 
 impl P0Server {
     fn launch(workspace: &Path, home: &Path) -> Self {
+        Self::launch_exposed(workspace, home, None)
+    }
+
+    fn launch_exposed(workspace: &Path, home: &Path, exposed: Option<&str>) -> Self {
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
-        let mut child = StdCommand::new(p0_binary())
+        let mut command = StdCommand::new(p0_binary());
+        command
             .current_dir(workspace)
             .env("HOME", home)
             .env("USERPROFILE", home)
             .env_remove("CODINGBUDDY_TRUST_WORKSPACE")
             .env("P0_FIXTURE_KEY", "synthetic-provider-key")
             .args(["--json", "serve", "--transport", "http", "--port", "0"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("start RPC server");
+            .stdout(Stdio::piped());
+        if let Some(id) = exposed {
+            command.args(["--expose-session", id]);
+        }
+        let mut child = command.spawn().expect("start RPC server");
         let mut line = String::new();
         BufReader::new(child.stdout.take().expect("startup stdout"))
             .read_line(&mut line)
@@ -1151,6 +1158,51 @@ fn p0_provider_settings(home: &Path, mock: &MockLlmServer, extra: Value) {
         settings.to_string(),
     )
     .unwrap();
+}
+
+#[test]
+fn delivery_one_http_rpc_reauthorizes_replay_after_restart() {
+    let workspace = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mock = start_mock_llm_server();
+    p0_provider_settings(home.path(), &mock, Value::Null);
+    let server = P0Server::launch(workspace.path(), home.path());
+    let auth = server.authorized();
+    let (_, opened) = server.request(&auth, "session/open", Value::Null);
+    let session = opened["result"]["session_id"].as_str().unwrap().to_owned();
+    let request = serde_json::json!({"session_id":session,"prompt":"hello","request_id":uuid::Uuid::now_v7()});
+    let (_, first) = server.request(&auth, "prompt/start", request.clone());
+    let id = first["result"]["prompt_id"].as_str().unwrap().to_owned();
+    let (_, second) = server.request(&auth, "prompt/start", request);
+    assert_eq!(second["result"]["prompt_id"], id);
+    let limit = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let (_, page) = server.request(&auth, "prompt/events", serde_json::json!({"prompt_id":id}));
+        if page["result"]["done"] == true {
+            assert_eq!(page["result"]["status"], "completed", "{page}");
+            break;
+        }
+        assert!(std::time::Instant::now() < limit, "{page}");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let old = server.token.clone();
+    drop(server);
+    let restarted = P0Server::launch_exposed(workspace.path(), home.path(), Some(&session));
+    let auth = restarted.authorized();
+    assert_eq!(
+        restarted
+            .request(
+                &auth.replace(&restarted.token, &old),
+                "session/open",
+                Value::Null
+            )
+            .0,
+        401
+    );
+    let (_, resumed) = restarted.request(&auth, "session/open", Value::Null);
+    assert_eq!(resumed["result"]["session_id"], session);
+    assert_eq!(resumed["result"]["latest_prompt"]["prompt_id"], id);
+    assert_eq!(mock.requests.load(Ordering::Relaxed), 1);
 }
 
 #[test]

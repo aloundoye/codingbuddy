@@ -163,6 +163,7 @@ mod tests {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: codingbuddy_core::ProviderDiscoveryConfig::default(),
             payload_options,

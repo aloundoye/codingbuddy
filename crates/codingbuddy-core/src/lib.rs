@@ -749,6 +749,14 @@ pub enum EventKind {
     /// Structured chat turn with full tool_call data for accurate session resume.
     #[serde(alias = "ChatTurnV1")]
     ChatTurn { message: ChatMessage },
+    ModelStep {
+        step_id: Uuid,
+        parts: Vec<ModelPart>,
+    },
+    ModelToolResult {
+        invocation_id: Uuid,
+        message: ChatMessage,
+    },
     /// Reverts the session to a prior state by dropping N turns.
     #[serde(alias = "TurnRevertedV1")]
     TurnReverted { turns_dropped: u32 },
@@ -1293,6 +1301,8 @@ impl EventKind {
             // Chat / transcript
             Self::TurnAdded { .. }
             | Self::ChatTurn { .. }
+            | Self::ModelStep { .. }
+            | Self::ModelToolResult { .. }
             | Self::TurnReverted { .. }
             | Self::ContextCompacted { .. }
             | Self::AgentInterrupted { .. }
@@ -1470,6 +1480,13 @@ impl EventKind {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct ToolExecutionContext<'a> {
+    pub session_id: Option<Uuid>,
+    pub invocation_id: Option<Uuid>,
+    pub cancellation: Option<&'a CancellationToken>,
+}
+
 pub trait ToolHost {
     fn approval_details(&self, _invocation: Uuid) -> Option<String> {
         None
@@ -1505,6 +1522,14 @@ pub trait ToolHost {
 
     fn propose(&self, call: ToolCall) -> ToolProposal;
     fn execute(&self, approved: ApprovedToolCall) -> ToolResult;
+
+    fn execute_with_context(
+        &self,
+        approved: ApprovedToolCall,
+        _context: ToolExecutionContext<'_>,
+    ) -> ToolResult {
+        self.execute(approved)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1534,12 +1559,50 @@ pub struct LlmToolCall {
     pub arguments: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelPart {
+    Text {
+        text: String,
+    },
+    Call {
+        id: Uuid,
+        provider_call_id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+/// Provider-owned blocks are carried in memory and in the private replay store.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NativeParts {
+    pub protocol: String,
+    pub blocks: Vec<serde_json::Value>,
+}
+
+impl std::fmt::Debug for NativeParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeParts")
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TransportPart {
+    Text(String),
+    Call(String),
+    Native(NativeParts),
+}
+
 fn default_finish_reason() -> String {
     "stop".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
+    #[serde(skip)]
+    pub transport_parts: Vec<TransportPart>,
     pub text: String,
     #[serde(default = "default_finish_reason")]
     pub finish_reason: String,
@@ -1972,6 +2035,8 @@ pub enum ChatMessage {
     User { content: String },
     #[serde(rename = "assistant")]
     Assistant {
+        #[serde(skip)]
+        native_parts: Option<NativeParts>,
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
         /// Chain-of-thought reasoning from thinking mode (DeepSeek V3.2).
@@ -2042,6 +2107,7 @@ pub fn estimate_message_tokens(messages: &[ChatMessage]) -> u64 {
                 content,
                 reasoning_content,
                 tool_calls,
+                ..
             } => {
                 content.as_deref().map_or(0, |c| c.len() as u64)
                     + reasoning_content.as_deref().map_or(0, |r| r.len() as u64)
@@ -2689,6 +2755,9 @@ pub struct ProviderConfig {
     /// `none`, `aws-sigv4`). Defaults are derived from provider kind/protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_strategy: Option<String>,
+    /// Stable provider account, organization, or project ID when one is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     /// Extra request headers to attach to provider calls after built-in headers.
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
@@ -2796,6 +2865,7 @@ impl LlmConfig {
             openai_compat_prefix: self.openai_compat_prefix,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3039,6 +3109,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: false,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3057,6 +3128,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3075,6 +3147,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3093,6 +3166,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3111,6 +3185,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3129,6 +3204,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3147,6 +3223,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3165,6 +3242,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3183,6 +3261,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3201,6 +3280,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3219,6 +3299,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3237,6 +3318,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             openai_compat_prefix: true,
             chat_protocol: None,
             auth_strategy: None,
+            account_id: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -4583,6 +4665,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("answer 1".to_string()),
+                native_parts: None,
                 reasoning_content: Some("thinking about q1".to_string()),
                 tool_calls: vec![],
             },
@@ -4592,6 +4675,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("tool call".to_string()),
+                native_parts: None,
                 reasoning_content: Some("thinking about q2".to_string()),
                 tool_calls: vec![],
             },
@@ -4635,6 +4719,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("answer".to_string()),
+                native_parts: None,
                 reasoning_content: Some("thinking".to_string()),
                 tool_calls: vec![],
             },
@@ -4657,6 +4742,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("answer".to_string()),
+                native_parts: None,
                 reasoning_content: Some("thinking".to_string()),
                 tool_calls: vec![],
             },
@@ -4698,6 +4784,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("z".repeat(100)),
+                native_parts: None,
                 reasoning_content: Some("r".repeat(200)),
                 tool_calls: vec![],
             },
@@ -4716,6 +4803,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("turn 1 answer".to_string()),
+                native_parts: None,
                 reasoning_content: Some("turn 1 thinking".to_string()),
                 tool_calls: vec![],
             },
@@ -4724,6 +4812,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("turn 2 answer".to_string()),
+                native_parts: None,
                 reasoning_content: Some("turn 2 thinking".to_string()),
                 tool_calls: vec![],
             },
@@ -4756,6 +4845,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("thinking step 1".to_string()),
+                native_parts: None,
                 reasoning_content: Some("reasoning 1".to_string()),
                 tool_calls: vec![LlmToolCall {
                     id: "c1".to_string(),
@@ -4770,6 +4860,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("thinking step 2".to_string()),
+                native_parts: None,
                 reasoning_content: Some("reasoning 2".to_string()),
                 tool_calls: vec![],
             },
@@ -4963,6 +5054,7 @@ mod tests {
                 openai_compat_prefix: true,
                 chat_protocol: None,
                 auth_strategy: None,
+                account_id: None,
                 headers: std::collections::BTreeMap::new(),
                 discovery: ProviderDiscoveryConfig::default(),
                 payload_options: serde_json::Value::Null,

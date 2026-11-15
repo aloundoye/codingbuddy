@@ -1,17 +1,21 @@
-import { useState, useRef, useCallback } from "preact/hooks";
+import { useState, useRef, useCallback, useEffect } from "preact/hooks";
 import type { JSX } from "preact";
-import { openSession, executePrompt, pollStream } from "./api";
+import { openSession, executePrompt, pollStream, cancelPrompt } from "./api";
 
 interface Message {
   role: "user" | "assistant" | "system";
   content: string;
 }
 
+const SESSION_KEY = "codingbuddy.rpc.session";
+const PENDING_KEY = "codingbuddy.rpc.pending";
+
 export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [activePrompt, setActivePrompt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const messagesEnd = useRef<HTMLDivElement>(null);
 
@@ -19,73 +23,84 @@ export function App() {
     messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
-  const ensureSession = async (): Promise<string> => {
-    if (sessionId) return sessionId;
-    const result = await openSession();
-    setSessionId(result.session_id);
-    return result.session_id;
+  const replayPrompt = async (promptId: string) => {
+    setActivePrompt(promptId);
+    let cursor = 0;
+    let fullText = "";
+    setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+    while (true) {
+      const page = await pollStream(promptId, cursor);
+      for (const { event } of page.events) {
+        if (event.type === "content_delta" && event.text) fullText += event.text;
+        if (event.type === "clear_streaming_text") fullText = "";
+      }
+      cursor = page.next_cursor;
+      const visible = page.done && page.output !== null ? page.output : fullText;
+      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: visible }]);
+      scrollToBottom();
+      if (page.done) {
+        if (page.status !== "completed") setError(page.error ?? page.status);
+        sessionStorage.removeItem(PENDING_KEY);
+        return;
+      }
+      if (page.events.length === 0) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   };
+
+  const reconnect = async () => {
+    const opened = await openSession(sessionStorage.getItem(SESSION_KEY));
+    sessionStorage.setItem(SESSION_KEY, opened.session_id);
+    setSessionId(opened.session_id);
+    const history = opened.history ?? [];
+    setMessages(history);
+    const pendingText = sessionStorage.getItem(PENDING_KEY);
+    const pending = pendingText ? JSON.parse(pendingText) as { session: string; request: string; text: string } : null;
+    if (pending?.session === opened.session_id) {
+      const result = await executePrompt(pending.session, pending.text, pending.request);
+      if (result.status === "completed") {
+        sessionStorage.removeItem(PENDING_KEY);
+        return;
+      }
+      if (history[history.length - 1]?.content !== pending.text) {
+        setMessages((prev) => [...prev, { role: "user", content: pending.text }]);
+      }
+      await replayPrompt(result.prompt_id);
+    } else {
+      sessionStorage.removeItem(PENDING_KEY);
+      if (opened.latest_prompt && opened.latest_prompt.status !== "completed") {
+        await replayPrompt(opened.latest_prompt.prompt_id);
+      }
+    }
+  };
+
+  const run = async (operation: () => Promise<void>) => {
+    setLoading(true);
+    setError(null);
+    try {
+      await operation();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setActivePrompt(null);
+      setLoading(false);
+      scrollToBottom();
+    }
+  };
+
+  useEffect(() => { void run(reconnect); }, []);
 
   const handleSubmit = async (e: JSX.TargetedEvent<HTMLFormElement>) => {
     e.preventDefault();
     const text = input.trim();
-    if (!text || loading) return;
-
+    if (!text || loading || !sessionId) return;
     setInput("");
-    setError(null);
     setMessages((prev) => [...prev, { role: "user", content: text }]);
-    setLoading(true);
-
-    try {
-      const sid = await ensureSession();
-      const result = await executePrompt(sid, text);
-
-      if (result.status === "failed") {
-        setError(result.error || "Unknown error");
-        setLoading(false);
-        return;
-      }
-
-      // If streaming is available, poll for chunks
-      if (result.stream) {
-        let cursor = 0;
-        let fullText = "";
-        const promptId = result.stream.prompt_id;
-
-        // Add placeholder assistant message
-        setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-
-        let done = false;
-        while (!done) {
-          const streamResult = await pollStream(promptId, cursor);
-          for (const chunk of streamResult.chunks) {
-            if (chunk.delta) {
-              fullText += chunk.delta;
-              setMessages((prev) => [
-                ...prev.slice(0, -1),
-                { role: "assistant" as const, content: fullText },
-              ]);
-            }
-          }
-          cursor = streamResult.next_cursor;
-          done = streamResult.done;
-          scrollToBottom();
-          if (!done && streamResult.chunks.length === 0) {
-            await new Promise((r) => setTimeout(r, 50));
-          }
-        }
-      } else if (result.output) {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: result.output! },
-        ]);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
-    } finally {
-      setLoading(false);
-      scrollToBottom();
-    }
+    await run(async () => {
+      const request = crypto.randomUUID();
+      sessionStorage.setItem(PENDING_KEY, JSON.stringify({ session: sessionId, request, text }));
+      const result = await executePrompt(sessionId, text, request);
+      await replayPrompt(result.prompt_id);
+    });
   };
 
   return (
@@ -144,9 +159,17 @@ export function App() {
           style={styles.input}
           autoFocus
         />
-        <button type="submit" disabled={loading || !input.trim()} style={styles.button}>
+        <button type="submit" disabled={loading || !sessionId || !input.trim()} style={styles.button}>
           Send
         </button>
+        {error && !loading && (
+          <button type="button" style={styles.button} onClick={() => { void run(reconnect); }}>Reconnect</button>
+        )}
+        {activePrompt && (
+          <button type="button" style={styles.button} onClick={() => {
+            void cancelPrompt(activePrompt).catch((err) => setError(String(err)));
+          }}>Cancel</button>
+        )}
       </form>
     </div>
   );
