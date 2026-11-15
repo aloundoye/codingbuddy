@@ -301,6 +301,25 @@ pin the workspace. An explicit managed grant list replaces the user list.
 MCP interpolation uses the same allowed variables. A literal fallback in
 `${VAR:-fallback}` can still be used when the variable is unavailable.
 
+Explicit deny rules remain binding in every permission mode, including
+`bypassPermissions`. Saved approvals and hooks cannot override a deny. Use
+`codingbuddy permissions dry-run bash_run --args-json '{"command":"git status"}'`
+to inspect the decision for a specific command.
+
+Isolation uses Bubblewrap on Linux and Seatbelt on macOS. The shell prompt shows
+the effective filesystem and network permissions. Windows rejects commands that
+require isolation. Unsandboxed shell calls, including command exclusions, require
+approval for each invocation. Headless sessions without an approval handler
+decline them. Existing custom wrapper templates cannot satisfy an isolation
+requirement. Use a supported backend or choose unsandboxed execution explicitly.
+Domain, localhost-binding, and Unix-socket exceptions are unsupported in the
+isolated shell modes.
+
+Release publication requires a RustSec check of the locked production graph and
+focused trust and isolation checks for each shipped target. Temporary advisory
+exceptions are recorded in `.cargo/release-audit-exceptions.json` with exact
+versions, affected targets, a mitigation, an owner, and an expiry within 90 days.
+
 ## Development
 
 ```bash

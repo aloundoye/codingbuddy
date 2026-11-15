@@ -1371,3 +1371,38 @@ fn p0_workspace_hooks_and_process_env_grants() {
     run(true, Some(&managed));
     assert!(!marker.exists());
 }
+
+#[test]
+fn delivery_zero_user_deny_survives_trusted_project_overlay() {
+    let workspace = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    for (root, decision) in [(home.path(), "deny"), (workspace.path(), "allow")] {
+        let config = root.join(".codingbuddy");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("settings.json"),
+            serde_json::json!({"policy":{"permission_rules":[{"rule":"Bash(git status)","decision":decision}]}}).to_string(),
+        ).unwrap();
+    }
+    let output = Command::new(p0_binary())
+        .current_dir(workspace.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
+        .args([
+            "--json",
+            "permissions",
+            "dry-run",
+            "bash_run",
+            "--args-json",
+            r#"{"command":"git status"}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: Value = serde_json::from_slice(&output).expect("permission output");
+    assert_eq!(result["dry_run"]["permission"]["decision"], "deny");
+    assert_eq!(result["dry_run"]["permission"]["source"], "user settings");
+}

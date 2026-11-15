@@ -29,7 +29,6 @@ use codingbuddy_index::IndexService;
 use codingbuddy_memory::MemoryManager;
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
-pub(crate) use command_guard::detect_container_environment;
 pub(crate) use command_guard::shell_quote;
 use ignore::WalkBuilder;
 pub use plugins::{
@@ -60,9 +59,6 @@ use fuzzy_edit::{
     fuzzy_block_anchor, fuzzy_context_aware, fuzzy_escape_normalized, fuzzy_indentation_flexible,
     fuzzy_line_trimmed, fuzzy_trimmed_boundary, fuzzy_whitespace_normalized,
 };
-use sandbox::sandbox_wrap_command;
-#[cfg(test)]
-use sandbox::{build_bwrap_command, build_seatbelt_profile, seatbelt_wrap};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;

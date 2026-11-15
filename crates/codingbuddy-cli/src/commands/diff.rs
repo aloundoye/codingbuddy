@@ -50,6 +50,15 @@ pub(crate) fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<
         return Err(anyhow!("approval required: pass --yes to apply"));
     }
 
+    let cfg = codingbuddy_core::AppConfig::load(cwd)?;
+    let policy = codingbuddy_policy::PolicyEngine::from_app_config(&cfg.policy);
+    policy.ensure_allowed(&codingbuddy_core::ToolCall {
+        name: "patch.apply".into(),
+        args: json!({"patch_id": patch.patch_id}),
+        requires_approval: true,
+    })?;
+    let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(cwd)?;
+
     let checkpoint = MemoryManager::new(cwd)?.create_checkpoint("patch_apply")?;
     append_control_event(
         cwd,
@@ -61,7 +70,9 @@ pub(crate) fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<
         },
     )?;
 
-    let (applied, conflicts) = store.apply(cwd, patch.patch_id)?;
+    let (applied, conflicts) = store.apply_checked(cwd, patch.patch_id, |path| {
+        policy.check_patch_target(&files, path)
+    })?;
     if json_mode {
         print_json(&json!({
             "patch_id": patch.patch_id,

@@ -111,17 +111,49 @@ pub(crate) fn run_command(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ShellRunResult> {
+    command.args(args);
+    spawn_piped(command, cwd, timeout, false)
+}
+
+pub(crate) fn run_shell_launch(
+    mut command: Command,
+    cwd: &Path,
+    timeout: Duration,
+    #[cfg(unix)] on_progress: Option<ProgressCallback>,
+) -> Result<ShellRunResult> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        if let Some(callback) = on_progress
+            && USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return run_prepared_with_pty(command, cwd, timeout, Some(callback));
+        }
+        command.process_group(0);
+    }
+    spawn_piped(command, cwd, timeout, cfg!(unix))
+}
+
+fn spawn_piped(
+    mut command: Command,
+    cwd: &Path,
+    timeout: Duration,
+    process_group: bool,
+) -> Result<ShellRunResult> {
     let child = command
-        .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    wait_for_output(child, timeout)
+    wait_for_output(child, timeout, process_group)
 }
 
-fn wait_for_output(mut child: Child, timeout: Duration) -> Result<ShellRunResult> {
+fn wait_for_output(
+    mut child: Child,
+    timeout: Duration,
+    process_group: bool,
+) -> Result<ShellRunResult> {
     use std::io::Read;
     let mut stdout = child
         .stdout
@@ -143,6 +175,12 @@ fn wait_for_output(mut child: Child, timeout: Duration) -> Result<ShellRunResult
             Ok::<_, std::io::Error>(bytes)
         });
         let status = child.wait_timeout(timeout)?;
+        #[cfg(unix)]
+        if process_group {
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        }
+        #[cfg(not(unix))]
+        let _ = process_group;
         let timed_out = status.is_none();
         let status = match status {
             Some(status) => status,
@@ -208,6 +246,20 @@ fn run_with_pty(
     timeout: Duration,
     on_progress: Option<ProgressCallback>,
 ) -> Result<ShellRunResult> {
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(cmd);
+    harden_command_env(&mut command, cwd, "shell");
+    command.env("TERM", "xterm-256color");
+    run_prepared_with_pty(command, cwd, timeout, on_progress)
+}
+
+#[cfg(unix)]
+fn run_prepared_with_pty(
+    mut command: Command,
+    cwd: &Path,
+    timeout: Duration,
+    on_progress: Option<ProgressCallback>,
+) -> Result<ShellRunResult> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
@@ -230,12 +282,8 @@ fn run_with_pty(
     }
 
     let slave_fd_copy = slave_fd;
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(cmd);
     command.current_dir(&cwd);
     command.stdin(Stdio::null());
-    harden_command_env(&mut command, &cwd, "shell");
-    command.env("TERM", "xterm-256color");
 
     unsafe {
         use std::os::unix::process::CommandExt;

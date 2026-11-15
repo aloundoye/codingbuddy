@@ -249,7 +249,7 @@ impl IndexService {
         let query = parser.parse_query(q)?;
         let docs = searcher.search(
             &query,
-            &TopDocs::with_limit(top_k.saturating_mul(4).max(10)),
+            &TopDocs::with_limit(top_k.saturating_mul(4).max(10)).order_by_score(),
         )?;
 
         let mut seen = HashSet::new();

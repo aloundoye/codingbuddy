@@ -237,14 +237,25 @@ pub(crate) fn handle_stream_event(
         } => {
             let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
             let explanation = approval_explanation(&tool_name, &args_summary);
+            let detail =
+                serde_json::from_str::<serde_json::Value>(&args_summary).unwrap_or_default();
+            let explanation = match detail["effective_isolation"].as_str() {
+                Some(isolation) => format!("{isolation}\n{explanation}"),
+                None => explanation,
+            };
+            let actions = if detail["fresh_approval"] == true {
+                "[y] Allow once  [n] Deny"
+            } else {
+                "[y] Allow once  [a] Always allow  [n] Deny"
+            };
             // Show diff preview for file edit/write operations
             let diff_preview = build_approval_diff_preview(&tool_name, &args_summary);
             if let Some(diff) = &diff_preview {
                 state.shell.push_system(diff.clone());
             }
-            *state.info_line = format!("{explanation}  [y] Allow  [a] Always  [n] Deny");
+            *state.info_line = format!("{explanation}  {actions}");
             state.shell.push_system(format!(
-                "Allow {tool_name} {compact_args}?\n{explanation}\n[y] Allow once  [a] Always allow  [n] Deny"
+                "Allow {tool_name} {compact_args}?\n{explanation}\n{actions}"
             ));
             use std::io::Write as _;
             let _ = write!(io::stdout(), "\x07");

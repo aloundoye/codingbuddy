@@ -1,4 +1,4 @@
-use codingbuddy_core::{ApprovedToolCall, ToolCall, ToolHost};
+use codingbuddy_core::{ApprovedToolCall, ToolCall, ToolHost, ToolPermission};
 use codingbuddy_tools::LocalToolHost;
 use serde_json::json;
 use std::path::Path;
@@ -43,15 +43,28 @@ pub fn run_verify(
             args: json!({"cmd": command, "timeout": timeout_seconds}),
             requires_approval: false,
         };
-        let proposal = tool_host.propose(call.clone());
+        let (proposal, permission) = tool_host.propose_with_permission(call);
+        if let ToolPermission::Deny { reason, .. } = permission {
+            failures.push(format!("verification command denied: {reason}"));
+            continue;
+        }
 
         if !proposal.approved {
             let approved_by_user = if let Some(ref mut cb) = approval {
-                cb(&proposal.call).unwrap_or(false)
+                let mut display = proposal.call.clone();
+                display.args["fresh_approval"] = json!(matches!(
+                    permission,
+                    ToolPermission::Ask { fresh: true, .. }
+                ));
+                if let Some(detail) = tool_host.approval_details(proposal.invocation_id) {
+                    display.args["effective_isolation"] = serde_json::Value::String(detail);
+                }
+                cb(&display).unwrap_or(false)
             } else {
                 false
             };
             if !approved_by_user {
+                tool_host.discard_proposal(proposal.invocation_id);
                 let line = format!("verification command denied by policy: `{}`", command);
                 failures.push(line.clone());
                 continue;

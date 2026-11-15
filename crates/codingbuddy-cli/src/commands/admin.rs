@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
-use codingbuddy_core::{AppConfig, EventKind, ToolCall, runtime_dir};
+use codingbuddy_core::{
+    AppConfig, EventKind, ToolCall, ToolHost, ToolName, ToolPermission, runtime_dir,
+};
 use codingbuddy_index::IndexService;
 use codingbuddy_policy::{PolicyEngine, TeamPolicyLocks, team_policy_locks};
 use codingbuddy_store::Store;
@@ -82,6 +84,10 @@ pub(crate) fn parse_permissions_cmd(args: Vec<String>) -> Result<PermissionsCmd>
             .ok_or_else(|| anyhow!("usage: /permissions dry-run <tool-name>"))?;
         return Ok(PermissionsCmd::DryRun(crate::PermissionsDryRunArgs {
             tool_name: tool_name.clone(),
+            args_json: args
+                .get(2..)
+                .filter(|tail| !tail.is_empty())
+                .map(|tail| tail.join(" ")),
         }));
     }
 
@@ -965,19 +971,37 @@ pub(crate) fn permissions_payload(cwd: &Path, cmd: PermissionsCmd) -> Result<ser
             }
         }
         PermissionsCmd::DryRun(args) => {
-            let engine = PolicyEngine::from_app_config(&cfg.policy);
+            let policy = PolicyEngine::from_app_config(&cfg.policy);
+            let host = codingbuddy_tools::LocalToolHost::new(cwd, policy)?;
+            let arguments: serde_json::Value = args
+                .args_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_else(|| json!({}));
+            anyhow::ensure!(
+                arguments.is_object(),
+                "tool arguments must be a JSON object"
+            );
             let call = ToolCall {
-                name: args.tool_name.clone(),
-                args: serde_json::json!({}),
+                name: ToolName::from_api_name(&args.tool_name)
+                    .map_or(args.tool_name.as_str(), |tool| tool.as_internal())
+                    .into(),
+                args: arguments,
                 requires_approval: false,
             };
-            let result = engine.dry_run(&call);
-            let verdict = format!("{:?}", result);
+            let decision = host.permission(&call);
+            let verdict = match &decision {
+                ToolPermission::Deny { reason, .. } => format!("Denied ({reason})"),
+                ToolPermission::Ask { reason, .. } => format!("NeedsApproval ({reason})"),
+                ToolPermission::Allow => "Allowed".into(),
+            };
             return Ok(json!({
                 "dry_run": {
                     "tool": args.tool_name,
                     "permission_mode": cfg.policy.permission_mode,
                     "result": verdict,
+                    "permission": decision,
                 }
             }));
         }

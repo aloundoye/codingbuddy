@@ -115,6 +115,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             &engine.workspace,
             &lane.patch,
             engine.cfg.agent_loop.apply_strategy.clone(),
+            &engine.policy,
         )?;
         if !applied {
             let conflict_text = if conflicts.is_empty() {
@@ -209,7 +210,7 @@ fn execute_lane(
 
     let lane_result = (|| -> Result<LaneResult> {
         let lane_engine = AgentEngine::new(&lane_root)?;
-        lane_engine.set_approval_handler(Box::new(|_call| Ok(true)));
+        lane_engine.set_approval_handler(Box::new(|call| Ok(call.args["fresh_approval"] != true)));
         let _ = lane_engine.chat_with_options(&lane_prompt, lane_options)?;
         let patch = git_stdout(&lane_root, &["diff", "--binary"])
             .context("failed to collect lane patch artifact")?;
@@ -232,10 +233,6 @@ fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> 
     let gate = &engine.cfg.agent_loop.safety_gate;
     let files_over = stats.touched_files as u64 > gate.max_files_without_approval;
     let loc_over = stats.loc_delta as u64 > gate.max_loc_without_approval;
-    if !files_over && !loc_over {
-        return Ok(true);
-    }
-
     let call = ToolCall {
         name: "patch.apply".to_string(),
         args: json!({
@@ -255,7 +252,13 @@ fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> 
         )),
         codingbuddy_policy::PermissionDryRunResult::AutoApproved
         | codingbuddy_policy::PermissionDryRunResult::Allowed => Ok(true),
-        codingbuddy_policy::PermissionDryRunResult::NeedsApproval => engine.request_approval(&call),
+        codingbuddy_policy::PermissionDryRunResult::NeedsApproval => {
+            if call.requires_approval {
+                engine.request_approval(&call)
+            } else {
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -263,6 +266,7 @@ fn apply_lane_patch(
     workspace: &Path,
     patch: &str,
     strategy: ApplyStrategy,
+    policy: &codingbuddy_policy::PolicyEngine,
 ) -> Result<(bool, Vec<String>)> {
     let store = PatchStore::new(workspace)?;
     let staged = store.stage(patch, &[])?;
@@ -270,7 +274,10 @@ fn apply_lane_patch(
         ApplyStrategy::Auto => GitApplyStrategy::Auto,
         ApplyStrategy::ThreeWay => GitApplyStrategy::ThreeWay,
     };
-    store.apply_with_strategy(workspace, staged.patch_id, strategy)
+    let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(workspace)?;
+    store.apply_with_check(workspace, staged.patch_id, strategy, |path| {
+        policy.check_patch_target(&files, path)
+    })
 }
 
 fn emit_spawned(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec) {
@@ -673,8 +680,13 @@ mod tests {
         commit_all(temp.path(), "seed").expect("seed commit");
 
         let patch = "diff --git a/demo.txt b/demo.txt\n--- a/demo.txt\n+++ b/demo.txt\n@@ -1 +1 @@\n-missing\n+new\n";
-        let (applied, _conflicts) =
-            apply_lane_patch(temp.path(), patch, ApplyStrategy::Auto).expect("apply lane patch");
+        let (applied, _conflicts) = apply_lane_patch(
+            temp.path(),
+            patch,
+            ApplyStrategy::Auto,
+            &codingbuddy_policy::PolicyEngine::default(),
+        )
+        .expect("apply lane patch");
         assert!(!applied, "mismatched context should not apply");
     }
 }

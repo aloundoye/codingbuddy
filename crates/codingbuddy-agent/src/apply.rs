@@ -198,6 +198,17 @@ pub fn apply_unified_diff(
         }
     }
 
+    let config = codingbuddy_core::AppConfig::load(workspace).map_err(map_anyhow)?;
+    let policy = codingbuddy_policy::PolicyEngine::from_app_config(&config.policy);
+    policy
+        .ensure_allowed(&codingbuddy_core::ToolCall {
+            name: "patch.apply".into(),
+            args: serde_json::json!({"paths": target_files}),
+            requires_approval: true,
+        })
+        .map_err(map_anyhow)?;
+    let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(workspace)
+        .map_err(|error| map_anyhow(error.into()))?;
     let store = PatchStore::new(workspace).map_err(map_anyhow)?;
     let staged = store.stage(diff, &[]).map_err(map_anyhow)?;
     let strategy = match apply_strategy {
@@ -205,7 +216,9 @@ pub fn apply_unified_diff(
         ApplyStrategy::ThreeWay => GitApplyStrategy::ThreeWay,
     };
     let (applied, conflicts) = store
-        .apply_with_strategy(workspace, staged.patch_id, strategy)
+        .apply_with_check(workspace, staged.patch_id, strategy, |path| {
+            policy.check_patch_target(&files, path)
+        })
         .map_err(map_anyhow)?;
 
     if !applied {

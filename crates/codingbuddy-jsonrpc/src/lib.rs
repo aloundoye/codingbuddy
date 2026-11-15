@@ -1157,14 +1157,31 @@ impl IdeRpcHandler {
             args: serde_json::json!({"patch_id": patch_id}),
             requires_approval: true,
         };
-        anyhow::ensure!(
-            !policy.denies_tool(&call),
-            "patch application denied by policy"
-        );
+        let record_denial = |error: anyhow::Error| -> Result<()> {
+            self.store.append_event(&codingbuddy_store::NewEvent::new(
+                session_id,
+                EventKind::ToolDenied {
+                    invocation_id: Uuid::now_v7(),
+                    tool_name: call.name.clone(),
+                    reason: error.to_string(),
+                },
+            ))?;
+            Err(error)
+        };
+        policy.ensure_allowed(&call).or_else(record_denial)?;
 
         let patches = codingbuddy_diff::PatchStore::new(&workspace)?;
-        if patches.read_patch(patch_id)?.applied {
+        let patch = patches.read_patch(patch_id)?;
+        if patch.applied {
             return Ok(serde_json::json!({"patch_id": patch_id, "applied": true, "conflicts": []}));
+        }
+        let check_target = |path: &Path| {
+            policy
+                .check_patch_target(&files, path)
+                .or_else(record_denial)
+        };
+        for path in codingbuddy_diff::checked_patch_paths(&workspace, &patch.unified_diff)? {
+            check_target(Path::new(&path))?;
         }
 
         let checkpoint =
@@ -1178,21 +1195,7 @@ impl IdeRpcHandler {
                 snapshot_path: checkpoint.snapshot_path,
             },
         ))?;
-        let (applied, conflicts) = codingbuddy_diff::PatchStore::new(&workspace)?.apply_checked(
-            &workspace,
-            patch_id,
-            |path| {
-                let resolved = files.resolve(path, true)?;
-                policy.check_path_name(&resolved)?;
-                let call = codingbuddy_core::ToolCall {
-                    name: "fs.edit".to_string(),
-                    args: serde_json::json!({"path": resolved}),
-                    requires_approval: true,
-                };
-                anyhow::ensure!(!policy.denies_tool(&call), "patch target denied by policy");
-                Ok(())
-            },
-        )?;
+        let (applied, conflicts) = patches.apply_checked(&workspace, patch_id, check_target)?;
         self.store.append_event(&codingbuddy_store::NewEvent::new(
             session_id,
             EventKind::PatchApplied {

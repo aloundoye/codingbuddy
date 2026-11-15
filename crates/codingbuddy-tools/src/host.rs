@@ -1,6 +1,7 @@
 use super::utils::*;
 use super::*;
-use codingbuddy_core::workspace_fs::WorkspaceFs;
+use crate::sandbox::ShellLaunch;
+use codingbuddy_core::{ToolPermission, workspace_fs::WorkspaceFs};
 
 /// Device and proc paths that could hang or produce infinite/dangerous output.
 const BLOCKED_DEVICE_PREFIXES: &[&str] = &[
@@ -108,7 +109,7 @@ pub struct LocalToolHost {
     policy: PolicyEngine,
     trusted_workspace: bool,
     sandbox_mode: String,
-    sandbox_wrapper: Option<String>,
+    shell_launches: std::sync::Mutex<std::collections::HashMap<Uuid, (ToolCall, ShellLaunch)>>,
     sandbox: codingbuddy_core::SandboxConfig,
     patches: PatchStore,
     index: IndexService,
@@ -154,12 +155,6 @@ impl LocalToolHost {
         let managed_hooks_only = codingbuddy_policy::load_managed_settings()
             .is_some_and(|settings| settings.allow_managed_hooks_only);
         let sandbox_mode = policy.sandbox_mode().to_ascii_lowercase();
-        let sandbox_wrapper = cfg
-            .policy
-            .sandbox_wrapper
-            .as_ref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
         let lint_after_edit = cfg
             .policy
             .lint_after_edit
@@ -175,7 +170,7 @@ impl LocalToolHost {
             policy,
             trusted_workspace,
             sandbox_mode,
-            sandbox_wrapper,
+            shell_launches: Default::default(),
             sandbox: cfg.policy.sandbox.clone(),
             runner,
             plugins: trusted_workspace
@@ -250,23 +245,15 @@ impl LocalToolHost {
     }
 
     fn check_resolved_rule(&self, call: &ToolCall, key: &str, resolved: &Path) -> Result<()> {
-        if self.policy.permission_mode() == codingbuddy_policy::PermissionMode::BypassPermissions {
-            return Ok(());
-        }
+        self.policy.ensure_allowed(call)?;
         let mut target = call.clone();
         if let Some(args) = target.args.as_object_mut() {
             args.insert(key.to_owned(), json!(normalize_rel_path(resolved)));
         }
-        let rules = self.policy.permission_rules();
-        let denied = [call, &target].into_iter().any(|candidate| {
-            codingbuddy_policy::evaluate_permission_rules(rules, candidate).as_deref()
-                == Some("deny")
-        });
-        anyhow::ensure!(!denied, "file target denied by policy");
-        Ok(())
+        self.policy.ensure_allowed(&target)
     }
 
-    fn run_tool(&self, call: &ToolCall) -> Result<serde_json::Value> {
+    fn run_tool(&self, call: &ToolCall, shell: Option<ShellLaunch>) -> Result<serde_json::Value> {
         // Enforce review mode: block all non-read tools
         if self.review_mode && is_review_blocked(&call.name) {
             return Err(anyhow!(
@@ -746,7 +733,7 @@ impl LocalToolHost {
                 let (applied, conflicts) =
                     self.patches
                         .apply_checked(&self.workspace, patch_id, |path| {
-                            self.resolve_path(path, true).map(drop)
+                            self.policy.check_patch_target(&self.files, path)
                         })?;
                 Ok(json!({"patch_id": id, "applied": applied, "conflicts": conflicts}))
             }
@@ -764,7 +751,7 @@ impl LocalToolHost {
                 let (applied, conflicts) =
                     self.patches
                         .apply_checked(&self.workspace, patch.patch_id, |path| {
-                            self.resolve_path(path, true).map(drop)
+                            self.policy.check_patch_target(&self.files, path)
                         })?;
                 let mut result = if applied {
                     json!({
@@ -834,14 +821,22 @@ impl LocalToolHost {
                     ));
                 }
 
-                self.enforce_sandbox_mode(cmd)?;
-                self.policy.check_command(cmd)?;
                 let timeout = call
                     .args
                     .get("timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-                let mut result = self.run_bash_cmd(cmd, timeout)?;
+                let launched = shell
+                    .ok_or_else(|| anyhow!("shell execution requires a prepared launch"))?
+                    .run_with_progress(
+                        Duration::from_secs(timeout),
+                        self.progress_callback
+                            .lock()
+                            .ok()
+                            .and_then(|callback| callback.clone()),
+                    )?;
+                let mut result = json!({"status": launched.status, "stdout": launched.stdout,
+                    "stderr": launched.stderr, "timed_out": launched.timed_out});
 
                 // Annotate result with AST-derived security metadata.
                 if cmd_analysis.has_network_access
@@ -1487,62 +1482,20 @@ impl LocalToolHost {
         }))
     }
 
-    fn run_bash_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
-        if command_guard::is_isolated_sandbox_mode(&self.sandbox_mode)
-            && detect_container_environment().is_none()
-        {
-            return self.run_cmd_in_isolated_sandbox(cmd, timeout_secs);
-        }
-        // Apply OS-level sandbox if enabled
-        let sandboxed_cmd = sandbox_wrap_command(&self.workspace, cmd, &self.sandbox);
-        self.run_cmd(&sandboxed_cmd, timeout_secs)
-    }
-
-    fn run_cmd_in_isolated_sandbox(
-        &self,
-        cmd: &str,
-        timeout_secs: u64,
-    ) -> Result<serde_json::Value> {
-        let workspace =
-            std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
-        if let Some(template) = self.sandbox_wrapper.as_deref() {
-            let wrapped = command_guard::render_wrapper_template(template, &workspace, cmd)?;
-            return self.run_cmd(&wrapped, timeout_secs);
-        }
-        if let Ok(template) = std::env::var("CODINGBUDDY_SANDBOX_WRAPPER")
-            && !template.trim().is_empty()
-        {
-            let wrapped = command_guard::render_wrapper_template(template.trim(), &workspace, cmd)?;
-            return self.run_cmd(&wrapped, timeout_secs);
-        }
-        if let Some(wrapped) = command_guard::auto_isolated_wrapper_command(&workspace, cmd) {
-            return self.run_cmd(&wrapped, timeout_secs);
-        }
-        #[cfg(target_os = "windows")]
-        {
-            // Windows doesn't have a built-in wrapper path today. Fall back to direct
-            // execution with strict logical isolation checks.
-            if command_guard::command_references_outside_workspace(cmd, &workspace) {
-                return Err(anyhow!(
-                    "sandbox_mode={} blocked path outside workspace: {}",
-                    self.sandbox_mode,
-                    cmd
-                ));
-            }
-            if command_guard::command_has_network_egress_intent(cmd) {
-                return Err(anyhow!(
-                    "sandbox_mode={} blocked network command: {}",
-                    self.sandbox_mode,
-                    cmd
-                ));
-            }
-            self.run_cmd(cmd, timeout_secs)
-        }
-        #[cfg(not(target_os = "windows"))]
-        Err(anyhow!(
-            "sandbox_mode={} requires an OS-level wrapper (set policy.sandbox_wrapper or CODINGBUDDY_SANDBOX_WRAPPER) or install bwrap/firejail/sandbox-exec",
-            self.sandbox_mode
-        ))
+    fn shell_launch(&self, call: &ToolCall) -> Result<ShellLaunch> {
+        let expression = call
+            .args
+            .get("cmd")
+            .or_else(|| call.args.get("command"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("shell command missing"))?;
+        self.policy.check_command(expression)?;
+        ShellLaunch::resolve(
+            &self.workspace,
+            expression,
+            &self.sandbox_mode,
+            &self.sandbox,
+        )
     }
 
     fn run_plugin_tool(
@@ -1590,56 +1543,29 @@ impl LocalToolHost {
         }
         Err(anyhow!("unknown plugin tool: {tool_name}"))
     }
-
-    fn enforce_sandbox_mode(&self, cmd: &str) -> Result<()> {
-        match self.sandbox_mode.as_str() {
-            "read-only" | "readonly" => {
-                if command_guard::command_has_mutating_intent(cmd) {
-                    return Err(anyhow!(
-                        "sandbox_mode=read-only blocked mutating command: {}",
-                        cmd
-                    ));
-                }
-                if command_guard::command_has_network_egress_intent(cmd) {
-                    return Err(anyhow!(
-                        "sandbox_mode=read-only blocked network command: {}",
-                        cmd
-                    ));
-                }
-            }
-            "workspace-write" | "workspace_write" => {
-                if command_guard::command_references_outside_workspace(cmd, &self.workspace) {
-                    return Err(anyhow!(
-                        "sandbox_mode=workspace-write blocked path outside workspace: {}",
-                        cmd
-                    ));
-                }
-                if command_guard::command_has_network_egress_intent(cmd) {
-                    return Err(anyhow!(
-                        "sandbox_mode=workspace-write blocked network command: {}",
-                        cmd
-                    ));
-                }
-            }
-            "isolated" | "container" | "os-sandbox" | "os_sandbox" => {
-                // Defer strict containment to the configured OS-level wrapper.
-            }
-            _ => {}
-        }
-        Ok(())
-    }
 }
 
 impl ToolHost for LocalToolHost {
-    fn requires_explicit_approval(&self, call: &ToolCall) -> bool {
-        !self.trusted_workspace
-            && (matches!(call.name.as_str(), "bash.run" | "bash_run")
-                || call.name.starts_with("github.")
-                || call.name.starts_with("github_"))
+    fn permission(&self, call: &ToolCall) -> ToolPermission {
+        self.assess(call).0
+    }
+
+    fn approval_details(&self, invocation: Uuid) -> Option<String> {
+        self.shell_launches
+            .lock()
+            .ok()?
+            .get(&invocation)
+            .map(|(_, plan)| plan.restrictions())
+    }
+
+    fn discard_proposal(&self, invocation: Uuid) {
+        if let Ok(mut launches) = self.shell_launches.lock() {
+            launches.remove(&invocation);
+        }
     }
 
     fn validate(&self, call: &ToolCall) -> Result<()> {
-        anyhow::ensure!(!self.policy.denies_tool(call), "tool denied by policy");
+        self.policy.ensure_allowed(call)?;
         anyhow::ensure!(
             self.trusted_workspace
                 || !(call.name.starts_with("plugin__")
@@ -1656,6 +1582,28 @@ impl ToolHost for LocalToolHost {
             "fs.list" => ("dir", Some("."), false),
             "fs.glob" | "fs.grep" => ("base", Some("."), false),
             "diagnostics.check" if call.args.get("path").is_some() => ("path", None, false),
+            "patch.apply" | "patch.direct" => {
+                let diff = if call.name == "patch.apply" {
+                    let id = call.args["patch_id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("patch_id missing"))?;
+                    self.patches.read_patch(Uuid::parse_str(id)?)?.unified_diff
+                } else {
+                    self.policy.ensure_allowed(&ToolCall {
+                        name: "patch.apply".into(),
+                        ..call.clone()
+                    })?;
+                    call.args["unified_diff"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("unified_diff missing"))?
+                        .to_owned()
+                };
+                for target in codingbuddy_diff::checked_patch_paths(&self.workspace, &diff)? {
+                    self.policy
+                        .check_patch_target(&self.files, Path::new(&target))?;
+                }
+                return Ok(());
+            }
             "multi_edit" => {
                 let files = call
                     .args
@@ -1706,22 +1654,73 @@ impl ToolHost for LocalToolHost {
     }
 
     fn propose(&self, call: ToolCall) -> ToolProposal {
-        ToolProposal {
-            invocation_id: Uuid::now_v7(),
-            approved: !self.requires_explicit_approval(&call)
-                && !self.policy.requires_approval(&call)
-                && !self.resolved_path_requires_approval(&call),
-            call,
+        self.propose_with_permission(call).0
+    }
+
+    fn propose_with_permission(&self, call: ToolCall) -> (ToolProposal, ToolPermission) {
+        let invocation_id = Uuid::now_v7();
+        let (mut permission, launch) = self.assess(&call);
+        if let Some(launch) = launch {
+            match self.shell_launches.lock() {
+                Ok(mut launches) if launches.len() < 256 => {
+                    launches.insert(invocation_id, (call.clone(), launch));
+                }
+                _ => {
+                    permission = ToolPermission::Deny {
+                        source: "shell policy",
+                        reason: "could not reserve a shell launch".into(),
+                        target: None,
+                    }
+                }
+            }
         }
+        let proposal = ToolProposal {
+            invocation_id,
+            approved: permission == ToolPermission::Allow,
+            call,
+        };
+        (proposal, permission)
     }
 
     fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
         let call = approved.call;
-        let (success, output) = match self.validate(&call).and_then(|()| {
+        let shell = self
+            .shell_launches
+            .lock()
+            .ok()
+            .and_then(|mut plans| plans.remove(&approved.invocation_id));
+        let check_plan = |prepared: Option<&(ToolCall, ShellLaunch)>| -> Result<()> {
+            if call.name == "bash.run" {
+                let (original, launch) = prepared
+                    .ok_or_else(|| anyhow!("shell execution requires a prepared launch"))?;
+                anyhow::ensure!(
+                    original.name == call.name
+                        && original.args == call.args
+                        && original.requires_approval == call.requires_approval
+                        && launch == &self.shell_launch(&call)?,
+                    "shell launch changed since approval"
+                );
+            }
+            Ok(())
+        };
+        let validate = || {
+            self.validate(&call)
+                .and_then(|()| check_plan(shell.as_ref()))
+        };
+        let precondition = validate().and_then(|()| {
             self.execute_hooks("pretooluse", Some(&call), None);
-            self.run_tool(&call)
-        }) {
-            Ok(output) => (true, output),
+            validate()
+        });
+        if let Err(error) = precondition {
+            return ToolResult {
+                invocation_id: approved.invocation_id,
+                success: false,
+                output: json!({"error": error.to_string()}),
+            };
+        }
+        let execution = self.run_tool(&call, shell.map(|(_, launch)| launch));
+        let (success, output) = match execution {
+            Ok(output) => (call.name != "bash.run" || output["status"] == 0, output),
             Err(err) => {
                 let message = err.to_string();
                 let payload = json!({"error": message});
@@ -1742,6 +1741,85 @@ impl ToolHost for LocalToolHost {
 }
 
 impl LocalToolHost {
+    fn assess(&self, call: &ToolCall) -> (ToolPermission, Option<ShellLaunch>) {
+        if let Some(deny) = self.policy.denial(call) {
+            return (deny, None);
+        }
+        if let Err(error) = self.validate(call) {
+            return (
+                ToolPermission::Deny {
+                    source: "workspace policy",
+                    reason: error.to_string(),
+                    target: call
+                        .args
+                        .get("path")
+                        .or_else(|| call.args.get("dir"))
+                        .or_else(|| call.args.get("base"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|path| self.resolve_path(Path::new(path), true).ok())
+                        .as_deref()
+                        .map(normalize_rel_path),
+                },
+                None,
+            );
+        }
+        let shell = if call.name == "bash.run" {
+            match self.shell_launch(call) {
+                Ok(launch) => Some(launch),
+                Err(error) => {
+                    return (
+                        ToolPermission::Deny {
+                            source: "shell policy",
+                            reason: error.to_string(),
+                            target: None,
+                        },
+                        None,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        (self.permission_with_launch(call, shell.as_ref()), shell)
+    }
+
+    fn permission_with_launch(
+        &self,
+        call: &ToolCall,
+        shell: Option<&ShellLaunch>,
+    ) -> ToolPermission {
+        if let Some(denial) = self.policy.denial(call) {
+            return denial;
+        }
+        let fresh = shell.is_some_and(|plan| !plan.is_isolated() || !self.trusted_workspace)
+            || !self.trusted_workspace
+                && (call.name.starts_with("github.") || call.name.starts_with("github_"));
+        let policy_ask =
+            self.policy.requires_approval(call) || self.resolved_path_requires_approval(call);
+        if fresh
+            || policy_ask
+                && !shell.is_some_and(|plan| {
+                    plan.is_isolated()
+                        && self.sandbox.auto_allow_bash_if_sandboxed
+                        && self.policy.permits_sandbox_auto_approval(call)
+                })
+        {
+            return ToolPermission::Ask {
+                source: if fresh {
+                    "execution restrictions"
+                } else {
+                    "permission policy"
+                },
+                reason: shell.map_or_else(
+                    || "tool requires approval".into(),
+                    ShellLaunch::restrictions,
+                ),
+                fresh,
+            };
+        }
+        ToolPermission::Allow
+    }
+
     /// Fire "stop" hooks when the agent run completes.
     pub fn fire_stop_hooks(&self) {
         self.execute_hooks("stop", None, None);

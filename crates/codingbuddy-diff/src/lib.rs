@@ -128,7 +128,7 @@ impl PatchStore {
         self.apply_with_check(workspace, patch_id, GitApplyStrategy::ThreeWay, check)
     }
 
-    fn apply_with_check(
+    pub fn apply_with_check(
         &self,
         workspace: &Path,
         patch_id: Uuid,
@@ -289,7 +289,7 @@ fn hash_workspace_state(workspace: &Path, files: &[String]) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn checked_patch_paths(workspace: &Path, diff: &str) -> Result<Vec<String>> {
+pub fn checked_patch_paths(workspace: &Path, diff: &str) -> Result<Vec<String>> {
     let mut command = codingbuddy_core::process_env::git_inspection(workspace);
     command.args(["apply", "--numstat", "-z", "--allow-empty"]);
     let output = git_apply(command, workspace, diff)?;

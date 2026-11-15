@@ -205,6 +205,12 @@ impl PermissionRule {
     pub fn matches(&self, call: &ToolCall) -> Option<&str> {
         let (tool_prefix, specifier) = parse_rule_syntax(&self.rule)?;
 
+        if tool_prefix.eq_ignore_ascii_case("tool") {
+            let specifier = codingbuddy_core::ToolName::from_api_name(&specifier)
+                .map_or(specifier.as_str(), |tool| tool.as_internal());
+            return (specifier == "*" || specifier == call.name).then_some(&self.decision);
+        }
+
         // MCP tool rules: Mcp(server_id) or Mcp(server_id__tool_name)
         if tool_prefix.eq_ignore_ascii_case("mcp") {
             if !call.name.starts_with("mcp__") {
@@ -253,7 +259,14 @@ impl PermissionRule {
         match tool_name {
             "bash.run" => {
                 let cmd = targets.command.as_deref().unwrap_or("");
-                if glob_command_matches(&specifier, cmd) {
+                if glob_command_matches(&specifier, cmd)
+                    || self.decision != "allow"
+                        && split_pipeline_segments(cmd).is_ok_and(|stages| {
+                            stages
+                                .iter()
+                                .any(|stage| glob_command_matches(&specifier, stage))
+                        })
+                {
                     Some(&self.decision)
                 } else {
                     None
@@ -552,6 +565,9 @@ pub struct AuditEntry {
 #[derive(Debug)]
 pub struct PolicyEngine {
     cfg: PolicyConfig,
+    managed_rule_count: usize,
+    builtin_rule_count: usize,
+    configured_denials: Vec<(PermissionRule, codingbuddy_core::process_env::Source)>,
     secret_regexes: Vec<Regex>,
     permission_mode: PermissionMode,
     /// Workspace root for path canonicalization. Absolute paths under this root
@@ -565,6 +581,9 @@ impl Clone for PolicyEngine {
     fn clone(&self) -> Self {
         Self {
             cfg: self.cfg.clone(),
+            managed_rule_count: self.managed_rule_count,
+            builtin_rule_count: self.builtin_rule_count,
+            configured_denials: self.configured_denials.clone(),
             secret_regexes: self.secret_regexes.clone(),
             permission_mode: self.permission_mode,
             workspace_root: self.workspace_root.clone(),
@@ -597,6 +616,7 @@ impl PolicyEngine {
         // Because deny > ask > allow in evaluate_permission_rules, user
         // rules cannot downgrade a default "deny" to "allow".
         let mut merged_rules = default_deny_rules();
+        let builtin_rule_count = merged_rules.len();
         merged_rules.extend(cfg.permission_rules.clone());
         let cfg = PolicyConfig {
             permission_rules: merged_rules,
@@ -604,6 +624,9 @@ impl PolicyEngine {
         };
         Self {
             cfg,
+            managed_rule_count: 0,
+            builtin_rule_count,
+            configured_denials: Vec::new(),
             secret_regexes,
             permission_mode,
             workspace_root: None,
@@ -671,6 +694,19 @@ impl PolicyEngine {
             mapped = apply_team_policy_override(mapped, &team_policy);
         }
         let mut engine = Self::new(mapped);
+        engine.configured_denials = cfg
+            .configured_denials
+            .iter()
+            .map(|(rule, source)| {
+                (
+                    PermissionRule {
+                        rule: rule.clone(),
+                        decision: "deny".into(),
+                    },
+                    *source,
+                )
+            })
+            .collect();
         // Apply managed settings (enterprise overrides).
         if let Some(managed) = load_managed_settings() {
             apply_managed_settings(&mut engine, &managed);
@@ -767,18 +803,129 @@ impl PolicyEngine {
     }
 
     pub fn denies_tool(&self, call: &ToolCall) -> bool {
-        self.permission_mode != PermissionMode::BypassPermissions
-            && ((self.permission_mode == PermissionMode::Locked
-                && self.is_blocked_in_locked_mode(call))
-                || evaluate_permission_rules(&self.cfg.permission_rules, call).as_deref()
-                    == Some("deny"))
+        self.denial(call).is_some()
+    }
+
+    pub fn ensure_allowed(&self, call: &ToolCall) -> anyhow::Result<()> {
+        if let Some(codingbuddy_core::ToolPermission::Deny { reason, .. }) = self.denial(call) {
+            anyhow::bail!("{reason}");
+        }
+        Ok(())
+    }
+
+    pub fn check_patch_target(
+        &self,
+        workspace: &codingbuddy_core::workspace_fs::WorkspaceFs,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        let resolved = workspace.resolve(path, true)?;
+        for candidate in [workspace.relative(path)?, resolved] {
+            self.check_path_name(&candidate)?;
+            let call = ToolCall {
+                name: "fs.edit".into(),
+                args: serde_json::json!({"path": candidate.to_string_lossy().replace('\\', "/")}),
+                requires_approval: true,
+            };
+            self.ensure_allowed(&call)?;
+        }
+        Ok(())
+    }
+
+    pub fn permits_sandbox_auto_approval(&self, call: &ToolCall) -> bool {
+        !matches!(
+            self.permission_mode,
+            PermissionMode::Plan | PermissionMode::Locked | PermissionMode::DontAsk
+        ) && evaluate_permission_rules(&self.cfg.permission_rules, call).as_deref() != Some("ask")
+    }
+
+    pub fn denial(&self, call: &ToolCall) -> Option<codingbuddy_core::ToolPermission> {
+        use codingbuddy_core::ToolPermission;
+        let why = |source, reason| ToolPermission::Deny {
+            source,
+            reason,
+            target: None,
+        };
+        let managed = load_managed_settings();
+        if managed.as_ref().is_some_and(|settings| {
+            settings
+                .permission_rules
+                .iter()
+                .any(|rule| rule.matches(call) == Some("deny"))
+        }) {
+            return Some(why(
+                "managed settings",
+                "tool denied by a managed permission rule".into(),
+            ));
+        }
+        if let Some((_, source)) = self
+            .configured_denials
+            .iter()
+            .find(|(rule, _)| rule.matches(call).is_some())
+        {
+            use codingbuddy_core::process_env::Source;
+            return Some(why(
+                match source {
+                    Source::User => "user settings",
+                    Source::Project => "project settings",
+                    Source::Managed => "managed settings",
+                },
+                "tool denied by an explicit permission rule".into(),
+            ));
+        }
+        if let Some((index, _)) = self
+            .cfg
+            .permission_rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches(call) == Some("deny"))
+        {
+            let source = if index < self.managed_rule_count {
+                "managed settings"
+            } else if index < self.managed_rule_count + self.builtin_rule_count {
+                "built-in policy"
+            } else {
+                "configured permission rules"
+            };
+            return Some(why(
+                source,
+                "tool denied by an explicit permission rule".into(),
+            ));
+        }
+        if self.permission_mode == PermissionMode::Locked && self.is_blocked_in_locked_mode(call) {
+            return Some(why(
+                "permission mode",
+                "locked mode blocks this tool".into(),
+            ));
+        }
+        let mcp_id = call
+            .name
+            .strip_prefix("mcp__")
+            .and_then(|name| name.split_once("__"));
+        let matches_tool = |name: &String| {
+            name == "*"
+                || name == &call.name
+                || codingbuddy_core::ToolName::from_api_name(name)
+                    .is_some_and(|tool| tool.as_internal() == call.name)
+        };
+        if let Some(settings) = managed
+            && (settings.blocked_tools.iter().any(matches_tool)
+                || mcp_id.is_some_and(|(id, _)| !is_mcp_server_allowed(id, &settings))
+                || !settings.allowed_tools.is_empty()
+                    && !settings.allowed_tools.iter().any(matches_tool))
+        {
+            return Some(why(
+                "managed settings",
+                "tool denied by managed policy".into(),
+            ));
+        }
+        None
     }
 
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
-        // BypassPermissions skips ALL checks -- this is intentional and requires
-        // both `--dangerously-skip-permissions` and `--allow-dangerously-skip-permissions`
-        // CLI flags to enable. It must be checked before permission rules so that
-        // default deny rules do not block bypass mode.
+        if self.denies_tool(call) {
+            return true;
+        }
+        // BypassPermissions waives ordinary prompts after binding denies have been checked.
         if self.permission_mode == PermissionMode::BypassPermissions {
             if let Ok(mut log) = self.audit_log.lock() {
                 let len = log.len();
@@ -907,6 +1054,9 @@ impl PolicyEngine {
 
     /// Dry-run evaluator: returns what would happen to a tool call under the current mode.
     pub fn dry_run(&self, call: &ToolCall) -> PermissionDryRunResult {
+        if let Some(codingbuddy_core::ToolPermission::Deny { reason, .. }) = self.denial(call) {
+            return PermissionDryRunResult::Denied(reason);
+        }
         match self.permission_mode {
             PermissionMode::BypassPermissions => PermissionDryRunResult::AutoApproved,
             PermissionMode::Locked => {
@@ -1473,12 +1623,15 @@ pub fn apply_managed_settings(engine: &mut PolicyEngine, managed: &ManagedSettin
     // Apply managed permission rules.
     if managed.allow_managed_permission_rules_only {
         engine.cfg.permission_rules = managed.permission_rules.clone();
+        engine.configured_denials.clear();
+        engine.builtin_rule_count = 0;
     } else {
         // Merge: managed rules take priority (prepended).
         let mut merged = managed.permission_rules.clone();
         merged.append(&mut engine.cfg.permission_rules);
         engine.cfg.permission_rules = merged;
     }
+    engine.managed_rule_count = managed.permission_rules.len();
 }
 
 #[cfg(test)]
@@ -2205,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn bypass_permissions_mode_never_requires_approval() {
+    fn bypass_permissions_waives_prompts_but_keeps_denies() {
         let cfg = PolicyConfig {
             permission_mode: PermissionMode::BypassPermissions,
             ..PolicyConfig::default()
@@ -2226,13 +2379,13 @@ mod tests {
             args: json!({"path": "test.txt"}),
             requires_approval: false,
         };
-        assert!(!policy.requires_approval(&bash_call));
+        assert!(policy.denies_tool(&bash_call));
         assert!(!policy.requires_approval(&write_call));
         assert!(!policy.requires_approval(&read_call));
-        assert_eq!(
+        assert!(matches!(
             policy.dry_run(&bash_call),
-            PermissionDryRunResult::AutoApproved
-        );
+            PermissionDryRunResult::Denied(_)
+        ));
         assert_eq!(
             policy.dry_run(&write_call),
             PermissionDryRunResult::AutoApproved

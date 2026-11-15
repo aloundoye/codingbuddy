@@ -108,6 +108,18 @@ impl ToolUseLoop<'_> {
     ) -> Result<Vec<ToolCallRecord>> {
         self.check_cancellation()?;
         if tool_bridge::is_agent_level_tool(&llm_call.name) {
+            let metadata = self.runtime_metadata_for_tool(&llm_call.name);
+            let call = tool_bridge::llm_tool_call_to_internal_with_metadata(llm_call, &metadata);
+            if let codingbuddy_core::ToolPermission::Deny { reason, .. } =
+                self.tool_host.permission(&call)
+            {
+                let ToolPreparation::Complete(records) =
+                    self.reject_policy_call(llm_call, Instant::now(), reason)
+                else {
+                    unreachable!()
+                };
+                return Ok(records);
+            }
             return self.handle_agent_level_tool(llm_call);
         }
         let prepared = match self.prepare_tool_call(llm_call, batch_child)? {
@@ -119,7 +131,11 @@ impl ToolUseLoop<'_> {
         {
             let _ = checkpoint("before tool execution", &prepared.modified_paths);
         }
-        self.check_cancellation()?;
+        if let Err(error) = self.check_cancellation() {
+            self.tool_host
+                .discard_proposal(prepared.approved.invocation_id);
+            return Err(error);
+        }
         let result = if prepared.approved.call.name == "batch" {
             self.execute_batch(&prepared.approved)?
         } else {
@@ -200,6 +216,12 @@ impl ToolUseLoop<'_> {
             args_summary: args_summary.clone(),
         });
 
+        if let codingbuddy_core::ToolPermission::Deny { reason, .. } =
+            self.tool_host.permission(&tool_call)
+        {
+            return Ok(self.reject_policy_call(&llm_call, start, reason));
+        }
+
         // Fire PreToolUse hook
         if let Some(ref hooks) = self.hooks {
             let input = HookInput {
@@ -259,23 +281,27 @@ impl ToolUseLoop<'_> {
             }
         }
 
-        if let Err(error) = self.tool_host.validate(&tool_call) {
-            return Ok(self.reject_tool_call(
-                &llm_call,
-                start,
-                "tool precondition failed",
-                &error.to_string(),
-            ));
-        }
         let args_summary = summarize_args(&parsed_args);
         llm_call.arguments = parsed_args.to_string();
 
-        let proposal = self.tool_host.propose(tool_call);
+        let (proposal, permission) = self.tool_host.propose_with_permission(tool_call);
         if let Some(ref cb) = self.event_cb {
             cb(EventKind::ToolProposed {
                 proposal: proposal.clone(),
             });
         }
+        if let codingbuddy_core::ToolPermission::Deny { reason, .. } = permission {
+            return Ok(self.reject_policy_call_with_id(
+                &llm_call,
+                start,
+                proposal.invocation_id,
+                reason,
+            ));
+        }
+        let fresh = matches!(
+            permission,
+            codingbuddy_core::ToolPermission::Ask { fresh: true, .. }
+        );
 
         if !proposal.approved {
             // Check PermissionRequest hooks — can auto-approve matching patterns
@@ -300,14 +326,22 @@ impl ToolUseLoop<'_> {
 
             let approved = if hook_decision == Some(codingbuddy_hooks::PermissionDecision::Deny) {
                 false
-            } else if hook_decision == Some(codingbuddy_hooks::PermissionDecision::Allow)
-                && !self.tool_host.requires_explicit_approval(&proposal.call)
+            } else if hook_decision == Some(codingbuddy_hooks::PermissionDecision::Allow) && !fresh
             {
                 true
             } else if let Some(ref cb) = self.approval_cb {
-                match cb(&proposal.call) {
+                let mut approval_call = proposal.call.clone();
+                if let Some(args) = approval_call.args.as_object_mut() {
+                    args.remove("effective_isolation");
+                    args.insert("fresh_approval".into(), serde_json::Value::Bool(fresh));
+                }
+                if let Some(details) = self.tool_host.approval_details(proposal.invocation_id) {
+                    approval_call.args["effective_isolation"] = serde_json::Value::String(details);
+                }
+                match cb(&approval_call) {
                     Ok(v) => v,
                     Err(e) => {
+                        self.tool_host.discard_proposal(proposal.invocation_id);
                         // Push a Tool message so the conversation chain stays valid
                         // (prevents HTTP 400 "insufficient tool messages" from the API)
                         let err_msg = format!("Approval error: {e}");
@@ -344,6 +378,7 @@ impl ToolUseLoop<'_> {
             };
 
             if !approved {
+                self.tool_host.discard_proposal(proposal.invocation_id);
                 if let Some(ref cb) = self.event_cb {
                     cb(EventKind::ToolDenied {
                         invocation_id: proposal.invocation_id,
@@ -716,6 +751,32 @@ impl ToolUseLoop<'_> {
             codingbuddy_tools::batch_children(args).map_err(|error| error.to_string())?;
         }
         codingbuddy_tools::validate_tool_args_schema(name, args, &self.tools)
+    }
+
+    fn reject_policy_call(
+        &mut self,
+        call: &LlmToolCall,
+        start: Instant,
+        reason: String,
+    ) -> ToolPreparation {
+        self.reject_policy_call_with_id(call, start, uuid::Uuid::now_v7(), reason)
+    }
+
+    fn reject_policy_call_with_id(
+        &mut self,
+        call: &LlmToolCall,
+        start: Instant,
+        invocation_id: uuid::Uuid,
+        reason: String,
+    ) -> ToolPreparation {
+        if let Some(ref callback) = self.event_cb {
+            callback(EventKind::ToolDenied {
+                invocation_id,
+                tool_name: call.name.clone(),
+                reason: reason.clone(),
+            });
+        }
+        self.reject_tool_call(call, start, "denied by policy", &reason)
     }
 
     fn reject_tool_call(
