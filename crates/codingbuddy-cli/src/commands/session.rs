@@ -6,6 +6,22 @@ use uuid::Uuid;
 
 #[derive(Subcommand)]
 pub enum SessionCmd {
+    /// Preview a redacted fork or create it using the preview fingerprint.
+    PortableFork {
+        id: Uuid,
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// Acknowledge an interrupted tool invocation with an unknown result.
+    ResolveInvocation {
+        session_id: Uuid,
+        invocation_id: Uuid,
+        #[arg(long, conflicts_with = "retry")]
+        acknowledge: bool,
+        /// Execute the recorded tool again under current permissions.
+        #[arg(long)]
+        retry: bool,
+    },
     /// List all sessions
     List,
     /// Show details of a specific session
@@ -25,10 +41,84 @@ pub enum SessionCmd {
     },
 }
 
+pub(crate) fn portable_history(
+    workspace: &Path,
+    store: &Store,
+    id: Uuid,
+) -> Result<Vec<codingbuddy_core::ChatMessage>> {
+    use codingbuddy_core::ChatMessage;
+    let config = codingbuddy_core::AppConfig::load(workspace)?;
+    let privacy = codingbuddy_policy::privacy::PrivacyRouter::from_settings(&config.privacy)?;
+    let history = store
+        .rebuild_from_events(id)?
+        .chat_messages
+        .into_iter()
+        .filter_map(|message| match message {
+            ChatMessage::User { content } => Some(ChatMessage::User {
+                content: privacy.redact(&content),
+            }),
+            ChatMessage::Assistant {
+                content: Some(content),
+                ..
+            } => Some(ChatMessage::Assistant {
+                content: Some(privacy.redact(&content)),
+                native_parts: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    Ok(history)
+}
+
 pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Result<()> {
     let store = Store::new(workspace)?;
 
     match command {
+        SessionCmd::ResolveInvocation {
+            session_id,
+            invocation_id,
+            acknowledge,
+            retry,
+        } => {
+            if retry {
+                let (id, result) = codingbuddy_agent::AgentEngine::new(workspace)?
+                    .retry_interrupted_tool(session_id, invocation_id)?;
+                println!("Retry invocation {id}. Success: {}", result.success);
+                return Ok(());
+            }
+            anyhow::ensure!(
+                acknowledge,
+                "Pass --acknowledge after checking for possible side effects"
+            );
+            store.resolve_invocation(session_id, invocation_id)?;
+            println!("Invocation {invocation_id} settled with an unknown result.");
+        }
+        SessionCmd::PortableFork { id, confirm } => {
+            use sha2::{Digest, Sha256};
+            anyhow::ensure!(store.load_session(id)?.is_some(), "session is unavailable");
+            let _lease = store.session_lease(id)?;
+            let history = portable_history(workspace, &store, id)?;
+            let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&history)?));
+            if let Some(confirm) = confirm {
+                anyhow::ensure!(
+                    confirm == fingerprint,
+                    "History changed. Preview the fork again."
+                );
+                println!(
+                    "{}",
+                    store.fork_session_with_messages(id, &history)?.session_id
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "source_session":id,"fingerprint":fingerprint,"history":history
+                    }))?
+                );
+            }
+        }
         SessionCmd::List => {
             let sessions = store.list_sessions()?;
             if sessions.is_empty() {
@@ -57,6 +147,9 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                 Some(s) => {
                     println!("Session ID: {}", s.session_id);
                     println!("Status: {:?}", s.status);
+                    if store.rebuild_from_events(s.session_id)?.legacy_tool_history {
+                        println!("Legacy tool history may lack provider continuation data.");
+                    }
                     println!("Workspace: {}", s.workspace_root);
                     if let Some(c) = s.baseline_commit {
                         println!("Baseline Commit: {}", c);

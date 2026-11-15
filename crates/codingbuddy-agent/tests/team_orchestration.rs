@@ -58,6 +58,7 @@ fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
             reasoning_content: String::new(),
             tool_calls: Vec::<LlmToolCall>::new(),
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         },
         // Tool-use loop: model responds with text (no tool calls) → loop exits
@@ -67,6 +68,7 @@ fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
             reasoning_content: String::new(),
             tool_calls: Vec::<LlmToolCall>::new(),
             usage: None,
+            transport_parts: Vec::new(),
             compatibility: None,
         },
     ]));

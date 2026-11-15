@@ -61,7 +61,10 @@ pub(crate) fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
                     "HTTP runtime state must use its workspace path"
                 );
             }
-            let handler = codingbuddy_jsonrpc::IdeRpcHandler::new(&workspace)?;
+            let mut handler = codingbuddy_jsonrpc::IdeRpcHandler::new(&workspace)?;
+            if let Some(id) = args.expose_session {
+                handler.expose_session(id)?;
+            }
             run_http_server(bind, &handler, args.web, json_mode)
         }
         other => Err(anyhow!(

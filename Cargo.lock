@@ -750,9 +750,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "codingbuddy-core",
+ "codingbuddy-store",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "uuid",
 ]
 
@@ -814,9 +816,11 @@ dependencies = [
  "codingbuddy-core",
  "keyring",
  "reqwest 0.13.5",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

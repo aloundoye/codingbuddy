@@ -381,6 +381,17 @@ impl HookRuntime {
         runtime
     }
 
+    pub fn has_handlers(&self, event: HookEvent) -> bool {
+        self.config
+            .events
+            .get(event.as_str())
+            .is_some_and(|definitions| {
+                definitions
+                    .iter()
+                    .any(|definition| !definition.disabled && !definition.hooks.is_empty())
+            })
+    }
+
     /// Fire hooks for an event with the given input context.
     pub fn fire(&self, event: HookEvent, input: &HookInput) -> HookResult {
         let event_key = event.as_str();

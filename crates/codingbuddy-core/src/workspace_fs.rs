@@ -124,6 +124,10 @@ impl WorkspaceFs {
         self.file(resolved, false, false)
     }
 
+    pub fn open_lock_file(&self, path: &Path) -> io::Result<File> {
+        self.file(path, true, true)
+    }
+
     pub fn read(&self, resolved: &Path) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.open_file(resolved)?.read_to_end(&mut bytes)?;

@@ -93,6 +93,7 @@ pub fn scripted_text_response(text: &str) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
@@ -109,6 +110,7 @@ pub fn scripted_tool_response(calls: Vec<LlmToolCall>) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }

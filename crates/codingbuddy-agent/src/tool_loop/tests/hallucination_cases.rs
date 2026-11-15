@@ -102,6 +102,7 @@ fn all_turns_use_auto_tool_choice() {
             name: "fs_read".to_string(),
             arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
         }],
+        native_parts: None,
         reasoning_content: None,
     });
     loop_.messages.push(ChatMessage::Tool {

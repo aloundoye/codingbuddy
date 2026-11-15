@@ -10,7 +10,7 @@
 //! - Tool calls are `functionCall` parts, results are `functionResponse` parts
 
 use anyhow::Result;
-use codingbuddy_core::{ChatMessage, ChatRequest, LlmResponse, LlmToolCall, TokenUsage};
+use codingbuddy_core::{ChatMessage, ChatRequest, LlmResponse, TokenUsage};
 use serde_json::{Value, json};
 
 /// Build the Gemini API endpoint URL.
@@ -56,8 +56,16 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                native_parts,
                 ..
             } => {
+                if let Some(native) = native_parts
+                    .as_ref()
+                    .filter(|native| native.protocol == crate::native_parts::GEMINI)
+                {
+                    contents.push(json!({"role":"model","parts":native.blocks}));
+                    continue;
+                }
                 let mut parts: Vec<Value> = Vec::new();
                 if let Some(text) = content
                     && !text.is_empty()
@@ -69,8 +77,8 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
                     let mut part = json!({
                         "functionCall": { "name": tc.name, "args": args }
                     });
-                    if let Some(signature) = gemini_signature(&tc.id) {
-                        part["thoughtSignature"] = json!(signature);
+                    if !tc.id.starts_with("codingbuddy-gemini-local:") {
+                        part["functionCall"]["id"] = json!(tc.id);
                     }
                     parts.push(part);
                 }
@@ -83,7 +91,7 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
                 }));
             }
             ChatMessage::Tool {
-                tool_call_id: _,
+                tool_call_id,
                 content,
                 tool_name,
             } => {
@@ -92,12 +100,15 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
                 let response_val: Value =
                     serde_json::from_str(content).unwrap_or_else(|_| json!({ "result": content }));
                 let tool_name = tool_name.as_deref().unwrap_or("tool_response");
-                let part = json!({
+                let mut part = json!({
                     "functionResponse": {
                         "name": tool_name,
                         "response": response_val
                     }
                 });
+                if !tool_call_id.starts_with("codingbuddy-gemini-local:") {
+                    part["functionResponse"]["id"] = json!(tool_call_id);
+                }
                 // Append to previous user message if it has functionResponse parts
                 if let Some(last) = contents.last_mut()
                     && last.get("role").and_then(|v| v.as_str()) == Some("user")
@@ -161,61 +172,40 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
     Ok(payload)
 }
 
-// Carry the opaque signature with the tool-call identity through the common
-// tool loop. Only this adapter interprets it.
 fn gemini_call_id(index: usize, part: &Value) -> String {
-    match part.get("thoughtSignature").and_then(Value::as_str) {
-        Some(signature) => format!("gemini:{index}:{signature}"),
-        None => format!("call_{index}"),
-    }
-}
-
-fn gemini_signature(id: &str) -> Option<&str> {
-    id.strip_prefix("gemini:")?
-        .split_once(':')
-        .map(|(_, signature)| signature)
+    part.pointer("/functionCall/id")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || format!("codingbuddy-gemini-local:{index}"),
+            str::to_owned,
+        )
 }
 
 /// Parse a non-streaming Gemini GenerateContent response.
 pub fn parse_response(body: &str) -> Result<LlmResponse> {
     let v: Value = serde_json::from_str(body)?;
+    anyhow::ensure!(v["error"].is_null(), "Provider sent a completion error");
 
     let candidate = v
         .get("candidates")
         .and_then(|c| c.as_array())
         .and_then(|arr| arr.first());
 
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-
-    if let Some(candidate) = candidate
-        && let Some(parts) = candidate
-            .get("content")
-            .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array())
-    {
-        for (i, part) in parts.iter().enumerate() {
-            if part.get("thought") != Some(&Value::Bool(true))
-                && let Some(t) = part.get("text").and_then(|t| t.as_str())
-            {
-                text.push_str(t);
-            }
-            if let Some(fc) = part.get("functionCall") {
-                let name = fc
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args = fc.get("args").cloned().unwrap_or_default();
-                tool_calls.push(LlmToolCall {
-                    id: gemini_call_id(i, part),
-                    name,
-                    arguments: serde_json::to_string(&args).unwrap_or_default(),
-                });
-            }
-        }
-    }
-
+    let (transport_parts, tool_calls) = crate::native_parts::native_response(
+        crate::native_parts::GEMINI,
+        candidate
+            .and_then(|c| c.pointer("/content/parts"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    )?;
+    let text: String = transport_parts
+        .iter()
+        .filter_map(|part| match part {
+            codingbuddy_core::TransportPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
     let finish_reason = match candidate
         .and_then(|c| c.get("finishReason"))
         .and_then(Value::as_str)
@@ -233,6 +223,7 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
         reasoning_content: String::new(),
         tool_calls,
         usage: Some(usage),
+        transport_parts,
         compatibility: None,
     })
 }
@@ -269,7 +260,9 @@ pub fn parse_streaming_chunk(data: &Value) -> StreamEvent {
 
     let mut events = Vec::new();
     for (i, part) in parts.iter().enumerate() {
-        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+        if part["thought"] != true
+            && let Some(t) = part.get("text").and_then(|t| t.as_str())
+        {
             events.push(StreamEvent::TextDelta(t.to_string()));
         }
         if let Some(fc) = part.get("functionCall") {

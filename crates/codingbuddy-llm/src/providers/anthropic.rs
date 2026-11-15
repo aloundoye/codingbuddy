@@ -9,7 +9,7 @@
 //! - Streaming uses `content_block_start`, `content_block_delta`, `message_delta` events
 
 use anyhow::Result;
-use codingbuddy_core::{ChatMessage, ChatRequest, LlmResponse, LlmToolCall, TokenUsage};
+use codingbuddy_core::{ChatMessage, ChatRequest, LlmResponse, TokenUsage};
 use serde_json::{Value, json};
 
 /// Anthropic API version header value.
@@ -36,8 +36,16 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                native_parts,
                 ..
             } => {
+                if let Some(native) = native_parts
+                    .as_ref()
+                    .filter(|native| native.protocol == crate::native_parts::ANTHROPIC)
+                {
+                    messages.push(json!({"role":"assistant","content":native.blocks}));
+                    continue;
+                }
                 let mut blocks: Vec<Value> = Vec::new();
                 if let Some(text) = content
                     && !text.is_empty()
@@ -146,10 +154,13 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
 /// Parse a non-streaming Anthropic Messages API response.
 pub fn parse_response(body: &str) -> Result<LlmResponse> {
     let v: Value = serde_json::from_str(body)?;
+    anyhow::ensure!(
+        v["type"] != "error" && v["error"].is_null(),
+        "Provider sent a completion error"
+    );
 
     let mut text = String::new();
     let mut reasoning = String::new();
-    let mut tool_calls = Vec::new();
 
     if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
         for block in content {
@@ -164,33 +175,26 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
                         reasoning.push_str(t);
                     }
                 }
-                Some("tool_use") => {
-                    let id = block
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("call_0")
-                        .to_string();
-                    let name = block
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let input = block.get("input").cloned().unwrap_or_default();
-                    tool_calls.push(LlmToolCall {
-                        id,
-                        name,
-                        arguments: serde_json::to_string(&input).unwrap_or_default(),
-                    });
-                }
                 _ => {}
             }
         }
     }
 
-    let stop_reason = v
-        .get("stop_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("end_turn");
+    let (transport_parts, tool_calls) = crate::native_parts::native_response(
+        crate::native_parts::ANTHROPIC,
+        v.get("content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    )?;
+    let stop_reason =
+        v.get("stop_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or(if tool_calls.is_empty() {
+                "end_turn"
+            } else {
+                "incomplete"
+            });
     let finish_reason = match stop_reason {
         "tool_use" => "tool_calls",
         "end_turn" | "stop_sequence" => "stop",
@@ -206,6 +210,7 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
         reasoning_content: reasoning,
         tool_calls,
         usage: Some(usage),
+        transport_parts,
         compatibility: None,
     })
 }
@@ -402,11 +407,12 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
-                tool_calls: vec![LlmToolCall {
+                tool_calls: vec![codingbuddy_core::LlmToolCall {
                     id: "call_1".to_string(),
                     name: "fs_read".to_string(),
                     arguments: r#"{"path":"src/main.rs"}"#.to_string(),
                 }],
+                native_parts: None,
                 reasoning_content: None,
             },
             ChatMessage::Tool {

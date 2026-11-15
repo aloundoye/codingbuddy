@@ -69,6 +69,7 @@ fn tool_call_response(calls: Vec<(&str, &str, &str)>) -> LlmResponse {
             completion_tokens: 40,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
@@ -84,6 +85,7 @@ fn text_response(text: &str) -> LlmResponse {
             completion_tokens: 20,
             ..Default::default()
         }),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }

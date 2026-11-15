@@ -132,13 +132,14 @@ impl ShellLaunch {
 
     #[cfg(test)]
     fn run(self, timeout: Duration) -> Result<ShellRunResult> {
-        self.run_with_progress(timeout, None)
+        self.run_with_progress(timeout, None, None)
     }
 
     pub(super) fn run_with_progress(
         self,
         timeout: Duration,
         on_progress: Option<crate::shell::ProgressCallback>,
+        cancellation: Option<&codingbuddy_core::CancellationToken>,
     ) -> Result<ShellRunResult> {
         #[cfg(target_os = "macos")]
         let temp = self.is_isolated().then(tempfile::tempdir).transpose()?;
@@ -180,6 +181,7 @@ impl ShellLaunch {
             command,
             &self.workspace,
             timeout,
+            cancellation,
             #[cfg(unix)]
             if self.is_isolated() {
                 None

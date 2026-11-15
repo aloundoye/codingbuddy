@@ -74,6 +74,15 @@ use safety::{
     FINISH_REASON_DOOM_LOOP, MAX_RECENT_ERRORS, STUCK_DETECTION_GUIDANCE,
 };
 
+fn native_transport_part(
+    part: &codingbuddy_core::TransportPart,
+) -> Option<codingbuddy_core::NativeParts> {
+    match part {
+        codingbuddy_core::TransportPart::Native(native) => Some(native.clone()),
+        _ => None,
+    }
+}
+
 /// Maximum retries when response is truncated (finish_reason == "length").
 const MAX_TRUNCATION_RETRIES: u8 = 3;
 
@@ -147,6 +156,9 @@ pub struct ToolUseLoop<'a> {
     user_question_cb: Option<UserQuestionCallback>,
     hooks: Option<HookRuntime>,
     event_cb: Option<EventCallback>,
+    pub(crate) durable_session: Option<(Store, Uuid)>,
+    pub(crate) durable_prompt: Option<Uuid>,
+    durable_invocation: Option<(Uuid, bool)>,
     checkpoint_cb: Option<CheckpointCallback>,
     /// Evidence-driven escalation signals from tool outputs.
     /// When the model hits compile errors, test failures, or patch rejections,
@@ -260,6 +272,9 @@ impl<'a> ToolUseLoop<'a> {
             user_question_cb: None,
             hooks: None,
             event_cb: None,
+            durable_session: None,
+            durable_prompt: None,
+            durable_invocation: None,
             checkpoint_cb: None,
             escalation: codingbuddy_core::complexity::EscalationSignals::default(),
             recent_errors: VecDeque::new(),
@@ -1036,6 +1051,30 @@ impl<'a> ToolUseLoop<'a> {
                             total_usage.prompt_tokens += u.prompt_tokens;
                             total_usage.completion_tokens += u.completion_tokens;
                         }
+                        if let Some((store, session)) = &self.durable_session {
+                            let text_parts = resp
+                                .transport_parts
+                                .iter()
+                                .filter(|part| {
+                                    !matches!(part, codingbuddy_core::TransportPart::Call(_))
+                                })
+                                .filter(|part| {
+                                    resp.tool_calls.is_empty()
+                                        || !matches!(
+                                            part,
+                                            codingbuddy_core::TransportPart::Native(_)
+                                        )
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            store.model_step(
+                                *session,
+                                self.durable_prompt,
+                                Some(resp.text.clone()),
+                                &[],
+                                &text_parts,
+                            )?;
+                        }
                         resp.text
                     }
                     Err(e) => format!("(Summary generation failed: {e})"),
@@ -1198,6 +1237,7 @@ impl<'a> ToolUseLoop<'a> {
                 }
                 self.messages.push(ChatMessage::Assistant {
                     content: Some(response.text.clone()),
+                    native_parts: None,
                     reasoning_content: None,
                     tool_calls: vec![],
                 });
@@ -1209,6 +1249,9 @@ impl<'a> ToolUseLoop<'a> {
 
             // Output token recovery: when the model hits max_output_tokens,
             // ask it to be more concise and retry (up to 3 attempts).
+            if self.durable_session.is_some() && response.finish_reason == "length" {
+                anyhow::bail!("Provider response was truncated before completion");
+            }
             if response.finish_reason == "length" && truncation_retries < MAX_TRUNCATION_RETRIES {
                 truncation_retries += 1;
                 self.messages.push(ChatMessage::System {
@@ -1223,6 +1266,7 @@ impl<'a> ToolUseLoop<'a> {
                 if !response.text.is_empty() {
                     self.messages.push(ChatMessage::Assistant {
                         content: Some(response.text.clone()),
+                        native_parts: None,
                         reasoning_content: None,
                         tool_calls: vec![],
                     });
@@ -1272,6 +1316,7 @@ impl<'a> ToolUseLoop<'a> {
                     }
                     self.messages.push(ChatMessage::Assistant {
                         content: Some(text),
+                        native_parts: None,
                         reasoning_content: None,
                         tool_calls: vec![],
                     });
@@ -1300,6 +1345,7 @@ impl<'a> ToolUseLoop<'a> {
                         verbosity_nudge_count += 1;
                         self.messages.push(ChatMessage::Assistant {
                             content: Some(text),
+                            native_parts: None,
                             reasoning_content: None,
                             tool_calls: vec![],
                         });
@@ -1313,9 +1359,23 @@ impl<'a> ToolUseLoop<'a> {
                     }
                 }
 
+                if let Some((store, session)) = &self.durable_session {
+                    store.model_step(
+                        *session,
+                        self.durable_prompt,
+                        Some(text.clone()),
+                        &[],
+                        &response.transport_parts,
+                    )?;
+                }
+
                 // Append assistant message to history
                 self.messages.push(ChatMessage::Assistant {
                     content: Some(text.clone()),
+                    native_parts: response
+                        .transport_parts
+                        .iter()
+                        .find_map(native_transport_part),
                     reasoning_content: if response.reasoning_content.is_empty() {
                         None
                     } else {
@@ -1364,6 +1424,10 @@ impl<'a> ToolUseLoop<'a> {
                 } else {
                     Some(response.text.clone())
                 },
+                native_parts: response
+                    .transport_parts
+                    .iter()
+                    .find_map(native_transport_part),
                 reasoning_content: if response.reasoning_content.is_empty() {
                     None
                 } else {
@@ -1373,7 +1437,56 @@ impl<'a> ToolUseLoop<'a> {
             });
 
             let was_escalated_before_batch = self.escalation.should_escalate();
-            let records = self.execute_tool_calls(&response.tool_calls)?;
+            let records = if let Some((store, session)) = self.durable_session.clone() {
+                let ids = store.model_step(
+                    session,
+                    self.durable_prompt,
+                    (!response.text.is_empty()).then_some(response.text.clone()),
+                    &response.tool_calls,
+                    &response.transport_parts,
+                )?;
+                let mut records = Vec::new();
+                for (call, id) in response.tool_calls.iter().zip(ids) {
+                    self.check_cancellation()?;
+                    self.durable_invocation = Some((id, false));
+                    let from = self.messages.len();
+                    let outcome = self.execute_tool_calls(std::slice::from_ref(call));
+                    let (_, dispatched) = self
+                        .durable_invocation
+                        .take()
+                        .expect("active durable invocation");
+                    records.extend(outcome?);
+                    let message = self.messages[from..]
+                        .iter()
+                        .rev()
+                        .find(|message| {
+                            matches!(message,
+                        ChatMessage::Tool { tool_call_id, .. } if tool_call_id == &call.id)
+                        })
+                        .cloned();
+                    let message = message.unwrap_or_else(|| {
+                        tool_bridge::tool_error_to_message(
+                            &call.id,
+                            "Tool returned no model-visible result",
+                        )
+                    });
+                    if !self.messages[from..].iter().any(|candidate| {
+                        matches!(candidate,
+                        ChatMessage::Tool { tool_call_id, .. } if tool_call_id == &call.id)
+                    }) {
+                        self.messages.push(message.clone());
+                    }
+                    store.settle_invocation(
+                        session,
+                        id,
+                        message,
+                        if dispatched { "running" } else { "prepared" },
+                    )?;
+                }
+                records
+            } else {
+                self.execute_tool_calls(&response.tool_calls)?
+            };
             let batch_had_success = records.iter().any(|record| record.success);
             let batch_had_failure = records.iter().any(|record| !record.success);
             tool_calls_made.extend(records);

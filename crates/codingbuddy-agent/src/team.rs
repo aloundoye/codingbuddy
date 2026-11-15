@@ -33,7 +33,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     if !is_git_workspace(&engine.workspace) {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return engine.chat_with_options(prompt, fallback);
+        return engine.run_tool_use_loop(prompt, &fallback);
     }
 
     let max_lanes = engine.cfg.agent_loop.team.max_lanes.max(1) as usize;
@@ -43,7 +43,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         // Single lane: fall back to standard routing (tool-use loop or pipeline).
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return engine.chat_with_options(prompt, fallback);
+        return engine.run_tool_use_loop(prompt, &fallback);
     }
     lanes.truncate(max_lanes);
     lanes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -68,6 +68,10 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             let lanes_root = lanes_root.clone();
             let prompt = prompt.to_string();
             let mut lane_options = options.clone();
+            lane_options.session_id = None;
+            lane_options.session_lease = None;
+            lane_options.prompt_id = None;
+            lane_options.chat_history.clear();
             lane_options.mode = ChatMode::Code;
             lane_options.disable_team_orchestration = true;
 
@@ -116,6 +120,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             &lane.patch,
             engine.cfg.agent_loop.apply_strategy.clone(),
             &engine.policy,
+            options.session_id,
         )?;
         if !applied {
             let conflict_text = if conflicts.is_empty() {
@@ -130,7 +135,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                 "Lane merge conflict while applying {} ({})\n\nConflict details:\n{}\n\nOriginal request:\n{}\n\nResolve with a single unified patch and re-verify.",
                 lane.lane.id, lane.lane.name, conflict_text, prompt
             );
-            return engine.chat_with_options(&recovery_prompt, recovery_options);
+            return engine.run_tool_use_loop(&recovery_prompt, &recovery_options);
         }
     }
 
@@ -150,7 +155,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             "Global verify failed after deterministic lane merge.\n\nVerify summary:\n{}\n\nOriginal request:\n{}\n\nProduce a corrective unified diff and pass verification.",
             verify.summary, prompt
         );
-        return engine.chat_with_options(&recovery_prompt, recovery_options);
+        return engine.run_tool_use_loop(&recovery_prompt, &recovery_options);
     }
 
     let non_empty = results
@@ -168,8 +173,10 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         }
         response = response.trim_end().to_string();
     }
-    engine.stream(StreamChunk::ContentDelta(response.clone()));
-    engine.stream(StreamChunk::Done { reason: None });
+    if let Some(callback) = engine.prompt_stream_callback(options.prompt_id) {
+        callback(StreamChunk::ContentDelta(response.clone()));
+        callback(StreamChunk::Done { reason: None });
+    }
     Ok(response)
 }
 
@@ -267,6 +274,7 @@ fn apply_lane_patch(
     patch: &str,
     strategy: ApplyStrategy,
     policy: &codingbuddy_policy::PolicyEngine,
+    session: Option<Uuid>,
 ) -> Result<(bool, Vec<String>)> {
     let store = PatchStore::new(workspace)?;
     let staged = store.stage(patch, &[])?;
@@ -275,9 +283,14 @@ fn apply_lane_patch(
         ApplyStrategy::ThreeWay => GitApplyStrategy::ThreeWay,
     };
     let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(workspace)?;
-    store.apply_with_check(workspace, staged.patch_id, strategy, |path| {
-        policy.check_patch_target(&files, path)
-    })
+    let check = |path: &Path| policy.check_patch_target(&files, path);
+    if let Some(session) = session {
+        let journal = codingbuddy_store::Store::new(workspace)?;
+        let (applied, conflicts, _) =
+            store.apply_for_session(&journal, session, staged.patch_id, check)?;
+        return Ok((applied, conflicts));
+    }
+    store.apply_with_check(workspace, staged.patch_id, strategy, check)
 }
 
 fn emit_spawned(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec) {
@@ -685,6 +698,7 @@ mod tests {
             patch,
             ApplyStrategy::Auto,
             &codingbuddy_policy::PolicyEngine::default(),
+            None,
         )
         .expect("apply lane patch");
         assert!(!applied, "mismatched context should not apply");

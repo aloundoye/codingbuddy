@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
     AppConfig, ChatMessage, EventKind, Session, SessionBudgets, SessionState, StreamChunk,
@@ -174,12 +174,10 @@ pub struct IdeRpcHandler {
     http_workspace: Option<PathBuf>,
     http_sessions: Mutex<HashSet<Uuid>>,
     http_prompts: Mutex<HashSet<Uuid>>,
+    exposed_session: Option<Uuid>,
+    running: Arc<Mutex<HashMap<Uuid, codingbuddy_core::CancellationToken>>>,
     /// Per-session pending tool approvals.
     approvals: Mutex<HashMap<Uuid, PendingToolApproval>>,
-    /// Per-session conversation histories (for prompt/execute streaming).
-    conversations: Mutex<HashMap<Uuid, Vec<ChatMessage>>>,
-    /// Per-prompt queued partial event chunks for stream polling.
-    prompt_streams: Mutex<HashMap<Uuid, Vec<Value>>>,
     /// Whether partial-message streaming should be enabled by default.
     include_partial_messages: bool,
     /// Context manager for intelligent file suggestions.
@@ -205,9 +203,9 @@ impl IdeRpcHandler {
             http_workspace: Some(workspace.canonicalize()?),
             http_sessions: Mutex::new(HashSet::new()),
             http_prompts: Mutex::new(HashSet::new()),
+            exposed_session: None,
+            running: Arc::new(Mutex::new(HashMap::new())),
             approvals: Mutex::new(HashMap::new()),
-            conversations: Mutex::new(HashMap::new()),
-            prompt_streams: Mutex::new(HashMap::new()),
             include_partial_messages: env_flag_enabled("CODINGBUDDY_INCLUDE_PARTIAL_MESSAGES"),
             context_manager: Mutex::new(context_manager),
         })
@@ -219,12 +217,151 @@ impl IdeRpcHandler {
             http_workspace: None,
             http_sessions: Mutex::new(HashSet::new()),
             http_prompts: Mutex::new(HashSet::new()),
+            exposed_session: None,
+            running: Arc::new(Mutex::new(HashMap::new())),
             approvals: Mutex::new(HashMap::new()),
-            conversations: Mutex::new(HashMap::new()),
-            prompt_streams: Mutex::new(HashMap::new()),
             include_partial_messages: env_flag_enabled("CODINGBUDDY_INCLUDE_PARTIAL_MESSAGES"),
             context_manager: Mutex::new(None),
         }
+    }
+
+    pub fn expose_session(&mut self, id: Uuid) -> Result<()> {
+        let session = self
+            .store
+            .load_session(id)?
+            .context("session is unavailable")?;
+        anyhow::ensure!(
+            Some(Path::new(&session.workspace_root).canonicalize()?) == self.http_workspace,
+            "session belongs to another workspace"
+        );
+        self.exposed_session = Some(id);
+        self.http_sessions
+            .lock()
+            .expect("HTTP sessions lock")
+            .insert(id);
+        Ok(())
+    }
+
+    fn run_durable_prompt(&self, params: Value, background: bool) -> Result<Value> {
+        let session_id = require_uuid(&params, "session_id")?;
+        let request = if background {
+            require_uuid(&params, "request_id")?
+        } else {
+            Uuid::now_v7()
+        };
+        anyhow::ensure!(
+            params["prompt"]
+                .as_str()
+                .is_some_and(|prompt| !prompt.trim().is_empty()),
+            "missing prompt"
+        );
+        anyhow::ensure!(
+            self.store.load_session(session_id)?.is_some(),
+            "session is unavailable"
+        );
+        if let Some(id) = self.store.existing_prompt(session_id, request, &params)? {
+            return Ok(serde_json::to_value(self.store.prompt_state(id)?)?);
+        }
+        let lease = match self.store.session_lease(session_id) {
+            Ok(lease) => Arc::new(lease),
+            Err(error) => {
+                if let Some(id) = self.store.existing_prompt(session_id, request, &params)? {
+                    return Ok(serde_json::to_value(self.store.prompt_state(id)?)?);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(id) = self.store.existing_prompt(session_id, request, &params)? {
+            drop(lease);
+            return Ok(serde_json::to_value(self.store.prompt_state(id)?)?);
+        }
+        let id = self
+            .store
+            .start_prompt(&lease, session_id, request, &params)?;
+        let token = codingbuddy_core::CancellationToken::new();
+        self.running
+            .lock()
+            .expect("prompt cancellation lock")
+            .insert(id, token.clone());
+        let run = move |handler: &Self| {
+            let result = handler.execute_prompt(params, id, Arc::clone(&lease), token.clone());
+            let (status, output, error) = match &result {
+                Ok(row) => (
+                    row["status"].as_str().unwrap_or("failed"),
+                    row["output"].as_str(),
+                    row["error"].as_str(),
+                ),
+                Err(_) => ("failed", None, Some("Prompt execution failed")),
+            };
+            let status = if token.is_cancelled() && status != "completed" {
+                "cancelled"
+            } else {
+                status
+            };
+            let finished = handler.store.finish_prompt(id, status, output, error);
+            drop(lease);
+            handler
+                .running
+                .lock()
+                .expect("prompt cancellation lock")
+                .remove(&id);
+            finished?;
+            result
+        };
+        if background {
+            let mut worker = Self::from_store(Arc::clone(&self.store));
+            worker.running = Arc::clone(&self.running);
+            std::thread::spawn(move || {
+                let _ = run(&worker);
+            });
+            return Ok(
+                serde_json::json!({"prompt_id":id,"session_id":session_id,"status":"running"}),
+            );
+        }
+        run(self)
+    }
+
+    fn handle_prompt_events(&self, params: Value) -> Result<Value> {
+        let id = require_uuid(&params, "prompt_id")?;
+        let cursor = params["cursor"].as_i64().unwrap_or(0).max(0);
+        let limit = params["limit"].as_u64().unwrap_or(32).clamp(1, 127) as u32;
+        let state = self.store.prompt_state(id)?;
+        let writer_active = self
+            .running
+            .lock()
+            .expect("prompt cancellation lock")
+            .contains_key(&id);
+        let mut rows = self.store.prompt_events(id, cursor, limit + 1)?;
+        let more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let next = rows.last().map_or(cursor, |(seq, _)| *seq);
+        let events: Vec<_> = rows
+            .into_iter()
+            .map(|(seq, event)| serde_json::json!({"seq":seq,"event":event}))
+            .collect();
+        Ok(
+            serde_json::json!({"prompt_id":id,"status":state.status,"output":state.output,"error":state.error,
+            "events":events,"next_cursor":next,"done":state.status != "running" && !more && !writer_active}),
+        )
+    }
+
+    fn handle_prompt_cancel(&self, params: Value) -> Result<Value> {
+        let id = require_uuid(&params, "prompt_id")?;
+        let state = self.store.prompt_state(id)?;
+        if let Some(token) = self
+            .running
+            .lock()
+            .expect("prompt cancellation lock")
+            .get(&id)
+        {
+            token.cancel();
+            return Ok(serde_json::json!({"prompt_id":id,"status":"cancelling"}));
+        }
+        anyhow::ensure!(
+            state.status != "running",
+            "prompt is running in a different server"
+        );
+        Ok(serde_json::to_value(state)?)
     }
 
     /// Browser transport exposes only the operations used by the bundled client.
@@ -234,8 +371,11 @@ impl IdeRpcHandler {
             .as_ref()
             .ok_or_else(|| anyhow!("HTTP workspace unavailable"))?;
         let allowed: &[&str] = match method {
-            "session/open" => &["workspace_root"],
+            "session/open" => &["workspace_root", "session_id"],
             "prompt/execute" => &["session_id", "prompt", "include_partial_messages"],
+            "prompt/start" => &["session_id", "prompt", "request_id"],
+            "prompt/events" => &["prompt_id", "cursor", "limit"],
+            "prompt/cancel" => &["prompt_id"],
             "prompt/stream_next" => &["prompt_id", "cursor", "max_chunks"],
             _ => return Err(anyhow!("method unavailable over HTTP")),
         };
@@ -261,6 +401,26 @@ impl IdeRpcHandler {
                         "workspace does not match the launch workspace"
                     );
                 }
+                let requested = params["session_id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok());
+                let selected = self.exposed_session.or_else(|| {
+                    requested.filter(|id| {
+                        self.http_sessions
+                            .lock()
+                            .expect("HTTP sessions lock")
+                            .contains(id)
+                    })
+                });
+                if let Some(id) = selected {
+                    let history =
+                        public_chat_history(self.store.rebuild_from_events(id)?.chat_messages);
+                    let latest = self.store.latest_prompt(id)?;
+                    return Ok(serde_json::json!({
+                        "session_id":id,"status":"resumed","workspace_root":workspace,
+                        "history":history,"latest_prompt":latest
+                    }));
+                }
                 let response =
                     self.handle_session_open(serde_json::json!({"workspace_root": workspace}))?;
                 self.http_sessions
@@ -269,7 +429,7 @@ impl IdeRpcHandler {
                     .insert(require_uuid(&response, "session_id")?);
                 Ok(response)
             }
-            "prompt/execute" => {
+            "prompt/execute" | "prompt/start" => {
                 let session_id = require_uuid(&params, "session_id")?;
                 anyhow::ensure!(
                     self.http_sessions
@@ -291,14 +451,35 @@ impl IdeRpcHandler {
                     .get("prompt")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("missing 'prompt' parameter"))?;
-                let result = self.handle_prompt_execute(serde_json::json!({
-                    "session_id": session_id, "prompt": prompt, "include_partial_messages": true
-                }))?;
+                let result =
+                    if method == "prompt/start" {
+                        self.run_durable_prompt(params, true)?
+                    } else {
+                        self.run_durable_prompt(serde_json::json!({
+                        "session_id":session_id,"prompt":prompt,"include_partial_messages":true
+                    }), false)?
+                    };
                 self.http_prompts
                     .lock()
                     .expect("HTTP prompts lock")
                     .insert(require_uuid(&result, "prompt_id")?);
                 Ok(result)
+            }
+            "prompt/events" | "prompt/cancel" => {
+                let id = require_uuid(&params, "prompt_id")?;
+                let session = self.store.prompt_session(id)?;
+                anyhow::ensure!(
+                    self.http_sessions
+                        .lock()
+                        .expect("HTTP sessions lock")
+                        .contains(&session),
+                    "prompt is unavailable"
+                );
+                if method == "prompt/cancel" {
+                    self.handle_prompt_cancel(params)
+                } else {
+                    self.handle_prompt_events(params)
+                }
             }
             _ => {
                 let prompt_id = require_uuid(&params, "prompt_id")?;
@@ -354,16 +535,15 @@ impl IdeRpcHandler {
         let projection = self.store.rebuild_from_events(session_id)?;
         let turn_count = projection.chat_messages.len();
 
-        // Cache the conversation history.
-        self.conversations
-            .lock()
-            .expect("conversations lock")
-            .insert(session_id, projection.chat_messages);
-
+        let history = public_chat_history(projection.chat_messages.clone());
+        let latest = self.store.latest_prompt(session_id)?;
         Ok(serde_json::json!({
             "session_id": session_id.to_string(),
             "status": format!("{:?}", session.status),
             "turn_count": turn_count,
+            "history": history,
+            "latest_prompt": latest,
+            "legacy_tool_history": projection.legacy_tool_history,
             "workspace_root": session.workspace_root,
         }))
     }
@@ -371,17 +551,6 @@ impl IdeRpcHandler {
     fn handle_session_fork(&self, params: Value) -> Result<Value> {
         let from_id = require_uuid(&params, "session_id")?;
         let forked = self.store.fork_session(from_id)?;
-
-        // Copy conversation history to the new session.
-        let conv = self.conversations.lock().expect("conversations lock");
-        if let Some(messages) = conv.get(&from_id) {
-            let cloned = messages.clone();
-            drop(conv);
-            self.conversations
-                .lock()
-                .expect("conversations lock")
-                .insert(forked.session_id, cloned);
-        }
 
         Ok(serde_json::json!({
             "session_id": forked.session_id.to_string(),
@@ -412,7 +581,13 @@ impl IdeRpcHandler {
 
     // -- Prompt methods --
 
-    fn handle_prompt_execute(&self, params: Value) -> Result<Value> {
+    fn execute_prompt(
+        &self,
+        params: Value,
+        prompt_id: Uuid,
+        lease: Arc<codingbuddy_store::SessionLease>,
+        cancellation: codingbuddy_core::CancellationToken,
+    ) -> Result<Value> {
         let session_id = require_uuid(&params, "session_id")?;
         let prompt = params
             .get("prompt")
@@ -426,18 +601,6 @@ impl IdeRpcHandler {
             .load_session(session_id)?
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
 
-        // Store the user message in conversation cache.
-        self.conversations
-            .lock()
-            .expect("conversations lock")
-            .entry(session_id)
-            .or_default()
-            .push(ChatMessage::User {
-                content: prompt.clone(),
-            });
-
-        // Execute the real agent runtime and collect deterministic stream events.
-        let prompt_id = Uuid::now_v7();
         let include_partial = params
             .get("include_partial_messages")
             .and_then(|v| v.as_bool())
@@ -480,7 +643,6 @@ impl IdeRpcHandler {
             })
             .unwrap_or_default();
 
-        let stream_rows: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let workspace_root = PathBuf::from(session.workspace_root.clone());
 
         let (status, output, error_message) =
@@ -495,27 +657,18 @@ impl IdeRpcHandler {
                         },
                     },
                 })?;
-                if let Ok(mut guard) = stream_rows.lock() {
-                    guard.push(stream_chunk_to_event_json(&StreamChunk::ContentDelta(
-                        mock_output.to_string(),
-                    )));
-                    guard.push(stream_chunk_to_event_json(&StreamChunk::Done {
-                        reason: None,
-                    }));
-                }
+                self.store.append_prompt_event(
+                    prompt_id,
+                    &stream_chunk_to_event_json(&StreamChunk::ContentDelta(mock_output.to_owned())),
+                )?;
                 ("completed".to_string(), mock_output.to_string(), None)
             } else {
                 let engine = AgentEngine::new(&workspace_root)?;
-                let stream_rows_cb = Arc::clone(&stream_rows);
-                engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
-                    let row = stream_chunk_to_event_json(&chunk);
-                    if let Ok(mut guard) = stream_rows_cb.lock() {
-                        guard.push(row);
-                    }
-                }));
-
                 let chat_options = ChatOptions {
                     session_id: Some(session_id),
+                    session_lease: Some(lease),
+                    prompt_id: Some(prompt_id),
+                    cancellation: Some(cancellation),
                     tools,
                     force_max_think,
                     additional_dirs,
@@ -528,41 +681,26 @@ impl IdeRpcHandler {
 
                 match engine.chat_with_options(&prompt, chat_options) {
                     Ok(output) => ("completed".to_string(), output, None),
-                    Err(err) => ("failed".to_string(), String::new(), Some(err.to_string())),
+                    Err(err) => (
+                        "failed".to_string(),
+                        String::new(),
+                        Some(format!("{err:#}")),
+                    ),
                 }
             };
 
-        if !output.is_empty() {
-            self.conversations
-                .lock()
-                .expect("conversations lock")
-                .entry(session_id)
-                .or_default()
-                .push(ChatMessage::Assistant {
-                    content: Some(output.clone()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                });
-            if params.get("mock_output").and_then(Value::as_str).is_some() {
-                self.store.append_event(&codingbuddy_store::NewEvent::new(
-                    session_id,
-                    EventKind::ChatTurn {
-                        message: ChatMessage::Assistant {
-                            content: Some(output.clone()),
-                            reasoning_content: None,
-                            tool_calls: vec![],
-                        },
+        if !output.is_empty() && params.get("mock_output").and_then(Value::as_str).is_some() {
+            self.store.append_event(&codingbuddy_store::NewEvent::new(
+                session_id,
+                EventKind::ChatTurn {
+                    message: ChatMessage::Assistant {
+                        content: Some(output.clone()),
+                        native_parts: None,
+                        reasoning_content: None,
+                        tool_calls: vec![],
                     },
-                ))?;
-            }
-        }
-
-        if include_partial {
-            let rows = stream_rows.lock().expect("stream rows lock").clone();
-            self.prompt_streams
-                .lock()
-                .expect("prompt_streams lock")
-                .insert(prompt_id, rows);
+                },
+            ))?;
         }
 
         let stream_meta = if include_partial {
@@ -589,33 +727,25 @@ impl IdeRpcHandler {
 
     fn handle_prompt_stream_next(&self, params: Value) -> Result<Value> {
         let prompt_id = require_uuid(&params, "prompt_id")?;
-        let cursor = params.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let max_chunks = params
-            .get("max_chunks")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(8) as usize;
-        let max_chunks = max_chunks.clamp(1, 128);
-
-        let mut streams = self.prompt_streams.lock().expect("prompt_streams lock");
-        let Some(chunks) = streams.get(&prompt_id) else {
-            return Ok(serde_json::json!({
-                "prompt_id": prompt_id.to_string(),
-                "chunks": [],
-                "next_cursor": cursor,
-                "done": true,
-                "missing": true,
-            }));
+        let cursor = params["cursor"].as_i64().unwrap_or(0).max(0);
+        let limit = params["max_chunks"].as_u64().unwrap_or(8).clamp(1, 128) as u32;
+        let Ok(state) = self.store.prompt_state(prompt_id) else {
+            return Ok(
+                serde_json::json!({"prompt_id":prompt_id,"chunks":[],"next_cursor":cursor,"done":true,"missing":true}),
+            );
         };
-
-        let start = cursor.min(chunks.len());
-        let end = (start + max_chunks).min(chunks.len());
-        let slice = &chunks[start..end];
-        let out_chunks = slice
+        let mut rows = self
+            .store
+            .prompt_events_by_offset(prompt_id, cursor, limit + 1)?;
+        let more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let next = cursor + rows.len() as i64;
+        let out_chunks = rows
             .iter()
             .enumerate()
             .map(|(idx, row)| {
                 let mut chunk = serde_json::json!({
-                    "cursor": start + idx,
+                    "cursor": cursor + idx as i64,
                     "event": row,
                 });
                 if let Some(kind) = row.get("type").and_then(|v| v.as_str()) {
@@ -627,16 +757,11 @@ impl IdeRpcHandler {
                 chunk
             })
             .collect::<Vec<_>>();
-        let done = end >= chunks.len();
-        if done {
-            streams.remove(&prompt_id);
-        }
-
         Ok(serde_json::json!({
             "prompt_id": prompt_id.to_string(),
             "chunks": out_chunks,
-            "next_cursor": end,
-            "done": done,
+            "next_cursor": next,
+            "done": state.status != "running" && !more,
         }))
     }
 
@@ -775,10 +900,6 @@ impl IdeRpcHandler {
                 },
             })?;
         }
-        self.conversations
-            .lock()
-            .expect("conversations lock")
-            .insert(session_id, chat_messages.clone());
 
         Ok(serde_json::json!({
             "session_id": session_id.to_string(),
@@ -1134,6 +1255,7 @@ impl IdeRpcHandler {
         let session_id = require_uuid(&params, "session_id")?;
         let patch_id = require_uuid(&params, "patch_id")?;
 
+        let _lease = self.store.session_lease(session_id)?;
         let projection = self.store.rebuild_from_events(session_id)?;
         anyhow::ensure!(
             projection.staged_patches.contains(&patch_id),
@@ -1172,9 +1294,6 @@ impl IdeRpcHandler {
 
         let patches = codingbuddy_diff::PatchStore::new(&workspace)?;
         let patch = patches.read_patch(patch_id)?;
-        if patch.applied {
-            return Ok(serde_json::json!({"patch_id": patch_id, "applied": true, "conflicts": []}));
-        }
         let check_target = |path: &Path| {
             policy
                 .check_patch_target(&files, path)
@@ -1195,19 +1314,13 @@ impl IdeRpcHandler {
                 snapshot_path: checkpoint.snapshot_path,
             },
         ))?;
-        let (applied, conflicts) = patches.apply_checked(&workspace, patch_id, check_target)?;
-        self.store.append_event(&codingbuddy_store::NewEvent::new(
-            session_id,
-            EventKind::PatchApplied {
-                patch_id,
-                applied,
-                conflicts: conflicts.clone(),
-            },
-        ))?;
+        let (applied, conflicts, recovery_status) =
+            patches.apply_for_session(&self.store, session_id, patch_id, check_target)?;
         Ok(serde_json::json!({
             "patch_id": patch_id,
             "applied": applied,
-            "conflicts": conflicts
+            "conflicts": conflicts,
+            "recovery_status": recovery_status
         }))
     }
 
@@ -1574,43 +1687,26 @@ impl IdeRpcHandler {
         let prompt_id = require_uuid(&params, "prompt_id")?;
         let cursor = params.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-        let streams = self.prompt_streams.lock().expect("prompt_streams lock");
-        let Some(chunks) = streams.get(&prompt_id) else {
-            return Ok(serde_json::json!({
-                "prompt_id": prompt_id.to_string(),
-                "events": [],
-                "next_cursor": cursor,
-                "done": true,
-            }));
+        let Ok(state) = self.store.prompt_state(prompt_id) else {
+            return Ok(
+                serde_json::json!({"prompt_id":prompt_id,"events":[],"next_cursor":cursor,"done":true}),
+            );
         };
-
-        // Filter for tool-related events only
-        let tool_events: Vec<&Value> = chunks
-            .iter()
-            .skip(cursor)
-            .filter(|c| {
-                c.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
-                    matches!(
-                        t,
-                        "tool_call_start" | "tool_call_end" | "tool_progress" | "security_warning"
-                    )
-                })
-            })
-            .collect();
-
-        let next_cursor = chunks.len();
-        let done = chunks
-            .last()
-            .and_then(|c| c.get("type"))
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "done");
-
-        Ok(serde_json::json!({
-            "prompt_id": prompt_id.to_string(),
-            "events": tool_events,
-            "next_cursor": next_cursor,
-            "done": done,
-        }))
+        let mut rows = self
+            .store
+            .prompt_events_by_offset(prompt_id, cursor as i64, 129)?;
+        let more = rows.len() > 128;
+        rows.truncate(128);
+        let next = cursor + rows.len();
+        rows.retain(|row| {
+            matches!(
+                row["type"].as_str(),
+                Some("tool_dispatch" | "tool_settlement")
+            )
+        });
+        Ok(
+            serde_json::json!({"prompt_id":prompt_id,"events":rows,"next_cursor":next,"done":state.status != "running" && !more}),
+        )
     }
 
     /// Register a pending tool approval that the IDE can approve/deny.
@@ -1637,7 +1733,7 @@ impl RpcHandler for IdeRpcHandler {
                     "session/open", "session/resume", "session/fork", "session/list", "session/timeline",
                     "session/remote_resume", "session/handoff_export", "session/handoff_import",
                     "session/handoff_link_create", "session/handoff_link_consume",
-                    "prompt/execute", "prompt/stream_next", "stream/chunk",
+                    "prompt/execute", "prompt/start", "prompt/events", "prompt/cancel", "prompt.v2", "prompt/stream_next", "stream/chunk",
                     "tool/approve", "tool/deny",
                     "patch/preview", "patch/apply",
                     "diagnostics/list", "events/poll",
@@ -1667,7 +1763,10 @@ impl RpcHandler for IdeRpcHandler {
             "session/handoff_link_consume" => self.handle_session_handoff_link_consume(params),
 
             // Prompt execution
-            "prompt/execute" => self.handle_prompt_execute(params),
+            "prompt/execute" => self.run_durable_prompt(params, false),
+            "prompt/start" => self.run_durable_prompt(params, true),
+            "prompt/events" => self.handle_prompt_events(params),
+            "prompt/cancel" => self.handle_prompt_cancel(params),
             "prompt/stream_next" => self.handle_prompt_stream_next(params),
 
             // Tool approval/denial
@@ -1841,6 +1940,22 @@ fn sha256_hex(value: &str) -> String {
 }
 
 /// Extract a UUID from a JSON params object.
+fn public_chat_history(messages: Vec<ChatMessage>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .filter_map(|message| match message {
+            ChatMessage::User { content } => {
+                Some(serde_json::json!({"role":"user","content":content}))
+            }
+            ChatMessage::Assistant {
+                content: Some(content),
+                ..
+            } => Some(serde_json::json!({"role":"assistant","content":content})),
+            _ => None,
+        })
+        .collect()
+}
+
 fn require_uuid(params: &Value, field: &str) -> Result<Uuid> {
     let s = params
         .get(field)
@@ -1880,6 +1995,52 @@ fn parse_chat_mode(value: &str) -> ChatMode {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn delivery_one_prompt_replay_is_deduplicated_and_launch_scoped() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let local = IdeRpcHandler::new(workspace.path())?;
+        let session = local.handle_http("session/open", json!({}))?;
+        let id = require_uuid(&session, "session_id")?;
+        let request = json!({"session_id":id,"request_id":Uuid::now_v7(),"prompt":"test","mock_output":"fixture"});
+        let first = local.handle("prompt/start", request.clone())?;
+        let prompt_id = require_uuid(&first, "prompt_id")?;
+        let repeat = local.handle("prompt/start", request)?;
+        assert_eq!(repeat["prompt_id"], first["prompt_id"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while local.store.prompt_state(prompt_id)?.status == "running" {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "prompt did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let page = local.handle_http("prompt/events", json!({"prompt_id":prompt_id,"limit":1}))?;
+        assert_eq!(page["events"][0]["event"]["text"], "fixture");
+        assert_eq!(page["done"], false);
+        let next = local.handle_http(
+            "prompt/events",
+            json!({"prompt_id":prompt_id,"cursor":page["next_cursor"]}),
+        )?;
+        assert_eq!(next["events"][0]["event"]["type"], "done");
+        assert_eq!(next["done"], true);
+        let mut restarted = IdeRpcHandler::new(workspace.path())?;
+        assert!(
+            restarted
+                .handle_http("prompt/events", json!({"prompt_id":prompt_id}))
+                .is_err()
+        );
+        let unrelated = restarted.handle_http("session/open", json!({"session_id":id}))?;
+        assert_ne!(unrelated["session_id"], session["session_id"]);
+        restarted.expose_session(id)?;
+        let resumed = restarted.handle_http("session/open", json!({}))?;
+        assert_eq!(resumed["session_id"], session["session_id"]);
+        assert_eq!(resumed["latest_prompt"]["prompt_id"], first["prompt_id"]);
+        assert_eq!(resumed["history"][1]["content"], "fixture");
+        assert!(restarted.handle_http("config/set", json!({})).is_err());
+        assert!(restarted.handle_http("prompt/start", json!({"session_id":id,"prompt":"test","request_id":Uuid::now_v7(),"additional_dirs":["/"]})).is_err());
+        Ok(())
+    }
 
     #[test]
     fn jsonrpc_request_round_trip() {

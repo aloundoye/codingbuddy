@@ -231,3 +231,90 @@ fn legacy_database_takes_precedence_and_repairs_collisions() -> Result<()> {
     assert_eq!(std::fs::read_to_string(journal)?, archive);
     Ok(())
 }
+
+#[test]
+fn delivery_one_killed_writer_fixture() -> Result<()> {
+    let Some(root) = std::env::var_os("CODINGBUDDY_DELIVERY_ONE_CRASH_FIXTURE") else {
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(root);
+    let store = Store::new(&root)?;
+    let session = Uuid::parse_str(&std::fs::read_to_string(root.join("session"))?)?;
+    let phase = std::fs::read_to_string(root.join("phase"))?;
+    let _lease = store.session_lease(session)?;
+    let args = codingbuddy_core::LlmToolCall {
+        id: "fixture".into(),
+        name: "fixture".into(),
+        arguments: "{}".into(),
+    };
+    let id = store.model_step(session, None, None, &[args], &[])?[0];
+    if phase != "prepared" {
+        store.dispatch_invocation(session, id)?;
+        if phase == "local" {
+            store.record_invocation_receipt(
+                session,
+                id,
+                &codingbuddy_store::InvocationReceipt::File {
+                    path: "local-effect".into(),
+                    postimage_sha256: "fixture".into(),
+                },
+            )?;
+        }
+        std::fs::write(root.join(format!("{phase}-effect")), "once")?;
+    }
+    std::fs::write(root.join("ready"), id.to_string())?;
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn delivery_one_killed_writer_releases_lock_without_repeating_effects() -> Result<()> {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    for phase in ["prepared", "local", "external"] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let session = Uuid::now_v7();
+        std::fs::write(root.join("session"), session.to_string())?;
+        std::fs::write(root.join("phase"), phase)?;
+        let mut child = Command::new(std::env::current_exe()?)
+            .args(["--exact", "delivery_one_killed_writer_fixture"])
+            .env("CODINGBUDDY_DELIVERY_ONE_CRASH_FIXTURE", root)
+            .stdout(Stdio::null())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let ready = loop {
+            if let Ok(id) = std::fs::read_to_string(root.join("ready"))
+                && let Ok(id) = Uuid::parse_str(&id)
+            {
+                break Some(id);
+            }
+            if child.try_wait()?.is_some() || Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let store = Store::new(root)?;
+        let writer_locked = store.session_lease(session).is_err();
+        let _ = child.kill();
+        child.wait()?;
+        let id = ready.expect("fixture must reach kill point");
+        assert!(writer_locked);
+        let lease = store.session_lease(session)?;
+        let recovered = store.interrupted_invocations(&lease, session)?;
+        if phase == "prepared" {
+            assert!(recovered.is_empty());
+        } else {
+            assert_eq!(recovered[0].id, id);
+            assert_eq!(
+                std::fs::read_to_string(root.join(format!("{phase}-effect")))?,
+                "once"
+            );
+            assert_eq!(store.invocation_receipt(id)?.is_some(), phase == "local");
+        }
+    }
+    Ok(())
+}

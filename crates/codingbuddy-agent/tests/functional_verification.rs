@@ -22,6 +22,7 @@ fn tool_call_response(calls: Vec<(&str, &str, &str)>) -> LlmResponse {
             })
             .collect(),
         usage: Some(TokenUsage::default()),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
@@ -33,6 +34,7 @@ fn text_response(text: &str) -> LlmResponse {
         reasoning_content: String::new(),
         tool_calls: vec![],
         usage: Some(TokenUsage::default()),
+        transport_parts: Vec::new(),
         compatibility: None,
     }
 }
