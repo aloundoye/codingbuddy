@@ -566,9 +566,7 @@ fn delivery_one_cancellation_closes_a_stalled_response_body() {
                 "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n"
             };
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n", event.len()).unwrap();
-            closed_tx
-                .send(matches!(stream.read(&mut [0; 1]), Ok(0)))
-                .unwrap();
+            closed_tx.send(stream.read(&mut [0; 1])).unwrap();
         });
         let token = codingbuddy_core::CancellationToken::new();
         let mut cfg = codingbuddy_core::LlmConfig::default();
@@ -596,7 +594,16 @@ fn delivery_one_cancellation_closes_a_stalled_response_body() {
             }),
         );
         assert!(format!("{:#}", response.unwrap_err()).contains("Turn interrupted"));
-        assert!(closed_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        let closed = closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Dropping a response with unread body bytes can close TCP with a reset
+        // instead of FIN. Both prove cancellation released the connection;
+        // a timeout or any additional request data must still fail this check.
+        assert!(
+            matches!(closed, Ok(0))
+                || matches!(&closed, Err(error) if matches!(error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted)),
+            "provider connection remained open after cancellation (responses={responses}): {closed:?}"
+        );
         server.join().unwrap();
     }
 }
