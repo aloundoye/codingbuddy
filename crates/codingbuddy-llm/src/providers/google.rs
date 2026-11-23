@@ -3,7 +3,7 @@
 //! Gemini's GenerateContent API differs from OpenAI:
 //! - Endpoint: `/v1beta/models/{model}:generateContent` (non-streaming)
 //!   or `:streamGenerateContent?alt=sse` (streaming)
-//! - Auth: API key as `?key=` query parameter
+//! - Auth: API key in the `x-goog-api-key` header
 //! - Messages use `contents` array with `parts`
 //! - System instruction is a top-level field
 //! - Tools use `functionDeclarations`
@@ -169,6 +169,19 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
         }]);
     }
 
+    use codingbuddy_core::ToolChoice;
+    let config = match &req.tool_choice {
+        ToolChoice::Mode(mode) => match mode.as_str() {
+            "auto" => json!({"mode":"AUTO"}),
+            "required" => json!({"mode":"ANY"}),
+            "none" => json!({"mode":"NONE"}),
+            _ => anyhow::bail!("Unsupported Gemini tool choice"),
+        },
+        ToolChoice::Function { function, .. } => {
+            json!({"mode":"ANY","allowedFunctionNames":[function.name]})
+        }
+    };
+    payload["toolConfig"] = json!({"functionCallingConfig":config});
     Ok(payload)
 }
 
@@ -186,6 +199,12 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
     let v: Value = serde_json::from_str(body)?;
     anyhow::ensure!(v["error"].is_null(), "Provider sent a completion error");
 
+    anyhow::ensure!(
+        v["candidates"]
+            .as_array()
+            .is_some_and(|candidates| candidates.len() == 1),
+        "Expected one Gemini candidate"
+    );
     let candidate = v
         .get("candidates")
         .and_then(|c| c.as_array())
@@ -215,14 +234,17 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
         None => "stop",
     };
 
-    let usage = parse_gemini_usage(&v);
+    let usage = v
+        .get("usageMetadata")
+        .filter(|value| value.is_object())
+        .map(|_| parse_gemini_usage(&v));
 
     Ok(LlmResponse {
         text,
         finish_reason: finish_reason.to_string(),
         reasoning_content: String::new(),
         tool_calls,
-        usage: Some(usage),
+        usage,
         transport_parts,
         compatibility: None,
     })
@@ -349,7 +371,7 @@ pub enum StreamEvent {
     Multiple(Vec<StreamEvent>),
 }
 
-fn parse_gemini_usage(v: &Value) -> TokenUsage {
+pub(crate) fn parse_gemini_usage(v: &Value) -> TokenUsage {
     let usage = v.get("usageMetadata");
     TokenUsage {
         prompt_tokens: usage
@@ -364,7 +386,20 @@ fn parse_gemini_usage(v: &Value) -> TokenUsage {
             .and_then(|u| u.get("cachedContentTokenCount"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
-        ..Default::default()
+        prompt_cache_miss_tokens: usage
+            .and_then(|u| u.get("promptTokenCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_sub(
+                usage
+                    .and_then(|u| u.get("cachedContentTokenCount"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            ),
+        reasoning_tokens: usage
+            .and_then(|u| u.get("thoughtsTokenCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     }
 }
 

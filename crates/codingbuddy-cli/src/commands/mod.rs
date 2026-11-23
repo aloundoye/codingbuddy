@@ -25,3 +25,5 @@ pub(crate) mod skills;
 pub(crate) mod status;
 pub(crate) mod tasks;
 pub(crate) mod update;
+
+pub(crate) mod provider;

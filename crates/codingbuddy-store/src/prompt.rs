@@ -166,6 +166,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn prompt_provider_error(&self, id: Uuid) -> Result<Option<Value>> {
+        let payload = self.db()?.query_row(
+            "SELECT payload FROM runtime_prompt_events WHERE prompt_id=?1 AND json_extract(payload,'$.type')='provider_error' ORDER BY seq DESC LIMIT 1",
+            [id.to_string()], |row|row.get::<_, String>(0)).optional()?;
+        payload
+            .map(|payload| {
+                serde_json::from_str::<Value>(&payload)
+                    .map(|value| value["provider_error"].clone())
+                    .map_err(Into::into)
+            })
+            .transpose()
+    }
+
     pub fn prompt_events(&self, id: Uuid, after: i64, limit: u32) -> Result<Vec<(i64, Value)>> {
         let conn = self.db()?;
         let mut query = conn.prepare("SELECT seq,payload FROM runtime_prompt_events WHERE prompt_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3")?;

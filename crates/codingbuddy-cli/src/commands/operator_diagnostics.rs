@@ -6,6 +6,7 @@ pub(crate) struct ProviderCompatibilityDiagnostics {
     pub provider: String,
     pub family: String,
     pub summary: String,
+    pub certification: serde_json::Value,
     pub active_transforms: Vec<String>,
 }
 
@@ -32,6 +33,7 @@ pub(crate) fn summarize_applied_compatibility(
 pub(crate) fn provider_compatibility_diagnostics(
     cfg: &AppConfig,
     model: &str,
+    workspace: &std::path::Path,
 ) -> Option<ProviderCompatibilityDiagnostics> {
     let resolution = cfg.llm.capability_resolution_for_model(model)?;
     let caps = resolution.capabilities;
@@ -86,11 +88,23 @@ pub(crate) fn provider_compatibility_diagnostics(
         ProviderKind::Deepseek => {}
     }
 
-    let summary = active.join(", ");
+    let certification = codingbuddy_store::Store::new(workspace)
+        .and_then(|store| store.route_key())
+        .map(|key| codingbuddy_llm::certification::live_status(&cfg.llm, model, workspace, &key))
+        .unwrap_or_else(|_| codingbuddy_llm::certification::status(&cfg.llm, model));
+    let summary = format!(
+        "{}; protocol={} configured={} fixtures={} live={}",
+        active.join(", "),
+        certification["protocol"].as_str().unwrap_or("unknown"),
+        certification["configured"],
+        certification["fixture_verified"],
+        certification["live_verified"]
+    );
     Some(ProviderCompatibilityDiagnostics {
         provider: caps.provider.as_key().to_string(),
         family: caps.family.as_key().to_string(),
         summary,
+        certification,
         active_transforms: active,
     })
 }
@@ -124,7 +138,12 @@ mod tests {
         }
         cfg.llm.endpoint = "https://litellm.internal/v1/chat/completions".to_string();
 
-        let diagnostics = provider_compatibility_diagnostics(&cfg, "o3-mini").expect("diagnostics");
+        let diagnostics = provider_compatibility_diagnostics(
+            &cfg,
+            "o3-mini",
+            tempfile::tempdir().unwrap().path(),
+        )
+        .expect("diagnostics");
         assert!(diagnostics.summary.contains("thinking->reasoning_effort"));
         assert!(
             diagnostics

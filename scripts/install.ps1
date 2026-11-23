@@ -72,6 +72,13 @@ if (-not $binary) {
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $destination = Join-Path $InstallDir "codingbuddy.exe"
 Copy-Item -Path $binary.FullName -Destination $destination -Force
+$evidencePath = Join-Path $binary.DirectoryName "provider-certification.json"
+$installedEvidence = Join-Path $InstallDir "provider-certification.json"
+if (Test-Path $evidencePath) {
+  Copy-Item -Path $evidencePath -Destination $installedEvidence -Force
+} elseif (Test-Path $installedEvidence) {
+  Remove-Item $installedEvidence -Force
+}
 
 # Auto-add to user PATH
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")

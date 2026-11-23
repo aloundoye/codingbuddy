@@ -147,7 +147,7 @@ pub(crate) fn current_ui_status(
             active_provider.kind
         }
     };
-    let provider_diagnostics = provider_compatibility_diagnostics(cfg, &selected_model);
+    let provider_diagnostics = provider_compatibility_diagnostics(cfg, &selected_model, cwd);
     let last_provider_diagnostics =
         summarize_applied_compatibility(projection.last_provider_compatibility.as_ref());
     let capability_summary = cfg
@@ -356,12 +356,12 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         .and_then(|manager| manager.list_servers())
         .unwrap_or_default();
     let base_model_diagnostics =
-        provider_compatibility_diagnostics(&cfg, &cfg.llm.active_base_model());
+        provider_compatibility_diagnostics(&cfg, &cfg.llm.active_base_model(), cwd);
     let reasoner_model = cfg.llm.active_reasoner_model();
     let reasoner_model_diagnostics = if reasoner_model == cfg.llm.active_base_model() {
         base_model_diagnostics.clone()
     } else {
-        provider_compatibility_diagnostics(&cfg, &reasoner_model)
+        provider_compatibility_diagnostics(&cfg, &reasoner_model, cwd)
     };
 
     let payload = if let Some(session) = session {

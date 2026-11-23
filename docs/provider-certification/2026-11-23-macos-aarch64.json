@@ -1,0 +1,95 @@
+{
+  "architecture": "aarch64",
+  "implementation_digest": "2c58db064062d943c716d763ae2c9b14b39145839a70da8f697437346e64f2b9",
+  "passed": true,
+  "platform": "macos",
+  "revision": null,
+  "routes": [
+    {
+      "id": "openai-responses",
+      "model": "gpt-4.1-mini",
+      "passed": true,
+      "streaming": false
+    },
+    {
+      "id": "openai-responses",
+      "model": "gpt-4.1-mini",
+      "passed": true,
+      "streaming": true
+    },
+    {
+      "id": "openai-chat",
+      "model": "gpt-4.1-mini",
+      "passed": true,
+      "streaming": false
+    },
+    {
+      "id": "openai-chat",
+      "model": "gpt-4.1-mini",
+      "passed": true,
+      "streaming": true
+    },
+    {
+      "id": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "passed": true,
+      "streaming": false
+    },
+    {
+      "id": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "passed": true,
+      "streaming": true
+    },
+    {
+      "id": "gemini",
+      "model": "gemini-2.5-flash",
+      "passed": true,
+      "streaming": false
+    },
+    {
+      "id": "gemini",
+      "model": "gemini-2.5-flash",
+      "passed": true,
+      "streaming": true
+    },
+    {
+      "id": "deepseek",
+      "model": "deepseek-chat",
+      "passed": true,
+      "streaming": false
+    },
+    {
+      "id": "deepseek",
+      "model": "deepseek-chat",
+      "passed": true,
+      "streaming": true
+    },
+    {
+      "id": "openrouter",
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "streaming": false
+    },
+    {
+      "id": "openrouter",
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "streaming": true
+    },
+    {
+      "id": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "passed": true,
+      "streaming": false
+    },
+    {
+      "id": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "passed": true,
+      "streaming": true
+    }
+  ],
+  "schema_version": 1,
+  "suite": "delivery-order-2"
+}

@@ -735,6 +735,26 @@ impl Menus {
         state.ready = true;
         state.pending = None;
         self.changed(state, None);
+        let verification = codingbuddy_store::Store::new(&self.cwd)
+            .and_then(|store| store.route_key())
+            .map(|key| {
+                codingbuddy_llm::certification::live_status(
+                    &state.llm,
+                    &state.llm.active_base_model(),
+                    &self.cwd,
+                    &key,
+                )
+            })
+            .unwrap_or_else(|_| {
+                codingbuddy_llm::certification::status(&state.llm, &state.llm.active_base_model())
+            });
+        self.notify(
+            format!(
+                "Provider verification — fixtures {}, live {}",
+                verification["fixture_verified"], verification["live_verified"]
+            ),
+            false,
+        );
         self.notify(
             format!(
                 "Connected to {}/{}.",

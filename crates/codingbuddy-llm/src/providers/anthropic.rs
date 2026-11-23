@@ -202,14 +202,17 @@ pub fn parse_response(body: &str) -> Result<LlmResponse> {
         other => other,
     };
 
-    let usage = parse_anthropic_usage(&v);
+    let usage = v
+        .get("usage")
+        .filter(|value| value.is_object())
+        .map(|_| parse_anthropic_usage(&v));
 
     Ok(LlmResponse {
         text,
         finish_reason: finish_reason.to_string(),
         reasoning_content: reasoning,
         tool_calls,
-        usage: Some(usage),
+        usage,
         transport_parts,
         compatibility: None,
     })
@@ -332,13 +335,21 @@ pub enum StreamEvent {
     Done,
 }
 
-fn parse_anthropic_usage(v: &Value) -> TokenUsage {
+pub(crate) fn parse_anthropic_usage(v: &Value) -> TokenUsage {
     let usage = v.get("usage");
     TokenUsage {
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+            .unwrap_or(0)
+            + usage
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+            + usage
+                .and_then(|u| u.get("cache_creation_input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         completion_tokens: usage
             .and_then(|u| u.get("output_tokens"))
             .and_then(|v| v.as_u64())

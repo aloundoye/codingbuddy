@@ -42,7 +42,12 @@ pub(crate) fn preflight_chat_messages(
     let mut null_content_for_tool_calls = false;
     let mut dropped_dangling_tool_messages = false;
 
-    for message in &req.messages {
+    let current_turn = req
+        .messages
+        .iter()
+        .rposition(|message| matches!(message, ChatMessage::User { .. }))
+        .unwrap_or(0);
+    for (position, message) in req.messages.iter().enumerate() {
         match message {
             ChatMessage::System { content } => {
                 if capabilities.strict_empty_content_filtering && content.trim().is_empty() {
@@ -62,6 +67,7 @@ pub(crate) fn preflight_chat_messages(
                 content,
                 reasoning_content,
                 tool_calls,
+                native_parts,
                 ..
             } => {
                 let mut msg = json!({"role": "assistant"});
@@ -74,7 +80,14 @@ pub(crate) fn preflight_chat_messages(
                     has_visible_content = true;
                 }
 
-                if let Some(rc) = reasoning_content
+                let replay_reasoning = native_parts
+                    .as_ref()
+                    .filter(|native| native.protocol == "openai-chat")
+                    .and_then(|native| native.blocks.first())
+                    .and_then(|block| block["reasoning_content"].as_str())
+                    .filter(|_| position > current_turn);
+                let reasoning = reasoning_content.as_deref().or(replay_reasoning);
+                if let Some(rc) = reasoning
                     && (!capabilities.strict_empty_content_filtering || !rc.trim().is_empty())
                     && provider_supports_reasoning_content(capabilities.provider)
                 {

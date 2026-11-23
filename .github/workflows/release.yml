@@ -117,6 +117,24 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} -p codingbuddy-agent --test tool_use_default delivery_zero
           cargo test --locked --target ${{ matrix.target }} -p codingbuddy-mcp --lib p0_
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Certify provider contracts
+        shell: bash
+        env:
+          CODINGBUDDY_CERTIFICATION_REPORT: ${{ runner.temp }}/provider-certification.json
+          CODINGBUDDY_BUILD_REVISION: ${{ github.sha }}
+        run: |
+          cargo test --locked --target ${{ matrix.target }} -p codingbuddy-store -p codingbuddy-jsonrpc -p codingbuddy-diff
+          cargo test --locked --target ${{ matrix.target }} -p codingbuddy-cli --test cli_json delivery_one
+          cargo test --locked --target ${{ matrix.target }} -p codingbuddy-llm --all-targets
+          cargo test --locked --target ${{ matrix.target }} -p codingbuddy-testkit --test provider_certification
+          cargo test --locked --target ${{ matrix.target }} -p codingbuddy-cli --test cli_json delivery_two
+          python scripts/test_provider_certification_gate.py
+          python scripts/provider_certification_gate.py "$CODINGBUDDY_CERTIFICATION_REPORT" --target '${{ matrix.target }}' --revision '${{ github.sha }}'
+
       - name: Build release binary
         run: cargo build --locked --release --bin codingbuddy --target ${{ matrix.target }}
 
@@ -125,7 +143,8 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/codingbuddy dist/codingbuddy
-          tar -C dist -czf dist/codingbuddy-${{ matrix.target }}.tar.gz codingbuddy
+          cp "$RUNNER_TEMP/provider-certification.json" dist/provider-certification.json
+          tar -C dist -czf dist/codingbuddy-${{ matrix.target }}.tar.gz codingbuddy provider-certification.json
           rm dist/codingbuddy
 
       - name: Package artifact (windows)
@@ -134,7 +153,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item target/${{ matrix.target }}/release/codingbuddy.exe dist/codingbuddy.exe
-          Compress-Archive -Path dist/codingbuddy.exe -DestinationPath dist/codingbuddy-${{ matrix.target }}.zip -Force
+          Copy-Item "$env:RUNNER_TEMP/provider-certification.json" dist/provider-certification.json
+          Compress-Archive -Path dist/codingbuddy.exe,dist/provider-certification.json -DestinationPath dist/codingbuddy-${{ matrix.target }}.zip -Force
           Remove-Item dist/codingbuddy.exe
 
       - name: Smoke-test packaged binary (unix)

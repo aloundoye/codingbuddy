@@ -465,7 +465,13 @@ fn delivery_one_requires_complete_calls_and_preserves_interleaving() {
             vec![ChatMessage::User {
                 content: "test".into(),
             }],
-            vec![sample_tool()],
+            vec![ToolDefinition {
+                function: FunctionDefinition {
+                    parameters: json!({"type":"object"}),
+                    ..sample_tool().function
+                },
+                ..sample_tool()
+            }],
         );
         let result = ApiClient::new(cfg)
             .unwrap()
@@ -531,58 +537,68 @@ fn delivery_one_cancellation_closes_a_stalled_response_body() {
         time::Duration,
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (closed_tx, closed_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let mut reader = BufReader::new(&mut stream);
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                break;
+    for responses in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
             }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse().unwrap();
-            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let event = if responses {
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"item\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"item\",\"content_index\":0,\"delta\":\"first\"}\n\n"
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n"
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n", event.len()).unwrap();
+            closed_tx
+                .send(matches!(stream.read(&mut [0; 1]), Ok(0)))
+                .unwrap();
+        });
+        let token = codingbuddy_core::CancellationToken::new();
+        let mut cfg = codingbuddy_core::LlmConfig::default();
+        cfg.select_provider("ollama");
+        cfg.providers.get_mut("ollama").unwrap().base_url = endpoint;
+        if responses {
+            cfg.providers.get_mut("ollama").unwrap().chat_protocol =
+                Some("openai-responses".into());
         }
-        reader.read_exact(&mut vec![0; length]).unwrap();
-        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n";
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n", event.len()).unwrap();
-        closed_tx
-            .send(matches!(stream.read(&mut [0; 1]), Ok(0)))
-            .unwrap();
-    });
-    let token = codingbuddy_core::CancellationToken::new();
-    let mut cfg = codingbuddy_core::LlmConfig::default();
-    cfg.select_provider("ollama");
-    cfg.providers.get_mut("ollama").unwrap().base_url = endpoint;
-    let request = make_request(
-        &cfg.active_base_model(),
-        vec![ChatMessage::User {
-            content: "test".into(),
-        }],
-        vec![],
-    );
-    let mut client = ApiClient::new(cfg).unwrap();
-    client.set_cancel_token(token.clone());
-    let response = client.complete_chat_streaming(
-        &request,
-        std::sync::Arc::new(move |chunk| {
-            if matches!(chunk, codingbuddy_core::StreamChunk::ContentDelta(_)) {
-                token.cancel();
-            }
-        }),
-    );
-    assert!(format!("{:#}", response.unwrap_err()).contains("Turn interrupted"));
-    assert!(closed_rx.recv_timeout(Duration::from_secs(2)).unwrap());
-    server.join().unwrap();
+        let request = make_request(
+            &cfg.active_base_model(),
+            vec![ChatMessage::User {
+                content: "test".into(),
+            }],
+            vec![],
+        );
+        let mut client = ApiClient::new(cfg).unwrap();
+        client.set_cancel_token(token.clone());
+        let response = client.complete_chat_streaming(
+            &request,
+            std::sync::Arc::new(move |chunk| {
+                if matches!(chunk, codingbuddy_core::StreamChunk::ContentDelta(_)) {
+                    token.cancel();
+                }
+            }),
+        );
+        assert!(format!("{:#}", response.unwrap_err()).contains("Turn interrupted"));
+        assert!(closed_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        server.join().unwrap();
+    }
 }
 
 #[test]
@@ -688,4 +704,249 @@ fn delivery_one_anthropic_replays_signed_interleaved_blocks() {
     );
     assert_eq!(payload["messages"][2]["content"][0]["tool_use_id"], "a");
     assert_eq!(payload["messages"][2]["content"][1]["tool_use_id"], "b");
+}
+
+#[test]
+fn responses_stateless_payload_keeps_wire_ids_and_private_order() {
+    use codingbuddy_core::NativeParts;
+    use codingbuddy_llm::providers::responses;
+    let blocks = vec![
+        json!({"type":"reasoning","id":"reason-item","encrypted_content":"PRIVATE","summary":[]}),
+        json!({"type":"function_call","id":"provider-item","call_id":"provider-call","name":"fs_read","arguments":"{}","status":"completed"}),
+    ];
+    let mut req = make_request(
+        "gpt-4.1-mini",
+        vec![
+            ChatMessage::System {
+                content: "instructions".into(),
+            },
+            ChatMessage::User {
+                content: "read".into(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+                native_parts: Some(NativeParts {
+                    protocol: responses::PROTOCOL.into(),
+                    blocks: blocks.clone(),
+                }),
+            },
+            ChatMessage::Tool {
+                tool_call_id: "provider-call".into(),
+                tool_name: Some("fs_read".into()),
+                content: "result".into(),
+            },
+        ],
+        vec![sample_tool()],
+    );
+    req.response_format = Some(
+        json!({"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object"}}}),
+    );
+    let payload = responses::build_payload(&req).unwrap();
+    assert_eq!(payload["store"], false);
+    assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(payload["instructions"], "instructions");
+    assert_eq!(payload["input"][1], blocks[0]);
+    assert_eq!(payload["input"][2], blocks[1]);
+    assert_eq!(payload["input"][3]["call_id"], "provider-call");
+    assert_eq!(payload["tools"][0]["name"], "fs_read");
+    assert_eq!(payload["text"]["format"]["type"], "json_schema");
+    assert!(payload.get("previous_response_id").is_none());
+    assert!(payload.get("messages").is_none());
+}
+
+#[test]
+fn responses_interleaved_calls_require_a_successful_terminal() {
+    use codingbuddy_llm::providers::responses::Stream;
+    let mut stream = Stream::default();
+    let mut output = vec![];
+    for index in 0..2 {
+        let item = json!({"type":"function_call","id":format!("item-{index}"),"call_id":format!("call-{index}"),"name":"fs_read","arguments":""});
+        stream
+            .frame(
+                &json!({"type":"response.output_item.added","output_index":index,"item":item}),
+                &|_| {},
+            )
+            .unwrap();
+        let mut item = item;
+        item["arguments"] = json!("{}");
+        item["status"] = json!("completed");
+        output.push(item);
+    }
+    for index in [1, 0] {
+        for delta in ["{", "}"] {
+            assert!(stream.frame(&json!({"type":"response.function_call_arguments.delta","output_index":index,"item_id":format!("item-{index}"),"delta":delta}), &|_| {}).unwrap().is_none());
+        }
+        assert!(stream.frame(&json!({"type":"response.output_item.done","output_index":index,"item":output[index]}), &|_| {}).unwrap().is_none());
+    }
+    let completed =
+        json!({"type":"response.completed","response":{"status":"completed","output":output}});
+    let result = stream.frame(&completed, &|_| {}).unwrap().unwrap();
+    assert_eq!(
+        result
+            .tool_calls
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["call-0", "call-1"]
+    );
+    for bad in [
+        json!({"type":"response.failed"}),
+        json!({"type":"response.incomplete"}),
+        json!({"type":"response.cancelled"}),
+        json!({"type":"error"}),
+        json!({"type":"response.completed","response":{"status":"completed","output":output}}),
+    ] {
+        assert!(Stream::default().frame(&bad, &|_| {}).is_err());
+    }
+}
+
+#[test]
+fn responses_reject_changed_item_ids_and_arguments() {
+    use codingbuddy_llm::providers::responses::Stream;
+    for changed in [
+        json!({"item_id":"changed","delta":"{}"}),
+        json!({"item_id":"item","arguments":"different"}),
+    ] {
+        let mut stream = Stream::default();
+        let item = json!({"id":"item","type":"function_call","call_id":"call","name":"fs_read","arguments":""});
+        let added = json!({"type":"response.output_item.added","output_index":0,"item":item});
+        stream.frame(&added, &|_| {}).unwrap();
+        assert!(stream.frame(&added, &|_| {}).is_err());
+        let mut event = changed;
+        event["output_index"] = json!(0);
+        event["type"] = json!(if event.get("delta").is_some() {
+            "response.function_call_arguments.delta"
+        } else {
+            "response.function_call_arguments.done"
+        });
+        assert!(stream.frame(&event, &|_| {}).is_err());
+    }
+}
+
+#[test]
+fn responses_errors_are_typed_and_sanitized_over_real_transport() {
+    use codingbuddy_llm::{
+        ApiClient, LlmClient,
+        error::{FailureKind, ProviderError},
+    };
+    for (events, expected) in [
+        ("data: {invalid}\n\n", FailureKind::MalformedResponse),
+        ("data: [DONE]\n\n", FailureKind::MalformedResponse),
+        (
+            "data: {\"type\":\"response.incomplete\"}\n\n",
+            FailureKind::IncompleteResponse,
+        ),
+        (
+            "data: {\"type\":\"response.failed\"}\n\n",
+            FailureKind::ProviderFailure,
+        ),
+        (
+            "data: {\"type\":\"error\",\"message\":\"SECRET\"}\n\n",
+            FailureKind::ProviderFailure,
+        ),
+        (
+            "data: {\"type\":\"response.created\"}\n\n",
+            FailureKind::IncompleteStream,
+        ),
+    ] {
+        let (base, worker) = delivery_one_loopback(events);
+        let mut cfg = codingbuddy_core::LlmConfig::default();
+        cfg.select_provider("openai-compatible");
+        let provider = cfg.providers.get_mut("openai-compatible").unwrap();
+        provider.base_url = base;
+        provider.chat_protocol = Some("openai-responses".into());
+        cfg.api_key = Some("synthetic-secret".into());
+        cfg.max_retries = 0;
+        let req = make_request(
+            "gpt-4.1-mini",
+            vec![ChatMessage::User {
+                content: "hello".into(),
+            }],
+            vec![sample_tool()],
+        );
+        let error = ApiClient::new(cfg)
+            .unwrap()
+            .complete_chat_streaming(&req, std::sync::Arc::new(|_| {}))
+            .unwrap_err();
+        worker.join().unwrap();
+        assert!(!error.to_string().contains("SECRET"));
+        assert_eq!(
+            error.downcast_ref::<ProviderError>().unwrap().category,
+            expected
+        );
+    }
+}
+
+#[test]
+fn native_missing_usage_stays_unavailable() {
+    assert!(
+        anthropic::parse_response(
+            r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#
+        )
+        .unwrap()
+        .usage
+        .is_none()
+    );
+    assert!(
+        google::parse_response(
+            r#"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"ok"}]}}]}"#
+        )
+        .unwrap()
+        .usage
+        .is_none()
+    );
+}
+
+#[test]
+fn responses_output_limit_and_refusal_have_distinct_outcomes() {
+    use codingbuddy_llm::{
+        error::{FailureKind, ProviderError},
+        providers::responses,
+    };
+    let error = responses::parse_response(&json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]})).unwrap_err();
+    let typed = error.downcast_ref::<ProviderError>().unwrap();
+    assert_eq!(typed.category, FailureKind::IncompleteResponse);
+    assert_eq!(typed.provider_code.as_deref(), Some("max_output_tokens"));
+    let refusal = responses::parse_response(&json!({"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"refusal","refusal":"Cannot help."}]}]})).unwrap();
+    assert_eq!(refusal.text, "Cannot help.");
+    assert!(refusal.tool_calls.is_empty());
+}
+
+#[test]
+fn unreachable_route_reports_transport_failure_without_provider_text() {
+    use codingbuddy_llm::{
+        ApiClient, LlmClient,
+        error::{FailureKind, ProviderError},
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut cfg = codingbuddy_core::LlmConfig::default();
+    cfg.select_provider("ollama");
+    cfg.providers.get_mut("ollama").unwrap().base_url = format!("http://{address}");
+    cfg.max_retries = 0;
+    cfg.timeout_seconds = 2;
+    let req = make_request(
+        &cfg.active_base_model(),
+        vec![ChatMessage::User {
+            content: "test".into(),
+        }],
+        vec![],
+    );
+    let client = ApiClient::new(cfg).unwrap();
+    for streaming in [false, true] {
+        let error = if streaming {
+            client.complete_chat_streaming(&req, std::sync::Arc::new(|_| {}))
+        } else {
+            client.complete_chat(&req)
+        }
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderError>().unwrap().category,
+            FailureKind::Transport
+        );
+        assert!(!error.to_string().contains(&address.to_string()));
+    }
 }

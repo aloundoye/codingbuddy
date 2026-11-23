@@ -77,6 +77,30 @@ jobs:
           cargo test --locked -p codingbuddy-agent --test tool_use_default p0_
           cargo test --locked -p codingbuddy-mcp --lib p0_
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Provider conformance
+        shell: bash
+        env:
+          CODINGBUDDY_CERTIFICATION_REPORT: ${{ runner.temp }}/provider-certification.json
+          CODINGBUDDY_BUILD_REVISION: ${{ github.sha }}
+        run: |
+          cargo test --locked -p codingbuddy-store -p codingbuddy-jsonrpc -p codingbuddy-diff
+          cargo test --locked -p codingbuddy-cli --test cli_json delivery_one
+          cargo test --locked -p codingbuddy-llm --all-targets
+          cargo test --locked -p codingbuddy-testkit --test provider_certification
+          cargo test --locked -p codingbuddy-cli --test cli_json delivery_two
+          python scripts/test_provider_certification_gate.py
+
+      - name: Upload provider evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-certification-${{ runner.os }}
+          path: ${{ runner.temp }}/provider-certification.json
+          if-no-files-found: error
+
       - name: "tests (workspace split: core)"
         run: cargo test --workspace --all-targets --exclude codingbuddy-agent --exclude codingbuddy-cli --exclude codingbuddy-ui
 
@@ -128,6 +152,36 @@ jobs:
 
       - name: build
         run: cargo build --workspace
+
+      - name: Focused trust-boundary regressions
+        run: |
+          cargo test --locked -p codingbuddy-cli --test cli_json p0_
+          cargo test --locked -p codingbuddy-agent --test tool_use_default p0_
+          cargo test --locked -p codingbuddy-mcp --lib p0_
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Provider conformance
+        shell: bash
+        env:
+          CODINGBUDDY_CERTIFICATION_REPORT: ${{ runner.temp }}/provider-certification.json
+          CODINGBUDDY_BUILD_REVISION: ${{ github.sha }}
+        run: |
+          cargo test --locked -p codingbuddy-store -p codingbuddy-jsonrpc -p codingbuddy-diff
+          cargo test --locked -p codingbuddy-cli --test cli_json delivery_one
+          cargo test --locked -p codingbuddy-llm --all-targets
+          cargo test --locked -p codingbuddy-testkit --test provider_certification
+          cargo test --locked -p codingbuddy-cli --test cli_json delivery_two
+          python scripts/test_provider_certification_gate.py
+
+      - name: Upload provider evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-certification-${{ runner.os }}
+          path: ${{ runner.temp }}/provider-certification.json
+          if-no-files-found: error
 
       - name: Filesystem regressions
         run: cargo test --locked -p codingbuddy-tools --lib workspace_

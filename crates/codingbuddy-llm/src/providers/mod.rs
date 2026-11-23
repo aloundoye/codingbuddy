@@ -6,6 +6,7 @@
 
 pub mod anthropic;
 pub mod google;
+pub mod responses;
 
 use codingbuddy_core::{LlmToolCall, StreamChunk};
 
@@ -117,7 +118,6 @@ impl NativeStreamState {
             }
             ProviderStreamEvent::ReasoningDelta(text) => {
                 self.reasoning.push_str(&text);
-                stream_cb(StreamChunk::ReasoningDelta(text));
             }
             ProviderStreamEvent::ToolStart { id, name } => {
                 self.flush_current_tool();
