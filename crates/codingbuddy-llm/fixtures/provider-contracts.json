@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "suite": "delivery-order-2",
+  "routes": [
+    {
+      "id": "openai-responses",
+      "provider": "openai-compatible",
+      "protocol": "openai-responses",
+      "model": "gpt-4.1-mini",
+      "path": "/v1/responses",
+      "auth": "bearer"
+    },
+    {
+      "id": "openai-chat",
+      "provider": "openai-compatible",
+      "protocol": "openai-chat",
+      "model": "gpt-4.1-mini",
+      "path": "/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "anthropic",
+      "provider": "anthropic",
+      "protocol": "anthropic-messages",
+      "model": "claude-sonnet-4-20250514",
+      "path": "/v1/messages",
+      "auth": "x-api-key"
+    },
+    {
+      "id": "gemini",
+      "provider": "google",
+      "protocol": "gemini-generate-content",
+      "model": "gemini-2.5-flash",
+      "path": "/v1beta/models/gemini-2.5-flash:generateContent",
+      "auth": "query-api-key"
+    },
+    {
+      "id": "deepseek",
+      "provider": "deepseek",
+      "protocol": "openai-chat",
+      "model": "deepseek-chat",
+      "path": "/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "openrouter",
+      "provider": "openrouter",
+      "protocol": "openai-chat",
+      "model": "openai/gpt-4.1-mini",
+      "path": "/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "ollama",
+      "provider": "ollama",
+      "protocol": "openai-chat",
+      "model": "qwen2.5-coder:7b",
+      "path": "/v1/chat/completions",
+      "auth": "none"
+    }
+  ],
+  "features": [
+    "text",
+    "function_calls",
+    "two_tool_rounds",
+    "streaming",
+    "non_streaming",
+    "durable_replay",
+    "private_continuation",
+    "route_isolation",
+    "cancellation",
+    "usage"
+  ],
+  "usage": {
+    "input": 20,
+    "output": 8,
+    "cached": 5,
+    "reasoning": 3
+  },
+  "expected_tools": [
+    {
+      "id": "call-first",
+      "name": "fs_read",
+      "arguments": {
+        "path": "first.txt"
+      }
+    },
+    {
+      "id": "call-second",
+      "name": "fs_read",
+      "arguments": {
+        "path": "second.txt"
+      }
+    }
+  ],
+  "expected_output": "Certification complete.",
+  "private_fixture": "opaque-certification-fixture",
+  "harness": {
+    "source": "crates/codingbuddy-testkit/tests/provider_certification.rs",
+    "request_builder": "real ApiClient",
+    "runner": "AgentEngine with SQLite Store",
+    "frames": "completion() and stream() in the versioned harness source",
+    "revision": "source SHA-256 plus optional CODINGBUDDY_BUILD_REVISION",
+    "modes": [
+      "streaming",
+      "non_streaming"
+    ]
+  },
+  "contracts": {
+    "openai-responses": {
+      "request_fields": [
+        "input",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "max_output_tokens",
+        "store=false",
+        "include=reasoning.encrypted_content"
+      ],
+      "item_id": "id",
+      "call_id": "call_id",
+      "linked_result": "function_call_output.call_id",
+      "frames": [
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed"
+      ],
+      "success": "response.completed with status=completed and exact assembled output",
+      "private": "reasoning.encrypted_content"
+    },
+    "openai-chat": {
+      "request_fields": [
+        "messages",
+        "tools",
+        "tool_choice",
+        "max_tokens"
+      ],
+      "call_id": "tool_calls[].id",
+      "linked_result": "tool_call_id",
+      "frames": [
+        "choices[].delta",
+        "choices[].finish_reason",
+        "usage",
+        "[DONE]"
+      ],
+      "success": "stop or tool_calls with complete arguments",
+      "private": "reasoning_content within current tool round"
+    },
+    "anthropic-messages": {
+      "request_fields": [
+        "system",
+        "messages",
+        "tools",
+        "max_tokens"
+      ],
+      "call_id": "tool_use.id",
+      "linked_result": "tool_result.tool_use_id",
+      "frames": [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop"
+      ],
+      "success": "message_stop with end_turn, stop_sequence, or tool_use",
+      "private": [
+        "thinking.signature",
+        "redacted_thinking.data"
+      ]
+    },
+    "gemini-generate-content": {
+      "request_fields": [
+        "contents",
+        "systemInstruction",
+        "tools",
+        "toolConfig",
+        "generationConfig"
+      ],
+      "call_id": "functionCall.id or stable local ID",
+      "linked_result": "functionResponse.id and name",
+      "frames": [
+        "candidates[].content.parts",
+        "candidates[].finishReason",
+        "usageMetadata"
+      ],
+      "success": "one candidate with STOP",
+      "private": "thoughtSignature on original associated part"
+    }
+  },
+  "negative_outcomes": [
+    "malformed_response",
+    "incomplete_stream",
+    "incomplete_response",
+    "provider_failure",
+    "cancelled",
+    "authentication",
+    "unsupported_feature"
+  ],
+  "negative_checks": [
+    "EOF after item completion",
+    "DONE without response.completed",
+    "failed or incomplete terminal",
+    "malformed JSON",
+    "HTTP 200 error envelope",
+    "changed or duplicate IDs",
+    "fragmented interleaved calls",
+    "cancel before headers",
+    "cancel during stalled body",
+    "unsupported route before dispatch"
+  ]
+}

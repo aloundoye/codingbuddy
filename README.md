@@ -81,6 +81,8 @@ paste and save it in your system credential store. Ollama can run without a key.
 - Use `/settings` to change the theme or save the active model as your default.
 - Use `codingbuddy --continue` to resume your latest conversation.
 
+OpenAI Responses is available with `chat_protocol = "openai-responses"`. See the [provider support matrix and verification commands](docs/PROVIDER_SUPPORT.md) for fixture coverage and live evidence.
+
 The provider menu supports OpenAI Chat Completions, Anthropic, Google Gemini,
 DeepSeek, OpenRouter, Ollama, and custom OpenAI-compatible endpoints. Coding
 mode requires a tool-capable model. Use `/ask` for chat-only models.

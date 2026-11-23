@@ -340,7 +340,7 @@ impl IdeRpcHandler {
             .map(|(seq, event)| serde_json::json!({"seq":seq,"event":event}))
             .collect();
         Ok(
-            serde_json::json!({"prompt_id":id,"status":state.status,"output":state.output,"error":state.error,
+            serde_json::json!({"prompt_id":id,"status":state.status,"output":state.output,"error":state.error,"provider_error":self.store.prompt_provider_error(id)?,
             "events":events,"next_cursor":next,"done":state.status != "running" && !more && !writer_active}),
         )
     }
@@ -645,49 +645,54 @@ impl IdeRpcHandler {
 
         let workspace_root = PathBuf::from(session.workspace_root.clone());
 
-        let (status, output, error_message) =
-            if let Some(mock_output) = params.get("mock_output").and_then(|v| v.as_str()) {
-                self.store.append_event(&codingbuddy_store::NewEvent {
-                    event_id: uuid::Uuid::now_v7(),
-                    at: chrono::Utc::now(),
-                    session_id,
-                    kind: EventKind::ChatTurn {
-                        message: ChatMessage::User {
-                            content: prompt.clone(),
-                        },
+        let mut provider_error = Value::Null;
+        let (status, output, error_message) = if let Some(mock_output) =
+            params.get("mock_output").and_then(|v| v.as_str())
+        {
+            self.store.append_event(&codingbuddy_store::NewEvent {
+                event_id: uuid::Uuid::now_v7(),
+                at: chrono::Utc::now(),
+                session_id,
+                kind: EventKind::ChatTurn {
+                    message: ChatMessage::User {
+                        content: prompt.clone(),
                     },
-                })?;
-                self.store.append_prompt_event(
-                    prompt_id,
-                    &stream_chunk_to_event_json(&StreamChunk::ContentDelta(mock_output.to_owned())),
-                )?;
-                ("completed".to_string(), mock_output.to_string(), None)
-            } else {
-                let engine = AgentEngine::new(&workspace_root)?;
-                let chat_options = ChatOptions {
-                    session_id: Some(session_id),
-                    session_lease: Some(lease),
-                    prompt_id: Some(prompt_id),
-                    cancellation: Some(cancellation),
-                    tools,
-                    force_max_think,
-                    additional_dirs,
-                    repo_root_override: repo_root,
-                    debug_context,
-                    mode,
-                    teammate_mode,
-                    ..Default::default()
-                };
-
-                match engine.chat_with_options(&prompt, chat_options) {
-                    Ok(output) => ("completed".to_string(), output, None),
-                    Err(err) => (
-                        "failed".to_string(),
-                        String::new(),
-                        Some(format!("{err:#}")),
-                    ),
-                }
+                },
+            })?;
+            self.store.append_prompt_event(
+                prompt_id,
+                &stream_chunk_to_event_json(&StreamChunk::ContentDelta(mock_output.to_owned())),
+            )?;
+            ("completed".to_string(), mock_output.to_string(), None)
+        } else {
+            let engine = AgentEngine::new(&workspace_root)?;
+            let chat_options = ChatOptions {
+                session_id: Some(session_id),
+                session_lease: Some(lease),
+                prompt_id: Some(prompt_id),
+                cancellation: Some(cancellation),
+                tools,
+                force_max_think,
+                additional_dirs,
+                repo_root_override: repo_root,
+                debug_context,
+                mode,
+                teammate_mode,
+                ..Default::default()
             };
+
+            match engine.chat_with_options(&prompt, chat_options) {
+                Ok(output) => ("completed".to_string(), output, None),
+                Err(err) => {
+                    provider_error =
+                        codingbuddy_llm::error::diagnostic(&err).unwrap_or(Value::Null);
+                    if !provider_error.is_null() {
+                        self.store.append_prompt_event(prompt_id, &serde_json::json!({"type":"provider_error","provider_error":provider_error}))?;
+                    }
+                    ("failed".into(), String::new(), Some(format!("{err:#}")))
+                }
+            }
+        };
 
         if !output.is_empty() && params.get("mock_output").and_then(Value::as_str).is_some() {
             self.store.append_event(&codingbuddy_store::NewEvent::new(
@@ -720,6 +725,7 @@ impl IdeRpcHandler {
             "prompt": prompt,
             "output": if output.is_empty() { Value::Null } else { serde_json::json!(output) },
             "error": error_message,
+            "provider_error": provider_error,
             "partial_messages_enabled": include_partial,
             "stream": stream_meta,
         }))

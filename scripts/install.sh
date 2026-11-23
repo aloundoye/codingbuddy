@@ -153,6 +153,12 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$bin_path" "$INSTALL_DIR/codingbuddy"
+evidence_path="$(dirname "$bin_path")/provider-certification.json"
+if [[ -f "$evidence_path" ]]; then
+  install -m 0644 "$evidence_path" "$INSTALL_DIR/provider-certification.json"
+else
+  rm -f "$INSTALL_DIR/provider-certification.json"
+fi
 
 # Auto-add to PATH if installing to ~/.local/bin and it's not already on PATH
 if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]]; then

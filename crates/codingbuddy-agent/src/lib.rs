@@ -1232,6 +1232,16 @@ impl AgentEngine {
         let cancellation = options.cancellation.clone();
         let result = self.execute_session_prompt(prompt, options, session, &lease);
         let output = result.as_ref().ok().map(String::as_str);
+        if let Some(provider_error) = result
+            .as_ref()
+            .err()
+            .and_then(codingbuddy_llm::error::diagnostic)
+        {
+            self.store.append_prompt_event(
+                id,
+                &serde_json::json!({"type":"provider_error","provider_error":provider_error}),
+            )?;
+        }
         let error = result.as_ref().err().map(|error| format!("{error:#}"));
         let status = if result.is_ok() {
             "completed"

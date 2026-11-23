@@ -2106,10 +2106,13 @@ pub fn estimate_message_tokens(messages: &[ChatMessage]) -> u64 {
             ChatMessage::Assistant {
                 content,
                 reasoning_content,
+                native_parts,
                 tool_calls,
                 ..
             } => {
-                content.as_deref().map_or(0, |c| c.len() as u64)
+                native_parts.as_ref().map_or(0, |native| {
+                    serde_json::to_vec(&native.blocks).map_or(0, |bytes| bytes.len() as u64)
+                }) + content.as_deref().map_or(0, |c| c.len() as u64)
                     + reasoning_content.as_deref().map_or(0, |r| r.len() as u64)
                     + tool_calls
                         .iter()

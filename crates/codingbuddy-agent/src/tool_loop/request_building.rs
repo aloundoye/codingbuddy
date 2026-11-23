@@ -56,7 +56,10 @@ pub(super) fn build_chat_request(
         frequency_penalty: None,
         logprobs: None,
         top_logprobs: None,
-        thinking: route.thinking,
+        thinking: route.thinking.filter(|_| {
+            caps.thinking_capability.accepts_thinking_config()
+                || caps.provider == ProviderKind::OpenAiCompatible
+        }),
         images,
         provider_options: Default::default(),
         response_format: None,

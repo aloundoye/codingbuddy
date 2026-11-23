@@ -326,6 +326,9 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             .flatten()
             .collect();
             print_check(true, &format!("  {model}: {}", features.join(", ")));
+            if let Some(summary) = item["compatibility"]["summary"].as_str() {
+                print_info(summary);
+            }
         }
     }
     println!();
@@ -550,7 +553,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
     for model in capability_models {
         if let Some(resolution) = cfg.llm.capability_resolution_for_model(&model) {
             let caps = resolution.capabilities;
-            let compatibility = provider_compatibility_diagnostics(&cfg, &model);
+            let compatibility = provider_compatibility_diagnostics(&cfg, &model, cwd);
             capability_profiles.push(json!({
                 "model": model,
                 "provider": caps.provider.as_key(),

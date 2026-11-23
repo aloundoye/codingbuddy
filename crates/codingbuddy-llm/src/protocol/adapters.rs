@@ -9,6 +9,7 @@ use super::{AuthStrategy, ChatProtocol};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSchemaDialect {
     OpenAiTools,
+    ResponsesFunctions,
     AnthropicTools,
     GeminiFunctionDeclarations,
     BedrockToolConfig,
@@ -17,6 +18,7 @@ pub enum ToolSchemaDialect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamEventDialect {
     OpenAiDataDelta,
+    ResponsesSse,
     AnthropicSse,
     GeminiSse,
     BedrockEventStream,
@@ -109,8 +111,8 @@ pub fn adapter_for(protocol: ChatProtocol) -> ProtocolAdapter {
         ChatProtocol::OpenAiResponses => ProtocolAdapter {
             protocol,
             payload_shape: PayloadShape::Responses,
-            tool_schema: ToolSchemaDialect::OpenAiTools,
-            stream_events: StreamEventDialect::OpenAiDataDelta,
+            tool_schema: ToolSchemaDialect::ResponsesFunctions,
+            stream_events: StreamEventDialect::ResponsesSse,
             default_auth: AuthStrategy::Bearer,
             support: ProtocolSupport {
                 tool_calls: true,
@@ -118,7 +120,7 @@ pub fn adapter_for(protocol: ChatProtocol) -> ProtocolAdapter {
                 reasoning: true,
                 cache_hints: true,
                 image_input: true,
-                pdf_input: true,
+                pdf_input: false,
             },
         },
         ChatProtocol::AnthropicMessages => ProtocolAdapter {
@@ -177,7 +179,7 @@ mod tests {
     fn adapters_expose_protocol_capabilities() {
         let openai = adapter_for(ChatProtocol::OpenAiResponses);
         assert_eq!(openai.payload_shape, PayloadShape::Responses);
-        assert!(openai.supports(ProtocolFeature::PdfInput));
+        assert!(!openai.supports(ProtocolFeature::PdfInput));
 
         let gemini = adapter_for(ChatProtocol::GeminiGenerateContent);
         assert_eq!(gemini.default_auth, AuthStrategy::QueryApiKey);

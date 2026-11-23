@@ -935,7 +935,33 @@ fn handle_mock_llm_connection(stream: &mut TcpStream) -> std::io::Result<()> {
     };
     let streaming =
         serde_json::from_slice::<Value>(&body).is_ok_and(|request| request["stream"] == true);
-    let (media_type, payload) = if streaming {
+    let responses =
+        serde_json::from_slice::<Value>(&body).is_ok_and(|request| request.get("input").is_some());
+    let (media_type, payload) = if responses {
+        let reasoning = serde_json::json!({"type":"reasoning","id":"reason","summary":[],"encrypted_content":"private-client-fixture"});
+        let message = serde_json::json!({"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":content,"annotations":[]}]});
+        let response =
+            serde_json::json!({"id":"response","status":"completed","output":[reasoning,message]});
+        if streaming {
+            let events = [
+                serde_json::json!({"type":"response.output_item.added","output_index":0,"item":reasoning}),
+                serde_json::json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+                serde_json::json!({"type":"response.output_item.added","output_index":1,"item":message}),
+                serde_json::json!({"type":"response.output_text.delta","output_index":1,"item_id":"message","content_index":0,"delta":content}),
+                serde_json::json!({"type":"response.output_item.done","output_index":1,"item":message}),
+                serde_json::json!({"type":"response.completed","response":response}),
+            ];
+            (
+                "text/event-stream",
+                events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>(),
+            )
+        } else {
+            ("application/json", response.to_string())
+        }
+    } else if streaming {
         let event =
             serde_json::json!({"choices":[{"delta":{"content":content},"finish_reason":"stop"}]});
         (
@@ -1457,4 +1483,127 @@ fn delivery_zero_user_deny_survives_trusted_project_overlay() {
     let result: Value = serde_json::from_slice(&output).expect("permission output");
     assert_eq!(result["dry_run"]["permission"]["decision"], "deny");
     assert_eq!(result["dry_run"]["permission"]["source"], "user settings");
+}
+
+#[test]
+fn delivery_two_responses_share_cli_web_and_legacy_ide_session() {
+    use std::process::Stdio;
+    let workspace = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mock = start_mock_llm_server();
+    p0_provider_settings(
+        home.path(),
+        &mock,
+        serde_json::json!({
+            "llm":{"provider":"openai-compatible","endpoint":mock.endpoint,"api_key":"synthetic-provider-key","stream":true,"max_retries":0,"timeout_seconds":10,
+                "providers":{"openai-compatible":{"chat_protocol":"openai-responses","models":{"chat":"gpt-4.1-mini"}}}},
+            "agent_loop":{"phase_loop_enabled":false}
+        }),
+    );
+    let status = StdCommand::new(p0_binary())
+        .current_dir(workspace.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("CODINGBUDDY_TRUST_WORKSPACE")
+        .args(["provider", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["live_verified"], false);
+    assert_eq!(mock.requests.load(Ordering::Relaxed), 0);
+    let server = P0Server::launch(workspace.path(), home.path());
+    let auth = server.authorized();
+    let (_, opened) = server.request(&auth, "session/open", Value::Null);
+    let session = opened["result"]["session_id"].as_str().unwrap().to_owned();
+    let output = StdCommand::new(p0_binary())
+        .current_dir(workspace.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("CODINGBUDDY_TRUST_WORKSPACE")
+        .args([
+            "--json",
+            "ask",
+            "hello",
+            "--session-id",
+            &session,
+            "--tools=false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(cli["output"].as_str().unwrap().contains("Mock response"));
+    let (_, started) = server.request(&auth,"prompt/start",serde_json::json!({"session_id":session,"prompt":"continue","request_id":uuid::Uuid::now_v7()}));
+    let id = &started["result"]["prompt_id"];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut cursor = 0;
+    loop {
+        let (_, page) = server.request(
+            &auth,
+            "prompt/events",
+            serde_json::json!({"prompt_id":id,"cursor":cursor}),
+        );
+        assert!(!page.to_string().contains("private-client-fixture"));
+        cursor = page["result"]["next_cursor"].as_i64().unwrap();
+        if page["result"]["done"] == true {
+            assert_eq!(page["result"]["status"], "completed", "{page}");
+            assert!(page["result"]["provider_error"].is_null());
+            break;
+        }
+        assert!(Instant::now() < deadline, "{page}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(server);
+    let mut ide = StdCommand::new(p0_binary())
+        .current_dir(workspace.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("CODINGBUDDY_TRUST_WORKSPACE")
+        .args(["serve", "--transport", "stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = ide.stdin.take().unwrap();
+    writeln!(input,"{}",serde_json::json!({"jsonrpc":"2.0","id":1,"method":"prompt/execute","params":{"session_id":session,"prompt":"legacy continuation","tools":false}})).unwrap();
+    writeln!(
+        input,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"shutdown"})
+    )
+    .unwrap();
+    drop(input);
+    let mut line = String::new();
+    ide.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut line)
+        .unwrap();
+    let reply: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(reply["result"]["session_id"], session);
+    assert_eq!(reply["result"]["status"], "completed", "{reply}");
+    assert!(!line.contains("private-client-fixture"));
+    assert!(ide.wait().unwrap().success());
+    assert_eq!(mock.requests.load(Ordering::Relaxed), 3);
+    let store = codingbuddy_store::Store::new(workspace.path()).unwrap();
+    let events = store
+        .session_events(uuid::Uuid::parse_str(&session).unwrap())
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(&event.kind, codingbuddy_core::EventKind::ModelStep { .. }))
+            .count(),
+        3
+    );
 }

@@ -17,6 +17,7 @@ codingbuddy-diff = { path = "../codingbuddy-diff" }
 codingbuddy-memory = { path = "../codingbuddy-memory" }
 codingbuddy-policy = { path = "../codingbuddy-policy" }
 codingbuddy-store = { path = "../codingbuddy-store" }
+codingbuddy-llm = { path = "../codingbuddy-llm" }
 codingbuddy-agent = { path = "../codingbuddy-agent" }
 
 [dev-dependencies]

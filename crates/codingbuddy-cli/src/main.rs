@@ -366,6 +366,11 @@ enum Commands {
     Status,
     /// List available models for each configured provider.
     Models,
+    /// Inspect provider evidence or run an explicit bounded live verification.
+    Provider {
+        #[command(subcommand)]
+        command: commands::provider::ProviderCommand,
+    },
     /// Interactive setup wizard for provider connection.
     Setup(SetupArgs),
     /// Display token and cost usage.
@@ -1175,7 +1180,8 @@ fn handle_error(error: anyhow::Error, json_mode: bool) -> ! {
         let json_error = json!({
             "error": error.to_string(),
             "message": error_message,
-            "success": false
+            "success": false,
+            "provider_error": codingbuddy_llm::error::diagnostic(&error),
         });
         if let Ok(s) = serde_json::to_string_pretty(&json_error) {
             eprintln!("{}", s);
@@ -1544,6 +1550,7 @@ fn run() -> Result<()> {
         Commands::Session { command } => run_session_cmd(&cwd, command, cli.json),
         Commands::Status => run_status(&cwd, cli.json),
         Commands::Models => run_models(&cwd, cli.json),
+        Commands::Provider { command } => commands::provider::run(&cwd, command, cli.json),
         Commands::Setup(args) => run_setup(&cwd, args, cli.json),
         Commands::Usage(args) => run_usage(&cwd, args, cli.json),
         Commands::Compact(args) => run_compact(&cwd, args, cli.json),

@@ -1,5 +1,8 @@
+pub mod certification;
 mod chat_transport;
+pub mod error;
 mod native_parts;
+mod route;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
@@ -193,20 +196,9 @@ impl std::fmt::Display for ConnectionError {
 impl std::error::Error for ConnectionError {}
 
 pub fn check_provider(cfg: &LlmConfig) -> Result<()> {
-    let kind = cfg
-        .active_provider_kind()
+    cfg.active_provider_kind()
         .ok_or_else(|| ConnectionError::UnknownProvider(cfg.provider.clone()))?;
-    let protocol = protocol::select_chat_protocol(&cfg.active_provider(), kind);
-    if matches!(
-        protocol,
-        protocol::ChatProtocol::OpenAiResponses | protocol::ChatProtocol::BedrockConverse
-    ) {
-        return Err(ConnectionError::UnsupportedProtocol {
-            provider: cfg.provider.clone(),
-            protocol: protocol.as_key(),
-        }
-        .into());
-    }
+    let route = route::ChatRoute::resolve(cfg, &cfg.active_base_model(), false)?;
     if provider_requires_key(cfg) && resolve_key_from_config(cfg).is_none() {
         return Err(ConnectionError::MissingCredential {
             provider: cfg.provider.clone(),
@@ -214,6 +206,7 @@ pub fn check_provider(cfg: &LlmConfig) -> Result<()> {
         }
         .into());
     }
+    route.headers(resolve_key_from_config(cfg).as_deref())?;
     Ok(())
 }
 
@@ -244,11 +237,7 @@ fn session_route_with_credential(
     } else {
         None
     };
-    let endpoint = if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent {
-        providers::google::endpoint(&provider.base_url, model, false)
-    } else {
-        resolved_endpoint(cfg, true, false, false)
-    };
+    let endpoint = route::ChatRoute::resolve(cfg, model, false)?.endpoint;
     let route = serde_json::to_vec(&(
         cfg.provider.as_str(),
         chat_protocol.as_key(),
@@ -749,19 +738,55 @@ impl ApiClient {
         payload
     }
 
+    #[cfg(test)]
     fn build_chat_payload(&self, req: &ChatRequest) -> Result<PreparedPayload> {
-        let provider = self.provider_config();
-        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
-                self.cfg.provider
-            )
-        })?;
-        let chat_protocol = protocol::select_chat_protocol(&provider, capabilities.provider);
+        let route = route::ChatRoute::resolve(&self.cfg, &req.model, false)?;
+        self.build_chat_payload_for_route(req, &route)
+    }
 
+    fn build_chat_payload_for_route(
+        &self,
+        req: &ChatRequest,
+        route: &route::ChatRoute,
+    ) -> Result<PreparedPayload> {
+        let provider = route.provider.clone();
+        let capabilities = &route.capabilities;
+        let chat_protocol = route.protocol;
+        for tool in &req.tools {
+            jsonschema::validator_for(&tool.function.parameters).map_err(|_| {
+                error::ProviderError::new(chat_protocol, error::FailureKind::UnsupportedFeature)
+            })?;
+        }
         // Native providers: build their own payload format
         match chat_protocol {
-            protocol::ChatProtocol::OpenAiResponses | protocol::ChatProtocol::BedrockConverse => {
+            protocol::ChatProtocol::OpenAiResponses => {
+                let mut payload = providers::responses::build_payload(req)?;
+                let mut layers = vec![&provider.payload_options];
+                for key in [
+                    "default",
+                    capabilities.provider.as_key(),
+                    capabilities.family.as_key(),
+                    req.model.as_str(),
+                ] {
+                    if let Some(options) = req.provider_options.get(key) {
+                        layers.push(options);
+                    }
+                }
+                providers::responses::apply_options(&mut payload, &layers)?;
+                payload["max_output_tokens"] = json!(req.max_tokens.min(
+                    max_output_tokens_for_model(capabilities.provider, &req.model, false)
+                ));
+                return Ok(PreparedPayload {
+                    payload,
+                    compatibility: AppliedCompatibility {
+                        provider: self.cfg.provider.clone(),
+                        family: capabilities.family.as_key().into(),
+                        transforms: vec!["protocol:openai-responses".into()],
+                        degraded_inputs: vec![],
+                    },
+                });
+            }
+            protocol::ChatProtocol::BedrockConverse => {
                 let adapter = protocol::adapters::adapter_for(chat_protocol);
                 return Err(anyhow!(
                     "chat protocol '{}' is registered ({:?}) but not enabled in the runtime execution path yet; set provider.chat_protocol='openai-chat' or use a provider with native support for this protocol",
@@ -816,7 +841,7 @@ impl ApiClient {
             .is_some_and(|t| t.thinking_type == "enabled");
         let thinking_enabled =
             requested_thinking && capabilities.thinking_capability.accepts_thinking_config();
-        let prepared_messages = provider_transform::preflight_chat_messages(req, &capabilities)?;
+        let prepared_messages = provider_transform::preflight_chat_messages(req, capabilities)?;
         let mut compatibility = AppliedCompatibility {
             provider: capabilities.provider.as_key().to_string(),
             family: capabilities.family.as_key().to_string(),
@@ -885,7 +910,7 @@ impl ApiClient {
         if capabilities.supports_tool_calling
             && let Some(prepared_tools) = provider_transform::prepare_chat_tools_with_compatibility(
                 req,
-                &capabilities,
+                capabilities,
                 &provider.base_url,
                 &self.cfg.endpoint,
                 &mut compatibility,
@@ -912,13 +937,13 @@ impl ApiClient {
             &mut payload,
             req,
             &provider,
-            &capabilities,
+            capabilities,
             &mut compatibility,
         );
         provider_transform::apply_chat_payload_compatibility_with_tracking(
             &mut payload,
             req,
-            &capabilities,
+            capabilities,
             &mut compatibility,
         );
         compatibility.transforms.sort();
@@ -929,37 +954,17 @@ impl ApiClient {
         })
     }
 
-    fn complete_chat_inner(&self, req: &ChatRequest, api_key: Option<&str>) -> Result<LlmResponse> {
-        let prepared = self.build_chat_payload(req)?;
-        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
-                self.cfg.provider
-            )
-        })?;
-        let provider = self.provider_config();
-        let chat_protocol = protocol::select_chat_protocol(&provider, capabilities.provider);
-
-        // Build provider-specific endpoint
-        let endpoint = match chat_protocol {
-            protocol::ChatProtocol::GeminiGenerateContent => {
-                let base = provider.base_url.trim_end_matches('/');
-                let url = providers::google::endpoint(base, &req.model, false);
-                if let Some(key) = api_key
-                    && provider
-                        .auth_strategy
-                        .as_deref()
-                        .and_then(protocol::parse_auth_strategy)
-                        == Some(protocol::AuthStrategy::QueryApiKey)
-                {
-                    providers::google::append_api_key(&url, key)
-                } else {
-                    url
-                }
-            }
-            _ => self.resolved_endpoint(true, false, false),
-        };
-
+    fn complete_chat_inner(
+        &self,
+        req: &ChatRequest,
+        api_key: Option<&str>,
+        route: &route::ChatRoute,
+    ) -> Result<LlmResponse> {
+        let prepared = self.build_chat_payload_for_route(req, route)?;
+        let capabilities = &route.capabilities;
+        let chat_protocol = route.protocol;
+        let endpoint = &route.endpoint;
+        let headers = route.headers(api_key)?;
         let transport = chat_transport::ChatTransport::new(
             Duration::from_secs(self.cfg.timeout_seconds),
             self.cancel_token.clone(),
@@ -968,12 +973,7 @@ impl ApiClient {
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             self.check_cancellation()?;
-            let request = self
-                .apply_auth_for_protocol(self.client.post(&endpoint), api_key, chat_protocol)
-                .build()
-                .map_err(reqwest::Error::without_url)?;
-            let response =
-                transport.post(&endpoint, request.headers().clone(), &prepared.payload)?;
+            let response = transport.post(endpoint, headers.clone(), &prepared.payload)?;
 
             match response {
                 Ok(resp) => {
@@ -982,7 +982,19 @@ impl ApiClient {
                     let retry_after = parse_retry_after(resp.headers());
                     let body = transport.text(resp)?;
                     if status.is_success() {
+                        let envelope: Value = serde_json::from_str(&body)?;
+                        if !envelope["error"].is_null() {
+                            return Err(error::ProviderError::http(
+                                chat_protocol,
+                                status.as_u16(),
+                                &body,
+                            )
+                            .into());
+                        }
                         let response = match chat_protocol {
+                            protocol::ChatProtocol::OpenAiResponses => {
+                                providers::responses::parse_response(&serde_json::from_str(&body)?)?
+                            }
                             protocol::ChatProtocol::AnthropicMessages => {
                                 providers::anthropic::parse_response(&body)?
                             }
@@ -993,7 +1005,7 @@ impl ApiClient {
                                 let r = parse_non_streaming_payload(&body)?;
                                 provider_transform::postprocess_chat_response_with_compatibility(
                                     r,
-                                    &capabilities,
+                                    capabilities,
                                     &req.tools,
                                     prepared.compatibility.clone(),
                                 )
@@ -1001,15 +1013,9 @@ impl ApiClient {
                         };
                         return Ok(response);
                     }
-                    last_err = Some(with_compatibility_context(
-                        format_api_error(
-                            status,
-                            &redact_key(&body, api_key),
-                            attempt,
-                            self.cfg.max_retries,
-                        ),
-                        &prepared.compatibility,
-                    ));
+                    last_err = Some(
+                        error::ProviderError::http(chat_protocol, status.as_u16(), &body).into(),
+                    );
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         self.wait_before_retry(retry_delay_ms(
                             self.cfg.retry_base_ms,
@@ -1022,10 +1028,10 @@ impl ApiClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(with_compatibility_context(
-                        format_transport_error(&e),
-                        &prepared.compatibility,
-                    ));
+                    last_err = Some(
+                        error::ProviderError::new(chat_protocol, error::FailureKind::Transport)
+                            .into(),
+                    );
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         self.wait_before_retry(retry_delay_ms(
                             NETWORK_RETRY_BASE_MS,
@@ -1229,46 +1235,21 @@ impl ApiClient {
         req: &ChatRequest,
         api_key: Option<&str>,
         cb: StreamCallback,
+        route: &route::ChatRoute,
     ) -> Result<LlmResponse> {
-        let mut prepared = self.build_chat_payload(req)?;
-        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
-                self.cfg.provider
-            )
-        })?;
-        let provider = self.provider_config();
-        let chat_protocol = protocol::select_chat_protocol(&provider, capabilities.provider);
-        // Native providers handle streaming differently
+        let mut prepared = self.build_chat_payload_for_route(req, route)?;
+        let capabilities = &route.capabilities;
+        let chat_protocol = route.protocol;
+        let is_responses = chat_protocol == protocol::ChatProtocol::OpenAiResponses;
         let is_native = chat_protocol.is_native();
-        if !is_native {
-            prepared.payload["stream"] = json!(true);
-            prepared.payload["stream_options"] = json!({"include_usage": true});
-        } else if chat_protocol == protocol::ChatProtocol::AnthropicMessages {
+        if chat_protocol != protocol::ChatProtocol::GeminiGenerateContent {
             prepared.payload["stream"] = json!(true);
         }
-        // Google uses ?alt=sse in the URL for streaming, no body flag needed
-
-        // Build provider-specific endpoint for streaming
-        let stream_endpoint = match chat_protocol {
-            protocol::ChatProtocol::GeminiGenerateContent => {
-                let base = provider.base_url.trim_end_matches('/');
-                let url = providers::google::endpoint(base, &req.model, true);
-                if let Some(key) = api_key
-                    && provider
-                        .auth_strategy
-                        .as_deref()
-                        .and_then(protocol::parse_auth_strategy)
-                        == Some(protocol::AuthStrategy::QueryApiKey)
-                {
-                    providers::google::append_api_key(&url, key)
-                } else {
-                    url
-                }
-            }
-            _ => self.resolved_endpoint(true, false, false),
-        };
-
+        if !is_native && !is_responses {
+            prepared.payload["stream_options"] = json!({"include_usage":true});
+        }
+        let stream_endpoint = &route.endpoint;
+        let headers = route.headers(api_key)?;
         let transport = chat_transport::ChatTransport::new(
             Duration::from_secs(self.cfg.timeout_seconds),
             self.cancel_token.clone(),
@@ -1277,15 +1258,7 @@ impl ApiClient {
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             self.check_cancellation()?;
-            let request = self
-                .apply_auth_for_protocol(self.client.post(&stream_endpoint), api_key, chat_protocol)
-                .build()
-                .map_err(reqwest::Error::without_url)?;
-            let response = transport.post(
-                &stream_endpoint,
-                request.headers().clone(),
-                &prepared.payload,
-            )?;
+            let response = transport.post(stream_endpoint, headers.clone(), &prepared.payload)?;
 
             match response {
                 Ok(resp) => {
@@ -1305,6 +1278,10 @@ impl ApiClient {
                         let mut native_state = providers::NativeStreamState::default();
                         let mut anthropic_blocks = native_parts::AnthropicBlocks::default();
                         let mut gemini_blocks = Vec::new();
+                        let mut native_usage = None;
+                        let mut anthropic_usage = json!({});
+                        let mut gemini_finished = false;
+                        let mut responses = providers::responses::Stream::default();
                         let mut reader = std::io::BufReader::new(transport.reader(resp));
                         while let Some(frame) = chat_transport::next_frame(&mut reader)
                             .context("Provider stream read failed")?
@@ -1312,19 +1289,36 @@ impl ApiClient {
                             let anthropic_event_type = frame.event;
                             let chunk = frame.data.as_str();
                             if chunk == "[DONE]" {
-                                if !is_native {
+                                if !is_native && !is_responses {
                                     break;
                                 }
                                 return Err(anyhow!("Unexpected [DONE] in native provider stream"));
                             }
                             let value: Value = serde_json::from_str(chunk)
                                 .context("Malformed provider stream event")?;
-                            anyhow::ensure!(
-                                anthropic_event_type != "error"
-                                    && value.get("type").and_then(Value::as_str) != Some("error")
-                                    && value.get("error").is_none_or(Value::is_null),
-                                "Provider sent an error during the response stream"
-                            );
+                            if anthropic_event_type == "error"
+                                || value.get("type").and_then(Value::as_str) == Some("error")
+                                || !value.get("error").is_none_or(Value::is_null)
+                            {
+                                return Err(error::ProviderError::http(
+                                    chat_protocol,
+                                    status.as_u16(),
+                                    &value.to_string(),
+                                )
+                                .into());
+                            }
+
+                            if is_responses {
+                                if let Some(mut response) = responses.frame(&value, &*cb)? {
+                                    response.compatibility = Some(prepared.compatibility.clone());
+                                    self.check_cancellation()?;
+                                    cb(StreamChunk::Done {
+                                        reason: Some(response.finish_reason.clone()),
+                                    });
+                                    return Ok(response);
+                                }
+                                continue;
+                            }
 
                             // ── Native Anthropic streaming ──
                             if chat_protocol == protocol::ChatProtocol::AnthropicMessages {
@@ -1333,6 +1327,30 @@ impl ApiClient {
                                 } else {
                                     &anthropic_event_type
                                 };
+                                let usage_part = if evt_type == "message_start" {
+                                    value.pointer("/message/usage")
+                                } else {
+                                    value.get("usage")
+                                };
+                                if let Some(fields) = usage_part.and_then(Value::as_object) {
+                                    anthropic_usage
+                                        .as_object_mut()
+                                        .expect("object")
+                                        .extend(fields.clone());
+                                    native_usage =
+                                        Some(providers::anthropic::parse_anthropic_usage(
+                                            &json!({"usage":anthropic_usage}),
+                                        ));
+                                }
+                                if evt_type == "content_block_start"
+                                    && value.pointer("/content_block/type").and_then(Value::as_str)
+                                        == Some("text")
+                                    && let Some(text) =
+                                        value.pointer("/content_block/text").and_then(Value::as_str)
+                                    && !text.is_empty()
+                                {
+                                    cb(StreamChunk::ContentDelta(text.into()));
+                                }
                                 anthropic_blocks.frame(evt_type, &value)?;
                                 let raw =
                                     providers::anthropic::parse_streaming_event(evt_type, &value);
@@ -1347,6 +1365,30 @@ impl ApiClient {
 
                             // ── Native Google streaming ──
                             if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent {
+                                anyhow::ensure!(
+                                    value["candidates"].as_array().is_none_or(|c| c.len() <= 1),
+                                    "Expected one Gemini candidate"
+                                );
+                                if value["usageMetadata"].is_object() {
+                                    native_usage =
+                                        Some(providers::google::parse_gemini_usage(&value));
+                                }
+                                if value.pointer("/candidates/0/content/parts").is_some() {
+                                    anyhow::ensure!(
+                                        !gemini_finished,
+                                        "Gemini content after terminal event"
+                                    );
+                                }
+                                if let Some(reason) = value
+                                    .pointer("/candidates/0/finishReason")
+                                    .and_then(Value::as_str)
+                                {
+                                    gemini_finished = true;
+                                    anyhow::ensure!(
+                                        reason == "STOP",
+                                        "Provider response incomplete"
+                                    );
+                                }
                                 if let Some(parts) = value
                                     .pointer("/candidates/0/content/parts")
                                     .and_then(Value::as_array)
@@ -1379,7 +1421,10 @@ impl ApiClient {
                                 finish_reason = Some(reason.to_string());
                             }
                             if let Some(delta) = choice.get("delta") {
-                                if let Some(content) = delta.get("content").and_then(|v| v.as_str())
+                                if let Some(content) = delta
+                                    .get("content")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| delta.get("refusal").and_then(Value::as_str))
                                 {
                                     content_out.push_str(content);
                                     order.push(Ok::<_, u64>(TransportPart::Text(
@@ -1444,7 +1489,10 @@ impl ApiClient {
                                 }
                             }
                             if let Some(message) = choice.get("message") {
-                                if let Some(content) = message["content"].as_str() {
+                                if let Some(content) = message["content"]
+                                    .as_str()
+                                    .or_else(|| message["refusal"].as_str())
+                                {
                                     content_out.push_str(content);
                                     order.push(Ok(TransportPart::Text(content.into())));
                                     cb(StreamChunk::ContentDelta(content.to_string()));
@@ -1515,7 +1563,17 @@ impl ApiClient {
                                 .collect();
                             reasoning_out = native_state.reasoning;
                             finish_reason = native_state.finish_reason;
-                            usage = native_state.usage;
+                            usage = native_usage.or(native_state.usage);
+                        }
+                        if chat_protocol == protocol::ChatProtocol::OpenAiChat
+                            && !reasoning_out.is_empty()
+                        {
+                            transport_parts.push(TransportPart::Native(
+                                codingbuddy_core::NativeParts {
+                                    protocol: "openai-chat".into(),
+                                    blocks: vec![json!({"reasoning_content":reasoning_out})],
+                                },
+                            ));
                         }
                         validate_completed_calls(&tool_calls)?;
                         let text = content_out;
@@ -1541,7 +1599,7 @@ impl ApiClient {
                         return Ok(
                             provider_transform::postprocess_chat_response_with_compatibility(
                                 response,
-                                &capabilities,
+                                capabilities,
                                 &req.tools,
                                 prepared.compatibility.clone(),
                             ),
@@ -1549,15 +1607,9 @@ impl ApiClient {
                     }
 
                     let body = transport.text(resp)?;
-                    last_err = Some(with_compatibility_context(
-                        format_api_error(
-                            status,
-                            &redact_key(&body, api_key),
-                            attempt,
-                            self.cfg.max_retries,
-                        ),
-                        &prepared.compatibility,
-                    ));
+                    last_err = Some(
+                        error::ProviderError::http(chat_protocol, status.as_u16(), &body).into(),
+                    );
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         self.wait_before_retry(retry_delay_ms(
                             self.cfg.retry_base_ms,
@@ -1570,10 +1622,10 @@ impl ApiClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(with_compatibility_context(
-                        format_transport_error(&e),
-                        &prepared.compatibility,
-                    ));
+                    last_err = Some(
+                        error::ProviderError::new(chat_protocol, error::FailureKind::Transport)
+                            .into(),
+                    );
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         self.wait_before_retry(retry_delay_ms(
                             NETWORK_RETRY_BASE_MS,
@@ -1609,15 +1661,15 @@ impl ApiClient {
     }
 
     /// Validate parameters that are incompatible with provider-managed thinking modes.
-    fn validate_thinking_params(&self, req: &ChatRequest) -> Result<()> {
+    fn validate_thinking_params(&self, req: &ChatRequest, route: &route::ChatRoute) -> Result<()> {
         let thinking_enabled = req
             .thinking
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled")
-            && self
-                .cfg
-                .capabilities_for_model(&req.model)
-                .is_some_and(|caps| caps.thinking_capability.accepts_thinking_config());
+            && route
+                .capabilities
+                .thinking_capability
+                .accepts_thinking_config();
         if !thinking_enabled {
             return Ok(());
         }
@@ -1636,21 +1688,24 @@ impl ApiClient {
 
     /// Validate chat request parameters against the resolved capability profile
     /// before any provider request is dispatched.
+    #[cfg(test)]
     fn validate_chat_request_contract(&self, req: &ChatRequest) -> Result<()> {
-        let resolution = self
-            .cfg
-            .capability_resolution_for_model(&req.model)
-            .ok_or_else(|| {
-                anyhow!(
-                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, anthropic, google, groq, openrouter, ollama)",
-                    self.cfg.provider
-                )
-            })?;
-        let caps = resolution.capabilities;
-        let applied_rules = if resolution.applied_rules.is_empty() {
+        self.validate_chat_request_for_route(
+            req,
+            &route::ChatRoute::resolve(&self.cfg, &req.model, false)?,
+        )
+    }
+
+    fn validate_chat_request_for_route(
+        &self,
+        req: &ChatRequest,
+        route: &route::ChatRoute,
+    ) -> Result<()> {
+        let caps = &route.capabilities;
+        let applied_rules = if route.capability_rules.is_empty() {
             "none".to_string()
         } else {
-            resolution.applied_rules.join(", ")
+            route.capability_rules.join(", ")
         };
 
         let has_assistant_tool_calls = req.messages.iter().any(|message| {
@@ -1981,13 +2036,31 @@ impl LlmClient for ApiClient {
     }
 
     fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        let _provider = self.provider_kind()?;
-        let key = self.resolve_request_api_key()?;
-        let mut normalized_req = req.clone();
-        normalized_req.model = self.resolve_request_model(&req.model)?;
-        self.validate_chat_request_contract(&normalized_req)?;
-        self.validate_thinking_params(&normalized_req)?;
-        self.complete_chat_inner(&normalized_req, key.as_deref())
+        let protocol = protocol::select_chat_protocol(
+            &self.cfg.active_provider(),
+            self.cfg
+                .active_provider_kind()
+                .unwrap_or(ProviderKind::OpenAiCompatible),
+        );
+        (|| {
+            let _provider = self.provider_kind()?;
+            let mut normalized_req = req.clone();
+            normalized_req.model = self.resolve_request_model(&req.model)?;
+            let route = route::ChatRoute::resolve(&self.cfg, &normalized_req.model, false)?;
+            let key = if route.auth == protocol::AuthStrategy::None {
+                None
+            } else {
+                self.resolve_api_key()
+            };
+            self.validate_chat_request_for_route(&normalized_req, &route)?;
+            self.validate_thinking_params(&normalized_req, &route)?;
+            confirmed_chat_response(
+                self.complete_chat_inner(&normalized_req, key.as_deref(), &route)?,
+                protocol,
+                &normalized_req.tools,
+            )
+        })()
+        .map_err(|error| error::ProviderError::classify(protocol, error))
     }
 
     fn complete_chat_streaming(
@@ -1995,23 +2068,72 @@ impl LlmClient for ApiClient {
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let _provider = self.provider_kind()?;
-        let key = self.resolve_request_api_key()?;
-        let mut normalized_req = req.clone();
-        normalized_req.model = self.resolve_request_model(&req.model)?;
-        self.validate_chat_request_contract(&normalized_req)?;
-        self.validate_thinking_params(&normalized_req)?;
-        if !self.cfg.stream {
-            let response = self.complete_chat_inner(&normalized_req, key.as_deref())?;
-            if !response.text.is_empty() {
-                cb(StreamChunk::ContentDelta(response.text.clone()));
+        let protocol = protocol::select_chat_protocol(
+            &self.cfg.active_provider(),
+            self.cfg
+                .active_provider_kind()
+                .unwrap_or(ProviderKind::OpenAiCompatible),
+        );
+        let terminal_cb = cb.clone();
+        let visible = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let presented = visible.clone();
+        let cb: StreamCallback = std::sync::Arc::new(move |chunk| {
+            if matches!(&chunk, StreamChunk::Done { .. }) {
+                return;
             }
-            cb(StreamChunk::Done {
+            if matches!(&chunk, StreamChunk::ContentDelta(text) if !text.is_empty()) {
+                presented.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            cb(chunk);
+        });
+        let result = (|| {
+            let _provider = self.provider_kind()?;
+            let mut normalized_req = req.clone();
+            normalized_req.model = self.resolve_request_model(&req.model)?;
+            let route =
+                route::ChatRoute::resolve(&self.cfg, &normalized_req.model, self.cfg.stream)?;
+            let key = if route.auth == protocol::AuthStrategy::None {
+                None
+            } else {
+                self.resolve_api_key()
+            };
+            self.validate_chat_request_for_route(&normalized_req, &route)?;
+            self.validate_thinking_params(&normalized_req, &route)?;
+            if !self.cfg.stream {
+                let response = confirmed_chat_response(
+                    self.complete_chat_inner(&normalized_req, key.as_deref(), &route)?,
+                    protocol,
+                    &normalized_req.tools,
+                )?;
+                if !response.text.is_empty() {
+                    cb(StreamChunk::ContentDelta(response.text.clone()));
+                }
+                cb(StreamChunk::Done {
+                    reason: Some(response.finish_reason.clone()),
+                });
+                return Ok(response);
+            }
+            confirmed_chat_response(
+                self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb, &route)?,
+                protocol,
+                &normalized_req.tools,
+            )
+        })()
+        .map_err(|error| {
+            let mut error = error::ProviderError::classify(protocol, error);
+            if visible.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(provider) = error.downcast_mut::<error::ProviderError>()
+            {
+                provider.retryable = false;
+            }
+            error
+        });
+        if let Ok(response) = &result {
+            terminal_cb(StreamChunk::Done {
                 reason: Some(response.finish_reason.clone()),
             });
-            return Ok(response);
         }
-        self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb)
+        result
     }
 
     fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
@@ -2388,6 +2510,7 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
     let content = message
         .get("content")
         .and_then(|v| v.as_str())
+        .or_else(|| message.get("refusal").and_then(Value::as_str))
         .unwrap_or_default()
         .to_string();
     let reasoning_content = message
@@ -2407,8 +2530,23 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
     );
     let text = content;
     let usage = parse_usage_object(value.get("usage"));
+    let mut transport_parts = Vec::new();
+    if !text.is_empty() {
+        transport_parts.push(TransportPart::Text(text.clone()));
+    }
+    transport_parts.extend(
+        tool_calls
+            .iter()
+            .map(|call| TransportPart::Call(call.id.clone())),
+    );
+    if !reasoning_content.is_empty() {
+        transport_parts.push(TransportPart::Native(codingbuddy_core::NativeParts {
+            protocol: "openai-chat".into(),
+            blocks: vec![json!({"reasoning_content":reasoning_content})],
+        }));
+    }
     Ok(LlmResponse {
-        transport_parts: Vec::new(),
+        transport_parts,
         text,
         finish_reason: if finish_reason == "missing_terminal" {
             "stop".into()
@@ -2424,25 +2562,28 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
 
 /// Extract token usage from a DeepSeek API usage JSON object.
 fn parse_usage_object(usage_value: Option<&Value>) -> Option<codingbuddy_core::TokenUsage> {
-    let u = usage_value?;
+    let usage = usage_value.filter(|value| value.is_object())?;
+    let input = usage["prompt_tokens"].as_u64().unwrap_or(0);
+    let cached = usage["prompt_cache_hit_tokens"]
+        .as_u64()
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0)
+        .min(input);
     Some(codingbuddy_core::TokenUsage {
-        prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        completion_tokens: u
-            .get("completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        prompt_cache_hit_tokens: u
-            .get("prompt_cache_hit_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        prompt_cache_miss_tokens: u
-            .get("prompt_cache_miss_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        reasoning_tokens: u
-            .get("completion_tokens_details")
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(|v| v.as_u64())
+        prompt_tokens: input,
+        completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
+        prompt_cache_hit_tokens: cached,
+        prompt_cache_miss_tokens: usage["prompt_cache_miss_tokens"]
+            .as_u64()
+            .unwrap_or(input - cached)
+            .min(input - cached),
+        reasoning_tokens: usage
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
             .unwrap_or(0),
     })
 }
@@ -2580,6 +2721,39 @@ fn merge_stream_tool_calls(chunks: &[Value], out: &mut BTreeMap<u64, StreamToolC
             }
         }
     }
+}
+
+fn confirmed_chat_response(
+    response: LlmResponse,
+    protocol: protocol::ChatProtocol,
+    tools: &[codingbuddy_core::ToolDefinition],
+) -> Result<LlmResponse> {
+    if !matches!(response.finish_reason.as_str(), "stop" | "tool_calls") {
+        return Err(
+            error::ProviderError::new(protocol, error::FailureKind::IncompleteResponse).into(),
+        );
+    }
+    for call in &response.tool_calls {
+        let definition = tools
+            .iter()
+            .find(|tool| tool.function.name == call.name)
+            .ok_or_else(|| {
+                error::ProviderError::new(protocol, error::FailureKind::MalformedResponse)
+            })?;
+        let args: Value = serde_json::from_str(&call.arguments).map_err(|_| {
+            error::ProviderError::new(protocol, error::FailureKind::MalformedResponse)
+        })?;
+        let validator =
+            jsonschema::validator_for(&definition.function.parameters).map_err(|_| {
+                error::ProviderError::new(protocol, error::FailureKind::UnsupportedFeature)
+            })?;
+        if !validator.is_valid(&args) {
+            return Err(
+                error::ProviderError::new(protocol, error::FailureKind::MalformedResponse).into(),
+            );
+        }
+    }
+    Ok(response)
 }
 
 fn validate_completed_calls(calls: &[LlmToolCall]) -> Result<()> {
@@ -2831,9 +3005,11 @@ mod tests {
         let err = client
             .complete_chat(&req)
             .expect_err("logprobs with thinking should fail");
-        assert!(
-            err.to_string()
-                .contains("logprobs is incompatible with thinking mode")
+        assert_eq!(
+            err.downcast_ref::<error::ProviderError>()
+                .expect("typed provider failure")
+                .category,
+            error::FailureKind::UnsupportedFeature
         );
     }
 
@@ -2866,9 +3042,11 @@ mod tests {
         let err = client
             .complete_chat(&req)
             .expect_err("top_logprobs with thinking should fail");
-        assert!(
-            err.to_string()
-                .contains("top_logprobs is incompatible with thinking mode")
+        assert_eq!(
+            err.downcast_ref::<error::ProviderError>()
+                .expect("typed provider failure")
+                .category,
+            error::FailureKind::UnsupportedFeature
         );
     }
 
@@ -4380,7 +4558,7 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 10);
         assert_eq!(usage.prompt_cache_hit_tokens, 0);
-        assert_eq!(usage.prompt_cache_miss_tokens, 0);
+        assert_eq!(usage.prompt_cache_miss_tokens, 42);
         assert_eq!(usage.reasoning_tokens, 0);
     }
 
