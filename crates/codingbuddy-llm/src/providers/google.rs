@@ -153,15 +153,11 @@ pub fn build_payload(req: &ChatRequest, max_output_tokens: u32) -> Result<Value>
             .tools
             .iter()
             .map(|t| {
-                let mut decl = json!({
+                json!({
                     "name": t.function.name,
                     "description": t.function.description,
-                });
-                // Sanitize parameters for Gemini compatibility
-                let mut params = t.function.parameters.clone();
-                crate::provider_transform::sanitize_gemini_schema(&mut params);
-                decl["parameters"] = params;
-                decl
+                    "parametersJsonSchema": t.function.parameters,
+                })
             })
             .collect();
         payload["tools"] = json!([{

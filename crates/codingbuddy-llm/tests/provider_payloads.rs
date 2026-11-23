@@ -107,6 +107,8 @@ fn anthropic_payload_system_toplevel_and_cache_control_on_last_tool() {
 // --------------------------------------------------------------------------
 #[test]
 fn google_payload_uses_contents_and_system_instruction() {
+    let mut tool = sample_tool();
+    tool.function.parameters["additionalProperties"] = json!(false);
     let req = make_request(
         "gemini-2.5-flash",
         vec![
@@ -117,7 +119,7 @@ fn google_payload_uses_contents_and_system_instruction() {
                 content: "Hello".to_string(),
             },
         ],
-        vec![sample_tool()],
+        vec![tool],
     );
     let payload = google::build_payload(&req, 8192).unwrap();
 
@@ -148,6 +150,11 @@ fn google_payload_uses_contents_and_system_instruction() {
         .expect("functionDeclarations must be present");
     assert_eq!(declarations.len(), 1);
     assert_eq!(declarations[0]["name"], "fs_read");
+    assert_eq!(
+        declarations[0]["parametersJsonSchema"],
+        req.tools[0].function.parameters
+    );
+    assert!(declarations[0].get("parameters").is_none());
 
     // generationConfig should contain maxOutputTokens
     assert_eq!(payload["generationConfig"]["maxOutputTokens"], 8192);

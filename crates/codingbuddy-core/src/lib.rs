@@ -3174,8 +3174,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
             models: ProviderModels {
-                chat: "gemini-2.5-flash".to_string(),
-                reasoner: Some("gemini-2.5-pro".to_string()),
+                chat: "gemini-3.8-flash".to_string(),
+                reasoner: Some("gemini-3.8-flash".to_string()),
             },
         },
     );

@@ -106,6 +106,7 @@ impl ProviderError {
 
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let http_error = self.http_status.filter(|status| *status >= 300);
         let reason = match self.category {
             FailureKind::Authentication => "Provider authentication failed",
             FailureKind::RateLimit => "Provider rate limit exceeded",
@@ -115,11 +116,18 @@ impl fmt::Display for ProviderError {
             }
             FailureKind::IncompleteStream => "Provider stream ended before a terminal response",
             FailureKind::IncompleteResponse => "Provider response incomplete",
+            FailureKind::ProviderFailure if http_error.is_some() => {
+                "Provider reported a request failure"
+            }
             FailureKind::ProviderFailure => "Provider sent an error during the response stream",
             FailureKind::Cancelled => "Turn interrupted",
             FailureKind::Transport => "Provider transport failed",
         };
-        write!(f, "{reason} ({})", self.protocol)
+        if let Some(status) = http_error {
+            write!(f, "{reason} ({}, HTTP {status})", self.protocol)
+        } else {
+            write!(f, "{reason} ({})", self.protocol)
+        }
     }
 }
 impl std::error::Error for ProviderError {}

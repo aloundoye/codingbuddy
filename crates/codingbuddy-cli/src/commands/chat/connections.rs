@@ -34,7 +34,6 @@ pub(super) struct Connection {
     history_choice: Option<LlmConfig>,
     history_preview: Option<(Uuid, Vec<codingbuddy_core::ChatMessage>)>,
     generation: u64,
-    save_key: bool,
 }
 
 impl Connection {
@@ -49,7 +48,6 @@ impl Connection {
             history_choice: None,
             history_preview: None,
             generation: 0,
-            save_key: false,
         }
     }
     fn candidate(&self, provider: &str) -> Result<LlmConfig> {
@@ -109,7 +107,6 @@ impl Menus {
                 state.pending = None;
                 state.history_choice = None;
                 state.history_preview = None;
-                state.save_key = false;
             }
             "commands" => self.menu(TerminalMenu::choices(
                 "Commands",
@@ -120,7 +117,7 @@ impl Menus {
                     ("settings", "/settings  Defaults and theme"),
                     ("ask", "/ask       Read-only questions"),
                     ("code", "/code      Coding tools"),
-                    ("remove-key", "/logout    Remove saved key"),
+                    ("remove-key", "/logout    Remove default saved key"),
                 ]),
             )),
             "ask" | "code" => {
@@ -165,7 +162,10 @@ impl Menus {
                 entries.extend(custom);
                 entries.extend(choices(&[
                     ("custom-id", "Add an OpenAI-compatible endpoint"),
-                    ("remove-key", "Remove the active provider’s saved key"),
+                    (
+                        "remove-key",
+                        "Remove the active provider’s default saved key",
+                    ),
                 ]));
                 self.menu(TerminalMenu::choices(
                     "Connect a provider",
@@ -257,7 +257,6 @@ impl Menus {
                 self.begin(&mut state, llm);
             }
             "models" => {
-                state.save_key = false;
                 let llm = state.llm.clone();
                 if state.ready {
                     self.discover(&mut state, llm);
@@ -268,20 +267,75 @@ impl Menus {
             }
             "paste-key" => self.prompt_key(),
             "key-entered" | "key-entered-save" => {
-                state.save_key = id == "key-entered-save";
                 anyhow::ensure!(!value.trim().is_empty(), "The API key is empty");
                 let llm = state
                     .pending
                     .as_mut()
                     .ok_or_else(|| anyhow!("Choose a provider first"))?;
                 llm.api_key = Some(value.trim().into());
-                let llm = llm.clone();
-                if llm.active_base_model().trim().is_empty() {
-                    self.discover(&mut state, llm);
-                } else if let Err(error) = self.verify(&mut state, llm.clone()) {
-                    self.notify(error.to_string(), true);
-                    self.discover(&mut state, llm);
+                if id == "key-entered-save" {
+                    self.prompt_key_name("save-key-and-connect");
+                } else {
+                    let llm = llm.clone();
+                    self.connect_with_key(&mut state, llm);
                 }
+            }
+            "save-key" => self.prompt_key_name("save-key-only"),
+            "save-key-only" | "save-key-and-connect" => {
+                let llm = state
+                    .pending
+                    .clone()
+                    .ok_or_else(|| anyhow!("Choose a provider first"))?;
+                let key = codingbuddy_llm::resolve_key_from_config(&llm)
+                    .ok_or_else(|| anyhow!("Enter an API key first"))?;
+                let name = value.trim();
+                // Make a new custom endpoint discoverable on the next launch.
+                if !AppConfig::load(&self.cwd)?
+                    .llm
+                    .providers
+                    .contains_key(&llm.provider)
+                {
+                    let mut profile = llm.active_provider();
+                    profile.headers.clear();
+                    update_settings(|settings| {
+                        settings["llm"]["providers"][&llm.provider] = json!(profile);
+                    })?;
+                }
+                let result = if name.is_empty() {
+                    codingbuddy_llm::save_provider_key(&llm, &key)
+                } else {
+                    codingbuddy_llm::save_named_provider_key(&llm, name, &key)
+                };
+                if let Err(error) = result {
+                    self.notify(format!("Could not save the API key. {error}"), true);
+                    self.prompt_key_name(id);
+                } else {
+                    self.notify("API key saved.".into(), false);
+                    if id == "save-key-and-connect" {
+                        self.connect_with_key(&mut state, llm);
+                    } else {
+                        self.menu(TerminalMenu::actions(
+                            "API key saved",
+                            "Retry when the provider is ready.",
+                            choices(&[
+                                ("retry-connection", "Retry connection"),
+                                ("retry-models", "Choose another model"),
+                                ("cancel", "Return to chat"),
+                            ]),
+                        ));
+                    }
+                }
+            }
+            id if id.starts_with("named-key:") => {
+                let mut llm = state
+                    .pending
+                    .clone()
+                    .ok_or_else(|| anyhow!("Choose a provider first"))?;
+                llm.api_key = Some(codingbuddy_llm::load_named_provider_key(
+                    &llm,
+                    &id["named-key:".len()..],
+                )?);
+                self.connect_with_key(&mut state, llm);
             }
             "retry-connection" => {
                 let llm = state
@@ -306,9 +360,9 @@ impl Menus {
                 self.changed(&state, None);
                 self.notify(
                     if state.ready {
-                        "Saved key removed. Another credential source is available."
+                        "Default saved key removed. Another credential source is available."
                     } else {
-                        "Saved key removed."
+                        "Default saved key removed."
                     }
                     .into(),
                     false,
@@ -476,23 +530,50 @@ impl Menus {
     }
 
     fn begin(&self, state: &mut Connection, llm: LlmConfig) {
-        state.save_key = false;
         if codingbuddy_llm::provider_requires_key(&llm) {
             let has_key = codingbuddy_llm::resolve_key_from_config(&llm).is_some();
-            state.pending = Some(llm);
+            let mut entries = Vec::new();
             if has_key {
-                self.menu(TerminalMenu::actions(
-                    "Credential options",
-                    "A credential is available for this provider.",
-                    choices(&[
-                        ("key-use", "Use available credential"),
-                        ("paste-key", "Enter a different API key"),
-                    ]),
-                ));
-            } else {
+                entries.extend(choices(&[("key-use", "Use available credential")]));
+            }
+            match codingbuddy_llm::provider_key_names(&llm) {
+                Ok(names) => entries.extend(
+                    names
+                        .into_iter()
+                        .map(|name| (format!("named-key:{name}"), name)),
+                ),
+                Err(error) => self.notify(format!("Could not list named API keys. {error}"), true),
+            }
+            state.pending = Some(llm);
+            if entries.is_empty() {
                 self.prompt_key();
+            } else {
+                entries.extend(choices(&[("paste-key", "Enter a different API key")]));
+                self.menu(TerminalMenu::choices(
+                    "Credential options",
+                    "Choose a saved key or enter another key.",
+                    entries,
+                ));
             }
         } else {
+            self.discover(state, llm);
+        }
+    }
+
+    fn prompt_key_name(&self, action: &str) {
+        self.menu(TerminalMenu::field(
+            "Name this API key",
+            "Use a unique name, or leave blank to replace the default saved key.",
+            action,
+            false,
+        ));
+    }
+
+    fn connect_with_key(&self, state: &mut Connection, llm: LlmConfig) {
+        if llm.active_base_model().trim().is_empty() {
+            self.discover(state, llm);
+        } else if let Err(error) = self.verify(state, llm.clone()) {
+            self.notify(error.to_string(), true);
             self.discover(state, llm);
         }
     }
@@ -535,11 +616,13 @@ impl Menus {
         let code = self.allow_tools
             && !self.read_only.load(std::sync::atomic::Ordering::Relaxed)
             && *self.chat_mode.lock().unwrap() == ChatMode::Code;
-        self.check_model(&llm, code)?;
+        if let Err(error) = self.check_model(&llm, code) {
+            self.show_connection_failure(state, llm, &error);
+            return Ok(());
+        }
         if state.ready
             && state.llm.connection_id() == llm.connection_id()
             && state.llm.active_base_model() == llm.active_base_model()
-            && !state.save_key
             && state.llm.api_key == llm.api_key
         {
             return self.select(state, llm);
@@ -565,42 +648,7 @@ impl Menus {
                 && state.generation == generation
             {
                 if let Err(error) = result {
-                    use codingbuddy_llm::ConnectionError;
-                    let (message, actions) = match error.downcast_ref::<ConnectionError>() {
-                        Some(ConnectionError::BillingRequired) => (
-                            "Insufficient balance. Top up your provider account.",
-                            vec![
-                                ("retry-connection", "Retry connection"),
-                                ("connect", "Switch provider"),
-                            ],
-                        ),
-                        Some(ConnectionError::RejectedCredential) => (
-                            "The provider rejected the API key.",
-                            vec![
-                                ("paste-key", "Enter a different API key"),
-                                ("connect", "Switch provider"),
-                            ],
-                        ),
-                        _ => {
-                            let mut actions = vec![("retry-models", "Choose another model")];
-                            if codingbuddy_llm::provider_requires_key(&llm) {
-                                actions.push(("paste-key", "Enter a different API key"));
-                            }
-                            (
-                                "Could not verify the model. Details are in the chat.",
-                                actions,
-                            )
-                        }
-                    };
-                    let mut actions = actions;
-                    actions.push(("cancel", "Return to chat"));
-                    controller.notify(error.to_string(), true);
-                    state.pending = Some(llm);
-                    controller.menu(TerminalMenu::actions(
-                        "Connection failed",
-                        message,
-                        choices(&actions),
-                    ));
+                    controller.show_connection_failure(&mut state, llm, &error);
                 } else if let Err(error) = controller.select(&mut state, llm) {
                     controller.notify(error.to_string(), true);
                     let _ = controller.tx.send(TuiStreamEvent::Menu(None));
@@ -608,6 +656,20 @@ impl Menus {
             }
         });
         Ok(())
+    }
+
+    fn show_connection_failure(
+        &self,
+        state: &mut Connection,
+        llm: LlmConfig,
+        error: &anyhow::Error,
+    ) {
+        let can_save = codingbuddy_llm::provider_requires_key(&llm)
+            && codingbuddy_llm::resolve_key_from_config(&llm).is_some();
+        let menu = connection_failure_menu(&llm, error, can_save);
+        self.notify(error.to_string(), true);
+        state.pending = Some(llm);
+        self.menu(menu);
     }
 
     fn select(&self, state: &mut Connection, llm: LlmConfig) -> Result<()> {
@@ -699,15 +761,6 @@ impl Menus {
     }
 
     fn activate(&self, state: &mut Connection, llm: LlmConfig) -> Result<()> {
-        if std::mem::take(&mut state.save_key)
-            && let Some(key) = llm.api_key.as_deref()
-            && codingbuddy_llm::save_provider_key(&llm, key).is_err()
-        {
-            self.notify(
-                "Credential store unavailable. Using the key for this session.".into(),
-                false,
-            );
-        }
         if state.configured
             && !AppConfig::load(&self.cwd)?
                 .llm
@@ -849,6 +902,50 @@ fn models_menu(
     TerminalMenu::choices(&format!("Models · {}", llm.provider), hint, entries)
 }
 
+fn connection_failure_menu(llm: &LlmConfig, error: &anyhow::Error, can_save: bool) -> TerminalMenu {
+    use codingbuddy_llm::{ConnectionError, error::ProviderError};
+    let status = error
+        .downcast_ref::<ProviderError>()
+        .and_then(|error| error.http_status);
+    let choose_model = ("retry-models", "Choose another model");
+    let retry = ("retry-connection", "Retry connection");
+    let paste_key = ("paste-key", "Enter a different API key");
+    let switch_provider = ("connect", "Switch provider");
+    let (message, mut actions) = match (status, error.downcast_ref::<ConnectionError>()) {
+        (Some(402), _) | (_, Some(ConnectionError::BillingRequired)) => (
+            "Insufficient balance. Top up your provider account.",
+            vec![retry, switch_provider],
+        ),
+        (Some(401), _) | (_, Some(ConnectionError::RejectedCredential)) => (
+            "The provider rejected the API key.",
+            vec![paste_key, switch_provider],
+        ),
+        (Some(404), _) => (
+            "The provider could not find the selected model (HTTP 404).",
+            vec![choose_model, switch_provider],
+        ),
+        (Some(503), _) => (
+            "The selected model is temporarily unavailable (HTTP 503).",
+            vec![retry, choose_model],
+        ),
+        _ => {
+            let mut actions = vec![choose_model];
+            if codingbuddy_llm::provider_requires_key(llm) {
+                actions.push(paste_key);
+            }
+            (
+                "Could not verify the model. Details are in the chat.",
+                actions,
+            )
+        }
+    };
+    if can_save {
+        actions.push(("save-key", "Save API key"));
+    }
+    actions.push(("cancel", "Return to chat"));
+    TerminalMenu::actions("Connection failed", message, choices(&actions))
+}
+
 fn save_default(llm: &LlmConfig) -> Result<()> {
     let mut profile = llm.active_provider();
     let provider = llm.provider.clone();
@@ -921,4 +1018,40 @@ fn update_settings(update: impl FnOnce(&mut serde_json::Value)) -> Result<()> {
     file.flush()?;
     file.persist(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codingbuddy_llm::{error::ProviderError, protocol::ChatProtocol};
+
+    #[test]
+    fn gemini_model_errors_offer_recovery_without_replacing_the_key() {
+        let mut llm = LlmConfig::default();
+        llm.select_provider("google");
+        for (status, expected_actions) in [
+            (404, ["retry-models", "connect", "cancel"]),
+            (503, ["retry-connection", "retry-models", "cancel"]),
+        ] {
+            let error = ProviderError::http(ChatProtocol::GeminiGenerateContent, status, "{}");
+            assert!(error.to_string().contains(&format!("HTTP {status}")));
+            let menu = connection_failure_menu(&llm, &error.into(), false);
+            assert!(menu.message.contains(&format!("HTTP {status}")));
+            assert_eq!(
+                menu.choices.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                expected_actions
+            );
+        }
+    }
+    #[test]
+    fn save_key_is_available_after_billing_and_unclassified_failures() {
+        let llm = LlmConfig::default();
+        for error in [
+            ProviderError::http(ChatProtocol::OpenAiChat, 402, "{}").into(),
+            anyhow!("The connection timed out"),
+        ] {
+            let menu = connection_failure_menu(&llm, &error, true);
+            assert!(menu.choices.iter().any(|(id, _)| id == "save-key"));
+        }
+    }
 }
