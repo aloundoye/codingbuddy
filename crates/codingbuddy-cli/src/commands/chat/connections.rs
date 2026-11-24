@@ -207,6 +207,8 @@ impl Menus {
                         chat_protocol: None,
                         auth_strategy: None,
                         account_id: None,
+                        cloud: None,
+                        gateway: None,
                         headers: Default::default(),
                         discovery: Default::default(),
                         payload_options: Default::default(),
@@ -644,6 +646,17 @@ impl Menus {
         ));
         thread::spawn(move || {
             let result = codingbuddy_llm::probe_provider(&llm);
+            if result.is_ok() {
+                let _ = codingbuddy_store::Store::new(&controller.cwd)
+                    .and_then(|store| store.route_key())
+                    .and_then(|key| {
+                        codingbuddy_llm::certification::record_connectivity(
+                            &llm,
+                            &controller.cwd,
+                            &key,
+                        )
+                    });
+            }
             if let Ok(mut state) = controller.state.lock()
                 && state.generation == generation
             {

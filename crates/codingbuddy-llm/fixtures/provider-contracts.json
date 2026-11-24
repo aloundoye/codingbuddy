@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "suite": "delivery-order-2",
+  "suite": "delivery-order-4",
   "routes": [
     {
       "id": "openai-responses",
@@ -47,7 +47,7 @@
       "provider": "openrouter",
       "protocol": "openai-chat",
       "model": "openai/gpt-4.1-mini",
-      "path": "/v1/chat/completions",
+      "path": "/api/v1/chat/completions",
       "auth": "bearer"
     },
     {
@@ -57,6 +57,131 @@
       "model": "qwen2.5-coder:7b",
       "path": "/v1/chat/completions",
       "auth": "none"
+    },
+    {
+      "id": "groq",
+      "provider": "groq",
+      "protocol": "openai-chat",
+      "model": "llama-3.3-70b-versatile",
+      "path": "/openai/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "mistral",
+      "provider": "mistral",
+      "protocol": "openai-chat",
+      "model": "mistral-large-latest",
+      "path": "/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "xai",
+      "provider": "xai",
+      "protocol": "openai-chat",
+      "model": "grok-3-mini",
+      "path": "/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "together",
+      "provider": "together",
+      "protocol": "openai-chat",
+      "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "path": "/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "custom-gateway",
+      "provider": "custom-gateway",
+      "protocol": "openai-chat",
+      "model": "fixture-instruct",
+      "path": "/v1/chat/completions",
+      "auth": "bearer"
+    },
+    {
+      "id": "azure-v1-api-key",
+      "provider": "azure",
+      "protocol": "openai-chat",
+      "model": "gpt-4o",
+      "path": "/openai/v1/chat/completions",
+      "auth": "azure-api-key",
+      "cloud": {
+        "type": "azure",
+        "resource": "fixture-resource",
+        "deployment": "fixture-deploy",
+        "api_version": "v1",
+        "credential": "api-key"
+      }
+    },
+    {
+      "id": "azure-v1-entra",
+      "provider": "azure",
+      "protocol": "openai-chat",
+      "model": "gpt-4o",
+      "path": "/openai/v1/chat/completions",
+      "auth": "azure-entra",
+      "cloud": {
+        "type": "azure",
+        "resource": "fixture-resource",
+        "deployment": "fixture-deploy",
+        "api_version": "v1",
+        "credential": "entra"
+      }
+    },
+    {
+      "id": "azure-2024-10-21-api-key",
+      "provider": "azure",
+      "protocol": "openai-chat",
+      "model": "gpt-4o",
+      "path": "/openai/deployments/fixture-deploy/chat/completions?api-version=2024-10-21",
+      "auth": "azure-api-key",
+      "cloud": {
+        "type": "azure",
+        "resource": "fixture-resource",
+        "deployment": "fixture-deploy",
+        "api_version": "2024-10-21",
+        "credential": "api-key"
+      }
+    },
+    {
+      "id": "azure-2024-10-21-entra",
+      "provider": "azure",
+      "protocol": "openai-chat",
+      "model": "gpt-4o",
+      "path": "/openai/deployments/fixture-deploy/chat/completions?api-version=2024-10-21",
+      "auth": "azure-entra",
+      "cloud": {
+        "type": "azure",
+        "resource": "fixture-resource",
+        "deployment": "fixture-deploy",
+        "api_version": "2024-10-21",
+        "credential": "entra"
+      }
+    },
+    {
+      "id": "vertex-adc",
+      "provider": "vertex",
+      "protocol": "gemini-generate-content",
+      "model": "gemini-2.5-flash",
+      "path": "/v1/projects/fixture-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent",
+      "auth": "google-adc",
+      "cloud": {
+        "type": "vertex",
+        "project": "fixture-project",
+        "location": "us-central1"
+      }
+    },
+    {
+      "id": "bedrock-sigv4",
+      "provider": "bedrock",
+      "protocol": "bedrock-converse",
+      "model": "anthropic.claude-sonnet-4-20250514-v1:0",
+      "path": "/model/anthropic.claude-sonnet-4-20250514-v1:0/converse",
+      "auth": "aws-sigv4",
+      "cloud": {
+        "type": "bedrock",
+        "region": "us-east-1"
+      }
     }
   ],
   "features": [

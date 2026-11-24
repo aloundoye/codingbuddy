@@ -49,3 +49,5 @@ Hosted tools, background responses, WebSockets, PDF upload, provider-managed con
 Locked dependency graph SHA-256: `fdee9d9e2fc0586256095d6d0d3109867f82da6964edbe97a71151aa3f0e7665`. Only workspace dependency edges changed; no registry package versions were upgraded for this milestone.
 
 [Linux ARM64 fixture report](provider-certification/2026-11-23-linux-aarch64.json) and [macOS ARM64 fixture report](provider-certification/2026-11-23-macos-aarch64.json). Both have implementation fingerprint `2c58db064062d943c716d763ae2c9b14b39145839a70da8f697437346e64f2b9`. The baseline is documented above; the implementation fingerprints identify the tested working-tree code. These changes have not been committed or published.
+
+For the expanded Bedrock, Vertex, Azure, and gateway fixtures, see the [Delivery Order 4 audit](DELIVERY_ORDER_4.md).

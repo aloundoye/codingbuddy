@@ -131,7 +131,9 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} -p codingbuddy-cli --test cli_json delivery_one
           cargo test --locked --target ${{ matrix.target }} -p codingbuddy-llm --all-targets
           cargo test --locked --target ${{ matrix.target }} -p codingbuddy-testkit --test provider_certification
+          cargo test --locked --target ${{ matrix.target }} -p codingbuddy-testkit --test provider_eval provider_neutral_fixture_scores
           cargo test --locked --target ${{ matrix.target }} -p codingbuddy-cli --test cli_json delivery_two
+          cargo test --locked --target ${{ matrix.target }} -p codingbuddy-cli --test cli_json delivery_four
           python scripts/test_provider_certification_gate.py
           python scripts/provider_certification_gate.py "$CODINGBUDDY_CERTIFICATION_REPORT" --target '${{ matrix.target }}' --revision '${{ github.sha }}'
 

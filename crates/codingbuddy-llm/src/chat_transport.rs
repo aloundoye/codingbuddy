@@ -26,7 +26,7 @@ impl ChatTransport {
         })
     }
 
-    fn wait<T>(&self, future: impl Future<Output = T>) -> Result<T> {
+    pub(crate) fn wait<T>(&self, future: impl Future<Output = T>) -> Result<T> {
         self.runtime.block_on(async {
             let mut future = std::pin::pin!(future);
             loop {
@@ -46,6 +46,14 @@ impl ChatTransport {
         })
     }
 
+    pub(crate) fn wait_with_timeout<T>(
+        &self,
+        timeout: Duration,
+        future: impl Future<Output = T>,
+    ) -> Result<Result<T, tokio::time::error::Elapsed>> {
+        self.wait(async { tokio::time::timeout(timeout, future).await })
+    }
+
     pub fn post(
         &self,
         endpoint: &str,
@@ -60,6 +68,24 @@ impl ChatTransport {
                 .send()
                 .await
         })
+    }
+
+    pub fn post_bytes(
+        &self,
+        endpoint: &str,
+        headers: reqwest::header::HeaderMap,
+        payload: Vec<u8>,
+    ) -> Result<reqwest::Response> {
+        Ok(self
+            .wait(async {
+                self.client
+                    .post(endpoint)
+                    .headers(headers)
+                    .body(payload)
+                    .send()
+                    .await
+            })?
+            .map_err(reqwest::Error::without_url)?)
     }
 
     pub fn text(&self, response: reqwest::Response) -> Result<String> {

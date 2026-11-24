@@ -10,6 +10,13 @@ use std::path::Path;
 pub enum ProviderCommand {
     /// Show evidence for the configured route, without contacting the provider.
     Status,
+    /// Check connectivity to the selected route with one bounded request.
+    Check {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Run a live two-tool verification against an explicitly selected route.
     Verify {
         #[arg(long)]
@@ -33,27 +40,23 @@ pub fn run(workspace: &Path, command: ProviderCommand, json_mode: bool) -> Resul
             workspace,
             &key,
         ),
+        ProviderCommand::Check { provider, model } => {
+            select_route(&mut config.llm, provider, model)?;
+            codingbuddy_llm::probe_provider(&config.llm)?;
+            certification::record_connectivity(&config.llm, workspace, &key)?;
+            certification::live_status(
+                &config.llm,
+                &config.llm.active_base_model(),
+                workspace,
+                &key,
+            )
+        }
         ProviderCommand::Verify {
             provider,
             model,
             non_streaming,
         } => {
-            if let Some(provider) = provider {
-                anyhow::ensure!(
-                    config.llm.providers.contains_key(&provider),
-                    "Provider profile is unavailable"
-                );
-                config.llm.select_provider(&provider);
-            }
-            if let Some(model) = model {
-                config.llm.base_model = model.clone();
-                let profile = config
-                    .llm
-                    .providers
-                    .get_mut(&config.llm.provider)
-                    .context("Provider profile is unavailable")?;
-                profile.models.chat = model;
-            }
+            select_route(&mut config.llm, provider, model)?;
             config.llm.api_key = codingbuddy_llm::resolve_key_from_config(&config.llm);
             let evidence = certification::live_probe(&config.llm, !non_streaming)?;
             let route = codingbuddy_llm::session_route(&config.llm, &evidence.model, &key)?;
@@ -88,6 +91,29 @@ pub fn run(workspace: &Path, command: ProviderCommand, json_mode: bool) -> Resul
         crate::output::print_json(&result)?;
     } else {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok(())
+}
+
+fn select_route(
+    cfg: &mut codingbuddy_core::LlmConfig,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
+    if let Some(provider) = provider {
+        anyhow::ensure!(
+            cfg.providers.contains_key(&provider),
+            "Provider profile is unavailable"
+        );
+        cfg.select_provider(&provider);
+    }
+    if let Some(model) = model {
+        cfg.base_model = model.clone();
+        let profile = cfg
+            .providers
+            .get_mut(&cfg.provider)
+            .context("Provider profile is unavailable")?;
+        profile.models.chat = model;
     }
     Ok(())
 }

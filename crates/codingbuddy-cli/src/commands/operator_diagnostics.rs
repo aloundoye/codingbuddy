@@ -93,10 +93,12 @@ pub(crate) fn provider_compatibility_diagnostics(
         .map(|key| codingbuddy_llm::certification::live_status(&cfg.llm, model, workspace, &key))
         .unwrap_or_else(|_| codingbuddy_llm::certification::status(&cfg.llm, model));
     let summary = format!(
-        "{}; protocol={} configured={} fixtures={} live={}",
+        "{}; protocol={} auth={} configured={} connectivity={} fixtures={} live={}",
         active.join(", "),
         certification["protocol"].as_str().unwrap_or("unknown"),
+        certification["auth"].as_str().unwrap_or("unknown"),
         certification["configured"],
+        certification["connectivity"]["confirmed"] == true,
         certification["fixture_verified"],
         certification["live_verified"]
     );
