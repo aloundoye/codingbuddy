@@ -2,6 +2,8 @@
 use super::*;
 use serde_json::Value;
 
+pub type FilePostimages = std::collections::BTreeMap<PathBuf, (Option<String>, Option<u32>)>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: Uuid,
@@ -15,6 +17,7 @@ pub struct OperationRecord {
 impl Store {
     pub(crate) fn init_operations(db: &Connection) -> Result<()> {
         db.execute_batch("CREATE TABLE IF NOT EXISTS runtime_operations(id TEXT PRIMARY KEY,session_id TEXT,parent_id TEXT,kind TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL,cancel_requested INTEGER NOT NULL DEFAULT 0);CREATE INDEX IF NOT EXISTS runtime_operation_parent ON runtime_operations(parent_id);CREATE TABLE IF NOT EXISTS runtime_file_postimages(path TEXT PRIMARY KEY,hash TEXT,recorded_at TEXT NOT NULL);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS runtime_restore_forks(plan_id TEXT PRIMARY KEY,fork_id TEXT NOT NULL);CREATE TABLE IF NOT EXISTS runtime_restore_requests(plan_id TEXT PRIMARY KEY,mode TEXT NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS runtime_scoped_postimages(workspace TEXT NOT NULL,path TEXT NOT NULL,hash TEXT,mode INTEGER,recorded_at TEXT NOT NULL,PRIMARY KEY(workspace,path));")?;
         Ok(())
     }
@@ -72,6 +75,32 @@ impl Store {
             ],
         )?;
         anyhow::ensure!(changed == 1, "Operation state changed concurrently");
+        Ok(())
+    }
+    pub fn settle_operation_event(
+        &self,
+        id: Uuid,
+        expected: &str,
+        next: &str,
+        payload: &Value,
+        event: Option<&NewEvent>,
+    ) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE runtime_operations SET state=?2,payload=?3 WHERE id=?1 AND state=?4",
+            params![
+                id.to_string(),
+                next,
+                serde_json::to_string(payload)?,
+                expected
+            ],
+        )?;
+        anyhow::ensure!(changed == 1, "Operation changed concurrently");
+        if let Some(event) = event {
+            Self::append_event_row(&tx, event)?;
+        }
+        tx.commit()?;
         Ok(())
     }
     pub fn attach_operation_parent(&self, id: Uuid, parent: Uuid) -> Result<()> {
@@ -139,11 +168,7 @@ impl Store {
             .map(|(path, (hash, _))| (path, hash))
             .collect())
     }
-    pub fn scoped_postimages_since(
-        &self,
-        workspace: &Path,
-        date: &str,
-    ) -> Result<std::collections::BTreeMap<PathBuf, (Option<String>, Option<u32>)>> {
+    pub fn scoped_postimages_since(&self, workspace: &Path, date: &str) -> Result<FilePostimages> {
         Ok(self.db()?.prepare("SELECT path,hash,mode FROM runtime_scoped_postimages WHERE workspace=?1 AND recorded_at>=?2")?.query_map(params![workspace.canonicalize()?.to_string_lossy(),date],|row|Ok((PathBuf::from(row.get::<_,String>(0)?),(row.get(1)?,row.get(2)?))))?.collect::<rusqlite::Result<_>>()?)
     }
 }
@@ -173,6 +198,32 @@ impl Store {
         Ok(safe)
     }
     pub fn fork_session_at_cursor(&self, source: Uuid, cursor: u64) -> Result<Session> {
+        self.fork_cursor(source, cursor, None)
+    }
+    pub fn fork_for_restore(&self, plan: Uuid, source: Uuid, cursor: u64) -> Result<Session> {
+        self.fork_cursor(source, cursor, Some(plan))
+    }
+    pub fn bind_restore_mode(&self, id: Uuid, mode: &str) -> Result<()> {
+        anyhow::ensure!(
+            matches!(mode, "files" | "conversation" | "both"),
+            "Invalid restore mode"
+        );
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO runtime_restore_requests(plan_id,mode) VALUES(?1,?2)",
+            params![id.to_string(), mode],
+        )?;
+        let existing: String = tx.query_row(
+            "SELECT mode FROM runtime_restore_requests WHERE plan_id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(existing == mode, "Restore mode changed; preview a new plan");
+        tx.commit()?;
+        Ok(())
+    }
+    fn fork_cursor(&self, source: Uuid, cursor: u64, restore: Option<Uuid>) -> Result<Session> {
         let original = self
             .load_session(source)?
             .ok_or_else(|| anyhow::anyhow!("Source session unavailable"))?;
@@ -209,6 +260,25 @@ impl Store {
         };
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(plan) = restore {
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT fork_id FROM runtime_restore_forks WHERE plan_id=?1",
+                    [plan.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                drop(tx);
+                return self
+                    .load_session(Uuid::parse_str(&existing)?)?
+                    .ok_or_else(|| anyhow::anyhow!("Restore fork receipt is unavailable"));
+            }
+            tx.execute(
+                "INSERT INTO runtime_restore_forks(plan_id,fork_id) VALUES(?1,?2)",
+                params![plan.to_string(), fork.session_id.to_string()],
+            )?;
+        }
         Self::save_session_row(&tx, &fork)?;
         let linked = EventKind::SessionForked {
             from_session_id: source,
@@ -290,6 +360,52 @@ impl Store {
             id,
             token: monitored,
         })
+    }
+}
+
+impl Store {
+    /// Reconcile only supervisor ownership, never replay a lost worker or its effects.
+    pub fn reconcile_background_job(&self, id: Uuid) -> Result<Option<BackgroundJobRecord>> {
+        let Some(mut job) = self.load_background_job(id)? else {
+            return Ok(None);
+        };
+        let Ok(mut operation) = self.operation(id) else {
+            return Ok(Some(job));
+        };
+        if operation.kind != "worker" {
+            return Ok(Some(job));
+        }
+        if matches!(operation.state.as_str(), "running" | "prepared")
+            && let Ok(_ownership) = self.session_lease(id)
+        {
+            let expired = operation.payload["created_at"]
+                .as_str()
+                .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+                .is_some_and(|created| {
+                    Utc::now().signed_duration_since(created).num_seconds() > 120
+                });
+            if operation.state == "running" || expired {
+                let next = if operation.state == "prepared" {
+                    "handoff_failed"
+                } else {
+                    "ambiguous"
+                };
+                operation.payload["recovery_status"] = serde_json::json!(next);
+                self.transition_operation(id, &operation.state, next, &operation.payload)?;
+                operation.state = next.into();
+            }
+        }
+        job.status = if operation.cancel_requested
+            && matches!(operation.state.as_str(), "running" | "prepared")
+        {
+            "cancelling".into()
+        } else {
+            operation.state
+        };
+        job.metadata_json = operation.payload.to_string();
+        job.updated_at = Utc::now().to_rfc3339();
+        self.upsert_background_job(&job)?;
+        Ok(Some(job))
     }
 }
 

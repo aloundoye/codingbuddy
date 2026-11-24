@@ -66,6 +66,9 @@ impl ToolUseLoop<'_> {
                                     let host = host.clone();
                                     let cancellation = self.cancellation.clone();
                                     let session = self.durable_session.as_ref().map(|(_, id)| *id);
+                                    let prompt_id = self.durable_prompt;
+                                    let deadline = self.deadline;
+                                    let parent_run_id = self.parent_run_id;
                                     Some(scope.spawn(move || {
                                         host.execute_with_context(
                                             approved,
@@ -73,7 +76,9 @@ impl ToolUseLoop<'_> {
                                                 session_id: session,
                                                 invocation_id: None,
                                                 cancellation: cancellation.as_ref(),
-                                                ..Default::default()
+                                                prompt_id,
+                                                deadline,
+                                                parent_run_id,
                                             },
                                         )
                                     }))
@@ -152,10 +157,16 @@ impl ToolUseLoop<'_> {
             ToolPreparation::Ready(prepared) => prepared,
             ToolPreparation::Complete(records) => return Ok(records),
         };
-        if !prepared.modified_paths.is_empty()
-            && let Some(ref checkpoint) = self.checkpoint_cb
-        {
-            let _ = checkpoint("before tool execution", &prepared.modified_paths);
+        if !prepared.modified_paths.is_empty() {
+            if let Some(worktree) = &self.active_worktree {
+                codingbuddy_memory::MemoryManager::new(worktree.path())?
+                    .create_checkpoint_for_files(
+                        "before isolated tool execution",
+                        &prepared.modified_paths,
+                    )?;
+            } else if let Some(ref checkpoint) = self.checkpoint_cb {
+                checkpoint("before tool execution", &prepared.modified_paths)?;
+            }
         }
         if let Err(error) = self.check_cancellation() {
             host.discard_proposal(prepared.approved.invocation_id);

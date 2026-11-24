@@ -126,32 +126,39 @@ fn wait_for_output(
         .take()
         .ok_or_else(|| anyhow!("missing child stderr"))?;
     std::thread::scope(|scope| {
-        let stdout = scope.spawn(move || {
+        fn drain(reader: &mut impl Read) -> std::io::Result<Vec<u8>> {
             let mut bytes = Vec::new();
-            stdout.by_ref().take(2_000_000).read_to_end(&mut bytes)?;
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let stderr = scope.spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.by_ref().take(2_000_000).read_to_end(&mut bytes)?;
-            Ok::<_, std::io::Error>(bytes)
-        });
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                let keep = count.min(2_000_000usize.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&buffer[..keep]);
+            }
+            Ok(bytes)
+        }
+        let stdout = scope.spawn(move || drain(&mut stdout));
+        let stderr = scope.spawn(move || drain(&mut stderr));
         let deadline = std::time::Instant::now() + timeout;
-        let status = loop {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                break None;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let interval = if cancellation.is_some() {
-                remaining.min(Duration::from_millis(30))
-            } else {
-                remaining
-            };
-            let status = child.wait_timeout(interval)?;
-            if status.is_some() || remaining <= interval {
-                break status;
-            }
-        };
+        let status = (|| -> Result<_> {
+            Ok(loop {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    break None;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let interval = if cancellation.is_some() {
+                    remaining.min(Duration::from_millis(30))
+                } else {
+                    remaining
+                };
+                let status = child.wait_timeout(interval)?;
+                if status.is_some() || remaining <= interval {
+                    break status;
+                }
+            })
+        })();
         #[cfg(unix)]
         if process_group {
             unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
@@ -159,6 +166,7 @@ fn wait_for_output(
         #[cfg(not(unix))]
         let _ = process_group;
         child.terminate();
+        let status = status?;
         let cancelled = cancellation.is_some_and(CancellationToken::is_cancelled);
         let timed_out = status.is_none() && !cancelled;
         let status = match status {
@@ -181,7 +189,7 @@ fn wait_for_output(
 }
 
 /// PTY-aware shell runner. Programs see a real terminal (isatty() = true)
-/// so they emit colored output. Falls back to pipe-based execution on failure.
+/// so they emit colored output. A failed PTY launch is never replayed.
 #[derive(Debug, Default)]
 pub struct PtyShellRunner;
 
@@ -192,10 +200,8 @@ impl ShellRunner for PtyShellRunner {
 
     fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
         #[cfg(unix)]
-        if USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
-            && let Ok(result) = run_with_pty(cmd, cwd, timeout, None)
-        {
-            return Ok(result);
+        if USE_PTY.load(std::sync::atomic::Ordering::Relaxed) {
+            return run_with_pty(cmd, cwd, timeout, None);
         }
         // Fallback to standard pipe-based execution
         PlatformShellRunner.run(cmd, cwd, timeout)
@@ -209,10 +215,8 @@ impl ShellRunner for PtyShellRunner {
         on_progress: ProgressCallback,
     ) -> Result<ShellRunResult> {
         #[cfg(unix)]
-        if USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
-            && let Ok(result) = run_with_pty(cmd, cwd, timeout, Some(on_progress))
-        {
-            return Ok(result);
+        if USE_PTY.load(std::sync::atomic::Ordering::Relaxed) {
+            return run_with_pty(cmd, cwd, timeout, Some(on_progress));
         }
         PlatformShellRunner.run(cmd, cwd, timeout)
     }
@@ -278,7 +282,7 @@ fn run_prepared_with_pty(
     }
 
     let mut child = match command.spawn() {
-        Ok(c) => c,
+        Ok(c) => OwnedChild::from_process_group(c),
         Err(e) => {
             unsafe {
                 libc::close(master_fd);

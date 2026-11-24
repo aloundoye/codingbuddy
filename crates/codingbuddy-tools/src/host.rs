@@ -176,6 +176,47 @@ impl LocalToolHost {
             .as_ref()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let mut lsp_manager = codingbuddy_lsp::server_manager::LspServerManager::new(workspace);
+        let language_workspace = files.root().to_owned();
+        let language_policy = policy.clone();
+        let language_config = cfg.policy.sandbox.clone();
+        let language_mode = sandbox_mode.clone();
+        lsp_manager.set_launcher(Arc::new(move |program, args, context| {
+            context.check()?;
+            anyhow::ensure!(
+                trusted_workspace,
+                "Language-server startup denied in untrusted workspace"
+            );
+            let expression = std::iter::once(program)
+                .chain(args.iter().copied())
+                .map(shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let call = ToolCall {
+                name: "bash.run".into(),
+                args: json!({"cmd":expression}),
+                requires_approval: false,
+            };
+            anyhow::ensure!(
+                language_policy.denial(&call).is_none(),
+                "Language-server startup denied by policy"
+            );
+            let mut launch = ShellLaunch::resolve(
+                &language_workspace,
+                &expression,
+                &language_mode,
+                &language_config,
+            )?;
+            anyhow::ensure!(
+                launch.is_isolated()
+                    && (!language_policy.requires_approval(&call)
+                        || language_config.auto_allow_bash_if_sandboxed
+                            && language_policy.permits_sandbox_auto_approval(&call)),
+                "Language-server startup requires fresh approval; no approval channel is available"
+            );
+            launch.set_consumer("language_tools");
+            launch.spawn_stdio(context)
+        }));
         Ok(Self {
             launch_config: cfg.clone(),
             workspace: files.root().to_path_buf(),
@@ -203,7 +244,7 @@ impl LocalToolHost {
             mcp_executor: None,
             context_mcp_executor: None,
             progress_callback: std::sync::Mutex::new(None),
-            lsp_manager: codingbuddy_lsp::server_manager::LspServerManager::new(workspace),
+            lsp_manager,
         })
     }
 
@@ -621,7 +662,7 @@ impl LocalToolHost {
                 }
                 // Auto-diagnostics after edit
                 if self.diagnostics_after_edit {
-                    self.post_edit_checks(&[full.clone()], context, &mut result);
+                    self.post_edit_checks(std::slice::from_ref(&full), context, &mut result);
                 }
                 Ok(result)
             }
@@ -1276,34 +1317,37 @@ impl LocalToolHost {
             }
             "lsp.hover" | "lsp_hover" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.hover(
+                let result = self.lsp_manager.hover_with_context(
                     &self
                         .workspace
                         .join(self.resolve_path(Path::new(path), false)?),
                     line,
                     col,
+                    &context.execution(),
                 )?;
                 Ok(json!({ "hover": result }))
             }
             "lsp.definition" | "lsp_definition" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.definition(
+                let result = self.lsp_manager.definition_with_context(
                     &self
                         .workspace
                         .join(self.resolve_path(Path::new(path), false)?),
                     line,
                     col,
+                    &context.execution(),
                 )?;
                 Ok(json!({ "definition": result }))
             }
             "lsp.references" | "lsp_references" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.references(
+                let result = self.lsp_manager.references_with_context(
                     &self
                         .workspace
                         .join(self.resolve_path(Path::new(path), false)?),
                     line,
                     col,
+                    &context.execution(),
                 )?;
                 Ok(json!({ "references": result }))
             }
@@ -1313,10 +1357,11 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing required parameter 'path'"))?;
-                let result = self.lsp_manager.symbols(
+                let result = self.lsp_manager.symbols_with_context(
                     &self
                         .workspace
                         .join(self.resolve_path(Path::new(path), false)?),
+                    &context.execution(),
                 )?;
                 Ok(json!({ "symbols": result }))
             }
@@ -1474,6 +1519,7 @@ impl LocalToolHost {
                 session,
                 id,
                 &codingbuddy_store::InvocationReceipt::File {
+                    execution_root: Some(self.workspace.clone()),
                     path: self.files.relative(path)?.to_owned(),
                     postimage_sha256: format!("{:x}", sha2::Sha256::digest(content)),
                 },
@@ -2166,6 +2212,8 @@ impl LocalToolHost {
     }
 }
 
+pub type VerificationApproval<'a> = Option<&'a mut dyn FnMut(&ToolCall) -> Result<bool>>;
+
 impl LocalToolHost {
     pub fn run_verification_command(
         &self,
@@ -2173,6 +2221,17 @@ impl LocalToolHost {
         cwd: &Path,
         timeout: u64,
         context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> serde_json::Value {
+        self.run_verification_with_approval(command, cwd, timeout, context, None)
+    }
+
+    pub fn run_verification_with_approval(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout: u64,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+        mut approval: VerificationApproval<'_>,
     ) -> serde_json::Value {
         let id = Uuid::now_v7();
         let started = std::time::Instant::now();
@@ -2191,7 +2250,7 @@ impl LocalToolHost {
             result["status"] = json!("persistence_failed");
             return result;
         }
-        if !self.trusted_workspace {
+        if !self.trusted_workspace && approval.is_none() {
             result["status"] = json!("denied");
         } else if context
             .cancellation
@@ -2205,7 +2264,24 @@ impl LocalToolHost {
                 requires_approval: false,
             };
             let (proposal, permission) = self.propose_with_permission(call);
-            if !proposal.approved || matches!(permission, ToolPermission::Deny { .. }) {
+            let accepted = if matches!(permission, ToolPermission::Deny { .. }) {
+                false
+            } else if proposal.approved {
+                true
+            } else if let Some(callback) = approval.as_mut() {
+                let mut display = proposal.call.clone();
+                display.args["fresh_approval"] = json!(matches!(
+                    permission,
+                    ToolPermission::Ask { fresh: true, .. }
+                ));
+                if let Some(detail) = self.approval_details(proposal.invocation_id) {
+                    display.args["effective_isolation"] = json!(detail);
+                }
+                callback(&display).unwrap_or(false)
+            } else {
+                false
+            };
+            if !accepted {
                 self.discard_proposal(proposal.invocation_id);
                 result["status"] = json!("denied");
             } else {
@@ -2249,8 +2325,8 @@ impl LocalToolHost {
             result["success"] = json!(false);
             result["status"] = json!("ambiguous");
         }
-        if let Some(session) = context.session_id {
-            if self
+        if let Some(session) = context.session_id
+            && self
                 .store
                 .append_event(&codingbuddy_store::NewEvent::new(
                     session,
@@ -2261,10 +2337,9 @@ impl LocalToolHost {
                     },
                 ))
                 .is_err()
-            {
-                result["success"] = json!(false);
-                result["status"] = json!("persistence_failed");
-            }
+        {
+            result["success"] = json!(false);
+            result["status"] = json!("persistence_failed");
         }
         result
     }

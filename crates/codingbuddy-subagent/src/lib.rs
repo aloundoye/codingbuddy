@@ -591,7 +591,7 @@ impl SubagentManager {
                                     used_read_only_fallback: current_task.read_only_fallback,
                                 };
                             }
-                            Err(err) if attempts <= retries => {
+                            Err(err) if attempts <= retries && matches!(task.role,SubagentRole::Explore|SubagentRole::Plan) && !task.execution.cancellation.is_cancelled() && err.downcast_ref::<codingbuddy_core::execution::UnconfirmedSideEffect>().is_none() => {
                                 // Detect policy denial errors and fall back to read-only.
                                 // Uses specific policy-engine patterns to avoid false positives
                                 // from OS-level permission errors (e.g. EACCES on /etc/shadow).
@@ -869,7 +869,7 @@ mod tests {
             run_id: Uuid::now_v7(),
             name: "retry-me".to_string(),
             goal: "recover".to_string(),
-            role: SubagentRole::Task,
+            role: SubagentRole::Explore,
             team: "execution".to_string(),
             task_id: None,
             parent_session_id: None,
@@ -930,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_denied_triggers_read_only_fallback() {
+    fn execution_task_requires_explicit_retry_after_failure() {
         let mut manager = SubagentManager::new(1);
         manager.max_retries_per_task = 2;
         let task = SubagentTask {
@@ -964,9 +964,9 @@ mod tests {
             Ok("read-only result".to_string())
         });
         assert_eq!(results.len(), 1);
-        assert!(results[0].success);
-        assert!(results[0].used_read_only_fallback);
-        assert_eq!(results[0].attempts, 2);
+        assert!(!results[0].success);
+        assert!(!results[0].used_read_only_fallback);
+        assert_eq!(results[0].attempts, 1);
     }
 
     #[test]
@@ -1389,7 +1389,8 @@ mod tests {
             Ok("retried without read-only".to_string())
         });
         assert_eq!(results.len(), 1);
-        assert!(results[0].success);
+        assert!(!results[0].success);
+        assert_eq!(results[0].attempts, 1);
         assert!(
             !results[0].used_read_only_fallback,
             "OS error should not trigger read-only fallback"

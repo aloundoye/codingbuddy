@@ -398,3 +398,28 @@ SyntaxError: unexpected EOF while parsing"#;
         assert!(first);
     }
 }
+
+#[cfg(test)]
+mod delivery_three {
+    use super::*;
+    #[test]
+    fn language_plans_coalesce_roots_without_spawning() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let validator = EditValidator::new(workspace.path().to_owned(), Default::default());
+        let plans = validator.command_plans(&[
+            workspace.path().join("src/a.rs"),
+            workspace.path().join("src/b.rs"),
+        ]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].cwd, workspace.path());
+        assert_eq!(plans[0].command, "cargo check --message-format=json");
+        assert!(!workspace.path().join("target").exists());
+        assert!(client::LspClient::spawn("unapproved-fixture", &[], workspace.path()).is_err());
+    }
+}

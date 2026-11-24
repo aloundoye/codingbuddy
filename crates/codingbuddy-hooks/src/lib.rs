@@ -348,6 +348,25 @@ pub struct HookRuntime {
     /// Tracks hooks that have `once: true` and have already run.
     #[allow(dead_code)]
     once_fired: Mutex<HashSet<String>>,
+    async_jobs: Mutex<Vec<AsyncHook>>,
+}
+struct AsyncHook {
+    token: codingbuddy_core::CancellationToken,
+    thread: std::thread::JoinHandle<()>,
+}
+impl Drop for HookRuntime {
+    fn drop(&mut self) {
+        let jobs = self
+            .async_jobs
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        for job in jobs.iter() {
+            job.token.cancel();
+        }
+        for job in jobs.drain(..) {
+            let _ = job.thread.join();
+        }
+    }
 }
 
 impl HookRuntime {
@@ -357,6 +376,7 @@ impl HookRuntime {
             config,
             sources: Default::default(),
             once_fired: Mutex::new(HashSet::new()),
+            async_jobs: Default::default(),
         }
     }
 
@@ -519,19 +539,9 @@ impl HookRuntime {
             HookHandler::Async { command, timeout } => {
                 self.run_async_handler(command, *timeout, consumer, source, context)
             }
-            HookHandler::Prompt {
-                prompt,
-                model,
-                schema,
-            } => self.run_prompt_handler(
-                prompt,
-                model.as_deref(),
-                schema.as_ref(),
-                input,
-                consumer,
-                source,
-                context,
-            ),
+            HookHandler::Prompt { prompt, .. } => {
+                self.run_prompt_handler(prompt, input, consumer, source, context)
+            }
             HookHandler::Agent {
                 agent,
                 model,
@@ -572,7 +582,9 @@ impl HookRuntime {
             .stderr(Stdio::null());
 
         process_env::apply_for(&mut cmd, &self.workspace, consumer, source);
-        let context = context.clone();
+        let mut context = context.clone();
+        context.cancellation = context.cancellation.child_token();
+        let token = context.cancellation.clone();
         let spawned = std::thread::Builder::new()
             .name("hook-supervisor".into())
             .spawn(move || {
@@ -582,8 +594,27 @@ impl HookRuntime {
                     &context,
                     Duration::from_secs(timeout_secs),
                 );
-            })
-            .is_ok();
+            });
+        let spawned = match spawned {
+            Ok(thread) => {
+                let mut jobs = self
+                    .async_jobs
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let mut index = 0;
+                while index < jobs.len() {
+                    if jobs[index].thread.is_finished() {
+                        let job = jobs.swap_remove(index);
+                        let _ = job.thread.join();
+                    } else {
+                        index += 1;
+                    }
+                }
+                jobs.push(AsyncHook { token, thread });
+                true
+            }
+            Err(_) => false,
+        };
 
         HookRun {
             handler_description: format!("async: {command}"),
@@ -604,8 +635,6 @@ impl HookRuntime {
     fn run_prompt_handler(
         &self,
         prompt_template: &str,
-        _model: Option<&str>,
-        _schema: Option<&serde_json::Value>,
         input: &HookInput,
         consumer: &str,
         source: Source,
@@ -1731,5 +1760,50 @@ mod tests {
             !result.additional_context.is_empty(),
             "agent handler should inject context about delegation"
         );
+    }
+}
+
+#[cfg(test)]
+mod delivery_three {
+    use super::*;
+    #[test]
+    fn cancelled_context_never_runs_or_approves_a_hook() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config:HooksConfig=serde_json::from_value(serde_json::json!({"PreToolUse":[{"hooks":[{"type":"command","command":"echo should-not-execute > marker"}]}]})).unwrap();
+        let runtime = HookRuntime::new(workspace.path(), config);
+        let token = codingbuddy_core::CancellationToken::new();
+        token.cancel();
+        let context = ExecutionContext {
+            cancellation: token,
+            ..Default::default()
+        };
+        let result = runtime.fire_with_context(
+            HookEvent::PreToolUse,
+            &HookInput::new(HookEvent::PreToolUse, workspace.path().to_str().unwrap()),
+            &context,
+        );
+        assert!(result.blocked);
+        assert!(result.runs.is_empty());
+        assert!(!workspace.path().join("marker").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn dropping_async_hook_owner_stops_descendants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config:HooksConfig=serde_json::from_value(serde_json::json!({"PostToolUse":[{"hooks":[{"type":"async","command":"echo ready > ready; sleep 1; echo escaped > escaped","timeout":5}]}]})).unwrap();
+        let runtime = HookRuntime::new(workspace.path(), config);
+        let result = runtime.fire(
+            HookEvent::PostToolUse,
+            &HookInput::new(HookEvent::PostToolUse, workspace.path().to_str().unwrap()),
+        );
+        assert!(result.runs[0].success);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !workspace.path().join("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(workspace.path().join("ready").exists());
+        drop(runtime);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!workspace.path().join("escaped").exists());
     }
 }

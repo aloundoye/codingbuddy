@@ -96,6 +96,7 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE runtime_prompts SET status='interrupted', error='Session writer exited before settling the prompt'
             WHERE session_id=?1 AND status='running'", [session.to_string()])?;
+        tx.execute("UPDATE runtime_operations SET state='interrupted' WHERE kind='prompt' AND state='running' AND id IN (SELECT id FROM runtime_prompts WHERE session_id=?1 AND status='interrupted')", [session.to_string()])?;
         let id = Uuid::now_v7();
         tx.execute("INSERT INTO runtime_prompts(id,session_id,request_id,request,status) VALUES(?1,?2,?3,?4,'running')",
             params![id.to_string(),session.to_string(),request.to_string(),serde_json::to_string(input)?])?;
@@ -151,7 +152,13 @@ impl Store {
         if state.status == "running"
             && let Ok(_lease) = self.session_lease(session_id)
         {
-            let changed = self.db()?.execute("UPDATE runtime_prompts SET status='interrupted', error='Session writer exited before settling the prompt' WHERE id=?1 AND status='running'", [id.to_string()])?;
+            let mut conn = self.db()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute("UPDATE runtime_prompts SET status='interrupted', error='Session writer exited before settling the prompt' WHERE id=?1 AND status='running'", [id.to_string()])?;
+            if changed != 0 {
+                tx.execute("UPDATE runtime_operations SET state='interrupted' WHERE id=?1 AND state='running' AND kind='prompt'", [id.to_string()])?;
+            }
+            tx.commit()?;
             if changed == 0 {
                 return self.prompt_state(id);
             }
@@ -265,6 +272,7 @@ mod delivery_one {
                 .is_err()
         );
         assert_eq!(reopened.prompt_state(id)?.status, "interrupted");
+        assert_eq!(reopened.operation(id)?.state, "interrupted");
         let second = reopened.prompt_events(id, first[0].0, 1)?;
         assert_eq!(second[0].1["text"], "two");
         assert!(reopened.prompt_events(id, second[0].0, 1)?.is_empty());

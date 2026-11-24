@@ -38,29 +38,16 @@ fn commit_all(workspace: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Team orchestration falls back to standard tool-use loop when only one lane
-/// is detected (prompt doesn't mention multiple domains).
+/// Team requests use the durable tool loop until legacy lane execution shares
+/// the owned execution contract. No extra planning provider call is dispatched.
 #[test]
-fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
+fn teammate_mode_uses_shared_durable_tool_use_loop() -> Result<()> {
     let dir = tempfile::tempdir()?;
     init_git(dir.path())?;
     fs::write(dir.path().join("demo.txt"), "old\n")?;
     commit_all(dir.path(), "seed")?;
 
-    // The LLM returns a file planning response, then a tool-free text response.
-    // Since the prompt doesn't span multiple domains, team orchestration
-    // detects a single lane and falls back to the standard tool-use loop.
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(ScriptedLlm::new(vec![
-        // Planning call (returns file list for lane classification)
-        LlmResponse {
-            text: "demo.txt".to_string(),
-            finish_reason: "stop".to_string(),
-            reasoning_content: String::new(),
-            tool_calls: Vec::<LlmToolCall>::new(),
-            usage: None,
-            transport_parts: Vec::new(),
-            compatibility: None,
-        },
         // Tool-use loop: model responds with text (no tool calls) → loop exits
         LlmResponse {
             text: "Task completed successfully.".to_string(),

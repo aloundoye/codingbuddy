@@ -352,8 +352,14 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
     let session = store.load_latest_session()?;
     let plugin_manager = PluginManager::new(cwd)?;
     let plugins = plugin_manager.list().unwrap_or_default();
-    let mcp_servers = McpManager::new(cwd)
-        .and_then(|manager| manager.list_servers())
+    let mcp_manager = McpManager::new(cwd).ok();
+    let mcp_servers = mcp_manager
+        .as_ref()
+        .and_then(|manager| manager.list_servers().ok())
+        .unwrap_or_default();
+    let mcp_states = mcp_manager
+        .as_ref()
+        .and_then(|manager| manager.diagnostics().ok())
         .unwrap_or_default();
     let base_model_diagnostics =
         provider_compatibility_diagnostics(&cfg, &cfg.llm.active_base_model(), cwd);
@@ -409,6 +415,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             },
             "privacy": {"enabled": cfg.privacy.enabled},
             "mcp_servers": mcp_servers.len(),
+            "mcp_states":mcp_states,
             "autopilot": latest_autopilot.map(|run| json!({
                 "run_id": run.run_id,
                 "status": run.status,
@@ -449,6 +456,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             },
             "privacy": {"enabled": cfg.privacy.enabled},
             "mcp_servers": mcp_servers.len(),
+            "mcp_states":mcp_states,
             "autopilot": null,
         })
     };

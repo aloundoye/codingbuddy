@@ -135,6 +135,20 @@ jobs:
           python scripts/test_provider_certification_gate.py
           python scripts/provider_certification_gate.py "$CODINGBUDDY_CERTIFICATION_REPORT" --target '${{ matrix.target }}' --revision '${{ github.sha }}'
 
+      - name: Verify unattended execution contracts
+        shell: bash
+        run: |
+          python -B scripts/test_unattended_conformance_gate.py
+          python -B scripts/unattended_conformance.py --target '${{ matrix.target }}' --output "${{ runner.temp }}/unattended.json" --revision '${{ github.sha }}'
+          python -B scripts/unattended_conformance_gate.py "${{ runner.temp }}/unattended.json" --target '${{ matrix.target }}' --revision '${{ github.sha }}'
+
+      - name: Upload unattended evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: unattended-${{ matrix.target }}
+          path: ${{ runner.temp }}/unattended.json
+          if-no-files-found: error
+
       - name: Build release binary
         run: cargo build --locked --release --bin codingbuddy --target ${{ matrix.target }}
 
@@ -202,6 +216,21 @@ jobs:
         with:
           path: dist
           pattern: codingbuddy-*
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download native unattended results
+        uses: actions/download-artifact@v4
+        with:
+          path: unattended-evidence
+          pattern: unattended-*
+          merge-multiple: false
+
+      - name: Require all six native target results
+        shell: bash
+        run: python -B scripts/unattended_conformance_gate.py unattended-evidence/*/unattended.json --revision '${{ github.sha }}'
 
       - name: Flatten artifacts
         run: |

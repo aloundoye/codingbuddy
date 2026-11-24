@@ -1745,7 +1745,7 @@ impl RpcHandler for IdeRpcHandler {
                     "session/handoff_link_create", "session/handoff_link_consume",
                     "prompt/execute", "prompt/start", "prompt/events", "prompt/cancel", "prompt.v2", "prompt/stream_next", "stream/chunk",
                     "tool/approve", "tool/deny",
-                    "patch/preview", "patch/apply", "checkpoint/preview", "checkpoint/apply",
+                    "patch/preview", "patch/apply", "checkpoint/preview", "checkpoint/apply", "checkpoint/reconcile", "checkpoint.v2", "execution.v1",
                     "diagnostics/list", "events/poll",
                     "context/suggest", "context/analyze", "context/compress", "context/related", "context/debug",
                     "task/list", "task/update",
@@ -1773,21 +1773,49 @@ impl RpcHandler for IdeRpcHandler {
                     *running.keys().next().unwrap()
                 };
                 let result = self.handle_prompt_cancel(serde_json::json!({"prompt_id":id}))?;
-                Ok(serde_json::json!({"cancelled":true,"prompt_id":id,"status":result["status"]}))
+                Ok(
+                    serde_json::json!({"cancelled":matches!(result["status"].as_str(),Some("cancelling"|"cancelled")),"prompt_id":id,"status":result["status"]}),
+                )
             }
             "checkpoint/preview" => {
-                let checkpoint = require_uuid(&params, "checkpoint_id")?;
-                let plan = codingbuddy_memory::MemoryManager::new(self.workspace_path())?
-                    .preview_restore(checkpoint, &[])?;
+                let memory = codingbuddy_memory::MemoryManager::new(self.workspace_path())?;
+                let plan = if params.get("step_id").is_some() {
+                    memory.preview_step_restore(require_uuid(&params, "step_id")?)?
+                } else {
+                    let checkpoint = require_uuid(&params, "checkpoint_id")?;
+                    let paths = params
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    item.as_str()
+                                        .map(PathBuf::from)
+                                        .ok_or_else(|| anyhow!("Invalid restore path"))
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    memory.preview_restore(checkpoint, &paths)?
+                };
                 Ok(serde_json::to_value(plan)?)
             }
             "checkpoint/apply" => {
                 let id = require_uuid(&params, "plan_id")?;
-                let plan = codingbuddy_memory::MemoryManager::new(self.workspace_path())?
-                    .apply_restore(id, params["approved"] == true)?;
+                let mode = params["mode"].as_str().unwrap_or("files");
+                let (plan, fork) = codingbuddy_memory::MemoryManager::new(self.workspace_path())?
+                    .complete_restore(id, mode, params["approved"] == true)?;
                 Ok(
-                    serde_json::json!({"plan_id":plan.id,"checkpoint_id":plan.checkpoint_id,"rewound":true,"recovery_status":"verified","preserved":plan.preserved}),
+                    serde_json::json!({"plan_id":plan.id,"checkpoint_id":plan.checkpoint_id,"rewound":true,"recovery_status":"verified","preserved":plan.preserved,"session_id":fork}),
                 )
+            }
+            "checkpoint/reconcile" => {
+                let id = require_uuid(&params, "plan_id")?;
+                let status = codingbuddy_memory::MemoryManager::new(self.workspace_path())?
+                    .reconcile_restore(id)?;
+                Ok(serde_json::json!({"plan_id":id,"recovery_status":status}))
             }
 
             // Session management
@@ -2514,5 +2542,83 @@ mod tests {
 
         let empty = json!({});
         assert!(require_uuid(&empty, "id").is_err());
+    }
+}
+
+#[cfg(test)]
+mod delivery_three {
+    use super::*;
+    #[test]
+    fn local_restore_requires_preview_approval_and_is_never_an_http_capability() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("file"), "before")?;
+        let memory = codingbuddy_memory::MemoryManager::new(temp.path())?;
+        let checkpoint = memory.create_checkpoint("fixture")?;
+        std::fs::write(temp.path().join("file"), "after")?;
+        let before = memory.capture_before(&["file"]);
+        memory.record_step_snapshot("fs.write", "fixture", before, &["file"])?;
+        let handler = IdeRpcHandler::new(temp.path())?;
+        let plan = handler.handle(
+            "checkpoint/preview",
+            serde_json::json!({"checkpoint_id":checkpoint.checkpoint_id}),
+        )?;
+        let id = plan["id"].clone();
+        assert_eq!(plan["entries"].as_array().unwrap().len(), 1);
+        assert!(
+            handler
+                .handle(
+                    "checkpoint/apply",
+                    serde_json::json!({"plan_id":id,"approved":false})
+                )
+                .is_err()
+        );
+        assert!(
+            handler
+                .handle_http(
+                    "checkpoint/apply",
+                    serde_json::json!({"plan_id":id,"approved":true})
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(temp.path().join("file"))?, "after");
+        let applied = handler.handle(
+            "checkpoint/apply",
+            serde_json::json!({"plan_id":id,"approved":true}),
+        )?;
+        assert_eq!(applied["recovery_status"], "verified");
+        assert_eq!(std::fs::read_to_string(temp.path().join("file"))?, "before");
+        assert_eq!(
+            handler.handle("checkpoint/reconcile", serde_json::json!({"plan_id":id}))?["recovery_status"],
+            "applied"
+        );
+        Ok(())
+    }
+    #[test]
+    fn cancellation_from_a_later_local_client_reaches_the_owned_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let handler = IdeRpcHandler::new(temp.path())?;
+        let session = handler.handle(
+            "session/open",
+            serde_json::json!({"workspace_root":temp.path()}),
+        )?;
+        let session = Uuid::parse_str(session["session_id"].as_str().unwrap())?;
+        let store = Store::new(temp.path())?;
+        let lease = store.session_lease(session)?;
+        let prompt = store.start_prompt(
+            &lease,
+            session,
+            Uuid::now_v7(),
+            &serde_json::json!({"prompt":"fixture"}),
+        )?;
+        let token = codingbuddy_core::CancellationToken::new();
+        let _monitor = store.monitor_operation(prompt, token.clone())?;
+        let response = handler.handle("cancel", serde_json::json!({"prompt_id":prompt}))?;
+        assert_eq!(response["cancelled"], true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !token.is_cancelled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(token.is_cancelled());
+        Ok(())
     }
 }

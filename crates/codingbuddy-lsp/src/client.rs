@@ -1,21 +1,32 @@
 use anyhow::{Result, anyhow};
+use codingbuddy_core::execution::{ExecutionContext, OwnedChild};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// A single LSP client connected to one server process over stdio.
 pub struct LspClient {
-    process: Mutex<Child>,
+    process: Mutex<OwnedChild>,
+    context: Mutex<ExecutionContext>,
+    responses: Mutex<mpsc::Receiver<Value>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+    writes: Option<mpsc::SyncSender<QueuedWrite>>,
     next_id: AtomicI64,
     server_command: String,
     workspace_root: PathBuf,
     initialized: Mutex<bool>,
 }
 
+struct QueuedWrite {
+    message: Value,
+    done: mpsc::SyncSender<std::io::Result<()>>,
+}
 /// An LSP location (file + line + column).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspLocation {
@@ -49,29 +60,70 @@ impl LspClient {
         server_args: &[&str],
         workspace_root: &Path,
     ) -> Result<Self> {
-        let mut command = Command::new(server_command);
-        codingbuddy_core::process_env::apply_for(
-            &mut command,
-            workspace_root,
-            "language_tools",
-            codingbuddy_core::process_env::Source::Project,
-        );
-        let child = command
-            .args(server_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .current_dir(workspace_root)
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn LSP server '{}': {}", server_command, e))?;
-
+        let _ = (server_command, server_args, workspace_root);
+        anyhow::bail!("Language-server startup requires a policy-prepared owned process")
+    }
+    pub fn from_owned(
+        mut child: OwnedChild,
+        server_command: &str,
+        workspace_root: &Path,
+        context: ExecutionContext,
+    ) -> Result<Self> {
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Missing language-server stdin"))?;
+        let (writes, requests) = mpsc::sync_channel::<QueuedWrite>(8);
+        let writer = std::thread::spawn(move || {
+            while let Ok(request) = requests.recv() {
+                let result = (|| -> std::io::Result<()> {
+                    let body = serde_json::to_vec(&request.message)?;
+                    if body.len() > 16 * 1024 * 1024 {
+                        return Err(std::io::Error::other("Language request limit exceeded"));
+                    }
+                    write!(input, "Content-Length: {}\r\n\r\n", body.len())?;
+                    input.write_all(&body)?;
+                    input.flush()
+                })();
+                let failed = result.is_err();
+                let _ = request.done.try_send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Missing language-server stdout"))?;
+        let (tx, rx) = mpsc::sync_channel(64);
+        let reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(output);
+            while let Ok(Some(frame)) = read_frame(&mut reader) {
+                if tx.try_send(frame).is_err() {
+                    break;
+                }
+            }
+        });
         Ok(Self {
             process: Mutex::new(child),
+            context: Mutex::new(context),
+            responses: Mutex::new(rx),
+            reader: Some(reader),
+            writes: Some(writes),
+            writer: Some(writer),
             next_id: AtomicI64::new(1),
-            server_command: server_command.to_string(),
-            workspace_root: workspace_root.to_path_buf(),
+            server_command: server_command.into(),
+            workspace_root: workspace_root.into(),
             initialized: Mutex::new(false),
         })
+    }
+    pub fn set_context(&self, context: &ExecutionContext) -> Result<()> {
+        *self
+            .context
+            .lock()
+            .map_err(|_| anyhow!("Language context unavailable"))? = context.clone();
+        Ok(())
     }
 
     /// Send the initialize request and initialized notification.
@@ -202,10 +254,8 @@ impl LspClient {
 
     /// Send a shutdown request then exit notification.
     pub fn shutdown(&self) -> Result<()> {
-        let _ = self.send_request("shutdown", json!(null));
-        let _ = self.send_notification("exit", json!(null));
         if let Ok(mut proc) = self.process.lock() {
-            let _ = proc.kill();
+            proc.terminate();
             let _ = proc.wait();
         }
         Ok(())
@@ -239,11 +289,56 @@ impl LspClient {
 
         let mut proc = self.process.lock().map_err(|_| anyhow!("lock poisoned"))?;
 
-        // Write
-        write_to_stdin(&mut proc, &req)?;
-
-        // Read (holding lock so no other thread can interleave)
-        read_response_from_stdout(&mut proc, id)
+        let mut context = self
+            .context
+            .lock()
+            .map_err(|_| anyhow!("Language context unavailable"))?
+            .clone();
+        let limit = Instant::now() + Duration::from_secs(30);
+        context.deadline = Some(
+            context
+                .deadline
+                .map_or(limit, |deadline| deadline.min(limit)),
+        );
+        self.write_queued(&mut proc, req, &context)?;
+        let responses = self
+            .responses
+            .lock()
+            .map_err(|_| anyhow!("Language response queue unavailable"))?;
+        loop {
+            if let Err(error) = context.check() {
+                let cleanup = ExecutionContext {
+                    deadline: Some(Instant::now() + Duration::from_millis(100)),
+                    ..Default::default()
+                };
+                let _ = self.write_queued(
+                    &mut proc,
+                    json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}}),
+                    &cleanup,
+                );
+                proc.terminate();
+                let _ = proc.wait();
+                return Err(error);
+            }
+            match responses.recv_timeout(Duration::from_millis(20)) {
+                Ok(frame) if frame["id"].as_i64() == Some(id) => {
+                    anyhow::ensure!(
+                        frame.get("error").is_none(),
+                        "Language server returned an error"
+                    );
+                    return frame
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| anyhow!("Language result missing"));
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => {
+                    proc.terminate();
+                    anyhow::bail!("Language server closed before response");
+                }
+            }
+        }
     }
 
     fn send_notification(&self, method: &str, params: Value) -> Result<()> {
@@ -253,69 +348,92 @@ impl LspClient {
             "params": params,
         });
         let mut proc = self.process.lock().map_err(|_| anyhow!("lock poisoned"))?;
-        write_to_stdin(&mut proc, &msg)
+        let mut context = self
+            .context
+            .lock()
+            .map_err(|_| anyhow!("Language context unavailable"))?
+            .clone();
+        let limit = Instant::now() + Duration::from_secs(30);
+        context.deadline = Some(
+            context
+                .deadline
+                .map_or(limit, |deadline| deadline.min(limit)),
+        );
+        self.write_queued(&mut proc, msg, &context)
+    }
+    fn write_queued(
+        &self,
+        proc: &mut OwnedChild,
+        message: Value,
+        context: &ExecutionContext,
+    ) -> Result<()> {
+        context.check()?;
+        let (done, ack) = mpsc::sync_channel(1);
+        self.writes
+            .as_ref()
+            .ok_or_else(|| anyhow!("Language input closed"))?
+            .try_send(QueuedWrite { message, done })
+            .map_err(|_| anyhow!("Language input queue unavailable"))?;
+        loop {
+            if let Err(error) = context.check() {
+                proc.terminate();
+                let _ = proc.wait();
+                return Err(error);
+            }
+            match ack.recv_timeout(Duration::from_millis(20)) {
+                Ok(result) => return result.map_err(Into::into),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => anyhow::bail!("Language input closed"),
+            }
+        }
     }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
         let _ = self.shutdown();
+        self.writes.take();
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
 // ── JSON-RPC I/O (free functions operating on locked Child) ──
 
-fn write_to_stdin(proc: &mut Child, msg: &Value) -> Result<()> {
-    let body = serde_json::to_string(msg)?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    let stdin = proc.stdin.as_mut().ok_or_else(|| anyhow!("no stdin"))?;
-    stdin.write_all(header.as_bytes())?;
-    stdin.write_all(body.as_bytes())?;
-    stdin.flush()?;
-    Ok(())
-}
-
-fn read_response_from_stdout(proc: &mut Child, expected_id: i64) -> Result<Value> {
-    let stdout = proc.stdout.as_mut().ok_or_else(|| anyhow!("no stdout"))?;
-    let mut reader = BufReader::new(stdout);
-
+fn read_frame(reader: &mut impl BufRead) -> Result<Option<Value>> {
+    let mut content_length = None;
+    let mut headers = 0usize;
     loop {
-        let mut content_length: usize = 0;
-        loop {
-            let mut header_line = String::new();
-            reader.read_line(&mut header_line)?;
-            let trimmed = header_line.trim();
-            if trimmed.is_empty() {
-                break;
-            }
-            if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
-                content_length = len_str.trim().parse().unwrap_or(0);
-            }
+        let mut line = String::new();
+        let size = std::io::Read::take(&mut *reader, 65537).read_line(&mut line)?;
+        if size == 0 {
+            return Ok(None);
         }
-
-        if content_length == 0 {
+        headers += size;
+        anyhow::ensure!(headers <= 65536, "Language frame headers exceeded limit");
+        #[cfg(test)]
+        if line.trim() == "running 1 test" || (line.trim().is_empty() && content_length.is_none()) {
             continue;
         }
-
-        let mut body = vec![0u8; content_length];
-        reader.read_exact(&mut body)?;
-        let parsed: Value = serde_json::from_slice(&body)?;
-
-        // Skip notifications (no id field)
-        if parsed.get("id").is_none() {
-            continue;
+        if line.trim().is_empty() {
+            break;
         }
-
-        if parsed["id"].as_i64() == Some(expected_id) {
-            if let Some(error) = parsed.get("error") {
-                return Err(anyhow!(
-                    "LSP error: {}",
-                    error["message"].as_str().unwrap_or("unknown")
-                ));
-            }
-            return Ok(parsed.get("result").cloned().unwrap_or(Value::Null));
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("Content-Length")
+        {
+            anyhow::ensure!(content_length.is_none(), "Duplicate language frame length");
+            content_length = Some(value.trim().parse::<usize>()?);
         }
     }
+    let size = content_length.ok_or_else(|| anyhow!("Missing language frame length"))?;
+    anyhow::ensure!(size <= 16 * 1024 * 1024, "Language frame limit exceeded");
+    let mut bytes = vec![0; size];
+    reader.read_exact(&mut bytes)?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 // ── Helpers ──
@@ -615,5 +733,69 @@ mod tests {
         assert_eq!(symbol_kind_name(12), "function");
         assert_eq!(symbol_kind_name(22), "struct");
         assert_eq!(symbol_kind_name(999), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod delivery_three {
+    use super::*;
+    #[test]
+    fn server_fixture() {
+        if std::env::var_os("CODINGBUDDY_LSP_FIXTURE").is_none() {
+            return;
+        }
+        let mut input = BufReader::new(std::io::stdin());
+        while let Ok(Some(request)) = read_frame(&mut input) {
+            if request.get("id").is_none() {
+                continue;
+            }
+            if request["method"] != "initialize" {
+                std::thread::sleep(Duration::from_secs(10));
+                continue;
+            }
+            let body = json!({"jsonrpc":"2.0","id":request["id"],"result":{"capabilities":{}}})
+                .to_string();
+            print!("Content-Length: {}\r\n\r\n{body}", body.len());
+            std::io::stdout().flush().unwrap();
+        }
+    }
+    #[test]
+    fn stalled_language_read_is_cancelled_and_owned_process_is_reaped() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let token = codingbuddy_core::CancellationToken::new();
+        let context = ExecutionContext {
+            cancellation: token.clone(),
+            deadline: Some(Instant::now() + Duration::from_secs(3)),
+            ..Default::default()
+        };
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "client::delivery_three::server_fixture",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env("CODINGBUDDY_LSP_FIXTURE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let child = OwnedChild::spawn(&mut command)?;
+        let client = LspClient::from_owned(child, "fixture", workspace.path(), context)?;
+        client.initialize()?;
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            token.cancel();
+        });
+        let started = Instant::now();
+        assert!(
+            client
+                .hover(&workspace.path().join("file.rs"), 1, 1)
+                .is_err()
+        );
+        cancel.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!client.is_alive());
+        Ok(())
     }
 }

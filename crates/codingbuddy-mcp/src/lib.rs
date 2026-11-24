@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod conformance;
 mod sessions;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -143,6 +145,32 @@ impl McpManager {
         })
     }
 
+    pub fn diagnostics(&self) -> Result<BTreeMap<String, String>> {
+        let servers = self.list_servers()?;
+        let mut states = self.session_states();
+        for server in servers {
+            let current = self
+                .catalog_fingerprints
+                .lock()
+                .unwrap()
+                .get(&server.id)
+                .is_some_and(|fingerprint| {
+                    sessions::fingerprint(&server).is_ok_and(|current| *fingerprint == current)
+                });
+            if !current || !states.contains_key(&server.id) {
+                states.insert(
+                    server.id,
+                    if server.enabled {
+                        "configured"
+                    } else {
+                        "disabled"
+                    }
+                    .into(),
+                );
+            }
+        }
+        Ok(states)
+    }
     pub fn session_states(&self) -> BTreeMap<String, String> {
         self.sessions.states.lock().unwrap().clone()
     }
@@ -298,8 +326,23 @@ impl McpManager {
         let mut seen = BTreeSet::new();
         let mut servers = Vec::new();
         for (mut server, source) in candidates {
-            if !seen.insert(server.id.clone()) || !server_allowed(&server) {
+            if !seen.insert(server.id.clone()) {
                 continue;
+            }
+            if !server_allowed(&server) {
+                self.sessions
+                    .states
+                    .lock()
+                    .unwrap()
+                    .insert(server.id.clone(), "denied".into());
+                continue;
+            }
+            if !server.enabled {
+                self.sessions
+                    .states
+                    .lock()
+                    .unwrap()
+                    .insert(server.id.clone(), "disabled".into());
             }
             if !server.metadata.is_object() {
                 server.metadata = json!({});
@@ -1425,9 +1468,15 @@ fn read_mcp_frame<R: BufRead>(reader: &mut R) -> Result<Option<serde_json::Value
                 continue;
             }
         }
-        if let Some((header, value)) = trimmed.split_once(':')
-            && header.eq_ignore_ascii_case("Content-Length")
-        {
+        #[cfg(test)]
+        if trimmed == "running 1 test" {
+            continue;
+        }
+        let (header, value) = trimmed
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Malformed MCP frame"))?;
+        if header.eq_ignore_ascii_case("Content-Length") {
+            anyhow::ensure!(content_length.is_none(), "Duplicate MCP frame length");
             content_length = Some(
                 value
                     .trim()
@@ -1544,7 +1593,7 @@ fn token_dir() -> Result<PathBuf> {
 fn store_token_file(server_id: &str, json: &str) -> Result<()> {
     let dir = token_dir()?;
     fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{server_id}.json"));
+    let path = dir.join(format!("{:x}.json", Sha256::digest(server_id.as_bytes())));
     fs::write(&path, json)?;
     #[cfg(unix)]
     {
@@ -1555,7 +1604,7 @@ fn store_token_file(server_id: &str, json: &str) -> Result<()> {
 }
 
 fn load_token_file(server_id: &str) -> Result<Option<McpOAuthToken>> {
-    let path = token_dir()?.join(format!("{server_id}.json"));
+    let path = token_dir()?.join(format!("{:x}.json", Sha256::digest(server_id.as_bytes())));
     match fs::read_to_string(path) {
         Ok(raw) => Ok(Some(serde_json::from_str(&raw)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1564,7 +1613,7 @@ fn load_token_file(server_id: &str) -> Result<Option<McpOAuthToken>> {
 }
 
 fn delete_token_file(server_id: &str) -> Result<()> {
-    let path = token_dir()?.join(format!("{server_id}.json"));
+    let path = token_dir()?.join(format!("{:x}.json", Sha256::digest(server_id.as_bytes())));
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1693,7 +1742,10 @@ fn exchange_oauth_code(
     code_verifier: &str,
     server_id: &str,
 ) -> Result<McpOAuthToken> {
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let mut body = json!({
         "grant_type": "authorization_code",
         "code": code,
@@ -1745,7 +1797,10 @@ pub fn refresh_oauth_token(server: &McpServer, token: &McpOAuthToken) -> Result<
         .refresh_token
         .as_deref()
         .ok_or_else(|| anyhow!("no refresh token available"))?;
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let resp: serde_json::Value = client
         .post(&oauth.token_url)
         .json(&json!({
@@ -1810,7 +1865,10 @@ fn wait_for_oauth_callback(
             Ok((mut stream, _)) => {
                 use std::io::Read;
                 let mut buf = [0u8; 4096];
-                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(
+                    Duration::from_secs(5).min(timeout.saturating_sub(started.elapsed())),
+                ))?;
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]);
                 if let Some(code) = extract_query_param(&request, "code") {

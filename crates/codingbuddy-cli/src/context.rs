@@ -16,6 +16,23 @@ const BG_CHILD_SESSION_ID_ENV: &str = "CODINGBUDDY_BG_CHILD_SESSION_ID";
 const BG_RUN_ID_ENV: &str = "CODINGBUDDY_BG_SUBAGENT_RUN_ID";
 const BG_TASK_ID_ENV: &str = "CODINGBUDDY_BG_SUBAGENT_TASK_ID";
 
+/// Early failures remain inspectable; side effects are never inferred from a return code.
+struct DelegationGuard {
+    store: Store,
+    id: Uuid,
+}
+impl Drop for DelegationGuard {
+    fn drop(&mut self) {
+        if let Ok(operation) = self.store.operation(self.id)
+            && operation.state == "running"
+        {
+            let _ = self.store.transition_operation(
+                self.id, "running", "ambiguous", &json!({"reason":"delegation interrupted; inspect child receipts and retained worktree"}),
+            );
+        }
+    }
+}
+
 /// Apply CLI-level engine overrides (permission mode, verbose, budget limits).
 pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
     if cli.dangerously_skip_permissions && cli.allow_dangerously_skip_permissions {
@@ -41,26 +58,35 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
 /// Subagent orchestration connects the parallel Worker execution to isolated engine scopes.
 pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
     let workspace = cwd.to_path_buf();
-    let parent_config = engine.cfg().clone();
+    let parent_config = engine.delegation_config();
     let worker = std::sync::Arc::new(
         move |task: &codingbuddy_subagent::SubagentTask| -> anyhow::Result<String> {
             task.execution.check()?;
             let run_store = Store::new(&workspace)?;
+            let operation_id = Uuid::now_v7();
             if !task.run_in_background {
                 run_store.begin_operation(
-                    task.run_id,
+                    operation_id,
                     task.child_session_id,
                     task.execution.prompt_id,
                     "subagent",
                     &json!({"name":task.name}),
                 )?;
             }
+            let _settlement = if task.run_in_background {
+                None
+            } else {
+                Some(DelegationGuard {
+                    store: Store::new(&workspace)?,
+                    id: operation_id,
+                })
+            };
             let _run_monitor = if task.run_in_background {
                 None
             } else {
                 Some(
                     run_store
-                        .monitor_operation(task.run_id, task.execution.cancellation.clone())?,
+                        .monitor_operation(operation_id, task.execution.cancellation.clone())?,
                 )
             };
             let (mode, force_max_think, role_prompt, _mode_name) = match &task.role {
@@ -138,7 +164,7 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
                         prompt: delegated_prompt.clone(),
                         tools: true,
                         session: child_session_id,
-                        task: Some(task.clone()),
+                        task: Some(Box::new(task.clone())),
                         max_turns: task.max_turns.map(|n| n as u64),
                     },
                     parent_config.clone(),
@@ -172,11 +198,15 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
             let mut options = codingbuddy_agent::ChatOptions {
                 tools: true,
                 force_max_think,
-                mode,
+                mode: if task.read_only_fallback {
+                    codingbuddy_agent::ChatMode::Ask
+                } else {
+                    mode
+                },
                 session_id: task.child_session_id,
                 cancellation: Some(task.execution.cancellation.clone()),
                 deadline: task.execution.deadline,
-                parent_run_id: Some(task.run_id),
+                parent_run_id: Some(operation_id),
                 ..Default::default()
             };
 
@@ -220,7 +250,7 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
                 "failed"
             };
             run_store.transition_operation(
-                task.run_id,
+                operation_id,
                 "running",
                 status,
                 &json!({"artifact":artifact,"workspace":worktree.path()}),
@@ -412,21 +442,36 @@ pub(crate) fn finalize_background_subagent_run_with_ids(
         run.background_job_id = Some(job.job_id);
     }
 
-    let (task_status, run_status, output, error, reason) = match outcome {
-        Ok(output) => (
-            "completed",
-            "completed",
-            Some(output.to_string()),
+    let cancelled = background_job.as_ref().is_some_and(|job| {
+        store
+            .operation(job.job_id)
+            .is_ok_and(|operation| operation.cancel_requested)
+    });
+    let (task_status, run_status, output, error, reason) = if cancelled {
+        (
+            "cancelled",
+            "cancelled",
             None,
-            "completed".to_string(),
-        ),
-        Err(error) => (
-            "failed",
-            "failed",
-            None,
-            Some(error.to_string()),
-            format!("failed: {error}"),
-        ),
+            Some("Cancellation acknowledged by worker".to_string()),
+            "cancelled".to_string(),
+        )
+    } else {
+        match outcome {
+            Ok(output) => (
+                "completed",
+                "completed",
+                Some(output.to_string()),
+                None,
+                "completed".to_string(),
+            ),
+            Err(error) => (
+                "failed",
+                "failed",
+                None,
+                Some(error.to_string()),
+                format!("failed: {error}"),
+            ),
+        }
     };
 
     store.update_task_status(task_id, task_status, output.as_deref().or(error.as_deref()))?;
@@ -452,7 +497,9 @@ pub(crate) fn finalize_background_subagent_run_with_ids(
                 object.insert("error".to_string(), json!(error));
             }
         }
-        job.status = if output.is_some() {
+        job.status = if cancelled {
+            "cancelled".to_string()
+        } else if output.is_some() {
             "completed".to_string()
         } else {
             "failed".to_string()

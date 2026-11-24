@@ -141,42 +141,50 @@ pub(crate) fn rewind_now(
             .checkpoint_id
     };
     let checkpoint = memory.rewind_to_checkpoint(checkpoint_id)?;
-    append_control_event(
-        cwd,
-        EventKind::CheckpointRewound {
-            checkpoint_id: checkpoint.checkpoint_id,
-            reason: checkpoint.reason.clone(),
-        },
-    )?;
     Ok(checkpoint)
 }
 
 pub(crate) fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Result<()> {
     let memory = MemoryManager::new(cwd)?;
-    let checkpoint_id = if let Some(value) = args.to_checkpoint.as_deref() {
-        Uuid::parse_str(value)?
-    } else {
-        let checkpoints = memory.list_checkpoints()?;
-        if checkpoints.is_empty() {
-            let payload = json!({"rewound": false, "reason": "no_checkpoints"});
-            if json_mode {
-                print_json(&payload)?;
-            } else {
-                println!("no checkpoints available");
-            }
-            return Ok(());
+    if args.reconcile {
+        let id = Uuid::parse_str(
+            args.plan
+                .as_deref()
+                .ok_or_else(|| anyhow!("--reconcile requires --plan"))?,
+        )?;
+        let status = memory.reconcile_restore(id)?;
+        let payload = json!({"plan_id":id,"recovery_status":status});
+        if json_mode {
+            print_json(&payload)?;
+        } else {
+            println!("{payload}");
         }
-        checkpoints
-            .into_iter()
-            .next()
-            .expect("non-empty checkpoints")
-            .checkpoint_id
-    };
+        return Ok(());
+    }
     let plan = if let Some(id) = args.plan.as_deref() {
         let record = Store::new(cwd)?.operation(Uuid::parse_str(id)?)?;
         anyhow::ensure!(record.kind == "restore", "Not a restore plan");
         serde_json::from_value::<codingbuddy_memory::RestorePlan>(record.payload)?
     } else {
+        let checkpoint_id = if let Some(value) = args.to_checkpoint.as_deref() {
+            Uuid::parse_str(value)?
+        } else {
+            let checkpoints = memory.list_checkpoints()?;
+            if checkpoints.is_empty() {
+                let payload = json!({"rewound": false, "reason": "no_checkpoints"});
+                if json_mode {
+                    print_json(&payload)?;
+                } else {
+                    println!("no checkpoints available");
+                }
+                return Ok(());
+            }
+            checkpoints
+                .into_iter()
+                .next()
+                .expect("non-empty checkpoints")
+                .checkpoint_id
+        };
         memory.preview_restore(checkpoint_id, &args.paths)?
     };
     if args.preview {
@@ -191,42 +199,17 @@ pub(crate) fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Resul
         args.yes,
         "rewind requires --yes; use --preview to review the restore plan"
     );
-    if args.mode != "files" {
-        anyhow::ensure!(
-            plan.session_id.is_some() && plan.cursor.is_some(),
-            "Checkpoint lacks a conversation cursor"
-        );
-    }
-    if args.mode != "conversation" {
-        memory.apply_restore(plan.id, true)?;
-    }
-    let fork = if args.mode != "files" {
-        Some(
-            Store::new(cwd)?
-                .fork_session_at_cursor(plan.session_id.unwrap(), plan.cursor.unwrap())?
-                .session_id,
-        )
-    } else {
-        None
-    };
+    let (plan, fork) = memory.complete_restore(plan.id, &args.mode, true)?;
     let checkpoint = memory
         .list_checkpoints()?
         .into_iter()
-        .find(|checkpoint| checkpoint.checkpoint_id == plan.checkpoint_id)
-        .ok_or_else(|| anyhow!("Checkpoint unavailable"))?;
-    append_control_event(
-        cwd,
-        EventKind::CheckpointRewound {
-            checkpoint_id: checkpoint.checkpoint_id,
-            reason: checkpoint.reason.clone(),
-        },
-    )?;
+        .find(|checkpoint| checkpoint.checkpoint_id == plan.checkpoint_id);
     let payload = json!({
-        "checkpoint_id": checkpoint.checkpoint_id,
-        "reason": checkpoint.reason,
-        "snapshot_path": checkpoint.snapshot_path,
-        "files_count": checkpoint.files_count,
-        "created_at": checkpoint.created_at,
+        "checkpoint_id": plan.checkpoint_id,
+        "reason": checkpoint.as_ref().map(|c| c.reason.as_str()).unwrap_or("step restore"),
+        "snapshot_path": checkpoint.as_ref().map(|c| &c.snapshot_path),
+        "files_count": checkpoint.as_ref().map(|c| c.files_count).unwrap_or(plan.entries.len() as u64),
+        "created_at": checkpoint.as_ref().map(|c| &c.created_at),
         "rewound": true,
         "plan_id":plan.id,"recovery_status":"verified","preserved":plan.preserved,"session_id":fork,
     });
