@@ -172,13 +172,48 @@ pub(crate) fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Resul
             .expect("non-empty checkpoints")
             .checkpoint_id
     };
-    if !args.yes {
-        return Err(anyhow!(
-            "rewind requires --yes to confirm (target checkpoint: {})",
-            checkpoint_id
-        ));
+    let plan = if let Some(id) = args.plan.as_deref() {
+        let record = Store::new(cwd)?.operation(Uuid::parse_str(id)?)?;
+        anyhow::ensure!(record.kind == "restore", "Not a restore plan");
+        serde_json::from_value::<codingbuddy_memory::RestorePlan>(record.payload)?
+    } else {
+        memory.preview_restore(checkpoint_id, &args.paths)?
+    };
+    if args.preview {
+        if json_mode {
+            print_json(&serde_json::to_value(&plan)?)?;
+        } else {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        return Ok(());
     }
-    let checkpoint = memory.rewind_to_checkpoint(checkpoint_id)?;
+    anyhow::ensure!(
+        args.yes,
+        "rewind requires --yes; use --preview to review the restore plan"
+    );
+    if args.mode != "files" {
+        anyhow::ensure!(
+            plan.session_id.is_some() && plan.cursor.is_some(),
+            "Checkpoint lacks a conversation cursor"
+        );
+    }
+    if args.mode != "conversation" {
+        memory.apply_restore(plan.id, true)?;
+    }
+    let fork = if args.mode != "files" {
+        Some(
+            Store::new(cwd)?
+                .fork_session_at_cursor(plan.session_id.unwrap(), plan.cursor.unwrap())?
+                .session_id,
+        )
+    } else {
+        None
+    };
+    let checkpoint = memory
+        .list_checkpoints()?
+        .into_iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == plan.checkpoint_id)
+        .ok_or_else(|| anyhow!("Checkpoint unavailable"))?;
     append_control_event(
         cwd,
         EventKind::CheckpointRewound {
@@ -193,6 +228,7 @@ pub(crate) fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Resul
         "files_count": checkpoint.files_count,
         "created_at": checkpoint.created_at,
         "rewound": true,
+        "plan_id":plan.id,"recovery_status":"verified","preserved":plan.preserved,"session_id":fork,
     });
     if json_mode {
         print_json(&payload)?;

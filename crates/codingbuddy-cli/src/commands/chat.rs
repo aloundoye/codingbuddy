@@ -634,7 +634,18 @@ pub(crate) fn run_chat(
                         .find(|arg| !arg.starts_with('-'))
                         .map(ToString::to_string);
                     let yes = true;
-                    run_rewind(cwd, RewindArgs { to_checkpoint, yes }, json_mode)?;
+                    run_rewind(
+                        cwd,
+                        RewindArgs {
+                            to_checkpoint,
+                            yes,
+                            preview: false,
+                            plan: None,
+                            mode: "files".into(),
+                            paths: vec![],
+                        },
+                        json_mode,
+                    )?;
                 }
                 SlashCommand::Export(args) => {
                     let format = args.first().cloned().unwrap_or_else(|| "json".to_string());

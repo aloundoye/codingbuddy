@@ -84,6 +84,7 @@ pub type SkillRunner =
 /// Request to spawn a subagent task.
 #[derive(Debug, Clone)]
 pub struct SubagentRequest {
+    pub execution: codingbuddy_core::execution::ExecutionContext,
     pub run_id: Uuid,
     pub task_id: Option<Uuid>,
     pub parent_session_id: Option<Uuid>,

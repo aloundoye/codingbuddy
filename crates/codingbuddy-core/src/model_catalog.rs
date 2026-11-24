@@ -965,7 +965,7 @@ const BUNDLED_MODELS: &[(&str, &[&str])] = &[
     ("deepseek", &["deepseek-chat", "deepseek-reasoner"]),
     ("openai-compatible", &["gpt-4o-mini", "o4-mini"]),
     ("anthropic", &["claude-sonnet-4-5"]),
-    ("google", &["gemini-2.5-pro"]),
+    ("google", &["gemini-3.5-flash-lite", "gemini-3.6-flash"]),
     ("openrouter", &["openrouter/auto"]),
     ("ollama", &["qwen2.5-coder:7b"]),
     ("mistral", &["mistral-large-latest"]),

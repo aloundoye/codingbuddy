@@ -111,6 +111,13 @@ fn command_passed(output: &serde_json::Value, tool_success: bool) -> bool {
         return false;
     }
     if output
+        .get("cancelled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if output
         .get("timed_out")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
@@ -126,7 +133,7 @@ fn command_passed(output: &serde_json::Value, tool_success: bool) -> bool {
     if let Some(code) = output.get("exit_code").and_then(|v| v.as_i64()) {
         return code == 0;
     }
-    true
+    false
 }
 
 fn extract_output(value: &serde_json::Value) -> String {

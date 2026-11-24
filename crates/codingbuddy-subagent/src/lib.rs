@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,8 @@ impl SubagentRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentTask {
+    #[serde(skip)]
+    pub execution: codingbuddy_core::execution::ExecutionContext,
     pub run_id: Uuid,
     pub name: String,
     pub goal: String,
@@ -370,108 +372,8 @@ impl BackgroundTaskRegistry {
 
 // ── P5-02: Worktree Isolation ──
 
-/// Manages git worktree creation and cleanup for isolated subagent execution.
-pub struct WorktreeIsolation {
-    workspace: PathBuf,
-    worktree_path: PathBuf,
-    created: bool,
-}
-
-impl WorktreeIsolation {
-    /// Create a new isolated worktree for a subagent.
-    pub fn create(workspace: &Path, name: &str) -> Result<Self> {
-        let runtime_dir = workspace.join(".codingbuddy");
-        let worktrees_dir = runtime_dir.join("worktrees");
-        std::fs::create_dir_all(&worktrees_dir)?;
-
-        let worktree_path = worktrees_dir.join(name);
-        if worktree_path.exists() {
-            let _ = std::fs::remove_dir_all(&worktree_path);
-        }
-
-        let base_commit = git_stdout(workspace, &["rev-parse", "HEAD"])
-            .context("failed to get HEAD commit for worktree")?;
-
-        let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
-            .arg("-C")
-            .arg(workspace)
-            .args(["worktree", "add", "--detach"])
-            .arg(&worktree_path)
-            .arg(&base_commit)
-            .output()
-            .context("failed to spawn git worktree add")?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        Ok(Self {
-            workspace: workspace.to_path_buf(),
-            worktree_path,
-            created: true,
-        })
-    }
-
-    /// Get the path to the worktree.
-    pub fn path(&self) -> &Path {
-        &self.worktree_path
-    }
-
-    /// Collect the diff of changes made in the worktree.
-    pub fn collect_diff(&self) -> Result<String> {
-        git_stdout(&self.worktree_path, &["diff", "--binary", "HEAD"])
-    }
-
-    /// Clean up the worktree.
-    pub fn cleanup(&mut self) -> Result<()> {
-        if !self.created {
-            return Ok(());
-        }
-        let output = codingbuddy_core::process_env::git_command(&self.workspace, "git_worktree")
-            .arg("-C")
-            .arg(&self.workspace)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.worktree_path)
-            .output()
-            .context("failed to spawn git worktree remove")?;
-
-        if output.status.success() {
-            self.created = false;
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "git worktree remove failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-}
-
-impl Drop for WorktreeIsolation {
-    fn drop(&mut self) {
-        let _ = self.cleanup();
-    }
-}
-
-fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
-    let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
-        .args(args)
-        .current_dir(workspace)
-        .output()
-        .context("failed to spawn git command")?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(anyhow!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
+mod worktree;
+pub use worktree::WorktreeIsolation;
 
 // ── P5-03: Persistent Memory ──
 
@@ -923,6 +825,7 @@ mod tests {
         let manager = SubagentManager::new(2);
         let tasks = (0..5)
             .map(|i| SubagentTask {
+                execution: Default::default(),
                 run_id: Uuid::now_v7(),
                 name: format!("task-{i}"),
                 goal: "analyze".to_string(),
@@ -962,6 +865,7 @@ mod tests {
         let mut manager = SubagentManager::new(1);
         manager.max_retries_per_task = 2;
         let task = SubagentTask {
+            execution: Default::default(),
             run_id: Uuid::now_v7(),
             name: "retry-me".to_string(),
             goal: "recover".to_string(),
@@ -1000,6 +904,7 @@ mod tests {
             ("explore", SubagentRole::Explore, "scan"),
         ] {
             tasks.push(SubagentTask {
+                execution: Default::default(),
                 run_id: Uuid::now_v7(),
                 name: name.to_string(),
                 goal: "x".to_string(),
@@ -1029,6 +934,7 @@ mod tests {
         let mut manager = SubagentManager::new(1);
         manager.max_retries_per_task = 2;
         let task = SubagentTask {
+            execution: Default::default(),
             run_id: Uuid::now_v7(),
             name: "edit-file".to_string(),
             goal: "fix bug".to_string(),
@@ -1099,6 +1005,7 @@ mod tests {
         let coordinator = TeamCoordinator::new(TeammateMode::InProcess, 2);
         let tasks = (0..3)
             .map(|i| SubagentTask {
+                execution: Default::default(),
                 run_id: Uuid::now_v7(),
                 name: format!("task-{i}"),
                 goal: "do work".to_string(),
@@ -1178,7 +1085,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         init_repo_with_initial_commit(temp.path(), "test.txt", "hello\n");
 
-        let mut wt = WorktreeIsolation::create(temp.path(), "test-agent").unwrap();
+        let mut wt =
+            WorktreeIsolation::create_with_trust(temp.path(), "test-agent", &[], true).unwrap();
         assert!(wt.path().exists(), "worktree should exist");
 
         wt.cleanup().unwrap();
@@ -1190,7 +1098,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         init_repo_with_initial_commit(temp.path(), "file.txt", "original\n");
 
-        let mut wt = WorktreeIsolation::create(temp.path(), "diff-test").unwrap();
+        let mut wt =
+            WorktreeIsolation::create_with_trust(temp.path(), "diff-test", &[], true).unwrap();
 
         // Make a change in the worktree
         std::fs::write(wt.path().join("file.txt"), "modified\n").unwrap();
@@ -1200,7 +1109,13 @@ mod tests {
             "diff should contain changes"
         );
 
-        wt.cleanup().unwrap();
+        assert!(
+            wt.cleanup().is_err(),
+            "Uncollected output must survive cleanup attempts"
+        );
+        let path = wt.path().to_owned();
+        drop(wt);
+        assert!(path.join("file.txt").exists());
     }
 
     // ── P5-04: Transcript Tests ──
@@ -1443,6 +1358,7 @@ mod tests {
         let mut manager = SubagentManager::new(1);
         manager.max_retries_per_task = 1;
         let task = SubagentTask {
+            execution: Default::default(),
             run_id: Uuid::now_v7(),
             name: "read-etc".to_string(),
             goal: "read system file".to_string(),

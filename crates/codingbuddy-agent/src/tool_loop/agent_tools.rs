@@ -367,11 +367,7 @@ pub(super) fn handle_task_create(
         )
         .with_tool("task_create", args.clone())
         .with_prompt(subject);
-        super::ToolUseLoop::fire_hook_logged(
-            hooks,
-            codingbuddy_hooks::HookEvent::TaskCreated,
-            &input,
-        );
+        tool_loop.fire_hook_logged(hooks, codingbuddy_hooks::HookEvent::TaskCreated, &input);
     }
 
     Ok(serde_json::json!({
@@ -419,7 +415,7 @@ pub(super) fn handle_task_update(
             session_type: None,
             workspace: tool_loop.workspace_str().to_string(),
         };
-        ToolUseLoop::fire_hook_logged(hooks, HookEvent::TaskCompleted, &input);
+        tool_loop.fire_hook_logged(hooks, HookEvent::TaskCompleted, &input);
     }
 
     Ok(serde_json::json!({
@@ -743,6 +739,7 @@ pub(super) fn handle_send_message(
     };
 
     let request = super::types::SubagentRequest {
+        execution: tool_loop.execution_context(),
         run_id: run.run_id,
         task_id: None,
         parent_session_id: tool_loop.config.session_id,
@@ -797,95 +794,18 @@ pub(super) fn handle_task_stop(
     }
     .ok_or_else(|| anyhow!("no background job found for task {task_id}"))?;
 
-    let mut metadata = serde_json::from_str::<serde_json::Value>(&background_job.metadata_json)
-        .unwrap_or_else(|_| serde_json::json!({}));
-    let mut terminated_pid = false;
-    let mut stop_file_written = false;
-
-    if let Some(stop_file) = metadata.get("stop_file").and_then(|value| value.as_str()) {
-        let stop_path = std::path::PathBuf::from(stop_file);
-        if let Some(parent) = stop_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            &stop_path,
-            format!("stop requested at {}\n", chrono::Utc::now().to_rfc3339()),
-        );
-        stop_file_written = true;
-    }
-
-    if let Some(pid) = metadata.get("pid").and_then(|value| value.as_u64()) {
-        #[cfg(not(windows))]
-        {
-            let status = std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-            terminated_pid = status.as_ref().is_ok_and(|status| status.success());
-        }
-        #[cfg(windows)]
-        {
-            let status = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .status();
-            terminated_pid = status.as_ref().is_ok_and(|status| status.success());
-        }
-    }
-
-    if let Some(object) = metadata.as_object_mut() {
-        object.insert("reason".to_string(), serde_json::json!("manual_stop"));
-        object.insert(
-            "terminated_pid".to_string(),
-            serde_json::json!(terminated_pid),
-        );
-        object.insert(
-            "stop_file_written".to_string(),
-            serde_json::json!(stop_file_written),
-        );
-        object.insert(
-            "stopped_at".to_string(),
-            serde_json::json!(chrono::Utc::now().to_rfc3339()),
-        );
-    }
-
-    background_job.status = "stopped".to_string();
+    anyhow::ensure!(
+        store.cancel_operation(background_job.job_id)? > 0,
+        "Legacy task has no owned cancellation channel"
+    );
+    background_job.status = "cancelling".into();
     background_job.updated_at = chrono::Utc::now().to_rfc3339();
-    background_job.metadata_json = metadata.to_string();
     store.upsert_background_job(&background_job)?;
-    store.update_task_status(task_id, "cancelled", Some("stopped by user"))?;
-
-    run.status = "stopped".to_string();
-    run.error = Some("stopped by user".to_string());
+    run.status = "cancelling".into();
     run.updated_at = chrono::Utc::now().to_rfc3339();
     store.upsert_subagent_run(&run)?;
-
-    let event = |kind| {
-        store
-            .append_event(&codingbuddy_store::NewEvent {
-                event_id: uuid::Uuid::now_v7(),
-                at: chrono::Utc::now(),
-                session_id,
-                kind,
-            })
-            .map(drop)
-    };
-    event(EventKind::BackgroundJobStopped {
-        job_id: background_job.job_id,
-        reason: "manual_stop".to_string(),
-    })?;
-    event(EventKind::TaskUpdated {
-        task_id: task_id.to_string(),
-        status: "cancelled".to_string(),
-    })?;
-
-    Ok(serde_json::json!({
-        "task_id": task_id,
-        "run_id": run.run_id,
-        "background_job_id": background_job.job_id,
-        "status": "cancelled",
-        "terminated_pid": terminated_pid,
-        "stop_file_written": stop_file_written,
-    })
-    .to_string())
+    let _ = (session_id, task_id);
+    Ok(serde_json::json!({"task_id":task_id,"run_id":run.run_id,"background_job_id":background_job.job_id,"status":"cancelling"}).to_string())
 }
 
 pub(super) fn handle_spawn_task(
@@ -975,6 +895,7 @@ pub(super) fn handle_spawn_task(
     });
 
     let request = SubagentRequest {
+        execution: tool_loop.execution_context(),
         run_id,
         task_id: Some(task_id),
         parent_session_id: Some(parent_session.session_id),
@@ -998,7 +919,7 @@ pub(super) fn handle_spawn_task(
                 session_type: None,
                 workspace: tool_loop.workspace_str().to_string(),
             };
-            ToolUseLoop::fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
+            tool_loop.fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
         }
         // Auto-promote: if foreground agent takes >60s, report as backgrounded
         let result = if !run_in_background {
@@ -1203,7 +1124,7 @@ pub(super) fn handle_spawn_task(
                 session_type: None,
                 workspace: tool_loop.workspace_str().to_string(),
             };
-            ToolUseLoop::fire_hook_logged(hooks, HookEvent::SubagentStop, &input);
+            tool_loop.fire_hook_logged(hooks, HookEvent::SubagentStop, &input);
         }
         result
     } else {
@@ -1349,6 +1270,7 @@ pub(super) fn handle_skill(
     if result.forked {
         if let Some(ref worker) = tool_loop.config.subagent_worker {
             let request = SubagentRequest {
+                execution: tool_loop.execution_context(),
                 run_id: Uuid::now_v7(),
                 task_id: None,
                 parent_session_id: tool_loop
@@ -1429,14 +1351,31 @@ pub(super) fn handle_enter_worktree(
         branch_name.replace('/', "-")
     };
 
-    let wt = codingbuddy_subagent::WorktreeIsolation::create(&workspace, &wt_name)?;
+    let inputs = args
+        .get("untracked_inputs")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let wt = codingbuddy_subagent::WorktreeIsolation::create_with_trust(
+        &workspace,
+        &wt_name,
+        &inputs,
+        tool_loop.config.trusted_workspace,
+    )?;
     let wt_path = wt.path().to_path_buf();
+    tool_loop.worktree_tool_host = Some(tool_loop.tool_host.scoped_workspace(&wt_path)?);
+    tool_loop.tool_cache.clear();
     tool_loop.active_worktree = Some(wt);
 
     Ok(format!(
         "Worktree created at: {}\n\
          All subsequent tool calls now operate in this isolated worktree.\n\
-         Call exit_worktree with action 'merge' or 'discard' when done.",
+         Call exit_worktree to stage an output patch for local review. Artifacts are retained.",
         wt_path.display()
     ))
 }
@@ -1445,61 +1384,40 @@ pub(super) fn handle_exit_worktree(
     tool_loop: &mut ToolUseLoop<'_>,
     args: &serde_json::Value,
 ) -> Result<String> {
-    let Some(mut wt) = tool_loop.active_worktree.take() else {
-        return Ok("No active worktree. Nothing to exit.".to_string());
+    let Some(wt) = tool_loop.active_worktree.as_ref() else {
+        return Ok("No active worktree.".into());
     };
-
+    let diff = wt.collect_for_parent()?;
+    let parent = tool_loop
+        .config
+        .workspace
+        .as_deref()
+        .ok_or_else(|| anyhow!("Parent workspace unavailable"))?;
+    let path = wt.path().to_path_buf();
     let action = args
         .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("discard");
-
-    let result = match action {
-        "merge" => {
-            let diff = wt.collect_diff().unwrap_or_default();
-            if diff.is_empty() {
-                wt.cleanup()?;
-                "Worktree exited (no changes to merge).".to_string()
-            } else {
-                // After .take(), workspace_path() returns the original workspace
-                let original = tool_loop.workspace_path();
-                let apply = codingbuddy_core::process_env::git_inspection(original)
-                    .arg("-C")
-                    .arg(original)
-                    .args(["apply", "--3way", "-"])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn();
-                match apply {
-                    Ok(mut child) => {
-                        if let Some(ref mut stdin) = child.stdin {
-                            use std::io::Write;
-                            let _ = stdin.write_all(diff.as_bytes());
-                        }
-                        let output = child.wait_with_output()?;
-                        wt.cleanup()?;
-                        if output.status.success() {
-                            "Worktree changes merged into main checkout.".to_string()
-                        } else {
-                            format!(
-                                "Worktree changes partially merged. Some conflicts may need manual resolution.\n{}",
-                                String::from_utf8_lossy(&output.stderr)
-                            )
-                        }
-                    }
-                    Err(e) => {
-                        wt.cleanup()?;
-                        format!("Failed to apply worktree diff: {e}")
-                    }
-                }
-            }
-        }
-        _ => {
-            wt.cleanup()?;
-            "Worktree discarded. All experimental changes have been removed.".to_string()
-        }
+        .and_then(|value| value.as_str())
+        .unwrap_or("stage");
+    let result = if diff.is_empty() {
+        format!(
+            "Worktree retained at {} (no output changes).",
+            path.display()
+        )
+    } else if action == "discard" {
+        format!(
+            "Worktree retained at {}. No parent files changed; local cleanup requires explicit review.",
+            path.display()
+        )
+    } else {
+        let patch = codingbuddy_diff::PatchStore::new(parent)?.stage(&diff, &[])?;
+        format!(
+            "Staged patch {} for local review and application. Worktree retained at {}. Parent files and index were preserved.",
+            patch.patch_id,
+            path.display()
+        )
     };
-
+    tool_loop.active_worktree.take();
+    tool_loop.worktree_tool_host = None;
+    tool_loop.tool_cache.clear();
     Ok(result)
 }

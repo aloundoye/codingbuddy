@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_core::CancellationToken;
+use codingbuddy_core::execution::OwnedChild;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use wait_timeout::ChildExt;
@@ -17,6 +18,8 @@ pub struct ShellRunResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 /// Callback for streaming live output from a running command.
@@ -57,53 +60,8 @@ impl ShellRunner for PlatformShellRunner {
 }
 
 fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, consumer: &str) -> Result<ShellRunResult> {
-    let mut child = spawn_command(cmd, cwd, consumer)?;
-
-    let status = child.wait_timeout(timeout)?;
-    if status.is_none() {
-        // Timeout: escalate SIGTERM → SIGKILL
-        #[cfg(unix)]
-        {
-            // Send SIGTERM first for graceful shutdown
-            unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-            }
-            // Wait briefly for graceful exit, then force kill
-            if child.wait_timeout(Duration::from_secs(2))?.is_none() {
-                let _ = child.kill(); // SIGKILL
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = child.kill();
-        }
-        let output = child.wait_with_output()?;
-        return Ok(ShellRunResult {
-            status: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            timed_out: true,
-        });
-    }
-
-    let output = child.wait_with_output()?;
-    Ok(ShellRunResult {
-        status: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        timed_out: false,
-    })
-}
-
-pub(crate) fn run_program(
-    program: &str,
-    args: &[&std::ffi::OsStr],
-    cwd: &Path,
-    timeout: Duration,
-) -> Result<ShellRunResult> {
-    let mut command = Command::new(program);
-    harden_command_env(&mut command, cwd, "language_tools");
-    run_command(command, args, cwd, timeout)
+    let command = shell_command(cmd, cwd, consumer)?;
+    spawn_piped(command, cwd, timeout, false, None)
 }
 
 pub(crate) fn run_command(
@@ -143,17 +101,17 @@ fn spawn_piped(
     process_group: bool,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ShellRunResult> {
-    let child = command
+    command
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let child = OwnedChild::spawn(&mut command)?;
     wait_for_output(child, timeout, process_group, cancellation)
 }
 
 fn wait_for_output(
-    mut child: Child,
+    mut child: OwnedChild,
     timeout: Duration,
     process_group: bool,
     cancellation: Option<&CancellationToken>,
@@ -170,12 +128,12 @@ fn wait_for_output(
     std::thread::scope(|scope| {
         let stdout = scope.spawn(move || {
             let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes)?;
+            stdout.by_ref().take(2_000_000).read_to_end(&mut bytes)?;
             Ok::<_, std::io::Error>(bytes)
         });
         let stderr = scope.spawn(move || {
             let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes)?;
+            stderr.by_ref().take(2_000_000).read_to_end(&mut bytes)?;
             Ok::<_, std::io::Error>(bytes)
         });
         let deadline = std::time::Instant::now() + timeout;
@@ -200,7 +158,9 @@ fn wait_for_output(
         }
         #[cfg(not(unix))]
         let _ = process_group;
-        let timed_out = status.is_none();
+        child.terminate();
+        let cancelled = cancellation.is_some_and(CancellationToken::is_cancelled);
+        let timed_out = status.is_none() && !cancelled;
         let status = match status {
             Some(status) => status,
             None => {
@@ -215,6 +175,7 @@ fn wait_for_output(
             stderr: String::from_utf8_lossy(&stderr.join().expect("stderr reader panicked")?)
                 .into_owned(),
             timed_out,
+            cancelled,
         })
     })
 }
@@ -391,6 +352,10 @@ fn run_prepared_with_pty(
         }
     }
 
+    // Reap descendants even if the command exited while leaving pipes open.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
     let status = child.wait().ok().and_then(|s| s.code());
     let text = String::from_utf8_lossy(&output).to_string();
     let clean = strip_ansi_escapes(&text);
@@ -399,7 +364,8 @@ fn run_prepared_with_pty(
         status,
         stdout: clean,
         stderr: String::new(), // PTY merges stdout+stderr
-        timed_out,
+        timed_out: timed_out && !cancellation.is_some_and(CancellationToken::is_cancelled),
+        cancelled: cancellation.is_some_and(CancellationToken::is_cancelled),
     })
 }
 
@@ -445,7 +411,7 @@ fn harden_command_env(command: &mut Command, workspace: &Path, consumer: &str) {
     command.env("LC_ALL", "C");
 }
 
-fn spawn_command(cmd: &str, cwd: &Path, consumer: &str) -> Result<Child> {
+fn shell_command(cmd: &str, cwd: &Path, consumer: &str) -> Result<Command> {
     // Always attempt canonicalization to resolve symlinks and prevent path traversal.
     // For non-existent paths, try canonicalizing the nearest existing parent.
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| {
@@ -461,24 +427,23 @@ fn spawn_command(cmd: &str, cwd: &Path, consumer: &str) -> Result<Child> {
         }
         cwd.to_path_buf()
     });
-    let mut errors = Vec::new();
+    let vars = codingbuddy_core::process_env::variables(
+        &cwd,
+        consumer,
+        codingbuddy_core::process_env::Source::Project,
+    );
     for mut command in candidate_commands(cmd) {
-        command.current_dir(&cwd);
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.stdin(Stdio::null());
-        harden_command_env(&mut command, &cwd, consumer);
-        let program = command.get_program().to_string_lossy().to_string();
-        match command.spawn() {
-            Ok(child) => return Ok(child),
-            Err(err) => errors.push(format!("{program}: {err}")),
+        let program = command.get_program().to_string_lossy();
+        if codingbuddy_core::process_env::find_program(&program, &vars).is_none()
+            && !std::path::Path::new(program.as_ref()).is_absolute()
+        {
+            continue;
         }
+        command.current_dir(&cwd).stdin(Stdio::null());
+        harden_command_env(&mut command, &cwd, consumer);
+        return Ok(command);
     }
-    Err(anyhow!(
-        "failed to spawn command '{cmd}' in '{}': {}",
-        cwd.display(),
-        errors.join(" | ")
-    ))
+    Err(anyhow!("No supported shell is available"))
 }
 
 #[cfg(target_os = "windows")]

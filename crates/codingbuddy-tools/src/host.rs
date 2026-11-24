@@ -103,7 +103,18 @@ fn extract_lsp_position(args: &serde_json::Value) -> Result<(&str, u32, u32)> {
 pub type McpExecutor =
     Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<serde_json::Value> + Send + Sync>;
 
+pub type ContextMcpExecutor = Arc<
+    dyn Fn(
+            &str,
+            &serde_json::Value,
+            codingbuddy_core::ToolExecutionContext<'_>,
+        ) -> Result<serde_json::Value>
+        + Send
+        + Sync,
+>;
+
 pub struct LocalToolHost {
+    launch_config: AppConfig,
     workspace: PathBuf,
     files: WorkspaceFs,
     policy: PolicyEngine,
@@ -122,6 +133,7 @@ pub struct LocalToolHost {
     diagnostics_after_edit: bool,
     review_mode: bool,
     mcp_executor: Option<McpExecutor>,
+    context_mcp_executor: Option<ContextMcpExecutor>,
     /// Optional progress callback for streaming live bash output.
     progress_callback: std::sync::Mutex<Option<super::shell::ProgressCallback>>,
     /// LSP server manager for code intelligence tools.
@@ -129,6 +141,9 @@ pub struct LocalToolHost {
 }
 
 impl LocalToolHost {
+    pub fn set_journal_store(&mut self, store: Store) {
+        self.store = store;
+    }
     pub fn new(workspace: &Path, policy: PolicyEngine) -> Result<Self> {
         Self::with_runner(workspace, policy, Arc::new(PtyShellRunner))
     }
@@ -162,6 +177,7 @@ impl LocalToolHost {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         Ok(Self {
+            launch_config: cfg.clone(),
             workspace: files.root().to_path_buf(),
             files,
             patches: PatchStore::new(workspace)?,
@@ -185,9 +201,14 @@ impl LocalToolHost {
             diagnostics_after_edit: trusted_workspace && cfg.tools.diagnostics_after_edit,
             review_mode: false,
             mcp_executor: None,
+            context_mcp_executor: None,
             progress_callback: std::sync::Mutex::new(None),
             lsp_manager: codingbuddy_lsp::server_manager::LspServerManager::new(workspace),
         })
+    }
+
+    pub fn set_context_mcp_executor(&mut self, executor: ContextMcpExecutor) {
+        self.context_mcp_executor = Some(executor);
     }
 
     /// Set the MCP executor callback for handling `mcp__*` tool calls.
@@ -574,36 +595,14 @@ impl LocalToolHost {
                 let checkpoint = self.create_checkpoint("fs_edit")?;
                 self.record_file_receipt(context, &full, after.as_bytes())?;
                 self.files.write(&full, after.as_bytes(), false)?;
+                self.record_actual_postimage(&full)?;
                 let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                 let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
 
                 // Auto-lint after edit (lint-fix loop)
-                let lint_output = if let Some(ref lint_cmd) = self.lint_after_edit {
-                    match self.runner.run_verification(
-                        lint_cmd,
-                        &self.workspace,
-                        Duration::from_secs(30),
-                    ) {
-                        Ok(result) => {
-                            if result.status.unwrap_or(1) != 0 {
-                                Some(json!({
-                                    "lint_command": lint_cmd,
-                                    "lint_passed": false,
-                                    "lint_stdout": result.stdout,
-                                    "lint_stderr": result.stderr,
-                                }))
-                            } else {
-                                Some(json!({
-                                    "lint_command": lint_cmd,
-                                    "lint_passed": true,
-                                }))
-                            }
-                        }
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
+                let lint_output = self.lint_after_edit.as_ref().map(|command| {
+                    self.run_verification_command(command, &self.workspace, 30, context)
+                });
 
                 let mut result = json!({
                     "path": path,
@@ -622,12 +621,7 @@ impl LocalToolHost {
                 }
                 // Auto-diagnostics after edit
                 if self.diagnostics_after_edit {
-                    maybe_run_auto_diagnostics(
-                        self.runner.as_ref(),
-                        &self.workspace,
-                        full.to_str(),
-                        &mut result,
-                    );
+                    self.post_edit_checks(&[full.clone()], context, &mut result);
                 }
                 Ok(result)
             }
@@ -768,13 +762,21 @@ impl LocalToolHost {
                         "files": patch.target_files,
                     })
                 };
+                if applied {
+                    for path in &patch.target_files {
+                        self.record_actual_postimage(Path::new(path))?;
+                    }
+                }
                 result["recovery_status"] = json!(recovery_status);
                 // Auto-diagnostics after patch application
                 if applied && self.diagnostics_after_edit {
-                    maybe_run_auto_diagnostics(
-                        self.runner.as_ref(),
-                        &self.workspace,
-                        None,
+                    self.post_edit_checks(
+                        &patch
+                            .target_files
+                            .iter()
+                            .map(|path| self.workspace.join(path))
+                            .collect::<Vec<_>>(),
+                        context,
                         &mut result,
                     );
                 }
@@ -795,6 +797,7 @@ impl LocalToolHost {
                 let checkpoint = self.create_checkpoint("fs_write")?;
                 self.record_file_receipt(context, &full, content.as_bytes())?;
                 self.files.write(&full, content.as_bytes(), true)?;
+                self.record_actual_postimage(&full)?;
                 Ok(json!({
                     "written": true,
                     "checkpoint_id": checkpoint.map(|id| id.to_string())
@@ -832,7 +835,12 @@ impl LocalToolHost {
                 let launched = shell
                     .ok_or_else(|| anyhow!("shell execution requires a prepared launch"))?
                     .run_with_progress(
-                        Duration::from_secs(timeout),
+                        Duration::from_secs(timeout).min(
+                            context
+                                .deadline
+                                .map(|end| end.saturating_duration_since(std::time::Instant::now()))
+                                .unwrap_or(Duration::MAX),
+                        ),
                         self.progress_callback
                             .lock()
                             .ok()
@@ -840,7 +848,7 @@ impl LocalToolHost {
                         context.cancellation,
                     )?;
                 let mut result = json!({"status": launched.status, "stdout": launched.stdout,
-                    "stderr": launched.stderr, "timed_out": launched.timed_out});
+                    "stderr": launched.stderr, "timed_out": launched.timed_out, "cancelled":launched.cancelled});
 
                 // Annotate result with AST-derived security metadata.
                 if cmd_analysis.has_network_access
@@ -1135,6 +1143,7 @@ impl LocalToolHost {
                 }
                 let updated = serde_json::to_string_pretty(&nb)?;
                 self.files.write(&full, updated.as_bytes(), false)?;
+                self.record_actual_postimage(&full)?;
                 Ok(json!({
                     "path": path,
                     "operation": operation,
@@ -1195,6 +1204,7 @@ impl LocalToolHost {
 
                     let diff = generate_unified_diff(path, &before, &after);
                     self.files.write(&full, after.as_bytes(), false)?;
+                    self.record_actual_postimage(&full)?;
                     let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                     let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
                     total_replacements += file_replacements;
@@ -1210,32 +1220,9 @@ impl LocalToolHost {
                 }
 
                 // Run lint once after all edits
-                let lint_output = if let Some(ref lint_cmd) = self.lint_after_edit {
-                    match self.runner.run_verification(
-                        lint_cmd,
-                        &self.workspace,
-                        Duration::from_secs(30),
-                    ) {
-                        Ok(result) => {
-                            if result.status.unwrap_or(1) != 0 {
-                                Some(json!({
-                                    "lint_command": lint_cmd,
-                                    "lint_passed": false,
-                                    "lint_stdout": result.stdout,
-                                    "lint_stderr": result.stderr,
-                                }))
-                            } else {
-                                Some(json!({
-                                    "lint_command": lint_cmd,
-                                    "lint_passed": true,
-                                }))
-                            }
-                        }
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
+                let lint_output = self.lint_after_edit.as_ref().map(|command| {
+                    self.run_verification_command(command, &self.workspace, 30, context)
+                });
 
                 let mut result = json!({
                     "results": results,
@@ -1249,12 +1236,12 @@ impl LocalToolHost {
                 }
                 // Auto-diagnostics after multi_edit
                 if self.diagnostics_after_edit {
-                    maybe_run_auto_diagnostics(
-                        self.runner.as_ref(),
-                        &self.workspace,
-                        None,
-                        &mut result,
-                    );
+                    let paths = results
+                        .iter()
+                        .filter(|item| item["edited"] == true)
+                        .filter_map(|item| item["path"].as_str().map(PathBuf::from))
+                        .collect::<Vec<_>>();
+                    self.post_edit_checks(&paths, context, &mut result);
                 }
                 Ok(result)
             }
@@ -1273,19 +1260,17 @@ impl LocalToolHost {
                     })
                     .transpose()?;
                 let (cmd, source) = detect_diagnostics_command(&self.workspace, target)?;
-                let result = run_diagnostics(
-                    self.runner.as_ref(),
-                    &self.workspace,
-                    target,
-                    &cmd,
+                let result = self.run_verification_command(&cmd, &self.workspace, 60, context);
+                let diagnostics = parse_diagnostics(
+                    result["stdout"].as_str().unwrap_or(""),
+                    result["stderr"].as_str().unwrap_or(""),
                     source,
-                    60,
-                )?;
-                let diagnostics = parse_diagnostics(&result.stdout, &result.stderr, source);
+                );
                 Ok(json!({
                     "diagnostics": diagnostics,
                     "command": cmd,
-                    "success": result.status.unwrap_or(1) == 0,
+                    "success": result["success"]==true,
+                    "verification": result,
                     "source": source,
                 }))
             }
@@ -1359,7 +1344,7 @@ impl LocalToolHost {
                 if draft {
                     cmd.push_str(" --draft");
                 }
-                self.run_cmd(&cmd, 30)
+                self.run_cmd(&cmd, 30, context)
             }
             "github.list_issues" | "github_list_issues" => {
                 let label = call.args.get("label").and_then(|v| v.as_str());
@@ -1380,7 +1365,7 @@ impl LocalToolHost {
                 if let Some(l) = label {
                     cmd.push_str(&format!(" --label {}", shell_quote(l)));
                 }
-                self.run_cmd(&cmd, 15)
+                self.run_cmd(&cmd, 15, context)
             }
             "github.view_pr" | "github_view_pr" => {
                 let pr = call
@@ -1393,11 +1378,14 @@ impl LocalToolHost {
                         "gh pr view {} --json title,body,state,reviews,statusCheckRollup,additions,deletions,changedFiles",
                         shell_quote(pr),
                     ),
-                    15,
+                    15,context,
                 )
             }
             name if name.starts_with("plugin__") => self.run_plugin_tool(name, &call.args),
             name if name.starts_with("mcp__") => {
+                if let Some(executor) = &self.context_mcp_executor {
+                    return executor(name, &call.args, context);
+                }
                 let rest = &name[5..]; // skip "mcp__"
                 let (server_id, tool_name) = rest
                     .split_once("__")
@@ -1424,11 +1412,18 @@ impl LocalToolHost {
                     };
                     let proposal = self.propose(sub_call);
                     let sub_result = if proposal.approved {
-                        self.execute(ApprovedToolCall {
-                            invocation_id: proposal.invocation_id,
-                            call: proposal.call,
-                        })
+                        self.execute_with_context(
+                            ApprovedToolCall {
+                                invocation_id: proposal.invocation_id,
+                                call: proposal.call,
+                            },
+                            codingbuddy_core::ToolExecutionContext {
+                                invocation_id: None,
+                                ..context
+                            },
+                        )
                     } else {
+                        self.discard_proposal(proposal.invocation_id);
                         ToolResult {
                             invocation_id: proposal.invocation_id,
                             success: false,
@@ -1454,6 +1449,18 @@ impl LocalToolHost {
             }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
         }
+    }
+
+    fn record_actual_postimage(&self, path: &Path) -> Result<()> {
+        use sha2::Digest;
+        let path = self.files.relative(path)?;
+        let hash = match self.files.read(&path) {
+            Ok(bytes) => Some(format!("{:x}", sha2::Sha256::digest(bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        self.store
+            .record_postimage_at(&self.workspace, &path, hash.as_deref())
     }
 
     fn record_file_receipt(
@@ -1516,21 +1523,37 @@ impl LocalToolHost {
         )
     }
 
-    fn run_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
-        let timeout = Duration::from_secs(timeout_secs);
-        let cb = self.progress_callback.lock().ok().and_then(|g| g.clone());
-        let result = if let Some(cb) = cb {
-            self.runner
-                .run_with_progress(cmd, &self.workspace, timeout, cb)?
-        } else {
-            self.runner.run(cmd, &self.workspace, timeout)?
+    fn run_cmd(
+        &self,
+        cmd: &str,
+        timeout_secs: u64,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> Result<serde_json::Value> {
+        let call = ToolCall {
+            name: "bash.run".into(),
+            args: json!({"cmd":cmd}),
+            requires_approval: false,
         };
-        Ok(json!({
-            "status": result.status,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "timed_out": result.timed_out,
-        }))
+        anyhow::ensure!(
+            self.policy.denial(&call).is_none(),
+            "Derived command denied by policy"
+        );
+        let launch = self.shell_launch(&call)?;
+        anyhow::ensure!(
+            launch.is_isolated(),
+            "Derived command requires isolated execution; approve the exact command locally instead"
+        );
+        let timeout = Duration::from_secs(timeout_secs).min(
+            context
+                .deadline
+                .map(|end| end.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or(Duration::MAX),
+        );
+        context.execution().check()?;
+        let result = launch.run_with_progress(timeout, None, context.cancellation)?;
+        Ok(
+            json!({"status":result.status,"stdout":result.stdout,"stderr":result.stderr,"timed_out":result.timed_out,"cancelled":result.cancelled}),
+        )
     }
 
     fn shell_launch(&self, call: &ToolCall) -> Result<ShellLaunch> {
@@ -1541,12 +1564,20 @@ impl LocalToolHost {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("shell command missing"))?;
         self.policy.check_command(expression)?;
-        ShellLaunch::resolve(
+        let mut launch = ShellLaunch::resolve(
             &self.workspace,
             expression,
             &self.sandbox_mode,
             &self.sandbox,
-        )
+        )?;
+        if let Some(cwd) = call.args.get("cwd").and_then(serde_json::Value::as_str) {
+            launch.set_cwd(
+                &self
+                    .workspace
+                    .join(self.files.resolve(Path::new(cwd), false)?),
+            )?;
+        }
+        Ok(launch)
     }
 
     fn run_plugin_tool(
@@ -1597,6 +1628,19 @@ impl LocalToolHost {
 }
 
 impl ToolHost for LocalToolHost {
+    fn scoped_workspace(&self, workspace: &Path) -> Result<Arc<dyn ToolHost + Send + Sync>> {
+        let mut host = Self::with_config(
+            workspace,
+            self.policy.clone(),
+            self.runner.clone(),
+            &self.launch_config,
+        )?;
+        host.store = self.store.clone();
+        host.context_mcp_executor = self.context_mcp_executor.clone();
+        host.mcp_executor = self.mcp_executor.clone();
+        Ok(Arc::new(host))
+    }
+
     fn permission(&self, call: &ToolCall) -> ToolPermission {
         self.assess(call).0
     }
@@ -1737,11 +1781,61 @@ impl ToolHost for LocalToolHost {
         self.execute_with_context(approved, Default::default())
     }
 
+    fn verify_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout: u64,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> serde_json::Value {
+        self.run_verification_command(command, cwd, timeout, context)
+    }
+
     fn execute_with_context(
         &self,
         approved: ApprovedToolCall,
         context: codingbuddy_core::ToolExecutionContext<'_>,
     ) -> ToolResult {
+        let execution_id = approved.invocation_id;
+        let cancellation = context
+            .cancellation
+            .map(codingbuddy_core::CancellationToken::child_token)
+            .unwrap_or_default();
+        let mut context = context;
+        context.cancellation = Some(&cancellation);
+        let payload = json!({"tool":approved.call.name,"workspace":self.workspace});
+        let tracked = context.session_id.is_some();
+        let _ownership = if tracked {
+            if let Err(error) = self.store.begin_operation(
+                execution_id,
+                context.session_id,
+                context.parent_run_id.or(context.prompt_id),
+                "tool",
+                &payload,
+            ) {
+                return ToolResult {
+                    invocation_id: execution_id,
+                    success: false,
+                    output: json!({"error":error.to_string(),"status":"persistence_failed"}),
+                };
+            }
+            match self
+                .store
+                .monitor_operation(execution_id, cancellation.clone())
+            {
+                Ok(monitor) => Some(monitor),
+                Err(error) => {
+                    return ToolResult {
+                        invocation_id: execution_id,
+                        success: false,
+                        output: json!({"error":error.to_string(),"status":"persistence_failed"}),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        context.parent_run_id = tracked.then_some(execution_id).or(context.parent_run_id);
         let call = approved.call;
         let shell = self
             .shell_launches
@@ -1766,11 +1860,20 @@ impl ToolHost for LocalToolHost {
             self.validate(&call)
                 .and_then(|()| check_plan(shell.as_ref()))
         };
-        let precondition = validate().and_then(|()| {
-            self.execute_hooks("pretooluse", Some(&call), None);
-            validate()
-        });
+        let precondition = context
+            .execution()
+            .check()
+            .and_then(|()| validate())
+            .and_then(|()| {
+                self.execute_hooks_with_context("pretooluse", Some(&call), None, context);
+                validate()
+            });
         if let Err(error) = precondition {
+            if tracked {
+                let _ =
+                    self.store
+                        .transition_operation(execution_id, "running", "denied", &payload);
+            }
             return ToolResult {
                 invocation_id: approved.invocation_id,
                 success: false,
@@ -1778,22 +1881,59 @@ impl ToolHost for LocalToolHost {
             };
         }
         let execution = self.run_tool(&call, shell.map(|(_, launch)| launch), context);
-        let (success, output) = match execution {
-            Ok(output) => (call.name != "bash.run" || output["status"] == 0, output),
+        let (mut success, mut output) = match execution {
+            Ok(output) => (
+                output["isError"] != true
+                    && output["cancelled"] != true
+                    && output["timed_out"] != true
+                    && (call.name != "bash.run" || output["status"] == 0),
+                output,
+            ),
             Err(err) => {
                 let message = err.to_string();
-                let payload = json!({"error": message});
+                let payload = if err
+                    .downcast_ref::<codingbuddy_core::execution::UnconfirmedSideEffect>()
+                    .is_some()
+                {
+                    json!({"error":message,"recovery_status":"ambiguous"})
+                } else {
+                    json!({"error": message})
+                };
                 (false, payload)
             }
         };
+        if tracked {
+            let status = if cancellation.is_cancelled() || output["recovery_status"] == "ambiguous"
+            {
+                "ambiguous"
+            } else if success {
+                "completed"
+            } else {
+                "failed"
+            };
+            let settlement = json!({"tool":call.name,"workspace":self.workspace,"success":success,"status":status});
+            if self
+                .store
+                .transition_operation(execution_id, "running", status, &settlement)
+                .is_err()
+            {
+                success = false;
+                output["recovery_status"] = json!("ambiguous");
+            }
+        }
         if !context
             .cancellation
             .is_some_and(codingbuddy_core::CancellationToken::is_cancelled)
         {
             if success {
-                self.execute_hooks("posttooluse", Some(&call), Some(&output));
+                self.execute_hooks_with_context("posttooluse", Some(&call), Some(&output), context);
             } else {
-                self.execute_hooks("posttooluse_failure", Some(&call), Some(&output));
+                self.execute_hooks_with_context(
+                    "posttooluse_failure",
+                    Some(&call),
+                    Some(&output),
+                    context,
+                );
             }
         }
         ToolResult {
@@ -1900,6 +2040,18 @@ impl LocalToolHost {
         call: Option<&ToolCall>,
         result: Option<&serde_json::Value>,
     ) {
+        self.execute_hooks_with_context(phase, call, result, Default::default());
+    }
+    fn execute_hooks_with_context(
+        &self,
+        phase: &str,
+        call: Option<&ToolCall>,
+        result: Option<&serde_json::Value>,
+        execution_context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) {
+        if execution_context.execution().check().is_err() {
+            return;
+        }
         if !self.hooks_enabled
             || codingbuddy_policy::load_managed_settings()
                 .is_some_and(|settings| settings.allow_managed_hooks_only)
@@ -1919,7 +2071,12 @@ impl LocalToolHost {
             tool_args_json: call.map(|call| call.args.to_string()),
             tool_result_json: result.map(ToString::to_string),
         };
-        match HookRuntime::run_legacy(&hooks, &context, Duration::from_secs(30)) {
+        match HookRuntime::run_legacy_with_context(
+            &hooks,
+            &context,
+            Duration::from_secs(30),
+            &execution_context.execution(),
+        ) {
             Ok(runs) => {
                 for run in runs {
                     self.emit_hook_event(
@@ -2006,5 +2163,131 @@ impl LocalToolHost {
         self.store.append_event(&event)?;
         self.fire_session_hooks("checkpointcreated");
         Ok(Some(checkpoint.checkpoint_id))
+    }
+}
+
+impl LocalToolHost {
+    pub fn run_verification_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout: u64,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> serde_json::Value {
+        let id = Uuid::now_v7();
+        let started = std::time::Instant::now();
+        let mut result = json!({"invocation_id":id,"command":command,"success":false,"status":"skipped","stdout":"","stderr":""});
+        if self
+            .store
+            .begin_operation(
+                id,
+                context.session_id,
+                context.parent_run_id.or(context.prompt_id),
+                "verification",
+                &result,
+            )
+            .is_err()
+        {
+            result["status"] = json!("persistence_failed");
+            return result;
+        }
+        if !self.trusted_workspace {
+            result["status"] = json!("denied");
+        } else if context
+            .cancellation
+            .is_some_and(codingbuddy_core::CancellationToken::is_cancelled)
+        {
+            result["status"] = json!("cancelled");
+        } else {
+            let call = ToolCall {
+                name: "bash.run".into(),
+                args: json!({"cmd":command,"cwd":cwd,"timeout":timeout}),
+                requires_approval: false,
+            };
+            let (proposal, permission) = self.propose_with_permission(call);
+            if !proposal.approved || matches!(permission, ToolPermission::Deny { .. }) {
+                self.discard_proposal(proposal.invocation_id);
+                result["status"] = json!("denied");
+            } else {
+                let output = self.execute_with_context(
+                    ApprovedToolCall {
+                        invocation_id: proposal.invocation_id,
+                        call: proposal.call,
+                    },
+                    codingbuddy_core::ToolExecutionContext {
+                        parent_run_id: Some(id),
+                        ..context
+                    },
+                );
+                result["stdout"] = output.output["stdout"].clone();
+                result["stderr"] = output.output["stderr"].clone();
+                result["status"] = json!(if output.output["cancelled"] == true {
+                    "cancelled"
+                } else if output.output["timed_out"] == true {
+                    "timed_out"
+                } else if output.success {
+                    "passed"
+                } else if matches!(output.output["status"].as_i64(), Some(127 | 9009)) {
+                    "unavailable"
+                } else {
+                    "failed"
+                });
+                result["success"] = json!(output.success && result["status"] == "passed");
+            }
+        }
+        result["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+        if self
+            .store
+            .transition_operation(
+                id,
+                "running",
+                result["status"].as_str().unwrap_or("failed"),
+                &result,
+            )
+            .is_err()
+        {
+            result["success"] = json!(false);
+            result["status"] = json!("ambiguous");
+        }
+        if let Some(session) = context.session_id {
+            if self
+                .store
+                .append_event(&codingbuddy_store::NewEvent::new(
+                    session,
+                    codingbuddy_core::EventKind::VerificationRun {
+                        command: command.into(),
+                        success: result["success"] == true,
+                        output: result.to_string(),
+                    },
+                ))
+                .is_err()
+            {
+                result["success"] = json!(false);
+                result["status"] = json!("persistence_failed");
+            }
+        }
+        result
+    }
+    fn post_edit_checks(
+        &self,
+        paths: &[PathBuf],
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+        result: &mut serde_json::Value,
+    ) {
+        let validator =
+            codingbuddy_lsp::EditValidator::new(self.workspace.clone(), Default::default());
+        let checks = validator
+            .command_plans(paths)
+            .into_iter()
+            .map(|plan| {
+                self.run_verification_command(
+                    &plan.command,
+                    &plan.cwd,
+                    plan.timeout_seconds,
+                    context,
+                )
+            })
+            .collect::<Vec<_>>();
+        result["verification"] = json!(checks);
     }
 }

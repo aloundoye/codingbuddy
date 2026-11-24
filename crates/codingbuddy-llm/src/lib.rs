@@ -45,6 +45,13 @@ impl Deref for PreparedPayload {
 const NETWORK_RETRY_BASE_MS: u64 = 1000;
 
 pub trait LlmClient {
+    /// Preserve the selected transport and cached account while attaching turn cancellation.
+    fn with_cancellation(
+        &self,
+        _token: CancellationToken,
+    ) -> Option<Box<dyn LlmClient + Send + Sync>> {
+        None
+    }
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse>;
 
     /// Streaming variant that invokes `cb` for each token chunk as it arrives.
@@ -132,6 +139,68 @@ fn credential_entry(cfg: &LlmConfig) -> Result<keyring::Entry> {
 
 pub fn save_provider_key(cfg: &LlmConfig, key: &str) -> Result<()> {
     Ok(credential_entry(cfg)?.set_password(key)?)
+}
+
+fn named_credential_entry(cfg: &LlmConfig, name: &str) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(
+        "codingbuddy-provider-named",
+        &format!("{}:{name}", cfg.connection_id()),
+    )?)
+}
+
+fn credential_names_entry(cfg: &LlmConfig) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(
+        "codingbuddy-provider-key-names",
+        &cfg.connection_id(),
+    )?)
+}
+
+pub fn provider_key_names(cfg: &LlmConfig) -> Result<Vec<String>> {
+    match credential_names_entry(cfg)?.get_password() {
+        Ok(names) => Ok(serde_json::from_str(&names)?),
+        Err(keyring::Error::NoEntry) => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn load_named_provider_key(cfg: &LlmConfig, name: &str) -> Result<String> {
+    Ok(named_credential_entry(cfg, name)?.get_password()?)
+}
+
+pub fn save_named_provider_key(cfg: &LlmConfig, name: &str, key: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.trim().is_empty()
+            && name.chars().count() <= 80
+            && !name.chars().any(char::is_control),
+        "Use a key name between 1 and 80 characters without control characters"
+    );
+    // Multiple terminal sessions can save keys for the same provider.
+    let settings =
+        codingbuddy_core::AppConfig::user_settings_path().context("Cannot locate user settings")?;
+    let directory = settings.parent().context("Invalid user settings path")?;
+    std::fs::create_dir_all(directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("named-credentials.lock"))?;
+    lock.lock()?;
+    let mut names = provider_key_names(cfg)?;
+    anyhow::ensure!(
+        !names.iter().any(|saved| saved == name),
+        "That key name already exists"
+    );
+    names.push(name.to_owned());
+    names.sort_unstable();
+    let names = serde_json::to_string(&names)?;
+    let index = credential_names_entry(cfg)?;
+    let entry = named_credential_entry(cfg, name)?;
+    entry.set_password(key)?;
+    if let Err(error) = index.set_password(&names) {
+        let _ = entry.delete_credential();
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub fn remove_provider_key(cfg: &LlmConfig) -> Result<()> {
@@ -272,8 +341,12 @@ pub fn validate_base_url(value: &str) -> Result<String> {
 
 pub fn probe_provider(cfg: &LlmConfig) -> Result<()> {
     check_provider(cfg)?;
+    let is_gemini = cfg.active_provider_kind().is_some_and(|kind| {
+        protocol::select_chat_protocol(&cfg.active_provider(), kind)
+            == protocol::ChatProtocol::GeminiGenerateContent
+    });
     let mut cfg = cfg.clone();
-    cfg.timeout_seconds = 8;
+    cfg.timeout_seconds = if is_gemini { 15 } else { 8 };
     cfg.max_retries = 0;
     let request = ChatRequest {
         model: cfg.active_base_model(),
@@ -282,7 +355,8 @@ pub fn probe_provider(cfg: &LlmConfig) -> Result<()> {
         }],
         tools: Vec::new(),
         tool_choice: codingbuddy_core::ToolChoice::none(),
-        max_tokens: 32,
+        // Gemini counts thinking tokens against the output limit.
+        max_tokens: if is_gemini { 512 } else { 32 },
         temperature: None,
         top_p: None,
         presence_penalty: None,
@@ -2010,6 +2084,14 @@ impl ApiClient {
 // annotate_cache_control / apply_cache_annotations / payload_rejects_cache_control removed in P9.
 
 impl LlmClient for ApiClient {
+    fn with_cancellation(
+        &self,
+        token: CancellationToken,
+    ) -> Option<Box<dyn LlmClient + Send + Sync>> {
+        let mut client = self.clone();
+        client.set_cancel_token(token);
+        Some(Box::new(client))
+    }
     fn pinned_session_route(&self, model: &str, local_key: &[u8]) -> Option<Result<String>> {
         Some(session_route_with_credential(
             &self.cfg,

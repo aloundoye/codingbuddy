@@ -6,9 +6,8 @@ pub mod server_manager;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+#[cfg(test)]
 use std::sync::Mutex;
-use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -77,20 +76,18 @@ pub struct EditValidator {
     /// Configuration controlling which languages are validated.
     pub config: LspConfig,
     /// Cached command availability checks (avoids repeated `which` calls).
+    #[cfg(test)]
     command_cache: Mutex<HashMap<String, bool>>,
-    /// Timeout for check commands.
-    timeout: Duration,
 }
 
 impl EditValidator {
     /// Create a new `EditValidator`.
     pub fn new(workspace: PathBuf, config: LspConfig) -> Self {
-        let timeout = Duration::from_secs(config.timeout_seconds);
         Self {
             workspace,
             config,
+            #[cfg(test)]
             command_cache: Mutex::new(HashMap::new()),
-            timeout,
         }
     }
 
@@ -110,13 +107,54 @@ impl EditValidator {
             return Ok(Vec::new());
         }
 
-        match language {
-            "rust" => self.check_rust(),
-            "typescript" => self.check_typescript(path),
-            "python" => self.check_python(path),
-            "go" => self.check_go(path),
-            _ => Ok(Vec::new()),
+        anyhow::bail!("Use the policy-mediated verification runner for {language}")
+    }
+
+    pub fn command_plans(&self, paths: &[PathBuf]) -> Vec<CheckPlan> {
+        let mut plans = std::collections::BTreeMap::new();
+        for path in paths {
+            let Some(language) = detect_language(path) else {
+                continue;
+            };
+            if !self.config.is_language_enabled(language) {
+                continue;
+            }
+            let marker = match language {
+                "rust" => "Cargo.toml",
+                "typescript" => "tsconfig.json",
+                "python" => "pyproject.toml",
+                "go" => "go.mod",
+                _ => continue,
+            };
+            let mut cwd = path.parent().unwrap_or(&self.workspace).to_owned();
+            if !cwd.is_absolute() {
+                cwd = self.workspace.join(cwd);
+            }
+            while cwd.starts_with(&self.workspace) && !cwd.join(marker).is_file() {
+                if cwd == self.workspace || !cwd.pop() {
+                    break;
+                }
+            }
+            if !cwd.starts_with(&self.workspace) {
+                cwd = self.workspace.clone();
+            }
+            let command = match language {
+                "rust" => "cargo check --message-format=json",
+                "typescript" => "tsc --noEmit --pretty false",
+                "python" => "python3 -m compileall -q .",
+                "go" => "go vet ./...",
+                _ => continue,
+            };
+            plans.insert(
+                (cwd.clone(), command.to_owned()),
+                CheckPlan {
+                    cwd,
+                    command: command.into(),
+                    timeout_seconds: self.config.timeout_seconds,
+                },
+            );
         }
+        plans.into_values().collect()
     }
 
     /// Format diagnostics for LLM consumption. Delegates to the formatters module.
@@ -124,123 +162,22 @@ impl EditValidator {
         formatters::format_diagnostics_for_llm(diagnostics)
     }
 
-    /// Check if a command is available, using a per-session cache.
+    #[cfg(test)]
     fn is_available(&self, cmd: &str) -> bool {
-        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&available) = cache.get(cmd) {
-            return available;
-        }
-        let available = is_command_available(cmd);
-        cache.insert(cmd.to_string(), available);
-        available
+        *self
+            .command_cache
+            .lock()
+            .unwrap()
+            .entry(cmd.into())
+            .or_insert_with(|| is_command_available(cmd))
     }
+}
 
-    /// Run a command with timeout. Returns stdout+stderr or empty on failure/timeout.
-    fn run_with_timeout(&self, mut cmd: Command) -> (String, String) {
-        codingbuddy_core::process_env::apply_for(
-            &mut cmd,
-            &self.workspace,
-            "language_tools",
-            codingbuddy_core::process_env::Source::Project,
-        );
-        let mut child = match cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return (String::new(), String::new()),
-        };
-
-        let deadline = std::time::Instant::now() + self.timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return (String::new(), String::new());
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(_) => return (String::new(), String::new()),
-            }
-        }
-
-        match child.wait_with_output() {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                (stdout, stderr)
-            }
-            Err(_) => (String::new(), String::new()),
-        }
-    }
-
-    /// Run `cargo check --message-format=json` in the workspace directory.
-    fn check_rust(&self) -> Result<Vec<Diagnostic>> {
-        if !self.is_available("cargo") {
-            return Ok(Vec::new());
-        }
-
-        let mut cmd = Command::new("cargo");
-        cmd.arg("check")
-            .arg("--message-format=json")
-            .current_dir(&self.workspace);
-
-        let (stdout, _) = self.run_with_timeout(cmd);
-        Ok(parsers::parse_cargo_check(&stdout))
-    }
-
-    /// Run `tsc --noEmit --pretty false` on a TypeScript file.
-    fn check_typescript(&self, path: &Path) -> Result<Vec<Diagnostic>> {
-        if !self.is_available("tsc") {
-            return Ok(Vec::new());
-        }
-
-        let mut cmd = Command::new("tsc");
-        cmd.arg("--noEmit")
-            .arg("--pretty")
-            .arg("false")
-            .arg(path)
-            .current_dir(&self.workspace);
-
-        let (stdout, stderr) = self.run_with_timeout(cmd);
-        let combined = format!("{stdout}\n{stderr}");
-        Ok(parsers::parse_tsc(&combined))
-    }
-
-    /// Run `python3 -m py_compile <file>` on a Python file.
-    fn check_python(&self, path: &Path) -> Result<Vec<Diagnostic>> {
-        if !self.is_available("python3") {
-            return Ok(Vec::new());
-        }
-
-        let mut cmd = Command::new("python3");
-        cmd.arg("-m")
-            .arg("py_compile")
-            .arg(path)
-            .current_dir(&self.workspace);
-
-        let (_, stderr) = self.run_with_timeout(cmd);
-        Ok(parsers::parse_python_compile(&stderr))
-    }
-
-    /// Run `go vet` on the package containing the edited Go file.
-    fn check_go(&self, path: &Path) -> Result<Vec<Diagnostic>> {
-        if !self.is_available("go") {
-            return Ok(Vec::new());
-        }
-
-        let dir = path.parent().unwrap_or(&self.workspace);
-
-        let mut cmd = Command::new("go");
-        cmd.arg("vet").arg("./...").current_dir(dir);
-
-        let (_, stderr) = self.run_with_timeout(cmd);
-        Ok(parsers::parse_go_vet(&stderr))
-    }
+#[derive(Debug, Clone)]
+pub struct CheckPlan {
+    pub command: String,
+    pub cwd: PathBuf,
+    pub timeout_seconds: u64,
 }
 
 /// Detect the language of a file based on its extension.
@@ -259,9 +196,21 @@ pub fn detect_language(path: &Path) -> Option<&'static str> {
 
 /// Check whether a command is available on the system PATH.
 ///
-pub fn is_command_available(cmd: &str) -> bool {
-    use codingbuddy_core::process_env::{Source, find_program, variables};
-    find_program(cmd, &variables(Path::new("."), "", Source::Project)).is_some()
+pub fn is_command_available(command: &str) -> bool {
+    let vars = codingbuddy_core::process_env::variables(
+        Path::new("."),
+        "language_tools",
+        codingbuddy_core::process_env::Source::User,
+    );
+    codingbuddy_core::process_env::lookup(&vars, "PATH").is_some_and(|path| {
+        std::env::split_paths(path).any(|root| {
+            root.join(command).is_file()
+                || cfg!(windows)
+                    && ["exe", "cmd", "bat"]
+                        .iter()
+                        .any(|ext| root.join(format!("{command}.{ext}")).is_file())
+        })
+    })
 }
 
 #[cfg(test)]

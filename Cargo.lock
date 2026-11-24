@@ -731,6 +731,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "chrono",
+ "libc",
  "notify",
  "proptest",
  "serde",
@@ -741,6 +742,7 @@ dependencies = [
  "thiserror 2.0.21",
  "toml",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -848,12 +850,14 @@ dependencies = [
  "codingbuddy-policy",
  "codingbuddy-store",
  "glob",
+ "jsonschema",
  "keyring",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 
@@ -864,6 +868,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "codingbuddy-core",
+ "codingbuddy-policy",
  "codingbuddy-store",
  "glob",
  "rusqlite",

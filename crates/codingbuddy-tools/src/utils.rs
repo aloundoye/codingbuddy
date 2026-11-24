@@ -462,40 +462,6 @@ pub(crate) fn generate_unified_diff(path: &str, before: &str, after: &str) -> St
     out
 }
 
-/// Run auto-diagnostics after an edit and inject results into the tool result JSON.
-pub(crate) fn maybe_run_auto_diagnostics(
-    runner: &dyn ShellRunner,
-    workspace: &Path,
-    target: Option<&str>,
-    result: &mut serde_json::Value,
-) {
-    let Ok((cmd, source)) = detect_diagnostics_command(workspace, target) else {
-        return;
-    };
-    let Ok(diag_result) = run_diagnostics(runner, workspace, target, &cmd, source, 30) else {
-        return;
-    };
-    let diagnostics = parse_diagnostics(&diag_result.stdout, &diag_result.stderr, source);
-    if diagnostics.is_empty() {
-        return;
-    }
-    result["diagnostics"] = json!(diagnostics);
-    let msg: Vec<String> = diagnostics
-        .iter()
-        .map(|d| {
-            let file = d.get("file").and_then(|v| v.as_str()).unwrap_or("?");
-            let line = d.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-            let text = d.get("message").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("  {file}:{line}: {text}")
-        })
-        .take(10)
-        .collect();
-    result["diagnostics_message"] = json!(format!(
-        "Errors detected after edit — please fix:\n{}",
-        msg.join("\n")
-    ));
-}
-
 pub(crate) fn detect_diagnostics_command(
     workspace: &Path,
     target: Option<&str>,
@@ -508,42 +474,16 @@ pub(crate) fn detect_diagnostics_command(
         ));
     }
     if workspace.join("tsconfig.json").exists() {
-        return Ok(("npx tsc --noEmit --pretty false 2>&1".to_string(), "tsc"));
+        return Ok(("tsc --noEmit --pretty false 2>&1".to_string(), "tsc"));
     }
     if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
         let cmd = format!(
             "ruff check --output-format json -- {}",
-            target.unwrap_or(".")
+            shell_quote(target.unwrap_or("."))
         );
         return Ok((cmd, "ruff"));
     }
     Err(anyhow!("no supported language project detected"))
-}
-
-pub(crate) fn run_diagnostics(
-    runner: &dyn ShellRunner,
-    workspace: &Path,
-    target: Option<&str>,
-    command: &str,
-    source: &str,
-    timeout: u64,
-) -> Result<ShellRunResult> {
-    let timeout = Duration::from_secs(timeout);
-    if source == "ruff" {
-        return crate::shell::run_program(
-            "ruff",
-            &[
-                "check".as_ref(),
-                "--output-format".as_ref(),
-                "json".as_ref(),
-                "--".as_ref(),
-                target.unwrap_or(".").as_ref(),
-            ],
-            workspace,
-            timeout,
-        );
-    }
-    runner.run_verification(command, workspace, timeout)
 }
 
 pub(crate) fn parse_diagnostics(

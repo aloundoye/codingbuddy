@@ -7,11 +7,9 @@ use codingbuddy_store::Store;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use uuid::Uuid;
 
 use crate::Cli;
-use crate::commands::background::spawn_background_process_for_session;
 
 const BG_PARENT_SESSION_ID_ENV: &str = "CODINGBUDDY_BG_PARENT_SESSION_ID";
 const BG_CHILD_SESSION_ID_ENV: &str = "CODINGBUDDY_BG_CHILD_SESSION_ID";
@@ -43,9 +41,29 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
 /// Subagent orchestration connects the parallel Worker execution to isolated engine scopes.
 pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
     let workspace = cwd.to_path_buf();
+    let parent_config = engine.cfg().clone();
     let worker = std::sync::Arc::new(
         move |task: &codingbuddy_subagent::SubagentTask| -> anyhow::Result<String> {
-            let (mode, force_max_think, role_prompt, mode_name) = match &task.role {
+            task.execution.check()?;
+            let run_store = Store::new(&workspace)?;
+            if !task.run_in_background {
+                run_store.begin_operation(
+                    task.run_id,
+                    task.child_session_id,
+                    task.execution.prompt_id,
+                    "subagent",
+                    &json!({"name":task.name}),
+                )?;
+            }
+            let _run_monitor = if task.run_in_background {
+                None
+            } else {
+                Some(
+                    run_store
+                        .monitor_operation(task.run_id, task.execution.cancellation.clone())?,
+                )
+            };
+            let (mode, force_max_think, role_prompt, _mode_name) = match &task.role {
                 codingbuddy_subagent::SubagentRole::Explore => (
                     codingbuddy_agent::ChatMode::Ask,
                     false,
@@ -106,49 +124,25 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
                 let child_session_id = task
                     .child_session_id
                     .ok_or_else(|| anyhow!("background subagent missing child_session_id"))?;
-                let task_id = task
+                let _task_id = task
                     .task_id
                     .ok_or_else(|| anyhow!("background subagent missing task_id"))?;
                 let parent_session_id = task
                     .parent_session_id
                     .ok_or_else(|| anyhow!("background subagent missing parent_session_id"))?;
 
-                let exe = std::env::current_exe()?;
-                let mut command = Command::new(exe);
-                if let Some(max_turns) = task.max_turns {
-                    command.arg("--max-turns").arg(max_turns.to_string());
-                }
-                if let Some(model) = &task.model_override {
-                    command.arg("--model").arg(model);
-                }
-                command
-                    .arg("--append-system-prompt")
-                    .arg(&delegated_prompt)
-                    .arg("ask")
-                    .arg(&task.goal)
-                    .arg("--tools")
-                    .arg("--mode")
-                    .arg(mode_name)
-                    .arg("--session-id")
-                    .arg(child_session_id.to_string())
-                    .env(BG_PARENT_SESSION_ID_ENV, parent_session_id.to_string())
-                    .env(BG_CHILD_SESSION_ID_ENV, child_session_id.to_string())
-                    .env(BG_RUN_ID_ENV, task.run_id.to_string())
-                    .env(BG_TASK_ID_ENV, task_id.to_string());
-
-                let payload = spawn_background_process_for_session(
+                let payload = crate::worker::spawn(
                     &workspace,
-                    Some(parent_session_id),
-                    "subagent",
-                    format!("subagent:{}", task.run_id),
-                    json!({
-                        "task_id": task_id,
-                        "run_id": task.run_id,
-                        "parent_session_id": parent_session_id,
-                        "child_session_id": child_session_id,
-                        "subagent_type": format!("{:?}", task.role),
-                    }),
-                    command,
+                    parent_session_id,
+                    crate::worker::WorkerJob::Agent {
+                        prompt: delegated_prompt.clone(),
+                        tools: true,
+                        session: child_session_id,
+                        task: Some(task.clone()),
+                        max_turns: task.max_turns.map(|n| n as u64),
+                    },
+                    parent_config.clone(),
+                    task.execution.prompt_id,
                 )?;
                 let store = Store::new(&workspace)?;
                 let background_job_id = payload
@@ -164,17 +158,37 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
                 return Ok(payload.to_string());
             }
 
-            let mut engine = codingbuddy_agent::AgentEngine::new(&workspace)?;
+            let worktree = codingbuddy_subagent::WorktreeIsolation::create_with_trust(
+                &workspace,
+                &task.name,
+                &[],
+                parent_config.workspace_trust == Some(true),
+            )?;
+            let mut engine = codingbuddy_agent::AgentEngine::new_isolated(
+                worktree.path(),
+                &workspace,
+                parent_config.clone(),
+            )?;
             let mut options = codingbuddy_agent::ChatOptions {
                 tools: true,
                 force_max_think,
                 mode,
                 session_id: task.child_session_id,
+                cancellation: Some(task.execution.cancellation.clone()),
+                deadline: task.execution.deadline,
+                parent_run_id: Some(task.run_id),
                 ..Default::default()
             };
 
             if let Some(max_turns) = task.max_turns {
-                engine.set_max_turns(Some(max_turns as u64));
+                engine.set_max_turns(Some(
+                    (max_turns as u64).min(
+                        parent_config
+                            .budgets
+                            .max_turns
+                            .unwrap_or(parent_config.agent_loop.tool_loop_max_turns),
+                    ),
+                ));
             }
             if let Some(model) = &task.model_override {
                 engine.cfg_mut().llm.base_model = model.clone();
@@ -187,7 +201,38 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
             }
 
             options.system_prompt_append = Some(delegated_prompt);
-            engine.chat_with_options(&task.goal, options)
+            let result = engine.chat_with_options(&task.goal, options);
+            let diff = worktree.collect_for_parent()?;
+            let artifact = if diff.is_empty() {
+                None
+            } else {
+                Some(
+                    codingbuddy_diff::PatchStore::new(&workspace)?
+                        .stage(&diff, &[])?
+                        .patch_id,
+                )
+            };
+            let status = if task.execution.cancellation.is_cancelled() {
+                "cancelled"
+            } else if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            run_store.transition_operation(
+                task.run_id,
+                "running",
+                status,
+                &json!({"artifact":artifact,"workspace":worktree.path()}),
+            )?;
+            let output = result?;
+            Ok(format!(
+                "{output}\n\nWorktree retained: {}. Staged patch: {}. Local review is required to apply it.",
+                worktree.path().display(),
+                artifact
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".into())
+            ))
         },
     );
     engine.set_subagent_worker(worker);

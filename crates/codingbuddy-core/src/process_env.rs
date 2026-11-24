@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     User,

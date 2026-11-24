@@ -348,6 +348,7 @@ impl IdeRpcHandler {
     fn handle_prompt_cancel(&self, params: Value) -> Result<Value> {
         let id = require_uuid(&params, "prompt_id")?;
         let state = self.store.prompt_state(id)?;
+        let persisted = self.store.cancel_operation(id)?;
         if let Some(token) = self
             .running
             .lock()
@@ -357,9 +358,12 @@ impl IdeRpcHandler {
             token.cancel();
             return Ok(serde_json::json!({"prompt_id":id,"status":"cancelling"}));
         }
+        if state.status == "running" && persisted > 0 {
+            return Ok(serde_json::json!({"prompt_id":id,"status":"cancelling"}));
+        }
         anyhow::ensure!(
             state.status != "running",
-            "prompt is running in a different server"
+            "Legacy prompt has no durable cancellation channel"
         );
         Ok(serde_json::to_value(state)?)
     }
@@ -1741,7 +1745,7 @@ impl RpcHandler for IdeRpcHandler {
                     "session/handoff_link_create", "session/handoff_link_consume",
                     "prompt/execute", "prompt/start", "prompt/events", "prompt/cancel", "prompt.v2", "prompt/stream_next", "stream/chunk",
                     "tool/approve", "tool/deny",
-                    "patch/preview", "patch/apply",
+                    "patch/preview", "patch/apply", "checkpoint/preview", "checkpoint/apply",
                     "diagnostics/list", "events/poll",
                     "context/suggest", "context/analyze", "context/compress", "context/related", "context/debug",
                     "task/list", "task/update",
@@ -1754,7 +1758,37 @@ impl RpcHandler for IdeRpcHandler {
                 "handler": "ide",
                 "partial_messages_enabled": self.include_partial_messages,
             })),
-            "cancel" => Ok(serde_json::json!({"cancelled": true})),
+            "cancel" => {
+                let id = if let Some(id) = params.get("prompt_id").and_then(Value::as_str) {
+                    Uuid::parse_str(id)?
+                } else {
+                    let running = self.running.lock().unwrap();
+                    anyhow::ensure!(
+                        running.len() <= 1,
+                        "Multiple active prompts; supply prompt_id"
+                    );
+                    if running.is_empty() {
+                        return Ok(serde_json::json!({"cancelled":false,"status":"idle"}));
+                    }
+                    *running.keys().next().unwrap()
+                };
+                let result = self.handle_prompt_cancel(serde_json::json!({"prompt_id":id}))?;
+                Ok(serde_json::json!({"cancelled":true,"prompt_id":id,"status":result["status"]}))
+            }
+            "checkpoint/preview" => {
+                let checkpoint = require_uuid(&params, "checkpoint_id")?;
+                let plan = codingbuddy_memory::MemoryManager::new(self.workspace_path())?
+                    .preview_restore(checkpoint, &[])?;
+                Ok(serde_json::to_value(plan)?)
+            }
+            "checkpoint/apply" => {
+                let id = require_uuid(&params, "plan_id")?;
+                let plan = codingbuddy_memory::MemoryManager::new(self.workspace_path())?
+                    .apply_restore(id, params["approved"] == true)?;
+                Ok(
+                    serde_json::json!({"plan_id":plan.id,"checkpoint_id":plan.checkpoint_id,"rewound":true,"recovery_status":"verified","preserved":plan.preserved}),
+                )
+            }
 
             // Session management
             "session/open" => self.handle_session_open(params),

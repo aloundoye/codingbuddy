@@ -48,17 +48,8 @@ pub type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send +
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
 fn install_mcp_executor(host: &mut LocalToolHost, manager: Arc<McpManager>) {
-    host.set_mcp_executor(Arc::new(move |server_id, tool_name, args| {
-        let server = manager
-            .get_server(server_id)?
-            .ok_or_else(|| anyhow!("MCP server unavailable"))?;
-        codingbuddy_mcp::execute_mcp_stdio_request(
-            &server,
-            "tools/call",
-            serde_json::json!({"name": tool_name, "arguments": args}),
-            1,
-            Duration::from_secs(30),
-        )
+    host.set_context_mcp_executor(Arc::new(move |alias, args, context| {
+        manager.call_tool(alias, args, context)
     }));
 }
 
@@ -121,6 +112,8 @@ pub struct ChatOptions {
     /// Effective connection for this turn, including session-only credentials.
     pub llm_config: Option<codingbuddy_core::LlmConfig>,
     pub cancellation: Option<codingbuddy_core::CancellationToken>,
+    pub deadline: Option<std::time::Instant>,
+    pub parent_run_id: Option<Uuid>,
     pub session_lease: Option<Arc<codingbuddy_store::SessionLease>>,
 }
 
@@ -177,8 +170,28 @@ impl AgentEngine {
 
     pub fn new_with_config_and_llm(
         workspace: &Path,
+        cfg: AppConfig,
+        llm: Box<dyn LlmClient + Send + Sync>,
+    ) -> Result<Self> {
+        Self::new_with_execution_store(workspace, cfg, llm, Store::new(workspace)?)
+    }
+
+    /// Execute in a scoped worktree while retaining the parent's durable session journal.
+    /// The caller passes the already-resolved parent policy and provider configuration.
+    pub fn new_isolated(
+        workspace: &Path,
+        journal_workspace: &Path,
+        cfg: AppConfig,
+    ) -> Result<Self> {
+        let llm = Box::new(ApiClient::new(cfg.llm.clone())?);
+        Self::new_with_execution_store(workspace, cfg, llm, Store::new(journal_workspace)?)
+    }
+
+    fn new_with_execution_store(
+        workspace: &Path,
         mut cfg: AppConfig,
         llm: Box<dyn LlmClient + Send + Sync>,
+        store: Store,
     ) -> Result<Self> {
         let trusted = cfg
             .workspace_trust
@@ -188,8 +201,6 @@ impl AgentEngine {
         if let Some(managed) = codingbuddy_policy::load_managed_settings() {
             managed.apply_to_config(&mut cfg);
         }
-
-        let store = Store::new(workspace).context("failed to open session store")?;
 
         // Spawn MCP discovery after Store init to avoid SQLite migration races.
         let mcp_workspace = workspace.to_path_buf();
@@ -223,6 +234,7 @@ impl AgentEngine {
             &cfg,
         )?;
 
+        tool_host.set_journal_store(store.clone());
         let mcp = mcp_handle.join().ok().flatten().map(Arc::new);
         if let Some(manager) = &mcp {
             install_mcp_executor(&mut tool_host, manager.clone());
@@ -304,18 +316,18 @@ impl AgentEngine {
         &self,
         cfg: &AppConfig,
         options: &ChatOptions,
-    ) -> Result<Option<ApiClient>> {
-        if options.llm_config.is_some()
-            || options.model_spec.is_some()
-            || options.cancellation.is_some()
-        {
+    ) -> Result<Option<Box<dyn LlmClient + Send + Sync>>> {
+        if options.llm_config.is_some() || options.model_spec.is_some() {
             let mut client = ApiClient::new(cfg.llm.clone())?;
             if let Some(token) = &options.cancellation {
                 client.set_cancel_token(token.clone());
             }
-            Ok(Some(client))
+            Ok(Some(Box::new(client)))
         } else {
-            Ok(None)
+            Ok(options
+                .cancellation
+                .clone()
+                .and_then(|token| self.llm.with_cancellation(token)))
         }
     }
 
@@ -521,6 +533,7 @@ impl AgentEngine {
                     _ => codingbuddy_subagent::SubagentRole::Task,
                 };
                 let task = SubagentTask {
+                    execution: req.execution.child(req.run_id),
                     run_id: req.run_id,
                     name: req.task_name.clone(),
                     goal: req.prompt.clone(),
@@ -599,6 +612,10 @@ impl AgentEngine {
     }
 
     /// Mutable access to the configuration for test overrides.
+    pub fn cfg(&self) -> &AppConfig {
+        &self.cfg
+    }
+
     pub fn cfg_mut(&mut self) -> &mut codingbuddy_core::AppConfig {
         &mut self.cfg
     }
@@ -649,7 +666,7 @@ impl AgentEngine {
         let cfg = self.effective_config(&options);
         let routed_llm = self.routed_llm_for_options(&cfg, &options)?;
         let llm = match routed_llm.as_ref() {
-            Some(client) => client as &(dyn LlmClient + Send + Sync),
+            Some(client) => client.as_ref(),
             None => self.llm.as_ref(),
         };
         // Grab a clone of the stream callback (if any) to pass to analyze().
@@ -732,7 +749,7 @@ impl AgentEngine {
         let cfg = self.effective_config(options);
         let routed_llm = self.routed_llm_for_options(&cfg, options)?;
         let llm = match routed_llm.as_ref() {
-            Some(client) => client as &(dyn LlmClient + Send + Sync),
+            Some(client) => client.as_ref(),
             None => self.llm.as_ref(),
         };
         let project_memory = codingbuddy_memory::MemoryManager::new(&self.workspace)
@@ -1071,31 +1088,22 @@ impl AgentEngine {
         loop_.set_hooks(HookRuntime::from_app_config(&self.workspace, &self.cfg));
 
         loop_.cancellation = options.cancellation.clone();
+        loop_.deadline = options.deadline;
+        loop_.parent_run_id = options.parent_run_id;
 
         // Wire config watcher for hot-reload polling between tool-use turns
         if let Some(ref watcher) = self.config_watcher {
             loop_.set_config_watcher(watcher);
         }
 
-        // Wire checkpoint callback — prefers git shadow commits, falls back to file snapshots
         let ws = self.workspace.clone();
-        let trusted = self.cfg.workspace_trust == Some(true);
-        loop_.set_checkpoint_callback(Arc::new(move |reason, modified_files| {
-            if let Ok(mm) = codingbuddy_memory::MemoryManager::new(&ws) {
-                // Try shadow commit first (lightweight git-based checkpoint)
-                if trusted
-                    && let Ok(sc) = mm.create_shadow_commit(reason)
-                    && sc.git_backed
-                {
-                    return Ok(());
-                }
-                // Fall back to file-based checkpoint
-                if modified_files.is_empty() {
-                    mm.create_checkpoint(reason)?;
-                } else {
-                    mm.create_checkpoint_for_files(reason, modified_files)?;
-                }
-            }
+        let checkpoint_session = session.session_id;
+        loop_.set_checkpoint_callback(Arc::new(move |reason, paths| {
+            codingbuddy_memory::MemoryManager::new(&ws)?.create_checkpoint_linked(
+                reason,
+                paths,
+                Some(checkpoint_session),
+            )?;
             Ok(())
         }));
 
@@ -1208,6 +1216,15 @@ impl AgentEngine {
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
         let session = self.ensure_session_record_for(options.session_id)?;
         options.session_id = Some(session.session_id);
+        if options.deadline.is_none() && self.cfg.budgets.max_turn_duration_secs > 0 {
+            options.deadline = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(self.cfg.budgets.max_turn_duration_secs),
+            );
+        }
+        options
+            .cancellation
+            .get_or_insert_with(codingbuddy_core::CancellationToken::new);
         let owned_prompt = options.session_lease.is_none();
         let lease = match options.session_lease.take() {
             Some(lease) => {
@@ -1229,6 +1246,9 @@ impl AgentEngine {
             &serde_json::json!({"prompt": prompt}),
         )?;
         options.prompt_id = Some(id);
+        if let Some(parent) = options.parent_run_id {
+            self.store.attach_operation_parent(id, parent)?;
+        }
         let cancellation = options.cancellation.clone();
         let result = self.execute_session_prompt(prompt, options, session, &lease);
         let output = result.as_ref().ok().map(String::as_str);
@@ -1293,6 +1313,7 @@ impl AgentEngine {
                 session_id: Some(session),
                 invocation_id: Some(invocation.id),
                 cancellation: None,
+                ..Default::default()
             },
         );
         anyhow::ensure!(
@@ -1377,11 +1398,22 @@ impl AgentEngine {
         session: Session,
         lease: &codingbuddy_store::SessionLease,
     ) -> Result<String> {
+        let execution = codingbuddy_core::execution::ExecutionContext {
+            cancellation: options.cancellation.clone().unwrap_or_default(),
+            deadline: options.deadline,
+            ..Default::default()
+        };
+        let _deadline_guard = execution.watch_deadline()?;
+        let _cancellation_monitor = options
+            .prompt_id
+            .map(|id| {
+                self.store
+                    .monitor_operation(id, options.cancellation.clone().unwrap_or_default())
+            })
+            .transpose()?;
         self.reconcile_session_invocations(lease, session.session_id)?;
         let mut effective = self.effective_config(&options);
-        let uses_routed_client = options.llm_config.is_some()
-            || options.model_spec.is_some()
-            || options.cancellation.is_some();
+        let uses_routed_client = options.llm_config.is_some() || options.model_spec.is_some();
         if uses_routed_client {
             effective.llm.api_key = codingbuddy_llm::resolve_key_from_config(&effective.llm);
             options.llm_config = Some(effective.llm.clone());
@@ -1445,9 +1477,10 @@ impl AgentEngine {
             codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::SessionStart, &ws)
                 .with_prompt(prompt)
                 .with_session_type("startup");
-        let _ = self.hooks.fire(
+        let _ = self.hooks.fire_with_context(
             codingbuddy_hooks::HookEvent::SessionStart,
             &session_start_input,
+            &execution,
         );
 
         // Fire Setup hook once per session (not per turn)
@@ -1457,18 +1490,21 @@ impl AgentEngine {
         {
             let setup_input =
                 codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Setup, &ws);
-            let _ = self
-                .hooks
-                .fire(codingbuddy_hooks::HookEvent::Setup, &setup_input);
+            let _ = self.hooks.fire_with_context(
+                codingbuddy_hooks::HookEvent::Setup,
+                &setup_input,
+                &execution,
+            );
         }
 
         // Fire UserPromptSubmit hook (blocking — can modify prompt)
         let user_submit_input =
             codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::UserPromptSubmit, &ws)
                 .with_prompt(prompt);
-        let submit_result = self.hooks.fire(
+        let submit_result = self.hooks.fire_with_context(
             codingbuddy_hooks::HookEvent::UserPromptSubmit,
             &user_submit_input,
+            &execution,
         );
         if submit_result.blocked {
             return Err(anyhow!("prompt blocked by UserPromptSubmit hook"));
@@ -1543,11 +1579,15 @@ impl AgentEngine {
             .as_ref()
             .ok()
             .map(|s| serde_json::Value::String(s.clone()));
-        let _ = self
-            .hooks
-            .fire(codingbuddy_hooks::HookEvent::SessionEnd, &session_end_input);
+        let _ = self.hooks.fire_with_context(
+            codingbuddy_hooks::HookEvent::SessionEnd,
+            &session_end_input,
+            &execution,
+        );
 
-        self.fire_stop();
+        let stop_input = codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Stop, &ws);
+        self.hooks
+            .fire_with_context(codingbuddy_hooks::HookEvent::Stop, &stop_input, &execution);
 
         result
     }
