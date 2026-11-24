@@ -28,6 +28,11 @@ TARGETS = {
 }
 
 
+def lockfile_sha256(path=pathlib.Path("Cargo.lock")):
+    # Git can check out the same lockfile with CRLF on Windows.
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=pathlib.Path)
@@ -43,7 +48,7 @@ def main():
         parser.error("Evidence revision must match the checked-out implementation")
     report = {
         "version": 1, "revision": args.revision, "target": target, "native": True,
-        "lockfile_sha256": hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest(),
+        "lockfile_sha256": lockfile_sha256(),
         "worktree_clean": not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip(),
         "groups": {}, "status": "failed",
     }
