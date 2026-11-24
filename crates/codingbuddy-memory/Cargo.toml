@@ -17,6 +17,8 @@ sha2.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-store = { path = "../codingbuddy-store" }
 
+codingbuddy-policy = { path = "../codingbuddy-policy" }
+
 [dev-dependencies]
 rusqlite = { workspace = true }
 tempfile = "3"

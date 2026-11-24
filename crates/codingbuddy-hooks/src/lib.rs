@@ -1,13 +1,12 @@
 use anyhow::Result;
+use codingbuddy_core::execution::{ExecutionContext, run_owned};
 use codingbuddy_core::process_env::{self, Source};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
-use wait_timeout::ChildExt;
 
 // ── Hook Events ──────────────────────────────────────────────────────────────
 
@@ -394,6 +393,21 @@ impl HookRuntime {
 
     /// Fire hooks for an event with the given input context.
     pub fn fire(&self, event: HookEvent, input: &HookInput) -> HookResult {
+        self.fire_with_context(event, input, &ExecutionContext::default())
+    }
+    pub fn fire_with_context(
+        &self,
+        event: HookEvent,
+        input: &HookInput,
+        context: &ExecutionContext,
+    ) -> HookResult {
+        if context.check().is_err() {
+            return HookResult {
+                blocked: true,
+                block_reason: Some("Execution cancelled".into()),
+                ..Default::default()
+            };
+        }
         let event_key = event.as_str();
         let Some(defs) = self.config.events.get(event_key) else {
             return HookResult::default();
@@ -450,7 +464,7 @@ impl HookRuntime {
                 {
                     continue;
                 }
-                let run = self.execute_handler(handler, input, &consumer, source);
+                let run = self.execute_handler(handler, input, &consumer, source, context);
                 if run.blocked && event.supports_blocking() {
                     result.blocked = true;
                     result.block_reason = run
@@ -496,13 +510,14 @@ impl HookRuntime {
         input: &HookInput,
         consumer: &str,
         source: Source,
+        context: &ExecutionContext,
     ) -> HookRun {
         match handler {
             HookHandler::Command { command, timeout } => {
-                self.run_command_handler(command, input, *timeout, consumer, source)
+                self.run_command_handler(command, input, *timeout, consumer, source, context)
             }
             HookHandler::Async { command, timeout } => {
-                self.run_async_handler(command, *timeout, consumer, source)
+                self.run_async_handler(command, *timeout, consumer, source, context)
             }
             HookHandler::Prompt {
                 prompt,
@@ -515,6 +530,7 @@ impl HookRuntime {
                 input,
                 consumer,
                 source,
+                context,
             ),
             HookHandler::Agent {
                 agent,
@@ -531,6 +547,7 @@ impl HookRuntime {
         timeout_secs: u64,
         consumer: &str,
         source: Source,
+        context: &ExecutionContext,
     ) -> HookRun {
         let shell = if cfg!(target_os = "windows") {
             "cmd"
@@ -555,20 +572,18 @@ impl HookRuntime {
             .stderr(Stdio::null());
 
         process_env::apply_for(&mut cmd, &self.workspace, consumer, source);
-        let spawn_result = cmd.spawn();
-        let spawned = spawn_result.is_ok();
-
-        // Move the child handle into a reaper thread for timeout enforcement.
-        // Previously this re-spawned the command, causing double-execution.
-        if let Ok(mut child) = spawn_result {
-            let timeout = Duration::from_secs(timeout_secs);
-            std::thread::spawn(move || {
-                if let Ok(None) = child.wait_timeout(timeout) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            });
-        }
+        let context = context.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hook-supervisor".into())
+            .spawn(move || {
+                let _ = run_owned(
+                    &mut cmd,
+                    vec![],
+                    &context,
+                    Duration::from_secs(timeout_secs),
+                );
+            })
+            .is_ok();
 
         HookRun {
             handler_description: format!("async: {command}"),
@@ -594,6 +609,7 @@ impl HookRuntime {
         input: &HookInput,
         consumer: &str,
         source: Source,
+        context: &ExecutionContext,
     ) -> HookRun {
         // Expand template variables with shell escaping to prevent injection.
         let context_json = serde_json::to_string(input).unwrap_or_default();
@@ -603,7 +619,14 @@ impl HookRuntime {
 
         // For now, treat the expanded prompt as a shell command that outputs HookOutput JSON.
         // In production, this would call the LLM API.
-        self.run_command_handler(&expanded, input, default_timeout(), consumer, source)
+        self.run_command_handler(
+            &expanded,
+            input,
+            default_timeout(),
+            consumer,
+            source,
+            context,
+        )
     }
 
     /// Agent-based hook: delegates to a named subagent for evaluation.
@@ -645,6 +668,7 @@ impl HookRuntime {
         timeout_secs: u64,
         consumer: &str,
         source: Source,
+        context: &ExecutionContext,
     ) -> HookRun {
         // Reject commands with embedded newlines (command injection vector)
         if command.contains('\n') || command.contains('\r') {
@@ -707,62 +731,28 @@ impl HookRuntime {
         cmd.stderr(Stdio::null());
 
         process_env::apply_for(&mut cmd, &self.workspace, consumer, source);
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_e) => {
-                return HookRun {
-                    handler_description: command.to_string(),
-                    success: false,
-                    timed_out: false,
-                    exit_code: None,
-                    output: HookOutput::default(),
-                    blocked: false,
-                };
-            }
+        let result = run_owned(
+            &mut cmd,
+            input_json.into_bytes(),
+            context,
+            Duration::from_secs(timeout_secs),
+        );
+        let (timed_out, exit_code, output, cancelled) = match result {
+            Ok(result) => (
+                result.timed_out,
+                result.status.code(),
+                parse_hook_output(&String::from_utf8_lossy(&result.stdout)),
+                result.cancelled,
+            ),
+            Err(_) => (
+                false,
+                None,
+                HookOutput::default(),
+                context.cancellation.is_cancelled(),
+            ),
         };
-
-        // Write input JSON to stdin.
-        let mut child = child;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input_json.as_bytes());
-            drop(stdin);
-        }
-
-        let timeout = Duration::from_secs(timeout_secs);
-        let (timed_out, status) = match child.wait_timeout(timeout) {
-            Ok(Some(status)) => (false, Some(status)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                (true, None)
-            }
-            Err(_) => (false, None),
-        };
-
-        let exit_code = status.and_then(|s| s.code());
-        let success = !timed_out && exit_code == Some(0);
-
-        // Exit code 2 = block.
-        let blocked_by_exit = exit_code == Some(2);
-
-        // Only parse stdout when the process exited normally. On timeout, descendants
-        // may still hold stdout fds open after killing the shell wrapper, which can make
-        // a blocking read hang until those descendants exit.
-        let output = if !timed_out && status.is_some() {
-            let stdout_output = child
-                .stdout
-                .take()
-                .and_then(|mut out| {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut out, &mut buf).ok()?;
-                    Some(buf)
-                })
-                .unwrap_or_default();
-            parse_hook_output(&stdout_output)
-        } else {
-            HookOutput::default()
-        };
-
+        let success = !timed_out && !cancelled && exit_code == Some(0);
+        let blocked_by_exit = cancelled || exit_code == Some(2);
         let blocked = blocked_by_exit || output.decision.as_deref() == Some("block");
 
         HookRun {
@@ -780,6 +770,14 @@ impl HookRuntime {
         paths: &[PathBuf],
         ctx: &HookContext,
         timeout: Duration,
+    ) -> Result<Vec<HookRun>> {
+        Self::run_legacy_with_context(paths, ctx, timeout, &ExecutionContext::default())
+    }
+    pub fn run_legacy_with_context(
+        paths: &[PathBuf],
+        ctx: &HookContext,
+        timeout: Duration,
+        context: &ExecutionContext,
     ) -> Result<Vec<HookRun>> {
         let mut out = Vec::new();
         for path in paths {
@@ -809,17 +807,12 @@ impl HookRuntime {
                 cmd.env("CODINGBUDDY_TOOL_RESULT_JSON", result);
             }
 
-            let mut child = cmd.spawn()?;
-            let (timed_out, status) = match child.wait_timeout(timeout)? {
-                Some(status) => (false, status),
-                None => {
-                    let _ = child.kill();
-                    (true, child.wait()?)
-                }
-            };
+            let result = run_owned(&mut cmd, vec![], context, timeout)?;
+            let timed_out = result.timed_out;
+            let status = result.status;
             out.push(HookRun {
                 handler_description: path.to_string_lossy().to_string(),
-                success: status.success() && !timed_out,
+                success: status.success() && !timed_out && !result.cancelled,
                 timed_out,
                 exit_code: status.code(),
                 output: HookOutput::default(),

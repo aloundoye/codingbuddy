@@ -21,6 +21,7 @@ mod context;
 mod md_render;
 mod output;
 mod util;
+mod worker;
 
 use commands::admin::{run_clean, run_config, run_doctor, run_index, run_permissions, run_plugins};
 use commands::agents::run_agents;
@@ -569,6 +570,14 @@ struct ApplyArgs {
 
 #[derive(Args, Default)]
 struct RewindArgs {
+    #[arg(long)]
+    preview: bool,
+    #[arg(long)]
+    plan: Option<String>,
+    #[arg(long, default_value="files", value_parser=["files","conversation","both"])]
+    mode: String,
+    #[arg(long = "path")]
+    paths: Vec<PathBuf>,
     #[arg(long)]
     to_checkpoint: Option<String>,
     #[arg(long)]
@@ -1331,6 +1340,10 @@ fn main() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             // Get json mode from args
+            if std::env::args_os().any(|arg| arg == "--internal-owned-worker") {
+                eprintln!("Worker failed: {e:#}");
+                std::process::exit(1);
+            }
             let cli = Cli::parse();
             handle_error(e, cli.json);
         }
@@ -1338,6 +1351,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if std::env::args_os().collect::<Vec<_>>()
+        == [
+            std::ffi::OsString::from(std::env::args_os().next().unwrap_or_default()),
+            std::ffi::OsString::from("--internal-owned-worker"),
+        ]
+    {
+        return worker::run();
+    }
     let mut prof = codingbuddy_core::profiler::StartupProfiler::new();
 
     let mut cli = Cli::parse();

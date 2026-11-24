@@ -21,6 +21,9 @@ impl ToolUseLoop<'_> {
         &mut self,
         mut calls: &[LlmToolCall],
     ) -> Result<Vec<ToolCallRecord>> {
+        let host_scope = self.worktree_tool_host.clone();
+        let host = host_scope.unwrap_or_else(|| self.tool_host.clone());
+
         let mut records = Vec::new();
         while let Some((first, rest)) = calls.split_first() {
             let group = calls
@@ -52,7 +55,7 @@ impl ToolUseLoop<'_> {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 self.check_cancellation()?;
-                let host = &self.tool_host;
+
                 let results = std::thread::scope(|scope| {
                     let workers = ready
                         .into_iter()
@@ -60,7 +63,20 @@ impl ToolUseLoop<'_> {
                             let worker = match &preparation {
                                 ToolPreparation::Ready(call) => {
                                     let approved = call.approved.clone();
-                                    Some(scope.spawn(move || host.execute(approved)))
+                                    let host = host.clone();
+                                    let cancellation = self.cancellation.clone();
+                                    let session = self.durable_session.as_ref().map(|(_, id)| *id);
+                                    Some(scope.spawn(move || {
+                                        host.execute_with_context(
+                                            approved,
+                                            codingbuddy_core::ToolExecutionContext {
+                                                session_id: session,
+                                                invocation_id: None,
+                                                cancellation: cancellation.as_ref(),
+                                                ..Default::default()
+                                            },
+                                        )
+                                    }))
                                 }
                                 ToolPreparation::Complete(_) => None,
                             };
@@ -106,13 +122,14 @@ impl ToolUseLoop<'_> {
         llm_call: &LlmToolCall,
         batch_child: bool,
     ) -> Result<Vec<ToolCallRecord>> {
+        let host_scope = self.worktree_tool_host.clone();
+        let host = host_scope.unwrap_or_else(|| self.tool_host.clone());
+
         self.check_cancellation()?;
         if tool_bridge::is_agent_level_tool(&llm_call.name) {
             let metadata = self.runtime_metadata_for_tool(&llm_call.name);
             let call = tool_bridge::llm_tool_call_to_internal_with_metadata(llm_call, &metadata);
-            if let codingbuddy_core::ToolPermission::Deny { reason, .. } =
-                self.tool_host.permission(&call)
-            {
+            if let codingbuddy_core::ToolPermission::Deny { reason, .. } = host.permission(&call) {
                 let ToolPreparation::Complete(records) =
                     self.reject_policy_call(llm_call, Instant::now(), reason)
                 else {
@@ -141,8 +158,7 @@ impl ToolUseLoop<'_> {
             let _ = checkpoint("before tool execution", &prepared.modified_paths);
         }
         if let Err(error) = self.check_cancellation() {
-            self.tool_host
-                .discard_proposal(prepared.approved.invocation_id);
+            host.discard_proposal(prepared.approved.invocation_id);
             return Err(error);
         }
         if !batch_child {
@@ -151,7 +167,7 @@ impl ToolUseLoop<'_> {
         let result = if prepared.approved.call.name == "batch" {
             self.execute_batch(&prepared.approved)?
         } else {
-            self.tool_host.execute_with_context(
+            host.execute_with_context(
                 prepared.approved.clone(),
                 codingbuddy_core::ToolExecutionContext {
                     session_id: self.durable_session.as_ref().map(|(_, session)| *session),
@@ -161,6 +177,9 @@ impl ToolUseLoop<'_> {
                         self.durable_invocation.map(|(id, _)| id)
                     },
                     cancellation: self.cancellation.as_ref(),
+                    prompt_id: self.durable_prompt,
+                    deadline: self.deadline,
+                    parent_run_id: self.parent_run_id,
                 },
             )
         };
@@ -202,6 +221,9 @@ impl ToolUseLoop<'_> {
         llm_call: &LlmToolCall,
         batch_child: bool,
     ) -> Result<ToolPreparation> {
+        let host_scope = self.worktree_tool_host.clone();
+        let host = host_scope.unwrap_or_else(|| self.tool_host.clone());
+
         self.check_cancellation()?;
         let mut records = Vec::new();
         let start = Instant::now();
@@ -269,9 +291,7 @@ impl ToolUseLoop<'_> {
             args_summary: args_summary.clone(),
         });
 
-        if let codingbuddy_core::ToolPermission::Deny { reason, .. } =
-            self.tool_host.permission(&tool_call)
-        {
+        if let codingbuddy_core::ToolPermission::Deny { reason, .. } = host.permission(&tool_call) {
             return Ok(self.reject_policy_call(&llm_call, start, reason));
         }
 
@@ -293,7 +313,8 @@ impl ToolUseLoop<'_> {
                 session_type: None,
                 workspace: self.workspace_str().to_string(),
             };
-            let hook_result = hooks.fire(HookEvent::PreToolUse, &input);
+            let hook_result =
+                hooks.fire_with_context(HookEvent::PreToolUse, &input, &self.execution_context());
             if hook_result.blocked
                 || hook_result.permission_decision
                     == Some(codingbuddy_hooks::PermissionDecision::Deny)
@@ -344,7 +365,7 @@ impl ToolUseLoop<'_> {
         let args_summary = summarize_args(&parsed_args);
         llm_call.arguments = parsed_args.to_string();
 
-        let (proposal, permission) = self.tool_host.propose_with_permission(tool_call);
+        let (proposal, permission) = host.propose_with_permission(tool_call);
         if let Some(ref cb) = self.event_cb {
             cb(EventKind::ToolProposed {
                 proposal: proposal.clone(),
@@ -383,7 +404,11 @@ impl ToolUseLoop<'_> {
                     session_type: None,
                     workspace: self.workspace_str().to_string(),
                 };
-                let result = hooks.fire(HookEvent::PermissionRequest, &perm_input);
+                let result = hooks.fire_with_context(
+                    HookEvent::PermissionRequest,
+                    &perm_input,
+                    &self.execution_context(),
+                );
                 hook_decision = if result.blocked {
                     Some(codingbuddy_hooks::PermissionDecision::Deny)
                 } else {
@@ -402,13 +427,13 @@ impl ToolUseLoop<'_> {
                     args.remove("effective_isolation");
                     args.insert("fresh_approval".into(), serde_json::Value::Bool(fresh));
                 }
-                if let Some(details) = self.tool_host.approval_details(proposal.invocation_id) {
+                if let Some(details) = host.approval_details(proposal.invocation_id) {
                     approval_call.args["effective_isolation"] = serde_json::Value::String(details);
                 }
                 match cb(&approval_call) {
                     Ok(v) => v,
                     Err(e) => {
-                        self.tool_host.discard_proposal(proposal.invocation_id);
+                        host.discard_proposal(proposal.invocation_id);
                         // Push a Tool message so the conversation chain stays valid
                         // (prevents HTTP 400 "insufficient tool messages" from the API)
                         let err_msg = format!("Approval error: {e}");
@@ -445,7 +470,7 @@ impl ToolUseLoop<'_> {
             };
 
             if !approved {
-                self.tool_host.discard_proposal(proposal.invocation_id);
+                host.discard_proposal(proposal.invocation_id);
                 if let Some(ref cb) = self.event_cb {
                     cb(EventKind::ToolDenied {
                         invocation_id: proposal.invocation_id,
@@ -502,7 +527,7 @@ impl ToolUseLoop<'_> {
             }
         }
 
-        let cache_args = self.tool_host.cache_key(&proposal.call);
+        let cache_args = host.cache_key(&proposal.call);
         // ── Cache lookup ──
         // For read-only tools, check if we have a recent cached result.
         // Reuse the already-parsed args from tool_call instead of re-parsing.
@@ -571,6 +596,9 @@ impl ToolUseLoop<'_> {
         mut result: codingbuddy_core::ToolResult,
         batch_child: bool,
     ) -> Result<Vec<ToolCallRecord>> {
+        let host_scope = self.worktree_tool_host.clone();
+        let host = host_scope.unwrap_or_else(|| self.tool_host.clone());
+
         let PreparedToolCall {
             llm_call,
             approved,
@@ -639,14 +667,24 @@ impl ToolUseLoop<'_> {
             self.tool_cache.clear();
         }
 
-        let lsp_diagnostics_text = if success && !modified_paths.is_empty() {
-            verification::post_edit_diagnostics(
-                self.config.edit_validator.as_ref(),
-                &modified_paths,
-            )
-        } else {
-            String::new()
-        };
+        let lsp_diagnostics_text =
+            if success && !modified_paths.is_empty() && result.output.get("verification").is_none()
+            {
+                verification::post_edit_diagnostics(
+                    self.config.edit_validator.as_ref(),
+                    &modified_paths,
+                    host.as_ref(),
+                    codingbuddy_core::ToolExecutionContext {
+                        session_id: self.durable_session.as_ref().map(|(_, session)| *session),
+                        invocation_id: None,
+                        cancellation: self.cancellation.as_ref(),
+                        prompt_id: self.durable_prompt,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                String::new()
+            };
 
         // Scan tool output for evidence-driven budget escalation signals
         if let Some(output_str) = result.output.as_str() {
@@ -678,7 +716,8 @@ impl ToolUseLoop<'_> {
                 session_type: None,
                 workspace: self.workspace_str().to_string(),
             };
-            let post_hook_result = hooks.fire(HookEvent::PostToolUse, &input);
+            let post_hook_result =
+                hooks.fire_with_context(HookEvent::PostToolUse, &input, &self.execution_context());
             for run in &post_hook_result.runs {
                 if !run.success {
                     eprintln!(
@@ -695,7 +734,7 @@ impl ToolUseLoop<'_> {
                     event: HookEvent::PostToolUseFailure.as_str().to_string(),
                     ..input
                 };
-                Self::fire_hook_logged(hooks, HookEvent::PostToolUseFailure, &fail_input);
+                self.fire_hook_logged(hooks, HookEvent::PostToolUseFailure, &fail_input);
             }
         }
 

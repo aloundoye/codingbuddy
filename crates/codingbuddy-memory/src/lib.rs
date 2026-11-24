@@ -1,5 +1,7 @@
 use codingbuddy_core::workspace_fs::WorkspaceFs;
 pub mod auto_extract;
+mod restore;
+pub use restore::{CheckpointManifest, FileState, RestoreEntry, RestorePlan};
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -50,6 +52,10 @@ pub struct FileSnapshot {
     /// Full file content for revert (None if file too large or binary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
     /// Whether the file exists at this point.
     pub exists: bool,
 }
@@ -57,88 +63,49 @@ pub struct FileSnapshot {
 impl FileSnapshot {
     /// Capture the current state of a file.
     pub fn capture(workspace: &Path, file_path: &str) -> Self {
-        let abs_path = if Path::new(file_path).is_absolute() {
-            PathBuf::from(file_path)
-        } else {
-            workspace.join(file_path)
-        };
-
-        // Check file size via metadata BEFORE reading to prevent OOM on huge files
-        let file_size = fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
-
-        // For files larger than the snapshot limit, only read a preview portion
-        let read_result = if file_size > SNAPSHOT_FULL_CONTENT_LIMIT as u64 {
-            // Read only the first portion for preview + hash the file in chunks
+        let captured = (|| -> Result<Self> {
             use std::io::Read;
-            let mut file = match std::fs::File::open(&abs_path) {
-                Ok(f) => f,
-                Err(_) => {
-                    return Self {
-                        path: file_path.to_string(),
-                        content_hash: String::new(),
-                        preview: String::new(),
-                        full_content: None,
-                        exists: false,
-                    };
-                }
+            let files = WorkspaceFs::open(workspace)?;
+            let relative = files.relative(Path::new(file_path))?;
+            anyhow::ensure!(!has_ignored_component(&relative), "Protected snapshot path");
+            let manager = MemoryManager::new(workspace)?;
+            let state = manager.capture_state(&files, &relative)?;
+            let Some(hash) = state.hash else {
+                anyhow::bail!("Snapshot file absent");
             };
-            // Read a small portion for preview
-            let mut preview_buf = vec![0u8; 8192.min(file_size as usize)];
-            let n = file.read(&mut preview_buf).unwrap_or(0);
-            let preview_str = String::from_utf8_lossy(&preview_buf[..n]);
-            let preview: String = preview_str.lines().take(50).collect::<Vec<_>>().join("\n");
-            // Hash the full file without loading it all into memory
-            let mut hasher = Sha256::new();
-            // Reset file position
-            use std::io::Seek;
-            let _ = file.seek(std::io::SeekFrom::Start(0));
-            let mut buf = vec![0u8; 65536];
-            loop {
-                let n = file.read(&mut buf).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            let hash = format!("{:x}", hasher.finalize());
-            return Self {
-                path: file_path.to_string(),
-                content_hash: hash,
+            let blobs = manager.blob_fs()?;
+            let mut file = blobs.open_file(Path::new(&hash))?;
+            let mut bytes = Vec::new();
+            file.by_ref()
+                .take(SNAPSHOT_FULL_CONTENT_LIMIT as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            let full_content = (bytes.len() <= SNAPSHOT_FULL_CONTENT_LIMIT)
+                .then(|| String::from_utf8(bytes.clone()).ok())
+                .flatten();
+            let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(8192)])
+                .lines()
+                .take(50)
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(Self {
+                path: relative.to_string_lossy().into_owned(),
+                content_hash: hash.clone(),
                 preview,
-                full_content: None,
+                full_content,
+                blob: Some(hash),
+                mode: state.mode,
                 exists: true,
-            };
-        } else {
-            fs::read_to_string(&abs_path)
-        };
-
-        match read_result {
-            Ok(content) => {
-                let mut hasher = Sha256::new();
-                hasher.update(content.as_bytes());
-                let hash = format!("{:x}", hasher.finalize());
-                let preview: String = content.lines().take(50).collect::<Vec<_>>().join("\n");
-                let full_content = if content.len() <= SNAPSHOT_FULL_CONTENT_LIMIT {
-                    Some(content)
-                } else {
-                    None
-                };
-                Self {
-                    path: file_path.to_string(),
-                    content_hash: hash,
-                    preview,
-                    full_content,
-                    exists: true,
-                }
-            }
-            Err(_) => Self {
-                path: file_path.to_string(),
-                content_hash: String::new(),
-                preview: String::new(),
-                full_content: None,
-                exists: false,
-            },
-        }
+            })
+        })();
+        captured.unwrap_or_else(|_| Self {
+            path: file_path.into(),
+            content_hash: String::new(),
+            preview: String::new(),
+            full_content: None,
+            blob: None,
+            mode: None,
+            exists: false,
+        })
     }
 }
 
@@ -423,200 +390,21 @@ impl MemoryManager {
     }
 
     pub fn create_checkpoint(&self, reason: &str) -> Result<CheckpointRecord> {
-        let checkpoint_id = Uuid::now_v7();
-        let checkpoint_root = runtime_dir(&self.workspace)
-            .join("checkpoints")
-            .join(checkpoint_id.to_string());
-        let snapshot_root = checkpoint_root.join("fs");
-        fs::create_dir_all(&snapshot_root)?;
-
-        let source = WorkspaceFs::open(&self.workspace)?;
-        let destination = WorkspaceFs::open(&snapshot_root)?;
-        let mut files = 0_u64;
-        for entry in WalkDir::new(source.root())
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let rel = entry.path().strip_prefix(source.root())?;
-            if !has_ignored_component(rel) {
-                let mut input = source.open_file(rel)?;
-                destination.copy_from(rel, &mut input)?;
-                files += 1;
-            }
-        }
-
-        let metadata = serde_json::json!({
-            "checkpoint_id": checkpoint_id,
-            "reason": reason,
-            "files": files,
-            "created_at": Utc::now().to_rfc3339(),
-        });
-        fs::write(
-            checkpoint_root.join("metadata.json"),
-            serde_json::to_vec_pretty(&metadata)?,
-        )?;
-
-        let record = CheckpointRecord {
-            checkpoint_id,
-            reason: reason.to_string(),
-            snapshot_path: snapshot_root.to_string_lossy().to_string(),
-            created_at: Utc::now().to_rfc3339(),
-            files_count: files,
-        };
-        self.store.insert_checkpoint(&record)?;
-        Ok(record)
+        self.create_checkpoint_linked(reason, &[], None)
     }
-
-    /// Create a checkpoint that only snapshots the specified files instead of the
-    /// entire workspace. Falls back to a full snapshot if `files` is empty.
     pub fn create_checkpoint_for_files(
         &self,
         reason: &str,
-        target_files: &[PathBuf],
+        paths: &[PathBuf],
     ) -> Result<CheckpointRecord> {
-        if target_files.is_empty() {
-            return self.create_checkpoint(reason);
-        }
-
-        let checkpoint_id = Uuid::now_v7();
-        let checkpoint_root = runtime_dir(&self.workspace)
-            .join("checkpoints")
-            .join(checkpoint_id.to_string());
-        let snapshot_root = checkpoint_root.join("fs");
-        fs::create_dir_all(&snapshot_root)?;
-
-        let source = WorkspaceFs::open(&self.workspace)?;
-        let destination = WorkspaceFs::open(&snapshot_root)?;
-        let mut count = 0_u64;
-        for file in target_files {
-            let rel = source.resolve(file, true)?;
-            let mut input = match source.open_file(&rel) {
-                Ok(input) => input,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            use std::io::{Read, Seek};
-            let mut prefix = [0; 512];
-            let len = input.read(&mut prefix)?;
-            if prefix[..len].contains(&0) {
-                continue;
-            }
-            input.rewind()?;
-            destination.copy_from(&rel, &mut input)?;
-            count += 1;
-        }
-
-        let metadata = serde_json::json!({
-            "checkpoint_id": checkpoint_id,
-            "reason": reason,
-            "files": count,
-            "targeted": true,
-            "created_at": Utc::now().to_rfc3339(),
-        });
-        fs::write(
-            checkpoint_root.join("metadata.json"),
-            serde_json::to_vec_pretty(&metadata)?,
-        )?;
-
-        let record = CheckpointRecord {
-            checkpoint_id,
-            reason: reason.to_string(),
-            snapshot_path: snapshot_root.to_string_lossy().to_string(),
-            created_at: Utc::now().to_rfc3339(),
-            files_count: count,
-        };
-        self.store.insert_checkpoint(&record)?;
-        Ok(record)
+        self.create_checkpoint_linked(reason, paths, None)
     }
-
-    pub fn rewind_to_checkpoint(&self, checkpoint_id: Uuid) -> Result<CheckpointRecord> {
-        let record = self
-            .store
-            .load_checkpoint(checkpoint_id)?
-            .ok_or_else(|| anyhow!("checkpoint not found: {checkpoint_id}"))?;
-
-        let snapshot_root = PathBuf::from(&record.snapshot_path);
-        if !snapshot_root.exists() {
-            return Err(anyhow!(
-                "checkpoint snapshot missing: {}",
-                snapshot_root.display()
-            ));
-        }
-
-        // Validate snapshot_root is within the runtime directory to prevent path traversal
-        let expected_root = std::fs::canonicalize(runtime_dir(&self.workspace))
-            .unwrap_or_else(|_| runtime_dir(&self.workspace));
-        if let Ok(canonical) = std::fs::canonicalize(&snapshot_root)
-            && !canonical.starts_with(&expected_root)
-        {
-            return Err(anyhow!(
-                "checkpoint path outside runtime directory: {}",
-                snapshot_root.display()
-            ));
-        }
-
-        // Check if this is a targeted checkpoint (only covers a subset of files).
-        // Targeted checkpoints must NOT delete files outside the snapshot — only
-        // restore the files that were originally captured.
-        // metadata.json lives in the checkpoint root (parent of snapshot_root/fs/).
-        let checkpoint_root = snapshot_root.parent().unwrap_or(snapshot_root.as_path());
-        let is_targeted = fs::read_to_string(checkpoint_root.join("metadata.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("targeted").and_then(|t| t.as_bool()))
-            .unwrap_or(false);
-
-        // Collect the relative paths present in the snapshot.
-        let snapshot_files: Vec<PathBuf> = WalkDir::new(&snapshot_root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().is_file())
-            .filter_map(|e| {
-                e.path()
-                    .strip_prefix(&snapshot_root)
-                    .ok()
-                    .map(PathBuf::from)
-            })
-            .filter(|rel| rel.to_str() != Some("metadata.json"))
-            .collect();
-
-        if is_targeted {
-            // Targeted: only delete + restore files that are IN the snapshot.
-            // Other workspace files are left untouched.
-            for rel in &snapshot_files {
-                let dest = self.workspace.join(rel);
-                if dest.exists() {
-                    fs::remove_file(&dest)?;
-                }
-            }
-        } else {
-            // Full checkpoint: delete all workspace files (original behavior).
-            for entry in WalkDir::new(&self.workspace)
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|e| e.path().is_file())
-            {
-                let path = entry.path();
-                let rel = path.strip_prefix(&self.workspace)?;
-                if has_ignored_component(rel) {
-                    continue;
-                }
-                fs::remove_file(path)?;
-            }
-        }
-
-        // Restore all files from the snapshot.
-        for rel in &snapshot_files {
-            let src = snapshot_root.join(rel);
-            let dest = self.workspace.join(rel);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(src, dest)?;
-        }
-
-        Ok(record)
+    pub fn rewind_to_checkpoint(&self, id: Uuid) -> Result<CheckpointRecord> {
+        let plan = self.preview_restore(id, &[])?;
+        self.apply_restore(plan.id, true)?;
+        self.store
+            .load_checkpoint(id)?
+            .ok_or_else(|| anyhow!("Checkpoint unavailable"))
     }
 
     pub fn list_checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
@@ -649,8 +437,19 @@ impl MemoryManager {
             RewindAction::RestoreCodeAndConversation | RewindAction::RestoreConversationOnly
         );
 
+        let plan = self.preview_restore(checkpoint_id, &[])?;
+        if conversation_rewound {
+            anyhow::ensure!(
+                plan.session_id.is_some() && plan.cursor.is_some(),
+                "Checkpoint has no recorded conversation boundary"
+            );
+        }
         if code_restored {
-            self.rewind_to_checkpoint(checkpoint_id)?;
+            self.apply_restore(plan.id, true)?;
+        }
+        if conversation_rewound {
+            self.store
+                .fork_session_at_cursor(plan.session_id.unwrap(), plan.cursor.unwrap())?;
         }
 
         Ok(RewindResult {
@@ -668,145 +467,30 @@ impl MemoryManager {
     /// git's object store directly. Falls back to file-based checkpoint if
     /// not in a git repo.
     pub fn create_shadow_commit(&self, reason: &str) -> Result<ShadowCommit> {
-        let commit_id = Uuid::now_v7();
-        let ref_name = format!("refs/codingbuddy-shadow/{commit_id}");
-        let workspace = &self.workspace;
-
-        // Check if we're in a git repo
-        let git_status = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-            .args(["rev-parse", "--git-dir"])
-            .current_dir(workspace)
-            .output();
-
-        if !git_status.as_ref().is_ok_and(|s| s.status.success()) {
-            // Not a git repo — fall back to file-based checkpoint
-            let record = self.create_checkpoint(reason)?;
-            return Ok(ShadowCommit {
-                id: commit_id,
-                ref_name,
-                reason: reason.to_string(),
-                created_at: record.created_at,
-                git_backed: false,
-            });
-        }
-
-        // Stage all tracked + untracked files to a temporary index
-        let stash_result = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-            .args(["stash", "create"])
-            .current_dir(workspace)
-            .output()?;
-
-        let tree_sha = if stash_result.status.success() && !stash_result.stdout.is_empty() {
-            // We have changes — use the stash tree
-            let stash_sha = String::from_utf8_lossy(&stash_result.stdout)
-                .trim()
-                .to_string();
-            // Get the tree from the stash commit
-            let tree_out = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-                .args(["rev-parse", &format!("{stash_sha}^{{tree}}")])
-                .current_dir(workspace)
-                .output()?;
-            String::from_utf8_lossy(&tree_out.stdout).trim().to_string()
-        } else {
-            // No changes — use HEAD tree
-            let head_tree = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-                .args(["rev-parse", "HEAD^{tree}"])
-                .current_dir(workspace)
-                .output()?;
-            if !head_tree.status.success() {
-                return Err(anyhow!("no git HEAD found for shadow commit"));
-            }
-            String::from_utf8_lossy(&head_tree.stdout)
-                .trim()
-                .to_string()
-        };
-
-        // Create a commit object from the tree
-        let commit_msg = format!("codingbuddy shadow: {reason} [{commit_id}]");
-        let commit_out = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-            .args(["commit-tree", &tree_sha, "-m", &commit_msg])
-            .current_dir(workspace)
-            .output()?;
-
-        if !commit_out.status.success() {
-            return Err(anyhow!(
-                "git commit-tree failed: {}",
-                String::from_utf8_lossy(&commit_out.stderr)
-            ));
-        }
-
-        let commit_sha = String::from_utf8_lossy(&commit_out.stdout)
-            .trim()
-            .to_string();
-
-        // Create the hidden ref
-        let ref_result = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-            .args(["update-ref", &ref_name, &commit_sha])
-            .current_dir(workspace)
-            .output()?;
-
-        if !ref_result.status.success() {
-            return Err(anyhow!(
-                "git update-ref failed: {}",
-                String::from_utf8_lossy(&ref_result.stderr)
-            ));
-        }
-
-        let now = Utc::now().to_rfc3339();
+        let record = self.create_checkpoint(&format!("shadow:{reason}"))?;
         Ok(ShadowCommit {
-            id: commit_id,
-            ref_name,
-            reason: reason.to_string(),
-            created_at: now,
-            git_backed: true,
+            id: record.checkpoint_id,
+            ref_name: format!("checkpoint:{}", record.checkpoint_id),
+            reason: reason.into(),
+            created_at: record.created_at,
+            git_backed: false,
         })
     }
 
-    /// Restore workspace files from a shadow commit ref.
+    /// New shadows use the same scoped restore journal as ordinary checkpoints.
     pub fn restore_shadow_commit(&self, shadow_id: Uuid) -> Result<()> {
-        let ref_name = format!("refs/codingbuddy-shadow/{shadow_id}");
-        let workspace = &self.workspace;
-
-        // Check if the ref exists
-        let verify = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-            .args(["rev-parse", "--verify", &ref_name])
-            .current_dir(workspace)
-            .output()?;
-
-        if !verify.status.success() {
-            // Try file-based checkpoint fallback
-            self.rewind_to_checkpoint(shadow_id)?;
-            return Ok(());
+        if self.store.load_checkpoint(shadow_id)?.is_some() {
+            return self.rewind_to_checkpoint(shadow_id).map(|_| ());
         }
-
-        let commit_sha = String::from_utf8_lossy(&verify.stdout).trim().to_string();
-
-        // Restore files: checkout tree from shadow commit
-        let checkout = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-            .args(["checkout", &commit_sha, "--", "."])
-            .current_dir(workspace)
-            .output()?;
-
-        if !checkout.status.success() {
-            return Err(anyhow!(
-                "git checkout from shadow commit failed: {}",
-                String::from_utf8_lossy(&checkout.stderr)
-            ));
-        }
-
-        // Unstage the checkout so working tree is clean but not committed
-        let _ = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
-            .args(["reset", "HEAD", "."])
-            .current_dir(workspace)
-            .output();
-
-        Ok(())
+        anyhow::bail!(
+            "Legacy shadow restore lacks verifiable provenance; inspect or export it manually"
+        )
     }
 
     /// List all shadow commit refs.
     pub fn list_shadow_commits(&self) -> Result<Vec<ShadowCommit>> {
         let workspace = &self.workspace;
-        let output = codingbuddy_core::process_env::git_command(workspace, "git_checkpoint")
+        let output = codingbuddy_core::process_env::git_inspection(workspace)
             .args([
                 "for-each-ref",
                 "--format=%(refname)\t%(subject)\t%(creatordate:iso-strict)",
@@ -815,12 +499,25 @@ impl MemoryManager {
             .current_dir(workspace)
             .output()?;
 
+        let versioned = self
+            .store
+            .list_checkpoints()?
+            .into_iter()
+            .filter(|record| record.reason.starts_with("shadow:"))
+            .map(|record| ShadowCommit {
+                id: record.checkpoint_id,
+                ref_name: format!("checkpoint:{}", record.checkpoint_id),
+                reason: record.reason.trim_start_matches("shadow:").into(),
+                created_at: record.created_at,
+                git_backed: false,
+            })
+            .collect::<Vec<_>>();
         if !output.status.success() {
-            return Ok(Vec::new());
+            return Ok(versioned);
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut commits = Vec::new();
+        let mut commits = versioned;
         for line in stdout.lines() {
             let parts: Vec<&str> = line.splitn(3, '\t').collect();
             if parts.len() < 2 {
@@ -946,6 +643,18 @@ impl MemoryManager {
             after,
         };
 
+        for file in &snapshot.after {
+            let files = WorkspaceFs::open(&self.workspace)?;
+            let relative = files.relative(Path::new(&file.path))?;
+            self.store.record_postimage(
+                &relative,
+                if file.exists {
+                    Some(file.content_hash.as_str())
+                } else {
+                    None
+                },
+            )?;
+        }
         // Persist to snapshot log
         let snapshots_dir = runtime_dir(&self.workspace).join("snapshots");
         fs::create_dir_all(&snapshots_dir)?;
@@ -957,41 +666,14 @@ impl MemoryManager {
     }
 
     /// Revert to a snapshot's "before" state — restores files to their pre-tool state.
-    pub fn revert_to_snapshot(&self, snapshot_id: Uuid) -> Result<Vec<String>> {
-        let snapshots_dir = runtime_dir(&self.workspace).join("snapshots");
-        let path = snapshots_dir.join(format!("{snapshot_id}.json"));
-        let json = fs::read_to_string(&path)?;
-        let snapshot: StepSnapshot = serde_json::from_str(&json)?;
-
-        let mut restored = Vec::new();
-
-        for file_snap in &snapshot.before {
-            let abs_path = if Path::new(&file_snap.path).is_absolute() {
-                PathBuf::from(&file_snap.path)
-            } else {
-                self.workspace.join(&file_snap.path)
-            };
-
-            if !file_snap.exists {
-                // File didn't exist before — delete the new file
-                if abs_path.exists() {
-                    fs::remove_file(&abs_path)?;
-                    restored.push(format!("deleted {}", file_snap.path));
-                }
-            } else if let Some(ref content) = file_snap.full_content {
-                // Full content available — write it back.
-                if let Some(parent) = abs_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&abs_path, content)?;
-                restored.push(format!("restored {}", file_snap.path));
-            } else {
-                // File too large for inline snapshot — needs git-based revert.
-                restored.push(format!("needs git revert (>1MB): {}", file_snap.path));
-            }
-        }
-
-        Ok(restored)
+    pub fn revert_to_snapshot(&self, id: Uuid) -> Result<Vec<String>> {
+        let plan = self.preview_step_restore(id)?;
+        let restored = self.apply_restore(plan.id, true)?;
+        Ok(restored
+            .entries
+            .into_iter()
+            .map(|entry| entry.path.to_string_lossy().into_owned())
+            .collect())
     }
 
     /// List all step snapshots, newest first.
@@ -1449,6 +1131,26 @@ fn render_html_export(transcript: &[String], session_id: Uuid) -> String {
 mod tests {
     use super::*;
 
+    fn linked_checkpoint(manager: &MemoryManager) -> CheckpointRecord {
+        let id = Uuid::now_v7();
+        manager
+            .store
+            .save_session(&codingbuddy_core::Session {
+                session_id: id,
+                workspace_root: manager.workspace.to_string_lossy().into_owned(),
+                baseline_commit: None,
+                status: codingbuddy_core::SessionState::Idle,
+                budgets: codingbuddy_core::SessionBudgets {
+                    per_turn_seconds: 30,
+                    max_think_tokens: 100,
+                },
+                active_plan_id: None,
+            })
+            .unwrap();
+        manager
+            .create_checkpoint_linked("test", &[], Some(id))
+            .unwrap()
+    }
     #[test]
     fn initializes_and_reads_memory() {
         let workspace =
@@ -1469,6 +1171,13 @@ mod tests {
         let manager = MemoryManager::new(&workspace).expect("manager");
         let checkpoint = manager.create_checkpoint("test").expect("checkpoint");
         fs::write(workspace.join("a.txt"), "two").expect("mutate");
+        manager
+            .store
+            .record_postimage(
+                Path::new("a.txt"),
+                Some(&format!("{:x}", Sha256::digest(b"two"))),
+            )
+            .unwrap();
 
         manager
             .rewind_to_checkpoint(checkpoint.checkpoint_id)
@@ -1739,8 +1448,15 @@ mod tests {
         fs::write(workspace.join("f.txt"), "original").expect("seed");
 
         let manager = MemoryManager::new(&workspace).expect("manager");
-        let cp = manager.create_checkpoint("test").expect("checkpoint");
+        let cp = linked_checkpoint(&manager);
         fs::write(workspace.join("f.txt"), "mutated").expect("mutate");
+        manager
+            .store
+            .record_postimage(
+                Path::new("f.txt"),
+                Some(&format!("{:x}", Sha256::digest(b"mutated"))),
+            )
+            .unwrap();
 
         let result = manager
             .rewind_with_action(
@@ -1765,6 +1481,13 @@ mod tests {
         let manager = MemoryManager::new(&workspace).expect("manager");
         let cp = manager.create_checkpoint("test").expect("checkpoint");
         fs::write(workspace.join("g.txt"), "mutated").expect("mutate");
+        manager
+            .store
+            .record_postimage(
+                Path::new("g.txt"),
+                Some(&format!("{:x}", Sha256::digest(b"mutated"))),
+            )
+            .unwrap();
 
         let result = manager
             .rewind_with_action(
@@ -1787,7 +1510,7 @@ mod tests {
         fs::write(workspace.join("h.txt"), "original").expect("seed");
 
         let manager = MemoryManager::new(&workspace).expect("manager");
-        let cp = manager.create_checkpoint("test").expect("checkpoint");
+        let cp = linked_checkpoint(&manager);
         fs::write(workspace.join("h.txt"), "mutated").expect("mutate");
 
         let result = manager
@@ -1843,15 +1566,23 @@ mod tests {
 
         assert_eq!(cp.files_count, 2); // only a.txt and c.txt
         assert_eq!(cp.reason, "targeted");
-        // b.txt should NOT be in the snapshot
-        let snapshot = PathBuf::from(&cp.snapshot_path);
-        assert!(snapshot.join("a.txt").exists());
-        assert!(!snapshot.join("b.txt").exists());
-        assert!(snapshot.join("c.txt").exists());
+        let manifest: CheckpointManifest = serde_json::from_slice(
+            &fs::read(
+                PathBuf::from(&cp.snapshot_path)
+                    .parent()
+                    .unwrap()
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(manifest.files.contains_key(Path::new("a.txt")));
+        assert!(!manifest.files.contains_key(Path::new("b.txt")));
+        assert!(manifest.files.contains_key(Path::new("c.txt")));
     }
 
     #[test]
-    fn targeted_checkpoint_skips_binary() {
+    fn targeted_checkpoint_preserves_binary() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let workspace = workspace.path();
         fs::write(workspace.join("text.txt"), "hello").expect("write text");
@@ -1864,11 +1595,20 @@ mod tests {
             .create_checkpoint_for_files("skip-binary", &target_files)
             .expect("checkpoint");
 
-        // Binary should be skipped
-        assert_eq!(cp.files_count, 1);
-        let snapshot = PathBuf::from(&cp.snapshot_path);
-        assert!(snapshot.join("text.txt").exists());
-        assert!(!snapshot.join("binary.bin").exists());
+        assert_eq!(cp.files_count, 2);
+        let manifest: CheckpointManifest = serde_json::from_slice(
+            &fs::read(
+                PathBuf::from(&cp.snapshot_path)
+                    .parent()
+                    .unwrap()
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        manager
+            .verify_blob(&manifest.files[Path::new("binary.bin")])
+            .unwrap();
     }
 
     // ── Per-step snapshots ──

@@ -1,12 +1,10 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use codingbuddy_core::{AppConfig, EventKind, runtime_dir};
-use codingbuddy_store::{BackgroundJobRecord, Store};
+use codingbuddy_core::{AppConfig, EventKind};
+use codingbuddy_store::Store;
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::fs::{self};
+use std::path::Path;
 use uuid::Uuid;
 
 use crate::context::*;
@@ -60,12 +58,6 @@ pub(crate) fn parse_background_cmd(args: Vec<String>) -> Result<BackgroundCmd> {
             "use /background list|attach|stop|run-agent|run-shell"
         )),
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) -> Result<()> {
@@ -151,56 +143,17 @@ pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde
             let mut job = store
                 .load_background_job(job_id)?
                 .ok_or_else(|| anyhow!("background job not found: {}", args.job_id))?;
-            let metadata =
-                serde_json::from_str::<serde_json::Value>(&job.metadata_json).unwrap_or_default();
-            if job.kind == "autopilot"
-                && let Ok(run_id) = Uuid::parse_str(&job.reference)
-                && let Some(run) = store.load_autopilot_run(run_id)?
-            {
-                let stop_path = if run.stop_file.trim().is_empty() {
-                    runtime_dir(cwd).join("autopilot.stop")
-                } else {
-                    PathBuf::from(run.stop_file)
-                };
-                if let Some(parent) = stop_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(
-                    &stop_path,
-                    format!("stop requested at {}\n", Utc::now().to_rfc3339()),
-                )?;
-            }
-            let mut terminated_pid = false;
-            if let Some(pid) = metadata.get("pid").and_then(|value| value.as_u64()) {
-                match terminate_background_pid(pid as u32) {
-                    Ok(_) => terminated_pid = true,
-                    Err(err) => {
-                        eprintln!("warning: failed to terminate background pid {pid}: {err}");
-                    }
-                }
-            }
-            job.status = "stopped".to_string();
+            let cancelled = store.cancel_operation(job_id)?;
+            anyhow::ensure!(
+                cancelled > 0,
+                "Legacy background job has no owned cancellation channel; inspect it locally before terminating any process"
+            );
+            job.status = "cancelling".into();
             job.updated_at = Utc::now().to_rfc3339();
-            job.metadata_json = serde_json::json!({
-                "reason":"manual_stop",
-                "terminated_pid": terminated_pid,
-                "previous": metadata,
-            })
-            .to_string();
             store.upsert_background_job(&job)?;
-            append_control_event(
-                cwd,
-                EventKind::BackgroundJobStopped {
-                    job_id,
-                    reason: "manual_stop".to_string(),
-                },
-            )?;
-            Ok(json!({
-                "job_id": job_id,
-                "stopped": true,
-                "terminated_pid": terminated_pid
-            }))
+            Ok(json!({"job_id":job_id,"stopped":false,"status":"cancelling"}))
         }
+
         BackgroundCmd::RunAgent(args) => {
             let prompt = args.prompt.join(" ").trim().to_string();
             if prompt.is_empty() {
@@ -208,156 +161,39 @@ pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde
             }
             let cfg = AppConfig::ensure(cwd)?;
             codingbuddy_llm::check_provider(&cfg.llm)?;
-            let exe = std::env::current_exe()?;
-            let mut command = Command::new(exe);
-            command.arg("ask").arg(&prompt);
-            if args.tools {
-                command.arg("--tools");
-            }
-            spawn_background_process(
+            let session = ensure_session_record(cwd, &store)?;
+            crate::worker::spawn(
                 cwd,
-                "agent",
-                format!("ask:{}", &sha256_hex(prompt.as_bytes())[..12]),
-                json!({
-                    "prompt": prompt,
-                    "tools": args.tools,
-                    "command": "deepseek ask",
-                }),
-                command,
+                session.session_id,
+                crate::worker::WorkerJob::Agent {
+                    prompt,
+                    tools: args.tools,
+                    session: session.session_id,
+                    task: None,
+                    max_turns: None,
+                },
+                cfg,
+                None,
             )
         }
+
         BackgroundCmd::RunShell(args) => {
             let command_line = args.command.join(" ").trim().to_string();
             if command_line.is_empty() {
                 return Err(anyhow!("background run-shell command is empty"));
             }
-            let (shell_label, mut command) = build_background_shell_command(&command_line);
-            codingbuddy_core::process_env::apply_for(
-                &mut command,
+            let session = ensure_session_record(cwd, &store)?;
+            crate::worker::spawn(
                 cwd,
-                "shell",
-                codingbuddy_core::process_env::Source::Project,
-            );
-            spawn_background_process(
-                cwd,
-                "shell",
-                format!("shell:{}", &sha256_hex(command_line.as_bytes())[..12]),
-                json!({
-                    "command_line": command_line,
-                    "shell": shell_label,
-                }),
-                command,
+                session.session_id,
+                crate::worker::WorkerJob::Shell {
+                    command: command_line,
+                },
+                AppConfig::ensure(cwd)?,
+                None,
             )
         }
     }
-}
-
-pub(crate) fn build_background_shell_command(command_line: &str) -> (String, Command) {
-    #[cfg(windows)]
-    {
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
-        let mut command = Command::new(&shell);
-        command.args(["/D", "/C"]).arg(command_line);
-        (shell, command)
-    }
-    #[cfg(not(windows))]
-    {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut command = Command::new(&shell);
-        command.arg("-c").arg(command_line);
-        (shell, command)
-    }
-}
-
-pub(crate) fn spawn_background_process(
-    cwd: &Path,
-    kind: &str,
-    reference: String,
-    metadata: serde_json::Value,
-    command: Command,
-) -> Result<serde_json::Value> {
-    spawn_background_process_for_session(cwd, None, kind, reference, metadata, command)
-}
-
-pub(crate) fn spawn_background_process_for_session(
-    cwd: &Path,
-    session_id: Option<Uuid>,
-    kind: &str,
-    reference: String,
-    metadata: serde_json::Value,
-    mut command: Command,
-) -> Result<serde_json::Value> {
-    let store = Store::new(cwd)?;
-    let session = if let Some(session_id) = session_id {
-        store
-            .load_session(session_id)?
-            .ok_or_else(|| anyhow!("session not found: {session_id}"))?
-    } else {
-        ensure_session_record(cwd, &store)?
-    };
-    let job_id = Uuid::now_v7();
-    let started_at = Utc::now().to_rfc3339();
-    let log_dir = runtime_dir(cwd).join("background").join(kind);
-    fs::create_dir_all(&log_dir)?;
-    let stdout_log = log_dir.join(format!("{job_id}.stdout.log"));
-    let stderr_log = log_dir.join(format!("{job_id}.stderr.log"));
-    let stdout_file = File::create(&stdout_log)?;
-    let stderr_file = File::create(&stderr_log)?;
-    command
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
-    let child = command.spawn()?;
-    let pid = child.id();
-
-    let mut metadata_map = metadata.as_object().cloned().unwrap_or_default();
-    metadata_map.insert("pid".to_string(), json!(pid));
-    metadata_map.insert(
-        "stdout_log".to_string(),
-        json!(stdout_log.to_string_lossy().to_string()),
-    );
-    metadata_map.insert(
-        "stderr_log".to_string(),
-        json!(stderr_log.to_string_lossy().to_string()),
-    );
-    metadata_map.insert("started_at".to_string(), json!(started_at.clone()));
-    let metadata_value = serde_json::Value::Object(metadata_map);
-
-    let record = BackgroundJobRecord {
-        job_id,
-        kind: kind.to_string(),
-        reference: reference.clone(),
-        status: "running".to_string(),
-        metadata_json: metadata_value.to_string(),
-        started_at: started_at.clone(),
-        updated_at: started_at.clone(),
-    };
-    store.upsert_background_job(&record)?;
-    store.append_event(&codingbuddy_store::NewEvent {
-        event_id: uuid::Uuid::now_v7(),
-        at: Utc::now(),
-        session_id: session.session_id,
-        kind: EventKind::BackgroundJobStarted {
-            job_id,
-            kind: kind.to_string(),
-            reference: reference.clone(),
-        },
-    })?;
-    // Replay projection currently stores '{}' for BackgroundJobStarted metadata.
-    // Re-apply the richer metadata payload after emitting the canonical event.
-    store.upsert_background_job(&record)?;
-
-    Ok(json!({
-        "job_id": job_id,
-        "kind": kind,
-        "status": "running",
-        "reference": reference,
-        "pid": pid,
-        "stdout_log": stdout_log,
-        "stderr_log": stderr_log,
-        "metadata": metadata_value,
-    }))
 }
 
 pub(crate) fn tail_file_lines(path: &Path, max_lines: usize) -> Option<String> {
@@ -370,26 +206,4 @@ pub(crate) fn tail_file_lines(path: &Path, max_lines: usize) -> Option<String> {
     let keep = max_lines.max(1);
     let start = lines.len().saturating_sub(keep);
     Some(lines[start..].join("\n"))
-}
-
-pub(crate) fn terminate_background_pid(pid: u32) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("taskkill failed for pid {}", pid));
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let status = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("kill -TERM failed for pid {}", pid));
-        }
-    }
-    Ok(())
 }

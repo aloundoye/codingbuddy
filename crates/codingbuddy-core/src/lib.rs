@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub mod complexity;
 pub mod config_watcher;
 pub mod cost;
+pub mod execution;
 mod llm_capabilities;
 mod model_catalog;
 pub mod process_env;
@@ -1482,12 +1483,44 @@ impl EventKind {
 
 #[derive(Clone, Copy, Default)]
 pub struct ToolExecutionContext<'a> {
+    pub prompt_id: Option<Uuid>,
+    pub parent_run_id: Option<Uuid>,
+    pub deadline: Option<std::time::Instant>,
     pub session_id: Option<Uuid>,
     pub invocation_id: Option<Uuid>,
     pub cancellation: Option<&'a CancellationToken>,
 }
 
+impl ToolExecutionContext<'_> {
+    pub fn execution(&self) -> execution::ExecutionContext {
+        execution::ExecutionContext {
+            session_id: self.session_id,
+            prompt_id: self.prompt_id,
+            invocation_id: self.invocation_id,
+            parent_run_id: self.parent_run_id,
+            deadline: self.deadline,
+            cancellation: self.cancellation.cloned().unwrap_or_default(),
+        }
+    }
+}
+
 pub trait ToolHost {
+    fn scoped_workspace(
+        &self,
+        _workspace: &std::path::Path,
+    ) -> anyhow::Result<std::sync::Arc<dyn ToolHost + Send + Sync>> {
+        anyhow::bail!("This tool transport cannot change execution workspace")
+    }
+    fn verify_command(
+        &self,
+        _command: &str,
+        _cwd: &Path,
+        _timeout: u64,
+        _context: ToolExecutionContext<'_>,
+    ) -> serde_json::Value {
+        serde_json::json!({"success":false,"status":"unavailable"})
+    }
+
     fn approval_details(&self, _invocation: Uuid) -> Option<String> {
         None
     }
@@ -1943,32 +1976,56 @@ pub type StreamCallback = std::sync::Arc<dyn Fn(StreamChunk) + Send + Sync>;
 /// Set by the UI layer (e.g. on Ctrl+C), checked by the LLM streaming loop.
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: std::sync::Arc<CancellationState>,
+}
+
+#[derive(Debug)]
+struct CancellationState {
+    cancelled: std::sync::atomic::AtomicBool,
+    parent: Option<std::sync::Arc<CancellationState>>,
 }
 
 impl CancellationToken {
-    /// Create a new token in the "not cancelled" state.
     pub fn new() -> Self {
         Self {
-            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            state: std::sync::Arc::new(CancellationState {
+                cancelled: false.into(),
+                parent: None,
+            }),
         }
     }
-
-    /// Signal cancellation.
+    /// A child observes its ancestors, but cannot cancel its parent or siblings.
+    pub fn child_token(&self) -> Self {
+        Self {
+            state: std::sync::Arc::new(CancellationState {
+                cancelled: false.into(),
+                parent: Some(self.state.clone()),
+            }),
+        }
+    }
     pub fn cancel(&self) {
-        self.cancelled
+        self.state
+            .cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
-
-    /// Check whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        let mut state = Some(self.state.as_ref());
+        while let Some(current) = state {
+            if current.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            state = current.parent.as_deref();
+        }
+        false
     }
-
-    /// Reset the token to "not cancelled" for reuse across turns.
+    /// Compatibility only: active scopes must create fresh tokens. A shared or
+    /// parented token cannot be reset and resurrect an owned operation.
     pub fn reset(&self) {
-        self.cancelled
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if self.state.parent.is_none() && std::sync::Arc::strong_count(&self.state) == 1 {
+            self.state
+                .cancelled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 

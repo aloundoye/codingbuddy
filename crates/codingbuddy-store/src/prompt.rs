@@ -99,6 +99,7 @@ impl Store {
         let id = Uuid::now_v7();
         tx.execute("INSERT INTO runtime_prompts(id,session_id,request_id,request,status) VALUES(?1,?2,?3,?4,'running')",
             params![id.to_string(),session.to_string(),request.to_string(),serde_json::to_string(input)?])?;
+        tx.execute("INSERT INTO runtime_operations(id,session_id,kind,state,payload) VALUES(?1,?2,'prompt','running','{}')",params![id.to_string(),session.to_string()])?;
         tx.commit()?;
         Ok(id)
     }
@@ -217,6 +218,10 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute("UPDATE runtime_prompts SET status=?2,output=?3,error=?4 WHERE id=?1 AND status='running'", params![id.to_string(),status,output,error])?;
         anyhow::ensure!(changed == 1, "prompt already settled");
+        tx.execute(
+            "UPDATE runtime_operations SET state=?2 WHERE id=?1 AND state='running'",
+            params![id.to_string(), status],
+        )?;
         tx.execute(
             "INSERT INTO runtime_prompt_events(prompt_id,payload) VALUES(?1,?2)",
             params![

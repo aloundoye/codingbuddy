@@ -22,3 +22,10 @@ codingbuddy-store = { path = "../codingbuddy-store" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "time", "net"]
+
+[dependencies.jsonschema]
+workspace = true

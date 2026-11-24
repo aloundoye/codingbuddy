@@ -200,7 +200,10 @@ pub struct ToolUseLoop<'a> {
     /// Count of edit/write tool calls since entering Execute phase.
     phase_edit_calls: usize,
     /// Active worktree isolation (if enter_worktree was called).
+    pub(crate) deadline: Option<std::time::Instant>,
+    pub(crate) parent_run_id: Option<Uuid>,
     pub(crate) active_worktree: Option<codingbuddy_subagent::WorktreeIsolation>,
+    worktree_tool_host: Option<Arc<dyn ToolHost + Send + Sync>>,
     /// Recently accessed file paths, ordered by most recent access.
     /// Used for post-compaction re-injection of active context.
     recent_file_accesses: Vec<String>,
@@ -297,6 +300,9 @@ impl<'a> ToolUseLoop<'a> {
             phase_read_only_calls: 0,
             phase_edit_calls: 0,
             active_worktree: None,
+            deadline: None,
+            parent_run_id: None,
+            worktree_tool_host: None,
             recent_file_accesses: Vec::new(),
             config_watcher: None,
             cancellation: None,
@@ -357,6 +363,9 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     fn workspace_store(&self) -> Result<Store> {
+        if let Some((store, _)) = &self.durable_session {
+            return Ok(store.clone());
+        }
         let workspace = self
             .config
             .workspace
@@ -912,8 +921,8 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Fire a hook event and log any failures.
-    fn fire_hook_logged(hooks: &HookRuntime, event: HookEvent, input: &HookInput) {
-        let result = hooks.fire(event, input);
+    fn fire_hook_logged(&self, hooks: &HookRuntime, event: HookEvent, input: &HookInput) {
+        let result = hooks.fire_with_context(event, input, &self.execution_context());
         for run in &result.runs {
             if !run.success {
                 eprintln!(
@@ -1648,6 +1657,11 @@ impl<'a> ToolUseLoop<'a> {
 
     fn check_cancellation(&self) -> Result<()> {
         anyhow::ensure!(
+            self.deadline
+                .is_none_or(|deadline| std::time::Instant::now() < deadline),
+            "Turn deadline exceeded"
+        );
+        anyhow::ensure!(
             !self
                 .cancellation
                 .as_ref()
@@ -1883,7 +1897,7 @@ impl<'a> ToolUseLoop<'a> {
         if let Some(ref hooks) = self.hooks {
             let mut input = HookInput::new(HookEvent::PreCompact, self.workspace_str());
             input.tool_result = Some(serde_json::Value::String(summary.clone()));
-            Self::fire_hook_logged(hooks, HookEvent::PreCompact, &input);
+            self.fire_hook_logged(hooks, HookEvent::PreCompact, &input);
         }
 
         // Scan compacted messages for any directives we haven't captured yet
@@ -1967,7 +1981,7 @@ impl<'a> ToolUseLoop<'a> {
         // Fire PostCompact hook if configured
         if let Some(ref hooks) = self.hooks {
             let input = HookInput::new(HookEvent::PostCompact, self.workspace_str());
-            Self::fire_hook_logged(hooks, HookEvent::PostCompact, &input);
+            self.fire_hook_logged(hooks, HookEvent::PostCompact, &input);
         }
 
         true
@@ -2015,6 +2029,16 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Get the workspace path as a `Path` reference.
+    fn execution_context(&self) -> codingbuddy_core::execution::ExecutionContext {
+        codingbuddy_core::execution::ExecutionContext {
+            session_id: self.durable_session.as_ref().map(|(_, session)| *session),
+            prompt_id: self.durable_prompt,
+            invocation_id: self.durable_invocation.map(|(id, _)| id),
+            cancellation: self.cancellation.clone().unwrap_or_default(),
+            deadline: self.deadline,
+            parent_run_id: self.parent_run_id,
+        }
+    }
     fn workspace_path(&self) -> &std::path::Path {
         if let Some(ref wt) = self.active_worktree {
             wt.path()

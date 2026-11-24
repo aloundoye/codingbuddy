@@ -33,6 +33,40 @@ impl WorkspaceFs {
         })
     }
 
+    /// Open or create a subordinate capability without following directory links.
+    pub fn subdir(&self, path: &Path, create: bool) -> io::Result<Self> {
+        let relative = self.relative(path)?;
+        let mut dir = self.dir.try_clone()?;
+        for component in relative.components() {
+            let part = component.as_os_str();
+            if create {
+                match dir.create_dir(part) {
+                    Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+                        return Err(error);
+                    }
+                    _ => {}
+                }
+            }
+            dir = dir.open_dir_nofollow(part)?;
+        }
+        let root = self.root.join(&relative);
+        Ok(Self {
+            original: root.clone(),
+            root,
+            dir,
+        })
+    }
+    pub fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let from = self.relative(from)?;
+        let to = self.relative(to)?;
+        let source = self.open_directory(from.parent().unwrap_or(Path::new("")))?;
+        let target = self.open_directory(to.parent().unwrap_or(Path::new("")))?;
+        source.rename(
+            from.file_name().ok_or_else(invalid_path)?,
+            &target,
+            to.file_name().ok_or_else(invalid_path)?,
+        )
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -150,6 +184,70 @@ impl WorkspaceFs {
         let mut output = self.file(resolved, true, true)?;
         output.set_len(0)?;
         io::copy(input, &mut output)
+    }
+
+    /// Replace within an already verified directory; never follow the final link.
+    pub fn replace_from(
+        &self,
+        path: &Path,
+        input: &mut impl Read,
+        mode: Option<u32>,
+    ) -> io::Result<()> {
+        let path = self.relative(path)?;
+        let name = path.file_name().ok_or_else(invalid_path)?;
+        let mut dir = self.dir.try_clone()?;
+        for component in path.parent().unwrap_or(Path::new("")).components() {
+            let part = component.as_os_str();
+            match dir.create_dir(part) {
+                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+                _ => {}
+            }
+            dir = dir.open_dir_nofollow(part)?;
+        }
+        match dir.symlink_metadata(name) {
+            Ok(meta) if is_link(&meta) || !meta.is_file() => return Err(invalid_path()),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let temporary = format!(".codingbuddy-restore-{}", uuid::Uuid::now_v7());
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let result = (|| {
+            let mut file = dir.open_with(&temporary, &options)?.into_std();
+            io::copy(input, &mut file)?;
+            #[cfg(unix)]
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            file.sync_all()?;
+            drop(file);
+            match dir.symlink_metadata(name) {
+                Ok(meta) if is_link(&meta) || !meta.is_file() => return Err(invalid_path()),
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+            dir.rename(&temporary, &dir, name)
+        })();
+        if result.is_err() {
+            let _ = dir.remove_file(&temporary);
+        }
+        result
+    }
+    pub fn remove_file(&self, path: &Path) -> io::Result<()> {
+        let path = self.relative(path)?;
+        let name = path.file_name().ok_or_else(invalid_path)?;
+        let dir = self.open_directory(path.parent().unwrap_or(Path::new("")))?;
+        let meta = dir.symlink_metadata(name)?;
+        if is_link(&meta) || !meta.is_file() {
+            return Err(invalid_path());
+        }
+        dir.remove_file(name)
     }
 
     fn file(&self, path: &Path, write: bool, create: bool) -> io::Result<File> {

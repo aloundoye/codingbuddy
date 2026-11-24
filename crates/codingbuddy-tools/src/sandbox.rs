@@ -20,6 +20,7 @@ enum Backend {
 pub(super) struct ShellLaunch {
     expression: String,
     workspace: PathBuf,
+    cwd: PathBuf,
     #[cfg(unix)]
     workspace_identity: (u64, u64),
     environment: Variables,
@@ -93,6 +94,7 @@ impl ShellLaunch {
         let environment = process_env::variables(&workspace, "shell", Source::Project);
         Ok(Self {
             expression: expression.to_owned(),
+            cwd: workspace.clone(),
             workspace,
             #[cfg(unix)]
             workspace_identity,
@@ -101,6 +103,16 @@ impl ShellLaunch {
             read_only,
             block_network,
         })
+    }
+
+    pub(super) fn set_cwd(&mut self, cwd: &Path) -> Result<()> {
+        let cwd = cwd.canonicalize()?;
+        ensure!(
+            cwd.starts_with(&self.workspace),
+            "Command working directory outside workspace"
+        );
+        self.cwd = cwd;
+        Ok(())
     }
 
     pub(super) fn is_isolated(&self) -> bool {
@@ -179,7 +191,7 @@ impl ShellLaunch {
         let _ = on_progress;
         run_shell_launch(
             command,
-            &self.workspace,
+            &self.cwd,
             timeout,
             cancellation,
             #[cfg(unix)]
@@ -239,7 +251,7 @@ impl ShellLaunch {
             .arg(&self.workspace)
             .arg(&self.workspace)
             .arg("--chdir")
-            .arg(&self.workspace);
+            .arg(&self.cwd);
         if self.block_network {
             block_linux_sockets(&mut command)?;
         }

@@ -1,3 +1,4 @@
+mod sessions;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::Utc;
@@ -121,6 +122,9 @@ pub struct McpManager {
     workspace: PathBuf,
     store: Store,
     trusted_workspace: bool,
+    sessions: sessions::Sessions,
+    catalog: std::sync::Mutex<BTreeMap<String, (Vec<u8>, McpTool)>>,
+    catalog_fingerprints: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl McpManager {
@@ -133,7 +137,108 @@ impl McpManager {
             workspace: workspace.to_path_buf(),
             store: Store::new(workspace)?,
             trusted_workspace,
+            sessions: Default::default(),
+            catalog: Default::default(),
+            catalog_fingerprints: Default::default(),
         })
+    }
+
+    pub fn session_states(&self) -> BTreeMap<String, String> {
+        self.sessions.states.lock().unwrap().clone()
+    }
+
+    pub fn request_server(
+        &self,
+        server: &McpServer,
+        method: &str,
+        params: serde_json::Value,
+        cancellation: Option<&codingbuddy_core::CancellationToken>,
+    ) -> Result<serde_json::Value> {
+        let context = codingbuddy_core::execution::ExecutionContext {
+            cancellation: cancellation.cloned().unwrap_or_default(),
+            deadline: Some(Instant::now() + Duration::from_secs(30)),
+            ..Default::default()
+        };
+        self.sessions.request(server, method, params, &context)
+    }
+
+    fn request_list(
+        &self,
+        server: &McpServer,
+        method: &str,
+        key: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut params = json!({});
+        let mut items = Vec::new();
+        let mut cursors = BTreeSet::new();
+        loop {
+            let response = self.request_server(server, method, params, None)?;
+            let result = response.get("result").context("MCP list result missing")?;
+            items.extend(
+                result
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .context("MCP list items missing")?
+                    .iter()
+                    .cloned(),
+            );
+            anyhow::ensure!(items.len() <= 100_000, "MCP catalog limit exceeded");
+            let Some(cursor) = result.get("nextCursor").and_then(|v| v.as_str()) else {
+                return Ok(items);
+            };
+            anyhow::ensure!(
+                cursors.len() < 1024 && cursors.insert(cursor.to_owned()),
+                "MCP pagination did not progress"
+            );
+            params = json!({"cursor":cursor});
+        }
+    }
+    pub fn call_tool(
+        &self,
+        alias: &str,
+        args: &serde_json::Value,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> Result<serde_json::Value> {
+        let (expected, tool) = self
+            .catalog
+            .lock()
+            .unwrap()
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| anyhow!("MCP tool is not in the active registry"))?;
+        let server = self
+            .get_server(&tool.server_id)?
+            .ok_or_else(|| anyhow!("MCP server disabled or denied"))?;
+        anyhow::ensure!(
+            !self.sessions.invalidated(&server.id),
+            "MCP tool list changed or connection unavailable; refresh before approval"
+        );
+        anyhow::ensure!(
+            expected == sessions::fingerprint(&server)?,
+            "MCP configuration changed; refresh tools before approval"
+        );
+        let validator = jsonschema::validator_for(&tool.input_schema)
+            .map_err(|_| anyhow!("Invalid MCP input schema"))?;
+        anyhow::ensure!(
+            validator.is_valid(args),
+            "MCP arguments do not match the discovered schema"
+        );
+        let mut execution = context.execution();
+        execution.deadline = Some(
+            execution
+                .deadline
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+        );
+        let result = self.sessions.request(
+            &server,
+            "tools/call",
+            json!({"name":tool.name,"arguments":args}),
+            &execution,
+        )?;
+        result
+            .get("result")
+            .cloned()
+            .context("MCP response missing result")
     }
 
     pub fn project_config_path(&self) -> PathBuf {
@@ -196,6 +301,11 @@ impl McpManager {
             if !seen.insert(server.id.clone()) || !server_allowed(&server) {
                 continue;
             }
+            if !server.metadata.is_object() {
+                server.metadata = json!({});
+            }
+            server.metadata["_codingbuddy_source"] = json!(format!("{source:?}"));
+            server.metadata["_codingbuddy_workspace"] = json!(self.workspace.canonicalize()?);
             server.child_env =
                 process_env::variables(&self.workspace, &format!("mcp:{}", server.id), source);
             if expand_server_env_vars(&mut server).is_err() {
@@ -203,6 +313,34 @@ impl McpManager {
                     "[mcp] Skipped server with invalid configuration or unauthorized environment reference"
                 );
                 continue;
+            }
+            if server.url.is_some()
+                && server.metadata.get("oauth").is_some()
+                && !server
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+            {
+                match load_mcp_token(&server.id)? {
+                    Some(token)
+                        if token.binding.as_ref() == Some(&mcp_token_binding(&server)?)
+                            && !is_token_expired(&token)
+                            && token.token_type.eq_ignore_ascii_case("Bearer") =>
+                    {
+                        server.headers.push((
+                            "Authorization".into(),
+                            format!("Bearer {}", token.access_token),
+                        ))
+                    }
+                    _ => {
+                        self.sessions
+                            .states
+                            .lock()
+                            .unwrap()
+                            .insert(server.id.clone(), "authentication_required".into());
+                        continue;
+                    }
+                }
             }
             servers.push(server);
         }
@@ -315,7 +453,19 @@ impl McpManager {
 
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
             // Skip re-discovery if cached tools are fresh enough
-            if !force && let Some(newest) = newest_by_server.get(&server.id) {
+            let same_configuration = self
+                .catalog_fingerprints
+                .lock()
+                .unwrap()
+                .get(&server.id)
+                .is_some_and(|old| {
+                    sessions::fingerprint(&server).is_ok_and(|current| *old == current)
+                });
+            if !force
+                && !self.sessions.invalidated(&server.id)
+                && same_configuration
+                && let Some(newest) = newest_by_server.get(&server.id)
+            {
                 let age = Utc::now().signed_duration_since(*newest).num_seconds();
                 if age < Self::TOOL_CACHE_TTL_SECS {
                     // Serve from cache
@@ -340,17 +490,35 @@ impl McpManager {
                 }
             }
 
-            let discovered = discover_server_tools(&server)
-                .with_context(|| format!("failed to discover MCP tools for {}", server.id))
-                .unwrap_or_else(|_| {
-                    vec![McpTool {
-                        server_id: server.id.clone(),
-                        name: format!("{}.tool", server.id),
-                        description: "fallback tool".to_string(),
-                        input_schema: serde_json::Value::Null,
-                        annotations: serde_json::Value::Null,
-                    }]
-                });
+            let discovered = match self.request_list(&server, "tools/list", "tools") {
+                Ok(items) => parse_tools_array(&server.id, &items),
+                Err(_) => {
+                    self.catalog
+                        .lock()
+                        .unwrap()
+                        .retain(|_, (_, tool)| tool.server_id != server.id);
+                    self.catalog_fingerprints.lock().unwrap().remove(&server.id);
+                    eprintln!(
+                        "[mcp] Discovery failed for {}; no tools activated",
+                        server.id
+                    );
+                    continue;
+                }
+            };
+            let fingerprint = sessions::fingerprint(&server)?;
+            self.catalog_fingerprints
+                .lock()
+                .unwrap()
+                .insert(server.id.clone(), fingerprint.clone());
+            {
+                let mut catalog = self.catalog.lock().unwrap();
+                catalog.retain(|_, (_, tool)| tool.server_id != server.id);
+                for tool in &discovered {
+                    let alias = format!("mcp__{}__{}", server.id, tool.name);
+                    anyhow::ensure!(!catalog.contains_key(&alias), "Ambiguous MCP tool alias");
+                    catalog.insert(alias, (fingerprint.clone(), tool.clone()));
+                }
+            }
             let previous = existing.get(&server.id).cloned().unwrap_or_default();
             let mut current = BTreeSet::new();
             let mut replacement_rows = Vec::new();
@@ -431,47 +599,12 @@ impl McpManager {
             .ok_or_else(|| anyhow!("MCP server not found: {server_id}"))?;
         ensure_server_enabled(&server)?;
 
-        match server.transport {
-            McpTransport::Http | McpTransport::Sse => {
-                let base_url = server
-                    .url
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("HTTP/SSE MCP server has no URL"))?;
-                let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-                let mut req = client.post(base_url);
-                for (k, v) in &server.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-                let resp: serde_json::Value = req
-                    .json(&json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "resources/read",
-                        "params": { "uri": uri }
-                    }))
-                    .send()?
-                    .error_for_status()?
-                    .json()?;
-                extract_resource_text(
-                    resp.get("result")
-                        .ok_or_else(|| anyhow!("MCP resources/read response missing result"))?,
-                )
-            }
-            McpTransport::Stdio => {
-                let response = execute_mcp_stdio_request(
-                    &server,
-                    "resources/read",
-                    json!({ "uri": uri }),
-                    2,
-                    Duration::from_secs(6),
-                )?;
-                extract_resource_text(
-                    response
-                        .get("result")
-                        .ok_or_else(|| anyhow!("MCP resources/read response missing result"))?,
-                )
-            }
-        }
+        let response = self.request_server(&server, "resources/read", json!({"uri":uri}), None)?;
+        extract_resource_text(
+            response
+                .get("result")
+                .context("MCP resources/read response missing result")?,
+        )
     }
 
     /// Import MCP servers from Claude Desktop configuration.
@@ -548,35 +681,9 @@ impl McpManager {
     pub fn list_resources(&self) -> Result<Vec<McpResource>> {
         let mut resources = Vec::new();
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
-            let discovered = match server.transport {
-                McpTransport::Stdio => execute_mcp_stdio_request(
-                    &server,
-                    "resources/list",
-                    json!({}),
-                    3,
-                    Duration::from_secs(6),
-                )
-                .ok()
-                .and_then(|r| r.get("result")?.get("resources")?.as_array().cloned()),
-                McpTransport::Http | McpTransport::Sse => server.url.as_deref().and_then(|url| {
-                    Client::builder()
-                        .timeout(Duration::from_secs(10))
-                        .build()
-                        .ok()?
-                        .post(url)
-                        .json(
-                            &json!({"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}),
-                        )
-                        .send()
-                        .ok()?
-                        .json::<serde_json::Value>()
-                        .ok()?
-                        .get("result")?
-                        .get("resources")?
-                        .as_array()
-                        .cloned()
-                }),
-            };
+            let discovered = self
+                .request_list(&server, "resources/list", "resources")
+                .ok();
             if let Some(items) = discovered {
                 for item in items {
                     resources.push(McpResource {
@@ -647,33 +754,7 @@ impl McpManager {
     pub fn list_prompts(&self) -> Result<Vec<McpPrompt>> {
         let mut prompts = Vec::new();
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
-            let discovered = match server.transport {
-                McpTransport::Stdio => execute_mcp_stdio_request(
-                    &server,
-                    "prompts/list",
-                    json!({}),
-                    4,
-                    Duration::from_secs(6),
-                )
-                .ok()
-                .and_then(|r| r.get("result")?.get("prompts")?.as_array().cloned()),
-                McpTransport::Http | McpTransport::Sse => server.url.as_deref().and_then(|url| {
-                    Client::builder()
-                        .timeout(Duration::from_secs(10))
-                        .build()
-                        .ok()?
-                        .post(url)
-                        .json(&json!({"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}))
-                        .send()
-                        .ok()?
-                        .json::<serde_json::Value>()
-                        .ok()?
-                        .get("result")?
-                        .get("prompts")?
-                        .as_array()
-                        .cloned()
-                }),
-            };
+            let discovered = self.request_list(&server, "prompts/list", "prompts").ok();
             if let Some(items) = discovered {
                 for item in items {
                     let arguments = item
@@ -745,42 +826,11 @@ impl McpManager {
             "name": prompt_name,
             "arguments": arguments,
         });
-        match server.transport {
-            McpTransport::Stdio => {
-                let response = execute_mcp_stdio_request(
-                    &server,
-                    "prompts/get",
-                    params,
-                    5,
-                    Duration::from_secs(10),
-                )?;
-                response
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("prompts/get returned no result"))
-            }
-            McpTransport::Http | McpTransport::Sse => {
-                let url = server
-                    .url
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("server has no URL"))?;
-                let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-                let response: serde_json::Value = client
-                    .post(url)
-                    .json(&json!({
-                        "jsonrpc": "2.0",
-                        "id": 5,
-                        "method": "prompts/get",
-                        "params": params,
-                    }))
-                    .send()?
-                    .json()?;
-                response
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("prompts/get returned no result"))
-            }
-        }
+        let response = self.request_server(&server, "prompts/get", params, None)?;
+        response
+            .get("result")
+            .cloned()
+            .context("MCP prompts/get returned no result")
     }
 
     /// Handle an MCP elicitation request — the server is asking the user for input.
@@ -1197,22 +1247,6 @@ fn ensure_server_enabled(server: &McpServer) -> Result<()> {
     Ok(())
 }
 
-fn stdio_fingerprint(server: &McpServer) -> [u8; 32] {
-    use std::hash::{Hash, Hasher};
-    struct DigestHasher(Sha256);
-    impl Hasher for DigestHasher {
-        fn finish(&self) -> u64 {
-            0
-        }
-        fn write(&mut self, bytes: &[u8]) {
-            self.0.update(bytes);
-        }
-    }
-    let mut hash = DigestHasher(Sha256::new());
-    (&server.command, &server.args, &server.child_env).hash(&mut hash);
-    hash.0.finalize().into()
-}
-
 fn stdio_command(server: &McpServer) -> Result<Command> {
     ensure_server_enabled(server)?;
     let executable = server
@@ -1229,70 +1263,17 @@ fn stdio_command(server: &McpServer) -> Result<Command> {
     };
     process_env::apply(&mut command, vars);
     command.args(&server.args);
+    if let Some(workspace) = server
+        .metadata
+        .get("_codingbuddy_workspace")
+        .and_then(|value| value.as_str())
+    {
+        command.current_dir(workspace);
+    }
     Ok(command)
 }
 
-fn discover_server_tools(server: &McpServer) -> Result<Vec<McpTool>> {
-    ensure_server_enabled(server)?;
-    if let Some(list) = server.metadata.get("tools").and_then(|v| v.as_array()) {
-        let tools = parse_tools_array(&server.id, list);
-        if !tools.is_empty() {
-            return Ok(tools);
-        }
-    }
-
-    match server.transport {
-        McpTransport::Http => {
-            let url = server
-                .url
-                .as_deref()
-                .ok_or_else(|| anyhow!("http transport requires url"))?;
-            let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-            // MCP uses JSON-RPC: POST with tools/list method.
-            let rpc_body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/list",
-                "params": {}
-            });
-            let value: serde_json::Value = client
-                .post(url)
-                .json(&rpc_body)
-                .send()?
-                .error_for_status()?
-                .json()?;
-            // JSON-RPC wraps the result in a "result" field.
-            let value = value.get("result").cloned().unwrap_or(value);
-            let tools = value
-                .get("tools")
-                .and_then(|v| v.as_array())
-                .map(|items| parse_tools_array(&server.id, items))
-                .unwrap_or_default();
-            Ok(tools)
-        }
-        McpTransport::Sse => discover_sse_tools(server),
-        McpTransport::Stdio => discover_stdio_tools(server),
-    }
-}
-
-fn discover_sse_tools(server: &McpServer) -> Result<Vec<McpTool>> {
-    let url = server
-        .url
-        .as_deref()
-        .ok_or_else(|| anyhow!("SSE transport requires url"))?;
-    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let mut req = client.get(url);
-    for (k, v) in &server.headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = req
-        .header("Accept", "text/event-stream")
-        .send()?
-        .error_for_status()?;
-    let text = resp.text()?;
-    parse_sse_tools(&server.id, &text)
-}
-
+#[cfg(test)]
 fn parse_sse_tools(server_id: &str, sse_text: &str) -> Result<Vec<McpTool>> {
     let mut tools = Vec::new();
     for chunk in sse_text.split("\n\n") {
@@ -1311,105 +1292,15 @@ fn parse_sse_tools(server_id: &str, sse_text: &str) -> Result<Vec<McpTool>> {
     Ok(tools)
 }
 
-fn discover_stdio_tools(server: &McpServer) -> Result<Vec<McpTool>> {
-    let mut child = stdio_command(server)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start MCP stdio server")?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("failed to open MCP stdio stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to open MCP stdio stdout"))?;
-    let (tx, rx) = mpsc::channel::<serde_json::Value>();
-
-    let reader_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
-            if tx.send(value).is_err() {
-                break;
-            }
-        }
-    });
-
-    let init = json!({
-        "protocolVersion": "2025-06-18",
-        "capabilities": {},
-        "clientInfo": {
-            "name": "codingbuddy-cli",
-            "version": "0.2.0"
-        }
-    });
-    write_mcp_request(&mut stdin, 1, "initialize", init)?;
-    write_mcp_request(&mut stdin, 2, "tools/list", json!({}))?;
-    let _ = stdin.flush();
-    drop(stdin);
-
-    let mut discovered = Vec::new();
-    for _ in 0..20 {
-        match rx.recv_timeout(Duration::from_millis(150)) {
-            Ok(message) => {
-                discovered.extend(parse_mcp_tools_message(&server.id, &message));
-                if !discovered.is_empty() {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = reader_handle.join();
-
-    if discovered.is_empty() {
-        return Err(anyhow!("no tools discovered from MCP stdio server"));
-    }
-
-    discovered.sort_by(|a, b| a.name.cmp(&b.name));
-    discovered.dedup_by(|a, b| a.name == b.name);
-    Ok(discovered)
-}
-
-/// A pooled MCP stdio connection — keeps a server process alive across requests.
-struct PooledConnection {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    rx: mpsc::Receiver<serde_json::Value>,
-    _reader_handle: Option<thread::JoinHandle<()>>,
-    last_used: Instant,
-    launch_fingerprint: [u8; 32],
-    next_request_id: u64,
-}
-
-/// Connection pool for MCP stdio servers. Keeps processes alive and reuses them
-/// across tool calls. Health checks before reuse, kills after idle timeout.
+/// Compatibility facade over the initialized transport service.
+#[derive(Default)]
 pub struct McpConnectionPool {
-    connections: std::sync::Mutex<std::collections::HashMap<String, PooledConnection>>,
-    idle_timeout: Duration,
+    sessions: sessions::Sessions,
 }
-
-/// Maximum idle time before a pooled connection is killed.
-const MCP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-
 impl McpConnectionPool {
-    /// Create a new empty connection pool.
     pub fn new() -> Self {
-        Self {
-            connections: std::sync::Mutex::new(std::collections::HashMap::new()),
-            idle_timeout: MCP_POOL_IDLE_TIMEOUT,
-        }
+        Self::default()
     }
-
-    /// Execute a request against a pooled stdio server. Reuses existing connections
-    /// or creates a new one. Health checks the connection before reuse.
     pub fn execute(
         &self,
         server: &McpServer,
@@ -1417,225 +1308,31 @@ impl McpConnectionPool {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value> {
-        ensure_server_enabled(server)?;
-        let key = server.id.clone();
-        let fingerprint = stdio_fingerprint(server);
-        let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Evict idle connections
-        pool.retain(|_, conn| conn.last_used.elapsed() < self.idle_timeout);
-
-        // Try reusing existing connection — take it out of the pool so we can
-        // release the lock before performing I/O.
-        let existing = if let Some(mut conn) = pool.remove(&key) {
-            // Health check: try_wait returns Some if process exited
-            if conn.launch_fingerprint != fingerprint
-                || conn.child.try_wait().ok().flatten().is_some()
-            {
-                let _ = conn.child.kill();
-                let _ = conn.child.wait();
-                None
-            } else {
-                conn.next_request_id += 1;
-                conn.last_used = Instant::now();
-                Some((conn.next_request_id - 1, conn))
-            }
-        } else {
-            None
-        };
-
-        if let Some((request_id, mut conn)) = existing {
-            drop(pool); // Release lock before I/O
-
-            if let Err(_e) = write_mcp_request(&mut conn.stdin, request_id, method, params.clone())
-            {
-                // Connection broken — discard and fall through to create new one
-                let _ = conn.child.kill();
-                let _ = conn.child.wait();
-            } else {
-                let _ = conn.stdin.flush();
-                let response = wait_for_mcp_response(&conn.rx, request_id, timeout);
-                // Re-insert connection into pool
-                let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
-                pool.insert(key.clone(), conn);
-                return match response {
-                    Some(value) => Ok(value),
-                    None => Err(anyhow!(
-                        "MCP pooled request timed out: method={method} timeout_ms={}",
-                        timeout.as_millis()
-                    )),
-                };
-            }
-        } else {
-            drop(pool); // Release lock before creating new connection
-        }
-
-        // Create new connection (lock already released above)
-        let conn = self.create_connection(server)?;
-        let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
-
-        let request_id = conn.next_request_id;
-        let mut conn = conn;
-        conn.next_request_id += 1;
-        conn.last_used = Instant::now();
-
-        write_mcp_request(&mut conn.stdin, request_id, method, params)?;
-        let _ = conn.stdin.flush();
-
-        let response = wait_for_mcp_response(&conn.rx, request_id, timeout);
-        pool.insert(key, conn);
-
-        match response {
-            Some(value) => Ok(value),
-            None => Err(anyhow!(
-                "MCP pooled request timed out: method={method} timeout_ms={}",
-                timeout.as_millis()
-            )),
-        }
+        self.sessions.request(
+            server,
+            method,
+            params,
+            &codingbuddy_core::execution::ExecutionContext {
+                deadline: Some(Instant::now() + timeout),
+                ..Default::default()
+            },
+        )
     }
-
-    /// Create a new pooled connection: spawn process, initialize MCP protocol.
-    fn create_connection(&self, server: &McpServer) -> Result<PooledConnection> {
-        let mut child = stdio_command(server)?
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to start MCP stdio server")?;
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("failed to open MCP stdio stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("failed to open MCP stdio stdout"))?;
-        let (tx, rx) = mpsc::channel::<serde_json::Value>();
-
-        let reader_handle = thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
-                if tx.send(value).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Send MCP initialize request
-        let init = json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "codingbuddy-cli",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
-        write_mcp_request(&mut stdin, 1, "initialize", init)?;
-        let _ = stdin.flush();
-
-        // Wait for initialize response (ID=1)
-        let _ = wait_for_mcp_response(&rx, 1, Duration::from_secs(10));
-
-        Ok(PooledConnection {
-            child,
-            stdin,
-            rx,
-            _reader_handle: Some(reader_handle),
-            last_used: Instant::now(),
-            launch_fingerprint: stdio_fingerprint(server),
-            next_request_id: 100, // Start after init
-        })
-    }
-
-    /// Gracefully shut down all pooled connections.
     pub fn shutdown(&self) {
-        let mut pool = self.connections.lock().unwrap_or_else(|e| e.into_inner());
-        for (id, mut conn) in pool.drain() {
-            let _ = id;
-            let _ = conn.child.kill();
-            let _ = conn.child.wait();
-        }
+        self.sessions.shutdown();
     }
 }
-
-impl Default for McpConnectionPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for McpConnectionPool {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Execute one framed JSON-RPC request against an MCP stdio server.
-///
-/// This function starts a short-lived server process, initializes MCP protocol,
-/// then sends exactly one method request and returns the matching response frame.
 pub fn execute_mcp_stdio_request(
     server: &McpServer,
     method: &str,
     params: serde_json::Value,
-    request_id: u64,
+    _request_id: u64,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
-    let mut child = stdio_command(server)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start MCP stdio server")?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("failed to open MCP stdio stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to open MCP stdio stdout"))?;
-    let (tx, rx) = mpsc::channel::<serde_json::Value>();
-
-    let reader_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
-            if tx.send(value).is_err() {
-                break;
-            }
-        }
-    });
-
-    let init = json!({
-        "protocolVersion": "2025-06-18",
-        "capabilities": {},
-        "clientInfo": {
-            "name": "codingbuddy-cli",
-            "version": env!("CARGO_PKG_VERSION")
-        }
-    });
-    write_mcp_request(&mut stdin, 1, "initialize", init)?;
-    write_mcp_request(&mut stdin, request_id, method, params)?;
-    let _ = stdin.flush();
-    drop(stdin);
-
-    let response = wait_for_mcp_response(&rx, request_id, timeout);
-
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = reader_handle.join();
-
-    match response {
-        Some(value) => Ok(value),
-        None => Err(anyhow!(
-            "MCP stdio request timed out: method={method} timeout_ms={}",
-            timeout.as_millis()
-        )),
-    }
+    McpConnectionPool::new().execute(server, method, params, timeout)
 }
 
+#[cfg(test)]
 fn wait_for_mcp_response(
     rx: &mpsc::Receiver<serde_json::Value>,
     request_id: u64,
@@ -1708,35 +1405,25 @@ fn extract_resource_text(result: &serde_json::Value) -> Result<String> {
     Ok(bounded)
 }
 
-fn write_mcp_request(
-    writer: &mut dyn Write,
-    id: u64,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<()> {
-    let body = serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params
-    }))?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
-}
-
 fn read_mcp_frame<R: BufRead>(reader: &mut R) -> Result<Option<serde_json::Value>> {
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
+        let n = std::io::Read::take(&mut *reader, 16 * 1024 * 1024 + 1).read_line(&mut line)?;
+        anyhow::ensure!(n <= 16 * 1024 * 1024, "MCP frame limit exceeded");
         if n == 0 {
             return Ok(None);
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with('{') {
+            return Ok(Some(serde_json::from_str(trimmed)?));
+        }
         if trimmed.is_empty() {
-            break;
+            if content_length.is_some() {
+                break;
+            } else {
+                continue;
+            }
         }
         if let Some((header, value)) = trimmed.split_once(':')
             && header.eq_ignore_ascii_case("Content-Length")
@@ -1751,11 +1438,13 @@ fn read_mcp_frame<R: BufRead>(reader: &mut R) -> Result<Option<serde_json::Value
     }
 
     let length = content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
+    anyhow::ensure!(length <= 16 * 1024 * 1024, "MCP frame limit exceeded");
     let mut buf = vec![0_u8; length];
     reader.read_exact(&mut buf)?;
     Ok(Some(serde_json::from_slice(&buf)?))
 }
 
+#[cfg(test)]
 fn parse_mcp_tools_message(server_id: &str, message: &serde_json::Value) -> Vec<McpTool> {
     let mut out = Vec::new();
     if let Some(tools) = message
@@ -1772,13 +1461,42 @@ fn parse_mcp_tools_message(server_id: &str, message: &serde_json::Value) -> Vec<
 }
 
 /// OAuth token for MCP server authentication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct McpOAuthToken {
     pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
     pub refresh_token: Option<String>,
     pub token_type: String,
     pub expires_at: Option<String>,
     pub server_id: String,
+}
+
+impl std::fmt::Debug for McpOAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOAuthToken")
+            .field("server_id", &self.server_id)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+/// Bind authentication to the exact endpoint, source and canonical project scope.
+fn mcp_token_binding(server: &McpServer) -> Result<String> {
+    let url = reqwest::Url::parse(server.url.as_deref().context("MCP endpoint unavailable")?)?;
+    anyhow::ensure!(
+        server.metadata.get("_codingbuddy_source").is_some(),
+        "MCP source identity unavailable"
+    );
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(
+            url.as_str(),
+            &server.id,
+            &server.metadata["_codingbuddy_source"],
+            &server.metadata["_codingbuddy_workspace"],
+            &server.metadata["oauth"]
+        ))?)
+    ))
 }
 
 /// Store an OAuth token for an MCP server.
@@ -1946,7 +1664,8 @@ pub fn start_oauth_flow(server: &McpServer) -> Result<McpOAuthToken> {
     let code = wait_for_oauth_callback(&listener, &state, Duration::from_secs(120))?;
 
     // 5. Exchange code for token
-    let token = exchange_oauth_code(&oauth, &code, &code_verifier, &server.id)?;
+    let mut token = exchange_oauth_code(&oauth, &code, &code_verifier, &server.id)?;
+    token.binding = Some(mcp_token_binding(server)?);
 
     // 6. Store token
     store_mcp_token(&server.id, &token)?;
@@ -1992,6 +1711,7 @@ fn exchange_oauth_code(
         .json()?;
 
     Ok(McpOAuthToken {
+        binding: None,
         access_token: resp["access_token"]
             .as_str()
             .unwrap_or_default()
@@ -2011,6 +1731,10 @@ fn exchange_oauth_code(
 
 /// Refresh an expired OAuth token.
 pub fn refresh_oauth_token(server: &McpServer, token: &McpOAuthToken) -> Result<McpOAuthToken> {
+    anyhow::ensure!(
+        token.binding.as_ref() == Some(&mcp_token_binding(server)?),
+        "MCP authentication binding changed; authenticate explicitly"
+    );
     let oauth = server
         .metadata
         .get("oauth")
@@ -2034,6 +1758,7 @@ pub fn refresh_oauth_token(server: &McpServer, token: &McpOAuthToken) -> Result<
         .json()?;
 
     let new_token = McpOAuthToken {
+        binding: token.binding.clone(),
         access_token: resp["access_token"]
             .as_str()
             .unwrap_or_default()
@@ -2458,6 +2183,74 @@ mod tests {
         manager
     }
 
+    trait FixtureServer {
+        fn add_fixture_server(&self, server: McpServer) -> Result<()>;
+    }
+    impl FixtureServer for McpManager {
+        fn add_fixture_server(&self, mut server: McpServer) -> Result<()> {
+            if server.command.as_deref() == Some("echo") {
+                fs::write(
+                    self.workspace.join("mcp-fixture.json"),
+                    serde_json::to_vec(&server.metadata)?,
+                )?;
+                server.command = Some(std::env::current_exe()?.to_string_lossy().into_owned());
+                server.args = vec![
+                    "--exact".into(),
+                    "tests::delivery_three_stdio_fixture".into(),
+                    "--nocapture".into(),
+                    "--quiet".into(),
+                ];
+            }
+            self.add_server(server)
+        }
+    }
+    #[test]
+    fn delivery_three_stdio_fixture() {
+        if !Path::new("mcp-fixture.json").is_file() {
+            return;
+        }
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read("mcp-fixture.json").unwrap()).unwrap();
+        use std::io::Write;
+        for line in std::io::stdin().lock().lines() {
+            let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let mut trace = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("mcp-fixture.trace")
+                .unwrap();
+            writeln!(trace, "{request}").unwrap();
+            if request.get("id").is_none() {
+                continue;
+            }
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{},"resources":{},"prompts":{}},"serverInfo":{"name":"fixture","version":"1"}})
+                }
+                "tools/list" => {
+                    let mut tools = metadata["tools"].as_array().cloned().unwrap_or_default();
+                    for tool in &mut tools {
+                        if tool.get("inputSchema").is_none() {
+                            tool["inputSchema"] = json!({"type":"object"});
+                        }
+                    }
+                    json!({"tools":tools})
+                }
+                "tools/call" => {
+                    json!({"content":[{"type":"text","text":request["params"]["arguments"].to_string()}]})
+                }
+                "resources/list" => json!({"resources":[]}),
+                "prompts/list" => json!({"prompts":[]}),
+                _ => json!({}),
+            };
+            println!(
+                "{}",
+                json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+            );
+            std::io::stdout().flush().unwrap();
+        }
+    }
+
     #[test]
     fn p0_mcp_project_activation_and_environment() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2510,7 +2303,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "local".to_string(),
                 name: "Local MCP".to_string(),
                 transport: McpTransport::Stdio,
@@ -2542,7 +2335,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "notify".to_string(),
                 name: "Notify".to_string(),
                 transport: McpTransport::Stdio,
@@ -2568,7 +2361,7 @@ mod tests {
         assert!(!first_notice.fingerprint.is_empty());
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "notify".to_string(),
                 name: "Notify".to_string(),
                 transport: McpTransport::Stdio,
@@ -2694,6 +2487,7 @@ mod tests {
     fn mcp_token_roundtrip() {
         let server_id = format!("test-server-{}", uuid::Uuid::now_v7());
         let token = McpOAuthToken {
+            binding: None,
             access_token: "abc123".to_string(),
             refresh_token: Some("refresh456".to_string()),
             token_type: "Bearer".to_string(),
@@ -2717,6 +2511,7 @@ mod tests {
     #[test]
     fn mcp_token_serialization() {
         let token = McpOAuthToken {
+            binding: None,
             access_token: "tok".to_string(),
             refresh_token: None,
             token_type: "Bearer".to_string(),
@@ -2857,7 +2652,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "search-test".to_string(),
                 name: "Search Test".to_string(),
                 transport: McpTransport::Stdio,
@@ -2893,7 +2688,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "missing".to_string(),
                 name: "Missing".to_string(),
                 transport: McpTransport::Stdio,
@@ -2924,7 +2719,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "http-test".to_string(),
                 name: "HTTP Test".to_string(),
                 transport: McpTransport::Http,
@@ -2943,11 +2738,10 @@ mod tests {
         assert!(http.is_some(), "HTTP server should be listed");
         assert!(matches!(http.unwrap().transport, McpTransport::Http));
 
-        // Discover tools from metadata cache
         let tools = manager.discover_tools().expect("discover");
         assert!(
-            tools.iter().any(|t| t.name == "remote_tool"),
-            "should discover tool from HTTP server metadata"
+            tools.is_empty(),
+            "Disconnected metadata must never fabricate tools"
         );
     }
 
@@ -2978,7 +2772,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "ctx-test".to_string(),
                 name: "Ctx Test".to_string(),
                 transport: McpTransport::Stdio,
@@ -3010,7 +2804,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "ctx-test2".to_string(),
                 name: "Ctx Test2".to_string(),
                 transport: McpTransport::Stdio,
@@ -3040,7 +2834,7 @@ mod tests {
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "ctx-test3".to_string(),
                 name: "Ctx Test3".to_string(),
                 transport: McpTransport::Stdio,
@@ -3096,6 +2890,7 @@ mod tests {
     #[test]
     fn is_token_expired_true_for_past_date() {
         let token = McpOAuthToken {
+            binding: None,
             access_token: "tok".to_string(),
             refresh_token: None,
             token_type: "Bearer".to_string(),
@@ -3108,6 +2903,7 @@ mod tests {
     #[test]
     fn is_token_expired_false_for_future_date() {
         let token = McpOAuthToken {
+            binding: None,
             access_token: "tok".to_string(),
             refresh_token: None,
             token_type: "Bearer".to_string(),
@@ -3211,7 +3007,7 @@ data: {"other":"ignored"}
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "sse-test".to_string(),
                 name: "SSE Test".to_string(),
                 transport: McpTransport::Sse,
@@ -3257,7 +3053,7 @@ data: {"other":"ignored"}
         let manager = trusted_manager(&workspace);
 
         manager
-            .add_server(McpServer {
+            .add_fixture_server(McpServer {
                 id: "removable".to_string(),
                 name: "Removable".to_string(),
                 transport: McpTransport::Stdio,
@@ -3352,8 +3148,7 @@ data: {"other":"ignored"}
     #[test]
     fn pool_default_creates_empty() {
         let pool = McpConnectionPool::new();
-        let conns = pool.connections.lock().unwrap();
-        assert!(conns.is_empty(), "new pool should have no connections");
+        assert!(pool.sessions.states.lock().unwrap().is_empty());
     }
 
     #[test]

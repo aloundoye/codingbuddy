@@ -1,3 +1,5 @@
+mod operations;
+pub use operations::{OperationMonitor, OperationRecord};
 mod steps;
 pub use steps::{InvocationReceipt, PendingInvocation};
 mod prompt;
@@ -744,6 +746,7 @@ impl Store {
         let db = store.db()?;
         Self::init_prompts(&db)?;
         Self::init_steps(&db)?;
+        Self::init_operations(&db)?;
         Ok(store)
     }
 

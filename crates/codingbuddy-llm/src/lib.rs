@@ -45,6 +45,13 @@ impl Deref for PreparedPayload {
 const NETWORK_RETRY_BASE_MS: u64 = 1000;
 
 pub trait LlmClient {
+    /// Preserve the selected transport and cached account while attaching turn cancellation.
+    fn with_cancellation(
+        &self,
+        _token: CancellationToken,
+    ) -> Option<Box<dyn LlmClient + Send + Sync>> {
+        None
+    }
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse>;
 
     /// Streaming variant that invokes `cb` for each token chunk as it arrives.
@@ -2077,6 +2084,14 @@ impl ApiClient {
 // annotate_cache_control / apply_cache_annotations / payload_rejects_cache_control removed in P9.
 
 impl LlmClient for ApiClient {
+    fn with_cancellation(
+        &self,
+        token: CancellationToken,
+    ) -> Option<Box<dyn LlmClient + Send + Sync>> {
+        let mut client = self.clone();
+        client.set_cancel_token(token);
+        Some(Box::new(client))
+    }
     fn pinned_session_route(&self, model: &str, local_key: &[u8]) -> Option<Result<String>> {
         Some(session_route_with_credential(
             &self.cfg,
