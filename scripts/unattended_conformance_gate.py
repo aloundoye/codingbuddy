@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Reject publication without complete native Order 3 results for this revision and lockfile."""
 import argparse
-import hashlib
 import json
 import pathlib
-from unattended_conformance import GROUPS, TARGETS
+from unattended_conformance import GROUPS, TARGETS, lockfile_sha256
 
 
 def validate(reports, targets, revision, lockfile):
@@ -37,7 +36,7 @@ def main():
     parser.add_argument("--revision", required=True)
     parser.add_argument("--target", action="append", choices=sorted(TARGETS))
     args = parser.parse_args()
-    lockfile = hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest()
+    lockfile = lockfile_sha256()
     validate([json.loads(path.read_text()) for path in args.reports], args.target or TARGETS, args.revision, lockfile)
 
 
