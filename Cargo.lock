@@ -919,6 +919,7 @@ dependencies = [
  "chrono",
  "codingbuddy-core",
  "codingbuddy-policy",
+ "dunce",
  "serde",
  "serde_json",
  "tempfile",

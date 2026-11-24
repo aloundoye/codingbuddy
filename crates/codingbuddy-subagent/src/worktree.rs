@@ -245,6 +245,12 @@ fn git(
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut command = process_env::git_inspection(workspace);
+    // Git for Windows can reject verbatim paths when resolving worktrees and index locks.
+    #[cfg(windows)]
+    let (paths, index) = (
+        paths.iter().copied().map(dunce::simplified),
+        index.map(dunce::simplified),
+    );
     command
         .args(args)
         .args(paths)
