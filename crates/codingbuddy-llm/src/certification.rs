@@ -19,6 +19,8 @@ pub struct FixtureRoute {
     pub model: String,
     pub path: String,
     pub auth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<codingbuddy_core::CloudDeployment>,
 }
 
 pub fn routes() -> Vec<FixtureRoute> {
@@ -37,6 +39,9 @@ pub fn implementation_digest() -> String {
         include_str!("../Cargo.toml"),
         include_str!("lib.rs"),
         include_str!("route.rs"),
+        include_str!("cloud_identity.rs"),
+        include_str!("extension.rs"),
+        include_str!("providers/bedrock.rs"),
         include_str!("error.rs"),
         include_str!("protocol.rs"),
         include_str!("protocol/adapters.rs"),
@@ -61,22 +66,54 @@ pub fn implementation_digest() -> String {
         .collect()
 }
 
+/// Only an exact, operator-configured price has evidence for this route.
+pub fn configured_price(cfg: &LlmConfig, model: &str) -> Option<codingbuddy_core::ModelCost> {
+    let cost = cfg
+        .model_catalog
+        .overrides
+        .iter()
+        .rev()
+        .find(|entry| entry.provider == cfg.provider && entry.id == model)?
+        .cost;
+    let rates = [cost.input_per_mtok_usd, cost.output_per_mtok_usd];
+    (rates.iter().all(|rate| rate.is_finite() && *rate >= 0.0)
+        && rates.iter().any(|rate| *rate > 0.0))
+    .then_some(cost)
+}
+
 pub fn status(cfg: &LlmConfig, model: &str) -> Value {
     let provider = cfg.active_provider();
     let kind = cfg
         .active_provider_kind()
         .unwrap_or(codingbuddy_core::ProviderKind::OpenAiCompatible);
     let protocol = crate::protocol::select_chat_protocol(&provider, kind).as_key();
-    let fixture = routes()
-        .into_iter()
-        .find(|route| route.provider == cfg.provider && route.protocol == protocol);
+    let auth = crate::protocol::select_auth_strategy(
+        &provider,
+        kind,
+        crate::protocol::select_chat_protocol(&provider, kind),
+    );
+    let cloud = serde_json::to_value(&provider.cloud).unwrap_or_default();
+    let resolved = crate::route::ChatRoute::resolve(cfg, model, false).ok();
+    let fixture = routes().into_iter().find(|route| {
+        let case = serde_json::to_value(&route.cloud).unwrap_or_default();
+        route.provider == cfg.provider
+            && route.protocol == protocol
+            && route.auth == auth.as_key()
+            && case["type"] == cloud["type"]
+            && case["api_version"] == cloud["api_version"]
+            && (route.cloud.is_some()
+                || resolved.as_ref().is_some_and(|resolved| {
+                    reqwest::Url::parse(&resolved.endpoint)
+                        .is_ok_and(|url| url.path() == route.path && url.query().is_none())
+                }))
+    });
     let evidence = std::env::current_exe()
         .ok()
         .and_then(|exe| std::fs::read(exe.with_file_name("provider-certification.json")).ok())
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
     let verified = evidence.as_ref().is_some_and(|evidence| {
         evidence["schema_version"] == 1
-            && evidence["suite"] == "delivery-order-2"
+            && evidence["suite"] == "delivery-order-4"
             && evidence["implementation_digest"] == implementation_digest()
             && evidence["platform"] == std::env::consts::OS
             && evidence["architecture"] == std::env::consts::ARCH
@@ -96,8 +133,10 @@ pub fn status(cfg: &LlmConfig, model: &str) -> Value {
     });
     json!({"configured": crate::check_provider(cfg).is_ok(),"protocol":protocol,
         "fixture_profile":fixture,"fixture_verified":verified,"live_verified":false,
+        "connectivity":Value::Null,
         "implementation_digest":implementation_digest(),"model":model,
-        "pricing":Value::Null})
+        "auth":auth.as_key(), "deployment":cloud,
+        "pricing":configured_price(cfg, model)})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +146,10 @@ pub struct LiveEvidence {
     pub provider: String,
     pub protocol: String,
     pub model: String,
+    #[serde(default)]
+    pub deployment: Option<codingbuddy_core::CloudDeployment>,
+    #[serde(default)]
+    pub auth: String,
     pub verified_at: String,
     pub streaming: bool,
     pub tool_rounds: usize,
@@ -249,15 +292,14 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
     } else {
         None
     };
-    let protocol = crate::route::ChatRoute::resolve(cfg, &model, false)?
-        .protocol
-        .as_key()
-        .into();
+    let route = crate::route::ChatRoute::resolve(cfg, &model, false)?;
     Ok(LiveEvidence {
         schema_version: 1,
         implementation_digest: implementation_digest(),
         provider: cfg.provider.clone(),
-        protocol,
+        protocol: route.protocol.as_key().into(),
+        auth: route.auth.as_key().into(),
+        deployment: route.provider.cloud,
         model,
         verified_at: chrono::Utc::now().to_rfc3339(),
         streaming,
@@ -276,12 +318,40 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
     })
 }
 
+/// Record an explicit successful connectivity probe without implying tool certification.
+pub fn record_connectivity(cfg: &LlmConfig, workspace: &Path, local_key: &[u8]) -> Result<()> {
+    let model = cfg.active_base_model();
+    let route = crate::session_route(cfg, &model, local_key)?;
+    let runtime = codingbuddy_core::runtime_dir(workspace);
+    let file = runtime.join(format!("provider-connectivity-{route}.json"));
+    let evidence = json!({"schema_version":1,"route":route,"implementation_digest":implementation_digest(),
+        "checked_at":chrono::Utc::now().to_rfc3339()});
+    let tmp = tempfile::NamedTempFile::new_in(&runtime)?;
+    serde_json::to_writer_pretty(tmp.as_file(), &evidence)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(file)?;
+    Ok(())
+}
+
 pub fn live_status(cfg: &LlmConfig, model: &str, workspace: &Path, local_key: &[u8]) -> Value {
     let mut result = status(cfg, model);
+    let route = crate::session_route(cfg, model, local_key).ok();
+    if let Some(route) = route.as_ref()
+        && let Ok(bytes) = std::fs::read(
+            codingbuddy_core::runtime_dir(workspace)
+                .join(format!("provider-connectivity-{route}.json")),
+        )
+        && let Ok(evidence) = serde_json::from_slice::<Value>(&bytes)
+        && evidence["schema_version"] == 1
+        && evidence["route"] == route.as_str()
+        && evidence["implementation_digest"] == implementation_digest()
+    {
+        result["connectivity"] = json!({"confirmed":true,"checked_at":evidence["checked_at"]});
+    }
     let path = codingbuddy_core::runtime_dir(workspace).join("provider-verification.json");
     if let Ok(bytes) = std::fs::read(path)
         && let Ok(evidence) = serde_json::from_slice::<Value>(&bytes)
-        && let Ok(actual) = crate::session_route(cfg, model, local_key)
+        && let Some(actual) = route.as_ref()
     {
         let entries = evidence["entries"]
             .as_array()
@@ -290,13 +360,18 @@ pub fn live_status(cfg: &LlmConfig, model: &str, workspace: &Path, local_key: &[
         let matching: Vec<_> = entries
             .iter()
             .filter(|entry| {
-                entry["route"] == actual
+                entry["route"] == actual.as_str()
                     && entry["evidence"]["schema_version"] == 1
                     && entry["evidence"]["implementation_digest"] == implementation_digest()
             })
             .map(|entry| entry["evidence"].clone())
             .collect();
         result["live_verified"] = json!(!matching.is_empty());
+        if result["connectivity"].is_null()
+            && let Some(evidence) = matching.last()
+        {
+            result["connectivity"] = json!({"confirmed":true,"checked_at":evidence["verified_at"]});
+        }
         result["live_evidence"] = json!(matching);
     }
     result

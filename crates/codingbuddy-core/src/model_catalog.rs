@@ -327,7 +327,9 @@ impl ModelCatalog {
                 Some(provider.kind.as_str()),
                 &config.capability_overrides,
             ));
-            if let Some(reasoner) = &provider.models.reasoner {
+            if !matches!(&provider.cloud, Some(crate::CloudDeployment::Azure { .. }))
+                && let Some(reasoner) = &provider.models.reasoner
+            {
                 catalog.upsert(ModelInfo::from_capabilities(
                     provider_id,
                     reasoner,
@@ -547,9 +549,13 @@ fn selector_item_for_model(
     let api_key_env = provider_config
         .map(|provider| provider.api_key_env.clone())
         .unwrap_or_default();
-    let requires_api_key = !api_key_env.is_empty();
     let chat_protocol = selector_chat_protocol(provider_config, provider_kind);
     let auth_strategy = selector_auth_strategy(provider_config, provider_kind, &chat_protocol);
+    let identity = matches!(
+        auth_strategy.as_str(),
+        "azure-entra" | "google-adc" | "aws-sigv4"
+    );
+    let requires_api_key = !api_key_env.is_empty() && !identity && auth_strategy != "none";
     let explicit_key_for_active_provider = model.provider == active_provider
         && config
             .api_key
@@ -640,6 +646,9 @@ fn selector_chat_protocol(
     provider_config: Option<&crate::ProviderConfig>,
     provider_kind: Option<ProviderKind>,
 ) -> String {
+    if let Some(cloud) = provider_config.and_then(|profile| profile.cloud.as_ref()) {
+        return cloud.protocol_key().into();
+    }
     provider_config
         .and_then(|provider| provider.chat_protocol.as_deref())
         .or_else(|| {
@@ -665,6 +674,9 @@ fn selector_auth_strategy(
     provider_kind: Option<ProviderKind>,
     chat_protocol: &str,
 ) -> String {
+    if let Some(cloud) = provider_config.and_then(|profile| profile.cloud.as_ref()) {
+        return cloud.auth_key().into();
+    }
     provider_config
         .and_then(|provider| provider.auth_strategy.as_deref())
         .map(normalize_auth_key)
@@ -1110,6 +1122,8 @@ mod tests {
                 chat_protocol: None,
                 auth_strategy: None,
                 account_id: None,
+                cloud: None,
+                gateway: None,
                 headers: std::collections::BTreeMap::new(),
                 discovery: crate::ProviderDiscoveryConfig::default(),
                 payload_options: serde_json::Value::Null,
@@ -1153,6 +1167,8 @@ mod tests {
                 chat_protocol: Some("responses".to_string()),
                 auth_strategy: Some("api-key".to_string()),
                 account_id: None,
+                cloud: None,
+                gateway: None,
                 headers: std::collections::BTreeMap::new(),
                 discovery: crate::ProviderDiscoveryConfig::default(),
                 payload_options: serde_json::Value::Null,

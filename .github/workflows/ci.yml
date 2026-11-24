@@ -139,7 +139,9 @@ jobs:
           cargo test --locked -p codingbuddy-cli --test cli_json delivery_one
           cargo test --locked -p codingbuddy-llm --all-targets
           cargo test --locked -p codingbuddy-testkit --test provider_certification
+          cargo test --locked -p codingbuddy-testkit --test provider_eval provider_neutral_fixture_scores
           cargo test --locked -p codingbuddy-cli --test cli_json delivery_two
+          cargo test --locked -p codingbuddy-cli --test cli_json delivery_four
           python scripts/test_provider_certification_gate.py
 
       - name: Upload provider evidence
@@ -221,7 +223,9 @@ jobs:
           cargo test --locked -p codingbuddy-cli --test cli_json delivery_one
           cargo test --locked -p codingbuddy-llm --all-targets
           cargo test --locked -p codingbuddy-testkit --test provider_certification
+          cargo test --locked -p codingbuddy-testkit --test provider_eval provider_neutral_fixture_scores
           cargo test --locked -p codingbuddy-cli --test cli_json delivery_two
+          cargo test --locked -p codingbuddy-cli --test cli_json delivery_four
           python scripts/test_provider_certification_gate.py
 
       - name: Upload provider evidence

@@ -1,6 +1,8 @@
 pub mod certification;
 mod chat_transport;
+mod cloud_identity;
 pub mod error;
+pub mod extension;
 mod native_parts;
 mod route;
 use anyhow::{Context, Result, anyhow};
@@ -12,7 +14,7 @@ use codingbuddy_core::{
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderName, HeaderValue, RETRY_AFTER};
+use reqwest::header::RETRY_AFTER;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
@@ -94,6 +96,8 @@ pub struct ApiClient {
     /// Cached API key resolved eagerly at construction time.
     /// Avoids env var races when the key is cleared during logout.
     api_key: Option<String>,
+    #[cfg(feature = "provider-fixtures")]
+    fixture_origin: Option<reqwest::Url>,
 }
 
 impl std::fmt::Debug for ApiClient {
@@ -108,6 +112,11 @@ impl std::fmt::Debug for ApiClient {
 /// Resolve an explicit credential, an environment key, or a saved key.
 pub fn resolve_key_from_config(cfg: &LlmConfig) -> Option<String> {
     let provider = cfg.active_provider();
+    let kind = cfg.active_provider_kind()?;
+    let protocol = protocol::select_chat_protocol(&provider, kind);
+    if protocol::select_auth_strategy(&provider, kind, protocol).uses_cloud_identity() {
+        return None;
+    }
     let env_key = provider.api_key_env.trim();
     let env_value = if env_key.is_empty() {
         None
@@ -216,8 +225,10 @@ pub fn provider_requires_key(cfg: &LlmConfig) -> bool {
         return false;
     };
     let protocol = protocol::select_chat_protocol(&provider, kind);
+    let auth = protocol::select_auth_strategy(&provider, kind, protocol);
     !provider.api_key_env.trim().is_empty()
-        && protocol::select_auth_strategy(&provider, kind, protocol) != protocol::AuthStrategy::None
+        && auth != protocol::AuthStrategy::None
+        && !auth.uses_cloud_identity()
 }
 
 #[derive(Debug)]
@@ -275,7 +286,9 @@ pub fn check_provider(cfg: &LlmConfig) -> Result<()> {
         }
         .into());
     }
-    route.headers(resolve_key_from_config(cfg).as_deref())?;
+    if !route.auth.uses_cloud_identity() {
+        route.headers(resolve_key_from_config(cfg).as_deref())?;
+    }
     Ok(())
 }
 
@@ -290,12 +303,10 @@ fn session_route_with_credential(
     local_key: &[u8],
     credential: impl FnOnce() -> Option<String>,
 ) -> Result<String> {
-    let provider = cfg.active_provider();
-    let kind = cfg
-        .active_provider_kind()
-        .unwrap_or(ProviderKind::OpenAiCompatible);
-    let chat_protocol = protocol::select_chat_protocol(&provider, kind);
-    let auth = protocol::select_auth_strategy(&provider, kind, chat_protocol);
+    let resolved = route::ChatRoute::resolve(cfg, model, false)?;
+    let provider = resolved.provider;
+    let chat_protocol = resolved.protocol;
+    let auth = resolved.auth;
     let account = provider
         .account_id
         .as_deref()
@@ -306,16 +317,31 @@ fn session_route_with_credential(
     } else {
         None
     };
-    let endpoint = route::ChatRoute::resolve(cfg, model, false)?.endpoint;
-    let route = serde_json::to_vec(&(
-        cfg.provider.as_str(),
-        chat_protocol.as_key(),
-        endpoint,
-        model,
-        account,
-        credential,
-        &provider.headers,
-    ))?;
+    let route = if provider.cloud.is_some() {
+        serde_json::to_vec(&(
+            "cloud-v1",
+            cfg.provider.as_str(),
+            chat_protocol.as_key(),
+            auth.as_key(),
+            resolved.endpoint,
+            resolved.deployment,
+            model,
+            account,
+            credential,
+            &provider.cloud,
+            cloud_identity::principal_hint(auth),
+        ))?
+    } else {
+        serde_json::to_vec(&(
+            cfg.provider.as_str(),
+            chat_protocol.as_key(),
+            resolved.endpoint,
+            model,
+            account,
+            credential,
+            &provider.headers,
+        ))?
+    };
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, local_key);
     Ok(ring::hmac::sign(&key, &route)
         .as_ref()
@@ -378,13 +404,73 @@ impl ApiClient {
             .timeout(Duration::from_secs(cfg.timeout_seconds))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
+        if cfg.active_provider().cloud.is_some() {
+            route::ChatRoute::resolve(&cfg, &cfg.active_base_model(), false)?;
+        }
         let api_key = resolve_key_from_config(&cfg);
         Ok(Self {
             cfg,
             client,
             cancel_token: None,
             api_key,
+            #[cfg(feature = "provider-fixtures")]
+            fixture_origin: None,
         })
+    }
+
+    /// Run conformance against an in-process fixture with synthetic credentials.
+    #[cfg(feature = "provider-fixtures")]
+    pub fn with_fixture_origin(mut self, origin: &str) -> Result<Self> {
+        let url = reqwest::Url::parse(origin)?;
+        anyhow::ensure!(
+            url.scheme() == "http"
+                && url.host_str() == Some("127.0.0.1")
+                && url.port().is_some()
+                && url.path() == "/"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "Provider fixture must be an explicit IPv4 loopback origin"
+        );
+        self.fixture_origin = Some(url);
+        Ok(self)
+    }
+
+    fn resolve_chat_route(&self, model: &str, streaming: bool) -> Result<route::ChatRoute> {
+        let route = route::ChatRoute::resolve(&self.cfg, model, streaming)?;
+        #[cfg(feature = "provider-fixtures")]
+        if let Some(origin) = &self.fixture_origin {
+            let mut route = route;
+            let endpoint = reqwest::Url::parse(&route.endpoint)?;
+            route.endpoint = format!(
+                "{}{}{}",
+                origin.origin().ascii_serialization(),
+                endpoint.path(),
+                endpoint
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default()
+            );
+            return Ok(route);
+        }
+        Ok(route)
+    }
+
+    fn chat_bearer(
+        &self,
+        route: &route::ChatRoute,
+        transport: &chat_transport::ChatTransport,
+    ) -> Result<String> {
+        #[cfg(feature = "provider-fixtures")]
+        if self.fixture_origin.is_some() {
+            return Ok("synthetic-certification-key".into());
+        }
+        cloud_identity::bearer(
+            route,
+            transport,
+            Duration::from_secs(self.cfg.timeout_seconds),
+        )
     }
 
     /// Clear the cached API key (e.g. on logout). Subsequent requests will
@@ -432,6 +518,9 @@ impl ApiClient {
     /// Returns a list of model IDs. Fails gracefully (empty vec) on error.
     fn discover_models_from_api(&self) -> Vec<String> {
         let provider = self.provider_config();
+        if provider.cloud.is_some() || route::custom_headers(&provider).is_err() {
+            return Vec::new();
+        }
         if !provider.discovery.enabled {
             return Vec::new();
         }
@@ -559,6 +648,9 @@ impl ApiClient {
             }
             protocol::AuthStrategy::QueryApiKey
             | protocol::AuthStrategy::AwsSigV4
+            | protocol::AuthStrategy::AzureApiKey
+            | protocol::AuthStrategy::AzureEntra
+            | protocol::AuthStrategy::GoogleAdc
             | protocol::AuthStrategy::None => builder,
         };
         self.apply_custom_provider_headers(builder, &provider_config)
@@ -566,22 +658,22 @@ impl ApiClient {
 
     fn apply_custom_provider_headers(
         &self,
-        mut builder: reqwest::blocking::RequestBuilder,
+        builder: reqwest::blocking::RequestBuilder,
         provider: &codingbuddy_core::ProviderConfig,
     ) -> reqwest::blocking::RequestBuilder {
-        for (name, value) in &provider.headers {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                builder = builder.header(name, value);
-            }
+        match route::custom_headers(provider) {
+            Ok(headers) => builder.headers(headers),
+            Err(_) => builder,
         }
-        builder
     }
 
     fn resolve_request_api_key(&self) -> Result<Option<String>> {
         let provider = self.provider_config();
+        anyhow::ensure!(
+            provider.cloud.is_none(),
+            "This cloud route supports chat requests only"
+        );
+        route::custom_headers(&provider)?;
         if self
             .cfg
             .active_provider()
@@ -831,6 +923,17 @@ impl ApiClient {
                 error::ProviderError::new(chat_protocol, error::FailureKind::UnsupportedFeature)
             })?;
         }
+        if let Some(adapter) = extension::registered_adapter(chat_protocol) {
+            return Ok(PreparedPayload {
+                payload: adapter.encode(req)?,
+                compatibility: AppliedCompatibility {
+                    provider: self.cfg.provider.clone(),
+                    family: capabilities.family.as_key().into(),
+                    transforms: vec![format!("protocol:{}", chat_protocol.as_key())],
+                    degraded_inputs: vec![],
+                },
+            });
+        }
         // Native providers: build their own payload format
         match chat_protocol {
             protocol::ChatProtocol::OpenAiResponses => {
@@ -859,14 +962,6 @@ impl ApiClient {
                         degraded_inputs: vec![],
                     },
                 });
-            }
-            protocol::ChatProtocol::BedrockConverse => {
-                let adapter = protocol::adapters::adapter_for(chat_protocol);
-                return Err(anyhow!(
-                    "chat protocol '{}' is registered ({:?}) but not enabled in the runtime execution path yet; set provider.chat_protocol='openai-chat' or use a provider with native support for this protocol",
-                    chat_protocol.as_key(),
-                    adapter.payload_shape
-                ));
             }
             protocol::ChatProtocol::AnthropicMessages => {
                 let max_cap = max_output_tokens_for_model(
@@ -1028,21 +1123,69 @@ impl ApiClient {
         })
     }
 
+    fn complete_native_adapter(
+        &self,
+        req: &ChatRequest,
+        route: &route::ChatRoute,
+        adapter: &dyn extension::ProviderAdapterV1,
+        callback: Option<StreamCallback>,
+    ) -> Result<LlmResponse> {
+        let prepared = self.build_chat_payload_for_route(req, route)?;
+        let bytes = serde_json::to_vec(&prepared.payload)?;
+        let timeout = Duration::from_secs(self.cfg.timeout_seconds);
+        let transport = chat_transport::ChatTransport::new(timeout, self.cancel_token.clone())?;
+        let headers = adapter.authenticate(
+            &extension::ProviderRequest {
+                route,
+                transport: &transport,
+                timeout,
+                #[cfg(feature = "provider-fixtures")]
+                fixture: self.fixture_origin.is_some(),
+            },
+            &bytes,
+        )?;
+        let response = transport.post_bytes(&route.endpoint, headers, bytes)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = transport.text(response)?;
+            return Err(error::ProviderError::http(route.protocol, status.as_u16(), &body).into());
+        }
+        let mut result = if let Some(callback) = callback {
+            adapter.decode_stream(&mut transport.reader(response), callback)?
+        } else {
+            adapter.decode_response(&serde_json::from_str(&transport.text(response)?)?)?
+        };
+        result.compatibility = Some(prepared.compatibility);
+        Ok(result)
+    }
+
     fn complete_chat_inner(
         &self,
         req: &ChatRequest,
         api_key: Option<&str>,
         route: &route::ChatRoute,
     ) -> Result<LlmResponse> {
-        let prepared = self.build_chat_payload_for_route(req, route)?;
+        if let Some(adapter) = extension::registered_adapter(route.protocol) {
+            return self.complete_native_adapter(req, route, adapter, None);
+        }
+        let mut prepared = self.build_chat_payload_for_route(req, route)?;
         let capabilities = &route.capabilities;
         let chat_protocol = route.protocol;
         let endpoint = &route.endpoint;
-        let headers = route.headers(api_key)?;
         let transport = chat_transport::ChatTransport::new(
             Duration::from_secs(self.cfg.timeout_seconds),
             self.cancel_token.clone(),
         )?;
+        if let Some(deployment) = &route.deployment {
+            prepared.payload["model"] = json!(deployment);
+        }
+        let cloud_token = match route.auth {
+            protocol::AuthStrategy::AzureEntra | protocol::AuthStrategy::GoogleAdc => {
+                Some(self.chat_bearer(route, &transport)?)
+            }
+            _ => None,
+        };
+        let headers = route.headers(cloud_token.as_deref().or(api_key))?;
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
@@ -1311,6 +1454,9 @@ impl ApiClient {
         cb: StreamCallback,
         route: &route::ChatRoute,
     ) -> Result<LlmResponse> {
+        if let Some(adapter) = extension::registered_adapter(route.protocol) {
+            return self.complete_native_adapter(req, route, adapter, Some(cb));
+        }
         let mut prepared = self.build_chat_payload_for_route(req, route)?;
         let capabilities = &route.capabilities;
         let chat_protocol = route.protocol;
@@ -1319,15 +1465,31 @@ impl ApiClient {
         if chat_protocol != protocol::ChatProtocol::GeminiGenerateContent {
             prepared.payload["stream"] = json!(true);
         }
-        if !is_native && !is_responses {
+        if !is_native
+            && !is_responses
+            && !route
+                .provider
+                .gateway
+                .as_ref()
+                .is_some_and(|g| g.omit_stream_usage_option)
+        {
             prepared.payload["stream_options"] = json!({"include_usage":true});
         }
         let stream_endpoint = &route.endpoint;
-        let headers = route.headers(api_key)?;
         let transport = chat_transport::ChatTransport::new(
             Duration::from_secs(self.cfg.timeout_seconds),
             self.cancel_token.clone(),
         )?;
+        if let Some(deployment) = &route.deployment {
+            prepared.payload["model"] = json!(deployment);
+        }
+        let cloud_token = match route.auth {
+            protocol::AuthStrategy::AzureEntra | protocol::AuthStrategy::GoogleAdc => {
+                Some(self.chat_bearer(route, &transport)?)
+            }
+            _ => None,
+        };
+        let headers = route.headers(cloud_token.as_deref().or(api_key))?;
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
@@ -2128,7 +2290,7 @@ impl LlmClient for ApiClient {
             let _provider = self.provider_kind()?;
             let mut normalized_req = req.clone();
             normalized_req.model = self.resolve_request_model(&req.model)?;
-            let route = route::ChatRoute::resolve(&self.cfg, &normalized_req.model, false)?;
+            let route = self.resolve_chat_route(&normalized_req.model, false)?;
             let key = if route.auth == protocol::AuthStrategy::None {
                 None
             } else {
@@ -2172,8 +2334,7 @@ impl LlmClient for ApiClient {
             let _provider = self.provider_kind()?;
             let mut normalized_req = req.clone();
             normalized_req.model = self.resolve_request_model(&req.model)?;
-            let route =
-                route::ChatRoute::resolve(&self.cfg, &normalized_req.model, self.cfg.stream)?;
+            let route = self.resolve_chat_route(&normalized_req.model, self.cfg.stream)?;
             let key = if route.auth == protocol::AuthStrategy::None {
                 None
             } else {

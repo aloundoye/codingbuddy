@@ -33,6 +33,111 @@ impl Drop for Mock {
     }
 }
 
+fn configure(
+    cfg: &mut codingbuddy_core::LlmConfig,
+    route: &FixtureRoute,
+    server: &Mock,
+) -> Result<()> {
+    cfg.select_provider(&route.provider);
+    if route.provider == "custom-gateway" {
+        let mut profile = cfg.active_provider();
+        profile.kind = "openai-compatible".into();
+        cfg.providers.insert(route.provider.clone(), profile);
+    }
+    let profile = cfg
+        .providers
+        .get_mut(&route.provider)
+        .with_context(|| format!("Missing fixture profile for {}", route.provider))?;
+    let suffix = reqwest::Url::parse(&profile.base_url)
+        .ok()
+        .map(|base| base.path().trim_end_matches('/').to_owned())
+        .unwrap_or_default();
+    profile.base_url = format!("{}{suffix}", server.base);
+    profile.openai_compat_prefix = true;
+    profile.chat_protocol = Some(route.protocol.clone());
+    profile.auth_strategy = route.cloud.is_none().then(|| route.auth.clone());
+    profile.cloud.clone_from(&route.cloud);
+    if route.provider == "custom-gateway" {
+        profile.gateway = Some(codingbuddy_core::GatewayProfile {
+            chat_path: route.path.clone(),
+            omit_stream_usage_option: true,
+        });
+        profile
+            .headers
+            .insert("X-Fixture-Profile".into(), "configured".into());
+    }
+    profile.account_id = route.cloud.as_ref().map(|_| "fixture-identity".into());
+    profile.models.chat.clone_from(&route.model);
+    cfg.api_key = Some("synthetic-certification-key".into());
+    cfg.max_retries = 0;
+    cfg.timeout_seconds = 5;
+    Ok(())
+}
+
+fn fixture_client(
+    cfg: codingbuddy_core::LlmConfig,
+    server: &Mock,
+) -> Result<codingbuddy_llm::ApiClient> {
+    let cloud = cfg.active_provider().cloud.is_some();
+    let client = codingbuddy_llm::ApiClient::new(cfg)?;
+    if cloud {
+        client.with_fixture_origin(&server.base)
+    } else {
+        Ok(client)
+    }
+}
+
+fn bedrock_stream(response: &Value) -> Result<Vec<u8>> {
+    use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
+    let mut output = Vec::new();
+    let mut event = |kind: &str, value: Value| -> Result<()> {
+        let message = Message::new_from_parts(
+            vec![
+                Header::new(":message-type", HeaderValue::String("event".into())),
+                Header::new(":event-type", HeaderValue::String(kind.to_owned().into())),
+            ],
+            serde_json::to_vec(&value)?,
+        );
+        aws_smithy_eventstream::frame::write_message_to(&message, &mut output)?;
+        Ok(())
+    };
+    event("messageStart", json!({"role":"assistant"}))?;
+    for (index, block) in response["output"]["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        if let Some(tool) = block.get("toolUse") {
+            event(
+                "contentBlockStart",
+                json!({"contentBlockIndex":index,"start":{"toolUse":{"name":tool["name"],"toolUseId":tool["toolUseId"]}}}),
+            )?;
+            let args = tool["input"].to_string();
+            for input in [&args[..1], &args[1..]] {
+                event(
+                    "contentBlockDelta",
+                    json!({"contentBlockIndex":index,"delta":{"toolUse":{"input":input}}}),
+                )?;
+            }
+        } else {
+            let delta = if let Some(reason) = block.get("reasoningContent") {
+                json!({"reasoningContent":reason["reasoningText"]})
+            } else {
+                block.clone()
+            };
+            event(
+                "contentBlockDelta",
+                json!({"contentBlockIndex":index,"delta":delta}),
+            )?;
+        }
+        event("contentBlockStop", json!({"contentBlockIndex":index}))?;
+    }
+    event("messageStop", json!({"stopReason":response["stopReason"]}))?;
+    event("metadata", json!({"usage":response["usage"]}))?;
+    Ok(output)
+}
+
 fn completion(route: &FixtureRoute, round: usize) -> Value {
     let call = round < 2;
     let id = if round == 0 {
@@ -55,6 +160,14 @@ fn completion(route: &FixtureRoute, round: usize) -> Value {
         } else {vec![json!({"id":format!("message-{round}"),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]})]},
             "usage":{"input_tokens":20,"output_tokens":8,"input_tokens_details":{"cached_tokens":5},"output_tokens_details":{"reasoning_tokens":3}}})
         }
+        "bedrock-converse" => json!({
+            "output":{"message":{"role":"assistant","content": if call { vec![
+                json!({"reasoningContent":{"reasoningText":{"text":"private fixture","signature":"opaque-certification-fixture"}}}),
+                json!({"toolUse":{"toolUseId":id,"name":"fs_read","input":args}})
+            ] } else { vec![json!({"text":text})] }}},
+            "stopReason":if call {"tool_use"} else {"end_turn"},
+            "usage":{"inputTokens":10,"cacheReadInputTokens":5,"cacheWriteInputTokens":5,"outputTokens":8,"totalTokens":28}
+        }),
         "anthropic-messages" => {
             json!({"id":format!("message-{round}"),"type":"message","role":"assistant","stop_reason":if call {"tool_use"} else {"end_turn"},
             "content":if call {vec![json!({"type":"thinking","thinking":"private fixture","signature":"opaque-certification-fixture"}),
@@ -189,11 +302,15 @@ fn mock_config(
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes)?;
             let body: Value = serde_json::from_slice(&bytes)?;
-            let streaming = body["stream"] == true || head.contains(":streamGenerateContent");
+            let streaming = body["stream"] == true
+                || head.contains(":streamGenerateContent")
+                || head.contains("/converse-stream ");
             let path = if streaming && route.protocol == "gemini-generate-content" {
                 route
                     .path
                     .replace(":generateContent", ":streamGenerateContent?alt=sse")
+            } else if streaming && route.protocol == "bedrock-converse" {
+                format!("{}-stream", route.path)
             } else {
                 route.path.clone()
             };
@@ -202,7 +319,20 @@ fn mock_config(
                 "unexpected endpoint {head}"
             );
             let headers = head.to_lowercase();
+            if route.provider == "custom-gateway" {
+                ensure!(
+                    headers.contains("x-fixture-profile: configured")
+                        && body.get("stream_options").is_none(),
+                    "configured gateway options missing"
+                );
+            }
             match route.auth.as_str() {
+                "azure-api-key" => ensure!(headers.contains("\r\napi-key: synthetic-certification-key") || headers.contains("\napi-key: synthetic-certification-key"),
+                    "missing Azure API key"),
+                "aws-sigv4" => ensure!(
+                    headers.contains("authorization: aws4-hmac-sha256 credential=syntheticaccess/20231114/us-east-1/bedrock/aws4_request")
+                    && headers.contains("x-amz-security-token: synthetic-session"),
+                    "missing Bedrock signature or session token"),
                 "none" => ensure!(
                     !headers.contains("authorization:") && !headers.contains("x-api-key:"),
                     "unexpected auth"
@@ -220,6 +350,12 @@ fn mock_config(
                     "missing bearer auth"
                 ),
             }
+            if route.provider == "azure" {
+                ensure!(
+                    body["model"] == "fixture-deploy",
+                    "Azure sent the model profile in place of the deployment"
+                );
+            }
             let mut requests = collected.lock().unwrap();
             let round = requests.len();
             if round > 0 {
@@ -235,7 +371,10 @@ fn mock_config(
                 );
                 if matches!(
                     route.protocol.as_str(),
-                    "openai-responses" | "anthropic-messages" | "gemini-generate-content"
+                    "openai-responses"
+                        | "anthropic-messages"
+                        | "gemini-generate-content"
+                        | "bedrock-converse"
                 ) {
                     ensure!(
                         wire.contains("opaque-certification-fixture"),
@@ -264,6 +403,19 @@ fn mock_config(
                         .to_string()
                         .replace("Certification complete.", "VERIFIED"),
                 )?;
+            }
+            if streaming && route.protocol == "bedrock-converse" {
+                let mut payload = bedrock_stream(&response)?;
+                if override_payload.as_deref() == Some("truncate-bedrock") {
+                    payload.truncate(payload.len().saturating_sub(8));
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )?;
+                socket.write_all(&payload)?;
+                continue;
             }
             let (content_type, payload) = if let Some(payload) = &override_payload {
                 (
@@ -296,7 +448,7 @@ fn mock_config(
 }
 
 #[test]
-fn seven_routes_complete_two_tool_rounds_and_restart() -> Result<()> {
+fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
     let mut evidence = Vec::new();
     for route in certification::routes() {
         for streaming in [false, true] {
@@ -305,24 +457,15 @@ fn seven_routes_complete_two_tool_rounds_and_restart() -> Result<()> {
             std::fs::write(workspace.path().join("first.txt"), "first fixture")?;
             std::fs::write(workspace.path().join("second.txt"), "second fixture")?;
             let mut cfg = AppConfig::default();
-            cfg.llm.select_provider(&route.provider);
-            let profile = cfg
-                .llm
-                .providers
-                .get_mut(&route.provider)
-                .context("profile")?;
-            profile.base_url = server.base.clone();
-            profile.openai_compat_prefix = true;
-            profile.chat_protocol = Some(route.protocol.clone());
-            profile.auth_strategy = Some(route.auth.clone());
-            profile.models.chat = route.model.clone();
-            cfg.llm.api_key = Some("synthetic-certification-key".into());
-            cfg.llm.max_retries = 0;
-            cfg.llm.timeout_seconds = 5;
+            configure(&mut cfg.llm, &route, &server)?;
             cfg.llm.stream = streaming;
             cfg.workspace_trust = Some(false);
             cfg.agent_loop.phase_loop_enabled = false;
-            let engine = AgentEngine::new_with_config(workspace.path(), cfg.clone())?;
+            let engine = AgentEngine::new_with_config_and_llm(
+                workspace.path(),
+                cfg.clone(),
+                Box::new(fixture_client(cfg.llm.clone(), &server)?),
+            )?;
             let output = engine.chat_with_options(
                 "Read first.txt then second.txt.",
                 ChatOptions {
@@ -408,7 +551,9 @@ fn seven_routes_complete_two_tool_rounds_and_restart() -> Result<()> {
                 public.contains("call-first") && public.contains("call-second"),
                 "call IDs lost"
             );
-            let resumed = AgentEngine::new_with_config(workspace.path(), cfg)?;
+            let client = fixture_client(cfg.llm.clone(), &server)?;
+            let resumed =
+                AgentEngine::new_with_config_and_llm(workspace.path(), cfg, Box::new(client))?;
             resumed.chat_with_options(
                 "Continue.",
                 ChatOptions {
@@ -428,7 +573,7 @@ fn seven_routes_complete_two_tool_rounds_and_restart() -> Result<()> {
         }
     }
     if let Some(path) = std::env::var_os("CODINGBUDDY_CERTIFICATION_REPORT") {
-        let report = json!({"schema_version":1,"suite":"delivery-order-2","implementation_digest":certification::implementation_digest(),
+        let report = json!({"schema_version":1,"suite":"delivery-order-4","implementation_digest":certification::implementation_digest(),
             "revision":option_env!("CODINGBUDDY_BUILD_REVISION"),"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"passed":true,"routes":evidence});
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
     }
@@ -438,22 +583,12 @@ fn seven_routes_complete_two_tool_rounds_and_restart() -> Result<()> {
 #[test]
 fn route_usage_and_private_parts_are_normalized() -> Result<()> {
     use codingbuddy_core::{ChatRequest, ToolChoice};
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::LlmClient;
     for route in certification::routes() {
         for streaming in [false, true] {
             let server = mock(route.clone())?;
             let mut cfg = codingbuddy_core::LlmConfig::default();
-            cfg.select_provider(&route.provider);
-            let profile = cfg
-                .providers
-                .get_mut(&route.provider)
-                .context("provider profile")?;
-            profile.base_url = server.base.clone();
-            profile.models.chat = route.model.clone();
-            profile.chat_protocol = Some(route.protocol.clone());
-            profile.auth_strategy = Some(route.auth.clone());
-            profile.openai_compat_prefix = true;
-            cfg.api_key = Some("synthetic-certification-key".into());
+            configure(&mut cfg, &route, &server)?;
             cfg.stream = streaming;
             cfg.max_retries = 0;
             let req = ChatRequest {
@@ -483,7 +618,7 @@ fn route_usage_and_private_parts_are_normalized() -> Result<()> {
                 provider_options: Default::default(),
                 response_format: None,
             };
-            let client = ApiClient::new(cfg)?;
+            let client = fixture_client(cfg, &server)?;
             let response = if streaming {
                 client.complete_chat_streaming(&req, Arc::new(|_| {}))?
             } else {
@@ -497,7 +632,7 @@ fn route_usage_and_private_parts_are_normalized() -> Result<()> {
                 "incorrect usage for {} streaming={streaming}: {usage:?}",
                 route.id
             );
-            if route.provider != "anthropic" {
+            if !matches!(route.provider.as_str(), "anthropic" | "bedrock") {
                 ensure!(usage.reasoning_tokens == 3, "reasoning usage missing");
             }
             ensure!(
@@ -594,23 +729,67 @@ fn unfinished_responses_never_dispatch_tools() -> Result<()> {
 }
 
 #[test]
+fn incomplete_cloud_streams_never_dispatch_tools() -> Result<()> {
+    for route in certification::routes()
+        .into_iter()
+        .filter(|route| route.cloud.is_some())
+    {
+        let mut response = completion(&route, 0);
+        let payload = match route.protocol.as_str() {
+            "bedrock-converse" => "truncate-bedrock".into(),
+            "gemini-generate-content" => {
+                response["candidates"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("finishReason");
+                sse(response)
+            }
+            _ => {
+                response["choices"][0]["finish_reason"] = Value::Null;
+                stream(&route, &response).replace("data: [DONE]\n\n", "")
+            }
+        };
+        let server = mock_outcome(route.clone(), Some(payload))?;
+        let workspace = tempfile::tempdir()?;
+        let mut cfg = AppConfig {
+            workspace_trust: Some(false),
+            ..Default::default()
+        };
+        configure(&mut cfg.llm, &route, &server)?;
+        cfg.llm.stream = true;
+        cfg.agent_loop.phase_loop_enabled = false;
+        let client = fixture_client(cfg.llm.clone(), &server)?;
+        let engine = AgentEngine::new_with_config_and_llm(workspace.path(), cfg, Box::new(client))?;
+        let result = engine.chat_with_options(
+            "Read first.txt.",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        ensure!(result.is_err(), "{} accepted incomplete output", route.id);
+        let store = Store::new(workspace.path())?;
+        let session = store.load_latest_session()?.context("missing session")?;
+        let state = store.rebuild_from_events(session.session_id)?;
+        ensure!(
+            state.tool_invocations.is_empty(),
+            "{} dispatched an unfinished tool",
+            route.id
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn explicit_probe_contract_is_bounded_and_uses_only_read_tools() -> Result<()> {
     // Ollama's installed model digest is deliberately reserved for its optional
     // real-server probe; these loopback fixtures exercise the other six routes.
-    for route in certification::routes()
-        .into_iter()
-        .filter(|route| route.provider != "ollama")
-    {
+    for route in certification::routes().into_iter().filter(|route| {
+        route.provider != "ollama" && route.provider != "custom-gateway" && route.cloud.is_none()
+    }) {
         let server = mock_config(route.clone(), None, true)?;
         let mut cfg = codingbuddy_core::LlmConfig::default();
-        cfg.select_provider(&route.provider);
-        let profile = cfg.providers.get_mut(&route.provider).context("profile")?;
-        profile.base_url = server.base.clone();
-        profile.models.chat = route.model.clone();
-        profile.chat_protocol = Some(route.protocol.clone());
-        profile.auth_strategy = Some(route.auth.clone());
-        profile.openai_compat_prefix = true;
-        cfg.api_key = Some("synthetic-certification-key".into());
+        configure(&mut cfg, &route, &server)?;
         let evidence = certification::live_probe(&cfg, true)?;
         ensure!(
             evidence.tool_rounds == 2 && evidence.model == route.model,
@@ -627,7 +806,7 @@ fn explicit_probe_contract_is_bounded_and_uses_only_read_tools() -> Result<()> {
 #[test]
 fn private_continuation_survives_restart_between_every_model_step() -> Result<()> {
     use codingbuddy_core::{ChatRequest, FunctionDefinition, ToolChoice, ToolDefinition};
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::LlmClient;
     use codingbuddy_store::NewEvent;
     for route in certification::routes() {
         for streaming in [false, true] {
@@ -636,15 +815,7 @@ fn private_continuation_survives_restart_between_every_model_step() -> Result<()
             std::fs::write(workspace.path().join("first.txt"), "first fixture")?;
             std::fs::write(workspace.path().join("second.txt"), "second fixture")?;
             let mut cfg = codingbuddy_core::LlmConfig::default();
-            cfg.select_provider(&route.provider);
-            let profile = cfg.providers.get_mut(&route.provider).context("profile")?;
-            profile.base_url = server.base.clone();
-            profile.openai_compat_prefix = true;
-            profile.models.chat = route.model.clone();
-            profile.chat_protocol = Some(route.protocol.clone());
-            profile.auth_strategy = Some(route.auth.clone());
-            cfg.api_key = Some("synthetic-certification-key".into());
-            cfg.max_retries = 0;
+            configure(&mut cfg, &route, &server)?;
             cfg.stream = streaming;
             let session = uuid::Uuid::now_v7();
             {
@@ -690,7 +861,7 @@ fn private_continuation_survives_restart_between_every_model_step() -> Result<()
                     provider_options: Default::default(),
                     response_format: None,
                 };
-                let client = ApiClient::new(cfg.clone())?;
+                let client = fixture_client(cfg.clone(), &server)?;
                 let response = if streaming {
                     client.complete_chat_streaming(&request, Arc::new(|_| {}))?
                 } else {

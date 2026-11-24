@@ -23,6 +23,9 @@ pub enum AuthStrategy {
     XApiKey,
     QueryApiKey,
     AwsSigV4,
+    AzureApiKey,
+    AzureEntra,
+    GoogleAdc,
     None,
 }
 
@@ -34,6 +37,9 @@ impl AuthStrategy {
             Self::XApiKey => "x-api-key",
             Self::QueryApiKey => "query-api-key",
             Self::AwsSigV4 => "aws-sigv4",
+            Self::AzureApiKey => "azure-api-key",
+            Self::AzureEntra => "azure-entra",
+            Self::GoogleAdc => "google-adc",
             Self::None => "none",
         }
     }
@@ -95,6 +101,12 @@ pub fn select_chat_protocol(provider: &ProviderConfig, kind: ProviderKind) -> Ch
                 .and_then(|value| value.as_str())
                 .and_then(parse_chat_protocol)
         })
+        .or_else(|| {
+            provider
+                .cloud
+                .as_ref()
+                .and_then(|cloud| parse_chat_protocol(cloud.protocol_key()))
+        })
         .unwrap_or_else(|| default_chat_protocol(kind))
 }
 
@@ -120,7 +132,25 @@ pub fn select_auth_strategy(
         .auth_strategy
         .as_deref()
         .and_then(parse_auth_strategy)
-        .unwrap_or_else(|| default_auth_strategy(kind, protocol))
+        .unwrap_or_else(|| {
+            cloud_auth(provider).unwrap_or_else(|| default_auth_strategy(kind, protocol))
+        })
+}
+
+pub(crate) fn cloud_auth(provider: &ProviderConfig) -> Option<AuthStrategy> {
+    match provider.cloud.as_ref()?.auth_key() {
+        "azure-api-key" => Some(AuthStrategy::AzureApiKey),
+        "azure-entra" => Some(AuthStrategy::AzureEntra),
+        "google-adc" => Some(AuthStrategy::GoogleAdc),
+        "aws-sigv4" => Some(AuthStrategy::AwsSigV4),
+        _ => None,
+    }
+}
+
+impl AuthStrategy {
+    pub(crate) fn uses_cloud_identity(self) -> bool {
+        matches!(self, Self::AzureEntra | Self::GoogleAdc | Self::AwsSigV4)
+    }
 }
 
 #[must_use]
@@ -164,6 +194,8 @@ mod tests {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: codingbuddy_core::ProviderDiscoveryConfig::default(),
             payload_options,

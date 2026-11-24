@@ -165,7 +165,7 @@ pub fn adapter_for(protocol: ChatProtocol) -> ProtocolAdapter {
                 reasoning: true,
                 cache_hints: false,
                 image_input: true,
-                pdf_input: true,
+                pdf_input: false,
             },
         },
     }

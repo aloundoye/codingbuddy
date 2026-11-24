@@ -2724,6 +2724,10 @@ fn merge_llm_settings(base: &mut serde_json::Value, overlay: &serde_json::Value)
             "/kind",
             "/chat_protocol",
             "/auth_strategy",
+            "/cloud",
+            "/gateway",
+            "/headers",
+            "/account_id",
         ]
         .iter()
         .any(|field| {
@@ -2818,6 +2822,10 @@ pub struct ProviderConfig {
     /// Stable provider account, organization, or project ID when one is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudDeployment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<GatewayProfile>,
     /// Extra request headers to attach to provider calls after built-in headers.
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
@@ -2826,6 +2834,80 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub payload_options: serde_json::Value,
     pub models: ProviderModels,
+}
+
+/// Wire options for OpenAI-compatible gateways.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayProfile {
+    pub chat_path: String,
+    #[serde(default)]
+    pub omit_stream_usage_option: bool,
+}
+
+/// Selects an explicit cloud data plane, separately from the model profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CloudDeployment {
+    Azure {
+        resource: String,
+        deployment: String,
+        #[serde(default)]
+        api_version: AzureApiVersion,
+        #[serde(default)]
+        credential: AzureCredential,
+    },
+    Vertex {
+        project: String,
+        location: String,
+    },
+    Bedrock {
+        region: String,
+        #[serde(default)]
+        profile: Option<String>,
+    },
+}
+
+impl CloudDeployment {
+    pub fn protocol_key(&self) -> &'static str {
+        match self {
+            Self::Azure { .. } => "openai-chat",
+            Self::Vertex { .. } => "gemini-generate-content",
+            Self::Bedrock { .. } => "bedrock-converse",
+        }
+    }
+
+    pub fn auth_key(&self) -> &'static str {
+        match self {
+            Self::Azure {
+                credential: AzureCredential::ApiKey,
+                ..
+            } => "azure-api-key",
+            Self::Azure {
+                credential: AzureCredential::Entra,
+                ..
+            } => "azure-entra",
+            Self::Vertex { .. } => "google-adc",
+            Self::Bedrock { .. } => "aws-sigv4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub enum AzureApiVersion {
+    #[default]
+    #[serde(rename = "v1")]
+    V1,
+    #[serde(rename = "2024-10-21")]
+    Dated20241021,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AzureCredential {
+    #[default]
+    ApiKey,
+    Entra,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2926,6 +3008,8 @@ impl LlmConfig {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -2944,7 +3028,9 @@ impl LlmConfig {
     pub fn auto_detect_provider(&mut self) {
         // If the current provider already has a key, keep it
         let current = self.active_provider();
-        if !current.api_key_env.is_empty() && std::env::var(&current.api_key_env).is_ok() {
+        if current.cloud.is_some()
+            || !current.api_key_env.is_empty() && std::env::var(&current.api_key_env).is_ok()
+        {
             return;
         }
         // Also accept explicit api_key in config
@@ -2956,7 +3042,11 @@ impl LlmConfig {
         for &(provider_name, env_var) in KNOWN_PROVIDER_ENV_VARS {
             if std::env::var(env_var).is_ok_and(|key| !key.trim().is_empty())
                 && self.providers.contains_key(provider_name)
-                && provider_name != "ollama"
+                && !matches!(provider_name, "ollama" | "bedrock" | "vertex")
+                && self
+                    .providers
+                    .get(provider_name)
+                    .is_some_and(|p| !p.base_url.is_empty() || p.cloud.is_some())
             {
                 self.select_provider(provider_name);
                 let p = self.active_provider();
@@ -2988,7 +3078,11 @@ impl LlmConfig {
     #[must_use]
     pub fn active_reasoner_model(&self) -> String {
         let provider = self.active_provider();
-        provider.models.reasoner.unwrap_or(provider.models.chat)
+        if matches!(provider.cloud, Some(CloudDeployment::Azure { .. })) {
+            provider.models.chat
+        } else {
+            provider.models.reasoner.unwrap_or(provider.models.chat)
+        }
     }
 
     #[must_use]
@@ -3076,6 +3170,12 @@ impl LlmConfig {
         ] {
             digest.update((value.len() as u64).to_le_bytes());
             digest.update(value.as_bytes());
+        }
+        if provider.cloud.is_some() || provider.gateway.is_some() {
+            let identity = serde_json::to_vec(&(&provider.cloud, &provider.gateway))
+                .expect("Deployment and gateway profiles serialize");
+            digest.update((identity.len() as u64).to_le_bytes());
+            digest.update(identity);
         }
         format!("{:x}", digest.finalize())
     }
@@ -3170,6 +3270,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3189,6 +3291,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3208,6 +3312,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3227,6 +3333,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3246,6 +3354,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3265,6 +3375,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3284,6 +3396,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3293,6 +3407,35 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             },
         },
     );
+    for (kind, model) in [
+        ("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0"),
+        ("vertex", "gemini-2.5-flash"),
+    ] {
+        map.insert(
+            kind.into(),
+            ProviderConfig {
+                kind: kind.into(),
+                base_url: String::new(),
+                api_key_env: String::new(),
+                openai_compat_prefix: false,
+                chat_protocol: None,
+                auth_strategy: None,
+                account_id: None,
+                cloud: None,
+                gateway: None,
+                headers: Default::default(),
+                discovery: ProviderDiscoveryConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                payload_options: serde_json::Value::Null,
+                models: ProviderModels {
+                    chat: model.into(),
+                    reasoner: None,
+                },
+            },
+        );
+    }
     map.insert(
         "azure".to_string(),
         ProviderConfig {
@@ -3303,6 +3446,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3322,6 +3467,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3341,6 +3488,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3360,6 +3509,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -3379,6 +3530,8 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             chat_protocol: None,
             auth_strategy: None,
             account_id: None,
+            cloud: None,
+            gateway: None,
             headers: std::collections::BTreeMap::new(),
             discovery: ProviderDiscoveryConfig::default(),
             payload_options: serde_json::Value::Null,
@@ -5115,6 +5268,8 @@ mod tests {
                 chat_protocol: None,
                 auth_strategy: None,
                 account_id: None,
+                cloud: None,
+                gateway: None,
                 headers: std::collections::BTreeMap::new(),
                 discovery: ProviderDiscoveryConfig::default(),
                 payload_options: serde_json::Value::Null,

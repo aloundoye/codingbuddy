@@ -32,8 +32,14 @@ fn plan_command_emits_json_shape() {
 #[test]
 fn ask_json_fails_fast_without_api_key_when_api_key_missing() {
     let workspace = TempDir::new().expect("workspace");
+    let home = TempDir::new().expect("home");
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
     let output = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
         .current_dir(workspace.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
         .env_remove("DEEPSEEK_API_KEY")
         .args(["--json", "ask", "hello"])
         .assert()
@@ -42,7 +48,8 @@ fn ask_json_fails_fast_without_api_key_when_api_key_missing() {
         .stderr
         .clone();
     let stderr = String::from_utf8_lossy(&output);
-    assert!(stderr.contains("DEEPSEEK_API_KEY"));
+    assert!(stderr.contains("DEEPSEEK_API_KEY"), "{stderr}");
+    assert_eq!(mock.requests.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1700,4 +1707,34 @@ fn delivery_two_responses_share_cli_web_and_legacy_ide_session() {
             .count(),
         3
     );
+}
+
+#[test]
+fn delivery_four_provider_check_records_connectivity_without_certification() {
+    let workspace = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
+    let run = |action: &str| -> Value {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
+            .current_dir(workspace.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("CODINGBUDDY_TRUST_WORKSPACE", workspace.path())
+            .env("DEEPSEEK_API_KEY", "synthetic-provider-key")
+            .args(["--json", "provider", action])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).expect("provider status JSON")
+    };
+    assert!(run("status")["connectivity"].is_null());
+    assert_eq!(mock.requests.load(Ordering::Relaxed), 0);
+    let checked = run("check");
+    assert_eq!(checked["connectivity"]["confirmed"], true);
+    assert_eq!(checked["live_verified"], false);
+    assert_eq!(run("status")["connectivity"], checked["connectivity"]);
+    assert_eq!(mock.requests.load(Ordering::Relaxed), 1);
 }

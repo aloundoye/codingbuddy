@@ -5,6 +5,7 @@
 //! use the OpenAI-compatible pipeline in `provider_transform.rs`.
 
 pub mod anthropic;
+pub(crate) mod bedrock;
 pub mod google;
 pub mod responses;
 

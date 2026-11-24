@@ -269,18 +269,16 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
 
     // ── LLM Provider ──
     print_section("LLM Provider");
-    let api_key_ok = payload["llm"]["api_key_env_set"].as_bool().unwrap_or(false)
-        || payload["llm"]["api_key_configured"]
-            .as_bool()
-            .unwrap_or(false);
+    let route = &payload["llm"]["route"];
     print_check(
-        api_key_ok,
+        route["configured"] == true,
         &format!(
-            "API key: {}",
-            if api_key_ok {
+            "Credentials ({}) {}",
+            route["auth"].as_str().unwrap_or("unknown"),
+            if route["configured"] == true {
                 "configured"
             } else {
-                "MISSING — run `codingbuddy setup`"
+                "need configuration"
             },
         ),
     );
@@ -441,7 +439,7 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
 
     // ── Summary ──
     let warning_count = payload["warnings"].as_array().map_or(0, |w| w.len());
-    if warning_count == 0 && api_key_ok {
+    if warning_count == 0 && route["configured"] == true {
         println!("  \x1b[32mAll checks passed.\x1b[0m");
     } else {
         println!(
@@ -517,7 +515,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
     let session_count = store.list_sessions().ok().map(|s| s.len());
 
     let mut warnings = Vec::new();
-    if !api_key_env_set && !api_key_configured {
+    if codingbuddy_llm::provider_requires_key(&cfg.llm) && !api_key_env_set && !api_key_configured {
         warnings.push(format!(
             "{} not set and llm.api_key not configured",
             provider.api_key_env
@@ -602,6 +600,19 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         .find(&cfg.llm.provider, &cfg.llm.active_base_model())
         .is_some();
 
+    let provider_route = store
+        .route_key()
+        .map(|key| {
+            codingbuddy_llm::certification::live_status(
+                &cfg.llm,
+                &cfg.llm.active_base_model(),
+                cwd,
+                &key,
+            )
+        })
+        .unwrap_or_else(|_| {
+            codingbuddy_llm::certification::status(&cfg.llm, &cfg.llm.active_base_model())
+        });
     let payload = json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -628,6 +639,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "api_key_env": provider.api_key_env,
             "api_key_env_set": api_key_env_set,
             "api_key_configured": api_key_configured,
+            "route": provider_route,
             "base_model": cfg.llm.active_base_model(),
             "max_think_model": cfg.llm.active_reasoner_model(),
             "active_provider_kind": active_provider_kind.map(codingbuddy_core::ProviderKind::as_key),
@@ -696,17 +708,17 @@ pub(crate) fn format_doctor_display(payload: &serde_json::Value) -> String {
         out.push_str(&format!("  {mark} {label:<16}\n"));
     }
 
-    // API key
-    let api_ok = payload["llm"]["api_key_env_set"].as_bool() == Some(true)
-        || payload["llm"]["api_key_configured"].as_bool() == Some(true);
-    let env_var = payload["llm"]["api_key_env"].as_str().unwrap_or("API_KEY");
+    let route = &payload["llm"]["route"];
+    let configured = route["configured"] == true;
+    let auth = route["auth"].as_str().unwrap_or("unknown");
+    let marker = if configured { "✓" } else { "✗" };
+    out.push_str(&format!("  {marker} Credentials      {auth}\n"));
     out.push_str(&format!(
-        "  {} API Key          {}\n",
-        if api_ok { "\u{2713}" } else { "\u{2717}" },
-        if api_ok {
-            format!("{env_var} is set")
+        "    Connectivity     {}\n",
+        if route["connectivity"]["confirmed"] == true {
+            "confirmed by a probe"
         } else {
-            format!("{env_var} not set")
+            "unverified"
         }
     ));
 
