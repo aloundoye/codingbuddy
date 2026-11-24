@@ -1,283 +1,92 @@
 # CodingBuddy
 
-An open-source, multi-model AI coding agent for the terminal. Written in Rust.
+CodingBuddy is an open-source AI coding agent for the terminal, with an optional browser UI and VS Code extension. It can explore a repository, plan changes, edit files, run approved checks, and resume work from the same local session.
 
-Connect any LLM — DeepSeek, OpenAI, Anthropic, Google, Groq, Ollama, OpenRouter — and get a production-grade coding assistant with tool execution, planning, code search, and safety guardrails.
+Use a hosted provider, a local Ollama model, or an OpenAI-compatible gateway. CodingBuddy supports OpenAI Chat Completions and Responses, Anthropic Messages, Gemini GenerateContent, AWS Bedrock Converse, Vertex AI Gemini, Azure OpenAI, and compatible routes such as DeepSeek and OpenRouter. Coding tasks need a model that supports tool calls.
 
-## Why CodingBuddy?
-
-- **Any model, any provider.** 7 providers preconfigured. Any OpenAI-compatible endpoint works.
-- **Fast.** Rust binary, no runtime dependencies. Sub-100ms startup with profiling.
-- **Safe.** 0 production unwraps. Tree-sitter bash AST analysis, 4-stage permission system, default deny rules.
-- **Smart.** 7-strategy fuzzy editing, coordinator mode for parallel agents, per-turn RAG, doom loop detection.
-- **Extensible.** MCP servers, 12 lifecycle hooks, custom skills with model/effort metadata, SendMessage for inter-agent communication.
+[Install](#installation) · [Quickstart](#quickstart) · [Provider setup](docs/PROVIDER_SUPPORT.md) · [User guide](docs/USER_GUIDE.md) · [0.5.0 release notes](docs/releases/0.5.0.md)
 
 ## Installation
 
-### One-liner (recommended)
+The installers select a prebuilt binary for macOS, GNU/Linux, or Windows on x64 or ARM64.
 
-**macOS / Linux:**
+**macOS or Linux**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.sh | bash
 ```
 
-**Windows (PowerShell):**
+**Windows PowerShell**
+
 ```powershell
 irm https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.ps1 | iex
 ```
 
-The installers select a prebuilt binary for macOS, GNU/Linux, or Windows on x64 or ARM64. On macOS and Linux, open a new terminal after installation so your shell loads the updated PATH. On Windows, the installer also updates PATH in the PowerShell session that runs it.
-
-### Other methods
-
-**npm** (macOS, GNU/Linux, or Windows with Node.js):
-```bash
-npm install -g codingbuddy
-```
-
-**From source** (requires Rust 1.94.1+):
-```bash
-cargo build --release --bin codingbuddy
-# Binary at target/release/codingbuddy — move it to a directory in your PATH
-```
-
-### Installer options
-
-The install scripts accept flags to customize behavior:
+You can also download the archive and checksums from [GitHub Releases](https://github.com/aloundoye/codingbuddy/releases), or build from source with Rust 1.94.1 or later. On Linux, source builds require pkg-config and the D-Bus development headers.
 
 ```bash
-# Install a specific version
-curl -fsSL .../install.sh | bash -s -- --version v0.3.0
-
-# Install to a custom directory
-curl -fsSL .../install.sh | bash -s -- --install-dir ~/.local/bin
-
-# Dry run (show what would happen)
-curl -fsSL .../install.sh | bash -s -- --dry-run
+cargo build --locked --release --bin codingbuddy
+./target/release/codingbuddy --version
 ```
 
-On Windows:
-```powershell
-# Custom install directory
-& { irm .../install.ps1 } -InstallDir "C:\tools\codingbuddy\bin"
-```
-
-### Verify installation
-
-```bash
-codingbuddy --version
-codingbuddy doctor    # Check dependencies and config
-```
+A source build puts the binary in `target/release/` (`codingbuddy.exe` on Windows). Move it onto your PATH to use it from any repository. Installers may require a new terminal to pick up the updated PATH. Run `codingbuddy doctor` to check your setup.
 
 ## Quickstart
 
-Run `codingbuddy` from your project directory. With no active connection, choose
-**Connect a provider**. CodingBuddy can use an environment key or accept a masked
-paste and save it in your system credential store. Ollama can run without a key.
-
-- Type `/` and press Enter to browse commands.
-- Use `/connect` to connect another provider or add an OpenAI-compatible endpoint.
-- Use `/models` to select a model for the current chat.
-- Use `/settings` to change the theme or save the active model as your default.
-- Use `codingbuddy --continue` to resume your latest conversation.
-
-OpenAI Responses is available with `chat_protocol = "openai-responses"`. See the [provider support matrix and verification commands](docs/PROVIDER_SUPPORT.md) for fixture coverage and live evidence.
-
-The provider menu supports OpenAI Chat Completions, Anthropic, Google Gemini,
-DeepSeek, OpenRouter, Ollama, and custom OpenAI-compatible endpoints. Coding
-mode requires a tool-capable model. Use `/ask` for chat-only models.
-
-For scripts, configure a provider credential in the environment and select the
-model with `codingbuddy --model provider/model -p "Summarize this repo"`.
-
-## Features
-
-### Agent Intelligence
-- **Coordinator mode**: Complex tasks get parallel worker spawning with synthesized results
-- **Adaptive complexity**: Simple/Medium/Complex classification with thinking budget escalation
-- **Phase overlay**: Complex tasks follow Explore → Plan → Execute → Verify with per-phase tool filtering
-- **Agent profiles**: `/agent build|explore|plan|bash|general` — constrains tool set per task type
-- **Doom loop + denial tracking**: Breaks repeated tool calls; tracks user denials with guidance after 3x
-- **Per-turn retrieval**: Vector + BM25 code search fires every turn, deduplicates against injected context
-- **Model routing**: Complex tasks auto-route to reasoning models
-- **Memory extraction**: Auto-extracts corrections, preferences, and decisions during compaction
-
-### Tool Execution
-- **PTY shell runner**: Real pseudo-terminal via `openpty()` — programs see `isatty()=true` for colored output
-- **7-strategy fuzzy editing**: Exact → line-trimmed → block-anchor → whitespace-normalized → indentation-flexible → escape-normalized → context-aware
-- **Bash security**: Tree-sitter AST parsing detects file ops, network access, dangerous patterns
-- **LSP validation**: Post-edit diagnostics (`cargo check`, `tsc`, `py_compile`, `go vet`) with 30s timeout, command caching, per-language config
-- **Tool result caching**: SHA-256 keyed cache with TTL (60s/120s), path-based invalidation on writes
-- **Step snapshots**: Per-tool-call file snapshots with SHA-256 hashing for undo
-- **SendMessage tool**: Follow up with running/completed subagents by ID or name
-
-### TUI & UX
-- **Full theme system**: 30+ semantic colors, dark/light auto-detection via COLORFGBG, hex color support
-- **Help modal**: F1 shows scrollable keybindings, slash commands, and tips
-- **Model picker**: `/model` with provider filtering, viewport scrolling, pricing display
-- **Session branching**: `/branch create <name>` forks session, `/branch list` shows branches
-- **Undo/redo**: `/undo` reverts last turn + file changes via checkpoint system
-- **Conversation scrolling**: Page Up and Page Down scroll the full-screen transcript
-- **Vim mode**: Toggle with `/vim`, full normal/insert/visual mode
-- **Visual token budget**: `[████████░░] 78%` bar with theme-aware colors
-- **Real-time cost tracking**: Per-model pricing with running total in status bar
-- **Graduated approval prompts**: [SHELL] red, [EDIT] yellow, [ACTION] cyan severity badges
-
-### Safety & Permissions
-- **4-stage permission system**: Auto-deny → glob pattern rules → hook auto-approve → graduated user prompt
-- **Persistent acceptance**: Press 'A' to always allow a pattern (saved to SQLite, survives sessions)
-- **Permission rules from config**: `[{"rule": "Bash(cargo *)", "decision": "allow"}]`
-- **Default deny rules**: Blocks `rm -rf *`, `git push --force`, `.env` edits, `chmod 777`, `curl | sh`
-- **Privacy scanning**: 3-layer secret detection with redaction on tool outputs
-
-### Extensibility
-- **MCP integration**: Stdio/HTTP/SSE transports, tool discovery, `codingbuddy mcp init` scaffold
-- **12 lifecycle hooks**: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, SubagentStart/Stop, PreCompact, SessionEnd, TaskCompleted, Stop
-- **Custom skills**: Markdown frontmatter with `model`, `effort`, `when_to_use` metadata
-- **Skill catalog**: Skills with `when_to_use` injected into system prompt so LLM auto-invokes
-- **Custom agents**: `.codingbuddy/agents/*.md` with model override, max_turns, tool restrictions
-
-## Architecture
-
-17-crate Rust workspace. Edition 2024, Rust 1.94.1, resolver v2.
-
-| Crate | Role |
-|-------|------|
-| `codingbuddy-cli` | CLI dispatch, 30+ subcommand handlers |
-| `codingbuddy-agent` | Agent engine, tool-use loop, profiles, phase loop, skills, context |
-| `codingbuddy-core` | Shared types, config, provider registry, complexity classifier, prompts, profiler |
-| `codingbuddy-llm` | LLM client, streaming, capability-driven provider transforms |
-| `codingbuddy-tools` | Tool definitions, bash AST security, fuzzy editing, PTY shell, sandbox |
-| `codingbuddy-policy` | Permission engine, glob rules, approval gates, output scanner |
-| `codingbuddy-hooks` | 14 lifecycle events, hook runtime, permission decisions |
-| `codingbuddy-lsp` | Post-edit validation with timeout, command caching, per-language config |
-| `codingbuddy-store` | SQLite session persistence, legacy JSONL import, persistent approvals |
-| `codingbuddy-memory` | Long-term memory, shadow commits, checkpoints, auto-extraction |
-| `codingbuddy-index` | Full-text code index (Tantivy), RAG retrieval |
-| `codingbuddy-mcp` | MCP server management (JSON-RPC stdio/http/SSE) |
-| `codingbuddy-ui` | TUI rendering (ratatui), themes, modals, Vim mode, history suggestions |
-| `codingbuddy-diff` | Unified diff parsing, patch staging |
-| `codingbuddy-subagent` | Background tasks, worktree isolation, custom agent definitions |
-| `codingbuddy-jsonrpc` | JSON-RPC server for IDE integration |
-| `codingbuddy-testkit` | Test utilities and mocks |
-
-## Commands
+From your repository, run `codingbuddy` and choose **Connect a provider**. Use an environment credential or save one in the system credential store. Ollama can run without an API key. Use `/models` to select a model, `/connect` to switch providers, and `/` to browse commands.
 
 ```bash
-codingbuddy chat                    # Interactive session (TUI in TTY)
-codingbuddy ask "Summarize this repo"  # One-shot question
-codingbuddy plan "Implement feature X" # Plan without executing
-codingbuddy autopilot "Fix tests" --hours 2  # Unattended loop
-codingbuddy review --staged         # Review staged changes
-codingbuddy agents list             # List custom agents
-codingbuddy skills list             # List available skills
-codingbuddy mcp list                # List MCP servers
-codingbuddy mcp init my-server      # Scaffold new MCP server
-codingbuddy status                  # Session/cost/provider info
-codingbuddy doctor                  # Diagnostics
-codingbuddy completions --shell zsh # Shell completions
+codingbuddy ask --tools=false "Summarize this repository"
+codingbuddy plan "Add pagination to the search results"
+codingbuddy review --staged
+codingbuddy --continue
 ```
 
-### Slash Commands (in chat)
+For scripts, select a configured profile with `codingbuddy --model provider/model -p "Summarize this repo"`. Use `--json` when a caller needs structured output.
 
-```
-/help               Help modal (or press F1)
-/model <name>       Switch model (picker with provider filtering)
-/agent <profile>    Switch agent profile (build/explore/plan/bash/general)
-/branch create <n>  Create session branch
-/branch list        List session branches
-/undo               Revert last turn + file changes
-/redo               Revert to specific checkpoint
-/rewind             Pick checkpoint to revert to
-/cost               Session cost breakdown
-/compact            Force conversation compaction
-/clear              Reset conversation
-/connect            Connect or switch providers
-/models             Choose a model
-/settings           Change the default model or theme
-/skills             List available skills
-/mcp                Manage MCP servers
-/vim                Toggle vim keybindings
-/exit               Exit CodingBuddy
-```
+### Providers and verification
 
-## Configuration
-
-Settings merge in order (later wins):
-1. `~/.codingbuddy/settings.json` (user)
-2. `.codingbuddy/settings.json` (project)
-3. `.codingbuddy/settings.local.json` (local overrides)
-
-```json
-{
-  "llm": {
-    "provider": "deepseek",
-    "context_window_tokens": 128000
-  },
-  "policy": {
-    "approve_edits": "ask",
-    "approve_bash": "ask",
-    "permission_rules": [
-      {"rule": "Bash(cargo *)", "decision": "allow"},
-      {"rule": "Bash(npm test *)", "decision": "allow"},
-      {"rule": "Edit(*.env*)", "decision": "ask"}
-    ]
-  },
-  "lsp": {
-    "enabled": true,
-    "languages": {"rust": true, "typescript": true},
-    "timeout_seconds": 30
-  },
-  "theme": {
-    "mode": "auto"
-  }
-}
-```
-
-## Web UI
-
-CodingBuddy includes an optional web interface for browser-based access:
+| Route | Setup |
+| --- | --- |
+| OpenAI, Anthropic, Gemini, DeepSeek | Select a provider profile and connect its credential. Set `chat_protocol = "openai-responses"` to use OpenAI Responses. |
+| Ollama | Run a local server with an installed tool-capable model for coding tasks. |
+| AWS Bedrock, Vertex AI, Azure OpenAI | Configure the deployment and local cloud identity in user settings. |
+| OpenRouter, Groq, Mistral, xAI, Together, custom gateways | Use a preset or configure a compatible endpoint, model, and credential. |
 
 ```bash
-# Start HTTP server with web UI
-codingbuddy serve --transport http --web
-
-# Open the URL printed by CodingBuddy, including its token fragment.
+codingbuddy provider status --json
+codingbuddy provider check --provider deepseek --json
+codingbuddy provider verify --provider deepseek --json
 ```
 
-HTTP listens on a loopback IP and requires the token generated at server startup. The browser API serves the launch workspace and exposes session creation, prompts, and prompt output. Build the frontend from the `web/` directory:
+`status` reads local evidence. `check` sends a bounded text request to confirm connectivity. `verify` runs an explicit live tool round trip using the selected route and may incur charges. The [support matrix](docs/PROVIDER_SUPPORT.md) distinguishes fixture coverage from live results and documents cloud configuration and gateway extensions.
+
+## Sessions and recovery
+
+CodingBuddy journals the order of model output, tool calls, and results to SQLite. CLI, web, and VS Code use the same session runner. Resume a session on its original provider route. To move to another route, use `session portable-fork` to preview the shareable history and create a linked session.
+
+Background agents can survive a normal CLI exit. Inspect their durable status with `background list`, read their logs with `background attach JOB_ID`, or request cancellation with `background stop JOB_ID`. A stopped or interrupted tool whose effect cannot be verified is reported for local review. Worktree output is staged for review before applying it to the parent workspace.
+
+To restore a checkpoint, preview the changes, then approve the selected plan.
 
 ```bash
-cd web && npm install && npm run build
+codingbuddy rewind --preview
+codingbuddy rewind --plan PLAN_ID --mode files --yes
 ```
 
-For development with hot-reload:
-```bash
-# Terminal 1: start the backend
-codingbuddy serve --transport http
+A restore preserves unrelated edits and flags conflicts with newer changes. Use `--mode conversation` to create a conversation fork, or `--mode both` to combine it with a file restore. See [execution and recovery](docs/DELIVERY_ORDER_3.md) for job ownership, restore reconciliation, and compatibility details.
 
-# Terminal 2: start the dev server (proxies /rpc to backend)
-cd web && npm run dev
-# Append /#token=<printed token> to the dev server URL.
-```
+## Workspace trust and approvals
 
-## Workspace trust
-
-CodingBuddy reads user settings from `~/.codingbuddy/settings.json`. Workspaces start with display and language preferences enabled. To activate project runtime settings, hooks, and project MCP servers for a repository you trust, run:
+User settings live in `~/.codingbuddy/settings.json`. Keep provider credentials there, in your environment, or in the keyring. Project and local project settings can configure runtime behavior after you trust the repository. Use its canonical absolute path.
 
 ```bash
 CODINGBUDDY_TRUST_WORKSPACE="$(pwd -P)" codingbuddy chat
 ```
 
-Use the workspace's absolute path when launching from another directory or from an IDE. This setting also applies to headless launches. Put provider credentials in user settings, the keyring, or your environment. Sandbox configuration alone does not waive Bash approval.
+Explicit denies take precedence over saved approvals and hooks. Untrusted workspaces require fresh approval for commands that can execute project code. Unsandboxed shell calls also require fresh approval. Headless runs decline commands when fresh approval is required. Linux uses Bubblewrap and macOS uses Seatbelt for supported isolation requests. Windows declines commands that require isolation.
 
-Shell commands in untrusted workspaces need approval for each invocation.
-Headless sessions without an approval handler decline them. Automatic builds,
-diagnostics and worktrees that execute workspace code require workspace trust.
-
-Workspace subprocesses start with a minimal environment. If an integration
-previously relied on inherited variables, grant only the names it needs in
-`~/.codingbuddy/settings.json` or the managed settings file.
+Hooks, MCP servers, shell commands, and language tooling start with a minimal environment. Put named grants in user or managed settings if an integration needs an environment variable. For example, grant one variable to one project MCP server.
 
 ```json
 {
@@ -294,78 +103,28 @@ previously relied on inherited variables, grant only the names it needs in
 }
 ```
 
-Consumer names are `mcp:<server-id>`, `hook:<event>:<definition-index>:<handler-index>`
-(zero-based), `plugin_hook:<workspace-relative-path>`, `shell`, `language_tools`,
-`git_worktree`, and `git_checkpoint`.
-Use `"source": "project"` and an exact workspace path for project consumers.
-For user or managed hooks and servers, use `"user"` or `"managed"` and optionally
-pin the workspace. An explicit managed grant list replaces the user list.
-MCP interpolation uses the same allowed variables. A literal fallback in
-`${VAR:-fallback}` can still be used when the variable is unavailable.
+MCP interpolation uses the same grants. Managed restrictions take precedence. See the [user guide](docs/USER_GUIDE.md) for settings, skills, hooks, and custom agents.
 
-Explicit deny rules remain binding in every permission mode, including
-`bypassPermissions`. Saved approvals and hooks cannot override a deny. Use
-`codingbuddy permissions dry-run bash_run --args-json '{"command":"git status"}'`
-to inspect the decision for a specific command.
+## Web and VS Code
 
-Isolation uses Bubblewrap on Linux and Seatbelt on macOS. The shell prompt shows
-the effective filesystem and network permissions. Windows rejects commands that
-require isolation. Unsandboxed shell calls, including command exclusions, require
-approval for each invocation. Headless sessions without an approval handler
-decline them. Existing custom wrapper templates cannot satisfy an isolation
-requirement. Use a supported backend or choose unsandboxed execution explicitly.
-Domain, localhost-binding, and Unix-socket exceptions are unsupported in the
-isolated shell modes.
+Run `codingbuddy serve --transport http --web` and open the printed URL with its token fragment. The server listens on loopback and scopes access to the launch workspace. To reauthorize a saved browser session after restarting, launch with `--expose-session SESSION_ID` and open the new URL. The [web source](web/) also supports a Vite development proxy.
 
-Release publication requires a RustSec check of the locked production graph and
-focused trust and isolation checks for each shipped target. Temporary advisory
-exceptions are recorded in `.cargo/release-audit-exceptions.json` with exact
-versions, affected targets, a mitigation, an owner, and an expiry within 90 days.
+The [VS Code extension](extensions/vscode/) connects over stdio. It supports live prompt events, cancellation, and local checkpoint review.
+
+## Upgrading to 0.5.0
+
+Stop older CodingBuddy processes before reopening a workspace. Existing SQLite sessions remain available, and CodingBuddy imports a legacy JSONL-only journal once while retaining the original archive. Review the [upgrade notes](docs/releases/0.5.0.md#before-upgrading) if you use hooks, background commands, custom sandbox wrappers, or a cloud gateway.
 
 ## Development
 
 ```bash
-cargo fmt --all -- --check          # Format check
-cargo clippy --workspace --all-targets -- -D warnings  # Lint (0 warnings)
-cargo test --workspace --all-targets  # 1,204+ tests (0 failures)
-cargo build --release --bin codingbuddy  # Release binary (LTO + strip)
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 ```
 
-### Startup Profiling
-
-```bash
-CODINGBUDDY_STARTUP_TRACE=1 codingbuddy chat
-# Outputs:
-# [startup-trace] Startup timing:
-#   cli_parse                      +  1.2ms  (total   1.2ms)
-#   config_load                    + 12.4ms  (total  13.6ms)
-#   llm_client                     +  0.1ms  (total  13.7ms)
-#   engine_init                    + 85.3ms  (total  99.0ms)
-```
-
-## Quality Metrics
-
-| Metric | Value |
-|--------|-------|
-| Crates | 18 |
-| Production lines | ~97K |
-| Tests | 1,204+ (0 failures) |
-| Production unwraps | 0 |
-| Clippy warnings | 0 |
-| Hooks fired | 12/14 |
-| Providers | 7 + any OpenAI-compatible |
-| Capability flags | 19 per provider |
-| Release profile | LTO (thin) + strip + codegen-units=1 |
+The [release workflow](.github/workflows/release.yml) gates publication on the locked dependency audit, trust and isolation checks, provider fixtures, and unattended conformance for the six native targets. The [Order 4 audit](docs/DELIVERY_ORDER_4.md) records local verification and the limits of its evidence.
 
 ## License
 
-MIT
-
-
-### Upgrading session storage
-
-Stop older CodingBuddy processes before opening a workspace with the upgraded binary.
-Session events and their projections now commit together in SQLite. Existing SQLite
-history takes precedence during the upgrade. A workspace with only a legacy
-`.codingbuddy/events.jsonl` journal imports it once, and the original file remains
-available as an archive. Use `codingbuddy export` for portable transcripts.
+[MIT](LICENSE)
