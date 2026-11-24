@@ -387,6 +387,7 @@ impl AgentEngine {
             &self.cfg,
         ) {
             Ok(mut host) => {
+                host.set_journal_store(self.store.clone());
                 if let Some(manager) = &self.mcp {
                     install_mcp_executor(&mut host, manager.clone());
                 }
@@ -612,6 +613,23 @@ impl AgentEngine {
     }
 
     /// Mutable access to the configuration for test overrides.
+    pub fn delegation_config(&self) -> AppConfig {
+        let mut cfg = self.cfg.clone();
+        if matches!(
+            self.policy.permission_mode(),
+            codingbuddy_policy::PermissionMode::Plan
+                | codingbuddy_policy::PermissionMode::Locked
+                | codingbuddy_policy::PermissionMode::DontAsk
+        ) {
+            cfg.policy.permission_mode = codingbuddy_core::PermissionMode::Locked;
+        }
+        cfg.budgets.max_turns = self
+            .max_turns
+            .or(cfg.budgets.max_turns)
+            .map(|limit| limit.min(cfg.agent_loop.tool_loop_max_turns));
+        cfg.budgets.max_budget_usd = self.max_budget_usd.or(cfg.budgets.max_budget_usd);
+        cfg
+    }
     pub fn cfg(&self) -> &AppConfig {
         &self.cfg
     }
@@ -918,7 +936,11 @@ impl AgentEngine {
             context_window_tokens: cfg.llm.context_window_tokens,
             reserved_overhead_tokens: cfg.context.reserved_overhead_tokens,
             response_budget_tokens: cfg.context.response_budget_tokens,
-            max_turns: self.max_turns.unwrap_or(cfg.agent_loop.tool_loop_max_turns) as usize,
+            max_turns: self
+                .max_turns
+                .or(cfg.budgets.max_turns)
+                .unwrap_or(cfg.agent_loop.tool_loop_max_turns)
+                .min(cfg.agent_loop.tool_loop_max_turns) as usize,
             read_only,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(think_budget)),
             extended_thinking_model: active_reasoner_model,
@@ -1029,6 +1051,7 @@ impl AgentEngine {
 
         let mut loop_ =
             tool_loop::ToolUseLoop::new(llm, self.tool_host.clone(), config, system_prompt, tools);
+        loop_.set_budget_limit(self.max_budget_usd.or(cfg.budgets.max_budget_usd));
         loop_.set_discoverable_tools(discoverable_tools);
         loop_.extend_tool_metadata(runtime_tool_metadata);
 
@@ -1345,7 +1368,8 @@ impl AgentEngine {
                 Some(InvocationReceipt::File {
                     path,
                     postimage_sha256,
-                }) => files
+                    execution_root,
+                }) if execution_root.as_ref().is_none_or(|root|root.canonicalize().is_ok_and(|root|root==files.root())) => files
                     .resolve(&path, false)
                     .ok()
                     .and_then(|path| files.read(&path).ok())
@@ -1353,6 +1377,7 @@ impl AgentEngine {
                     .map(
                         |_| serde_json::json!({"path":path,"recovery_status":"verified_postimage"}),
                     ),
+                Some(InvocationReceipt::File {..})=>None,
                 Some(InvocationReceipt::Patch { patch_id }) => {
                     let patches = codingbuddy_diff::PatchStore::new(&self.workspace)?;
                     if patches.verify_postimage(patch_id).unwrap_or(false) {
@@ -1964,6 +1989,7 @@ mod tests {
             session,
             ids[0],
             &codingbuddy_store::InvocationReceipt::File {
+                execution_root: None,
                 path: "marker".into(),
                 postimage_sha256: format!("{:x}", Sha256::digest(b"expected")),
             },

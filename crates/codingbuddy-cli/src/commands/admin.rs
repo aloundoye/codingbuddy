@@ -507,6 +507,10 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         "gh": command_exists("gh"),
     });
 
+    let mcp_states =
+        codingbuddy_mcp::McpManager::with_trust(cwd, cfg.workspace_trust == Some(true))
+            .and_then(|manager| manager.diagnostics())
+            .unwrap_or_default();
     let hooks_count = cfg.hooks.as_object().map_or(0, |m| m.len());
 
     let storage_bytes = store.storage_bytes().ok();
@@ -646,6 +650,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "installed": plugins.len(),
             "enabled": plugins.iter().filter(|p| p.enabled).count(),
         },
+        "mcp_states": mcp_states,
         "privacy": {"enabled": cfg.privacy.enabled},
         "hooks": {
             "count": hooks_count,

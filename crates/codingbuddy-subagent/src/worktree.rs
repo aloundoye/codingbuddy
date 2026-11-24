@@ -156,6 +156,24 @@ impl WorktreeIsolation {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Err(error) => return Err(error.into()),
                     };
+                    #[cfg(unix)]
+                    if hash.is_some() {
+                        use std::os::unix::fs::PermissionsExt;
+                        let executable = parent
+                            .open_file(&path)?
+                            .into_std()
+                            .metadata()?
+                            .permissions()
+                            .mode()
+                            & 0o111
+                            != 0;
+                        let mode = std::str::from_utf8(meta)?.split_whitespace().next();
+                        ensure!(
+                            mode == Some(if executable { "100755" } else { "100644" }),
+                            "Parent file mode changed at {}",
+                            path.display()
+                        );
+                    }
                     ensure!(
                         actual.as_deref() == hash,
                         "Parent changed at {}; worktree retained for review",
@@ -227,6 +245,12 @@ fn git(
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut command = process_env::git_inspection(workspace);
+    // Git for Windows can reject verbatim paths when resolving worktrees and index locks.
+    #[cfg(windows)]
+    let (paths, index) = (
+        paths.iter().copied().map(dunce::simplified),
+        index.map(dunce::simplified),
+    );
     command
         .args(args)
         .args(paths)
@@ -241,10 +265,10 @@ fn git(
     // Feed while collecting output, avoiding a full stdin/stdout pipe deadlock.
     std::thread::scope(|scope| {
         let writer = scope.spawn(move || -> Result<()> {
-            if let Some(mut stdin) = stdin {
-                if let Some(input) = input {
-                    stdin.write_all(input)?;
-                }
+            if let Some(mut stdin) = stdin
+                && let Some(input) = input
+            {
+                stdin.write_all(input)?;
             }
             Ok(())
         });
@@ -285,9 +309,29 @@ fn snapshot(
 ) -> Result<(String, Vec<PathBuf>)> {
     let files = WorkspaceFs::open(workspace)?;
     let mut names = BTreeSet::new();
-    let tracked = git(workspace, None, &["ls-files", "-z", "--cached"], &[], None)?;
-    for path in tracked.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        names.insert(path_from_bytes(path)?);
+    #[cfg(not(unix))]
+    let mut tracked_modes = std::collections::BTreeMap::new();
+    let tracked = git(workspace, None, &["ls-files", "-z", "--stage"], &[], None)?;
+    for record in tracked.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let split = record
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or_else(|| anyhow::anyhow!("Invalid tracked path metadata"))?;
+        let fields = std::str::from_utf8(&record[..split])?
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 3 && fields[2] == "0",
+            "Unmerged input must be resolved before delegation"
+        );
+        ensure!(
+            matches!(fields[0], "100644" | "100755"),
+            "Unsupported tracked file type in delegation input"
+        );
+        let path = path_from_bytes(&record[split + 1..])?;
+        #[cfg(not(unix))]
+        tracked_modes.insert(path.clone(), fields[0] == "100755");
+        names.insert(path);
     }
     if include_new {
         let untracked = git(
@@ -353,7 +397,7 @@ fn snapshot(
                 != 0
         };
         #[cfg(not(unix))]
-        let executable = false;
+        let executable = tracked_modes.get(&path).copied().unwrap_or(false);
         records.extend_from_slice(if executable { b"100755 " } else { b"100644 " });
         records.extend_from_slice(hash.trim().as_bytes());
         records.push(b'\t');

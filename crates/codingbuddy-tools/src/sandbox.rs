@@ -105,6 +105,9 @@ impl ShellLaunch {
         })
     }
 
+    pub(super) fn set_consumer(&mut self, consumer: &str) {
+        self.environment = process_env::variables(&self.workspace, consumer, Source::Project);
+    }
     pub(super) fn set_cwd(&mut self, cwd: &Path) -> Result<()> {
         let cwd = cwd.canonicalize()?;
         ensure!(
@@ -160,33 +163,10 @@ impl ShellLaunch {
             .as_ref()
             .map(|dir| dir.path().canonicalize())
             .transpose()?;
-        let mut command = match &self.backend {
-            Backend::Direct => direct_shell(&self.expression)?,
-            #[cfg(target_os = "linux")]
-            Backend::Bubblewrap(program) => self.bubblewrap(program)?,
+        let command = self.command(
             #[cfg(target_os = "macos")]
-            Backend::Seatbelt => {
-                let mut command = Command::new("/usr/bin/sandbox-exec");
-                command.args([
-                    "-p",
-                    &self.seatbelt(private_temp.as_deref().expect("sandbox temp"))?,
-                    "--",
-                    "/bin/sh",
-                    "-c",
-                    &self.expression,
-                ]);
-                command
-            }
-        };
-        process_env::apply(&mut command, &self.environment);
-        #[cfg(target_os = "macos")]
-        if let Some(path) = private_temp {
-            set_temp(&mut command, &path);
-        }
-        #[cfg(target_os = "linux")]
-        if self.is_isolated() {
-            set_temp(&mut command, Path::new("/tmp"));
-        }
+            private_temp.as_deref(),
+        )?;
         #[cfg(not(unix))]
         let _ = on_progress;
         run_shell_launch(
@@ -204,6 +184,66 @@ impl ShellLaunch {
         .with_context(|| format!("could not launch {}", self.restrictions()))
     }
 
+    fn command(&self, #[cfg(target_os = "macos")] private_temp: Option<&Path>) -> Result<Command> {
+        let mut command = match &self.backend {
+            Backend::Direct => direct_shell(&self.expression)?,
+            #[cfg(target_os = "linux")]
+            Backend::Bubblewrap(program) => self.bubblewrap(program)?,
+            #[cfg(target_os = "macos")]
+            Backend::Seatbelt => {
+                let mut command = Command::new("/usr/bin/sandbox-exec");
+                command.args([
+                    "-p",
+                    &self.seatbelt(private_temp.expect("sandbox temp"))?,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    &self.expression,
+                ]);
+                command
+            }
+        };
+        process_env::apply(&mut command, &self.environment);
+        #[cfg(target_os = "macos")]
+        if let Some(path) = private_temp {
+            set_temp(&mut command, path);
+        }
+        #[cfg(target_os = "linux")]
+        if self.is_isolated() {
+            set_temp(&mut command, Path::new("/tmp"));
+        }
+        command.current_dir(&self.cwd);
+        Ok(command)
+    }
+    pub(super) fn spawn_stdio(
+        self,
+        context: &codingbuddy_core::execution::ExecutionContext,
+    ) -> Result<codingbuddy_core::execution::OwnedChild> {
+        context.check()?;
+        #[cfg(target_os = "macos")]
+        let temp = self.is_isolated().then(tempfile::tempdir).transpose()?;
+        #[cfg(target_os = "macos")]
+        let private_temp = temp
+            .as_ref()
+            .map(|dir| dir.path().canonicalize())
+            .transpose()?;
+        let mut command = self.command(
+            #[cfg(target_os = "macos")]
+            private_temp.as_deref(),
+        )?;
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = codingbuddy_core::execution::OwnedChild::spawn(&mut command)?;
+        #[cfg(target_os = "macos")]
+        if let Some(temp) = temp {
+            child.retain_resource(temp);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = &mut child;
+        Ok(child)
+    }
     #[cfg(target_os = "linux")]
     fn bubblewrap(&self, program: &Path) -> Result<Command> {
         let mut command = Command::new(program);

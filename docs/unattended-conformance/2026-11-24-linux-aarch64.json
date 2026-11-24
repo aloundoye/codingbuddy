@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "revision": "eb31d9a01ea3c1b440e3a24304e27e7c4b5e3999",
+  "target": "aarch64-unknown-linux-gnu",
+  "native": true,
+  "lockfile_sha256": "d8f519ffcc011c9477d4d842d40645e09a097eba7c854cdd5bec8e6980bf458b",
+  "worktree_clean": false,
+  "groups": {
+    "process": {
+      "status": "passed",
+      "passed": 4,
+      "exit_code": 0,
+      "output_sha256": "db3349769009b17f8f0f27b9a812c23a7b3a89ab271e210a7a2cde7d28de7c85"
+    },
+    "operations": {
+      "status": "passed",
+      "passed": 2,
+      "exit_code": 0,
+      "output_sha256": "aeff2d215bf067399ec1e8e5d6e5ebfa4de64721359a6befc240fc72d95f0350"
+    },
+    "restore": {
+      "status": "passed",
+      "passed": 6,
+      "exit_code": 0,
+      "output_sha256": "a465ae88f790e8bb96e5ec7b142d295e8f2876f8402b6e66886e1c99f7651596"
+    },
+    "worktree": {
+      "status": "passed",
+      "passed": 2,
+      "exit_code": 0,
+      "output_sha256": "a4763cc17a6602c6225648e37ee9e7805299a560608fe8b84a0b97f556e4b2a5"
+    },
+    "mcp": {
+      "status": "passed",
+      "passed": 5,
+      "exit_code": 0,
+      "output_sha256": "776215159dc4ffd9cd6267ad0e94a26aaae5ceb770a7dbff8d1fccbd4ffdeb91"
+    },
+    "hooks": {
+      "status": "passed",
+      "passed": 2,
+      "exit_code": 0,
+      "output_sha256": "1d073542cca9d173e724da4ef4f3ec4217ec8ea2e59d7da02b2cb2b891187e38"
+    },
+    "language": {
+      "status": "passed",
+      "passed": 3,
+      "exit_code": 0,
+      "output_sha256": "ffc65fa9d518e4030ed3cd976041190ed3a1736a2bda5cfe8760559e108956c7"
+    },
+    "verification": {
+      "status": "passed",
+      "passed": 2,
+      "exit_code": 0,
+      "output_sha256": "ca3773e038bc652c94751d5e5fd360d748d365add813831d28c942c5a8683445"
+    },
+    "local_rpc": {
+      "status": "passed",
+      "passed": 2,
+      "exit_code": 0,
+      "output_sha256": "12e01c04f5724ee739b2330b74572b92cf17d1e435d529883ca40a8c6da313fe"
+    },
+    "agent": {
+      "status": "passed",
+      "passed": 1,
+      "exit_code": 0,
+      "output_sha256": "ef3e8302ae4798e48833d902c8675884ae130b282aba7ec4ddb8c6ca16439f68"
+    },
+    "clients": {
+      "status": "passed",
+      "passed": 2,
+      "exit_code": 0,
+      "output_sha256": "68fe7c990a32e65d1537bd3be9157421f0f7d593f10f85ea259f498467f8357b"
+    }
+  },
+  "status": "passed"
+}

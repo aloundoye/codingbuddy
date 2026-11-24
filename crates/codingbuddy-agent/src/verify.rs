@@ -1,6 +1,5 @@
-use codingbuddy_core::{ApprovedToolCall, ToolCall, ToolHost, ToolPermission};
+use codingbuddy_core::ToolCall;
 use codingbuddy_tools::LocalToolHost;
-use serde_json::json;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -38,45 +37,23 @@ pub fn run_verify(
     let mut failures = Vec::new();
 
     for command in commands {
-        let call = ToolCall {
-            name: "bash.run".to_string(),
-            args: json!({"cmd": command, "timeout": timeout_seconds}),
-            requires_approval: false,
+        let result = match approval.as_mut() {
+            Some(callback) => tool_host.run_verification_with_approval(
+                command,
+                workspace,
+                timeout_seconds,
+                Default::default(),
+                Some(&mut **callback),
+            ),
+            None => tool_host.run_verification_command(
+                command,
+                workspace,
+                timeout_seconds,
+                Default::default(),
+            ),
         };
-        let (proposal, permission) = tool_host.propose_with_permission(call);
-        if let ToolPermission::Deny { reason, .. } = permission {
-            failures.push(format!("verification command denied: {reason}"));
-            continue;
-        }
-
-        if !proposal.approved {
-            let approved_by_user = if let Some(ref mut cb) = approval {
-                let mut display = proposal.call.clone();
-                display.args["fresh_approval"] = json!(matches!(
-                    permission,
-                    ToolPermission::Ask { fresh: true, .. }
-                ));
-                if let Some(detail) = tool_host.approval_details(proposal.invocation_id) {
-                    display.args["effective_isolation"] = serde_json::Value::String(detail);
-                }
-                cb(&display).unwrap_or(false)
-            } else {
-                false
-            };
-            if !approved_by_user {
-                tool_host.discard_proposal(proposal.invocation_id);
-                let line = format!("verification command denied by policy: `{}`", command);
-                failures.push(line.clone());
-                continue;
-            }
-        }
-
-        let result = tool_host.execute(ApprovedToolCall {
-            invocation_id: proposal.invocation_id,
-            call: proposal.call,
-        });
-        let output = extract_output(&result.output);
-        if command_passed(&result.output, result.success) {
+        let output = extract_output(&result);
+        if command_passed(&result, result["success"] == true) {
             continue;
         } else {
             let mut failure_message = format!("`{}` failed:\n{}", command, truncate(&output, 2500));
@@ -174,8 +151,11 @@ fn truncate(text: &str, max: usize) -> String {
 
 fn build_failure_context_pack(workspace: &Path, output: &str) -> String {
     use std::collections::HashSet;
-    use std::fs;
+    use std::io::Read;
 
+    let Ok(files) = codingbuddy_core::workspace_fs::WorkspaceFs::open(workspace) else {
+        return String::new();
+    };
     let mut found_files = HashSet::new();
     let mut pack = String::new();
 
@@ -204,15 +184,13 @@ fn build_failure_context_pack(workspace: &Path, output: &str) -> String {
             continue;
         }
 
-        let full_path = workspace.join(path_str);
-        if full_path.is_file() && !found_files.contains(path_str) {
-            found_files.insert(path_str.to_string());
-            if let Ok(content) = fs::read_to_string(&full_path) {
-                let content_str = if content.len() > 8000 {
-                    format!("{}...(truncated)", &content[..8000])
-                } else {
-                    content
-                };
+        if found_files.insert(path_str.to_string())
+            && let Ok(file) = files.open_file(Path::new(path_str))
+        {
+            let mut bytes = Vec::new();
+            if file.into_std().take(8001).read_to_end(&mut bytes).is_ok() {
+                let text = String::from_utf8_lossy(&bytes);
+                let content_str = truncate(&text, 8000);
                 pack.push_str(&format!(
                     "\n--- Context Auto-Attached: {} ---\n{}\n",
                     path_str, content_str
@@ -309,8 +287,8 @@ mod tests {
     }
 
     #[test]
-    fn command_passed_defaults_to_true_on_empty_output() {
-        assert!(command_passed(&json!({}), true));
+    fn command_passed_requires_a_confirmed_outcome() {
+        assert!(!command_passed(&json!({}), true));
     }
 
     #[test]

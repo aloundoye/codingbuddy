@@ -57,6 +57,10 @@
       {
         "command": "deepseek.showDiff",
         "title": "DeepSeek: Show Diff"
+      },
+      {
+        "command": "deepseek.restoreCheckpoint",
+        "title": "DeepSeek: Preview and Restore Checkpoint"
       }
     ]
   },

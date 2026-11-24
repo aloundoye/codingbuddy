@@ -1228,24 +1228,15 @@ For each task: id, subject, status, owner, blockedBy list\n\n\
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "enter_worktree".to_string(),
-                description: "Create an isolated git worktree and switch the session's working directory into it. \
-This lets you experiment on a separate branch without affecting the main checkout. \
-All subsequent tool calls operate inside the worktree until you call exit_worktree.\n\n\
-## When to use\n\
-- Before making risky or experimental changes that you may want to discard\n\
-- When you need to work on a separate branch while preserving the main checkout\n\
-- For safe prototyping: try an approach, then merge or discard\n\n\
-## Important\n\
-- A new branch is created automatically from the current HEAD\n\
-- You MUST call exit_worktree when done to merge changes or clean up\n\
-- Only one worktree can be active at a time per session".to_string(),
+                description: "Create a private worktree from current tracked files and explicitly selected untracked inputs. Tool calls execute there until exit_worktree. The parent branch and index stay intact. Exit stages a patch for local review; artifacts survive exit and cancellation.".into(),
             strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
+                        "untracked_inputs":{"type":"array","items":{"type":"string"},"description":"Exact non-ignored untracked file paths to include."},
                         "branch_name": {
                             "type": "string",
-                            "description": "Name for the worktree branch (e.g. 'experiment/try-new-api'). Auto-generated if omitted."
+                            "description": "Label for the UUID-owned worktree; no branch is created."
                         }
                     },
                     "required": []
@@ -1256,23 +1247,15 @@ All subsequent tool calls operate inside the worktree until you call exit_worktr
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "exit_worktree".to_string(),
-                description: "Exit the current git worktree and return to the main checkout. \
-Changes made in the worktree can be merged or discarded.\n\n\
-## When to use\n\
-- After finishing experimental work in a worktree\n\
-- To merge successful changes back to the main branch\n\
-- To discard failed experiments\n\n\
-## Actions\n\
-- merge: merge the worktree branch into the original branch, then clean up\n\
-- discard: delete the worktree and branch without merging".to_string(),
+                description: "Return to the parent workspace and stage an output patch for explicit local review. The legacy merge action also stages; discard retains the worktree for inspection. No action applies changes to the parent or destroys output.".into(),
             strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["merge", "discard"],
-                            "description": "What to do with the worktree changes: 'merge' to keep, 'discard' to throw away"
+                            "enum": ["stage", "merge", "discard"],
+                            "description": "stage (or legacy merge) exports a patch; discard returns without exporting. Artifacts are retained."
                         }
                     },
                     "required": ["action"]

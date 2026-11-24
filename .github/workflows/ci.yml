@@ -35,11 +35,59 @@ jobs:
           expected=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
           test "$(rustc --version | cut -d ' ' -f 2)" = "$expected"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Compile VS Code client
+        working-directory: extensions/vscode
+        run: |
+          npm install --ignore-scripts --no-package-lock
+          npm run compile
+
       - name: fmt
         run: cargo fmt --all -- --check
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  unattended:
+    name: unattended (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_BUILD_JOBS: "1"
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify unattended execution contracts
+        shell: bash
+        run: |
+          python -B scripts/test_unattended_conformance_gate.py
+          python -B scripts/unattended_conformance.py --output "${{ runner.temp }}/unattended.json" --revision '${{ github.sha }}'
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          python -B scripts/unattended_conformance_gate.py "${{ runner.temp }}/unattended.json" --target "$target" --revision '${{ github.sha }}'
+      - name: Upload unattended evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unattended-${{ runner.os }}
+          path: ${{ runner.temp }}/unattended.json
+          if-no-files-found: error
 
   tests:
     name: tests (${{ matrix.os }})

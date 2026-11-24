@@ -98,6 +98,14 @@ class DeepSeekRpcClient {
     return this.request("prompt/cancel", { prompt_id: promptId });
   }
 
+  async checkpointPreview(checkpointId: string): Promise<JsonRpcResponse> {
+    return this.request("checkpoint/preview", { checkpoint_id: checkpointId });
+  }
+
+  async checkpointApply(planId: string, mode: string): Promise<JsonRpcResponse> {
+    return this.request("checkpoint/apply", { plan_id: planId, mode, approved: true });
+  }
+
   async toolApprove(sessionId: string, invocationId: string): Promise<JsonRpcResponse> {
     return this.request("tool/approve", { session_id: sessionId, invocation_id: invocationId });
   }
@@ -779,6 +787,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         vscode.window.showErrorMessage(`Fork failed: ${message}`);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("deepseek.restoreCheckpoint", async () => {
+      const checkpointId = await vscode.window.showInputBox({ prompt: "Checkpoint ID to preview" });
+      if (!checkpointId) return;
+      try {
+        const preview = await rpcClient.checkpointPreview(checkpointId);
+        if (preview.error) throw new Error(preview.error.message);
+        const plan = preview.result as { id: string; session_id?: string; cursor?: number; conflicts: string[] };
+        const document = await vscode.workspace.openTextDocument({ language: "json", content: JSON.stringify(preview.result, null, 2) });
+        await vscode.window.showTextDocument(document, { preview: true });
+        const modes = [{ label: "Restore files", mode: "files" }];
+        if (plan.session_id && plan.cursor !== undefined && plan.cursor !== null) {
+          modes.push({ label: "Fork conversation", mode: "conversation" }, { label: "Restore files and fork conversation", mode: "both" });
+        }
+        const selected = await vscode.window.showQuickPick(modes, { placeHolder: "Choose what to restore from the preview" });
+        if (!selected) return;
+        if (selected.mode !== "conversation" && plan.conflicts.length > 0) throw new Error("Resolve the previewed conflicts or select a smaller set of paths in the CLI.");
+        const confirmed = await vscode.window.showWarningMessage(`Apply reviewed restore plan ${plan.id}?`, { modal: true }, "Apply restore");
+        if (confirmed !== "Apply restore") return;
+        const applied = await rpcClient.checkpointApply(plan.id, selected.mode);
+        if (applied.error) throw new Error(applied.error.message);
+        const result = applied.result as { recovery_status: string; session_id?: string };
+        vscode.window.showInformationMessage(`Restore ${result.recovery_status}${result.session_id ? `; conversation fork ${result.session_id}` : ""}.`);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Restore failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     })
   );

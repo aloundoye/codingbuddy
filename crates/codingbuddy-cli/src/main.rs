@@ -570,6 +570,8 @@ struct ApplyArgs {
 
 #[derive(Args, Default)]
 struct RewindArgs {
+    #[arg(long, requires = "plan")]
+    reconcile: bool,
     #[arg(long)]
     preview: bool,
     #[arg(long)]
@@ -1351,11 +1353,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    if std::env::args_os().collect::<Vec<_>>()
-        == [
-            std::ffi::OsString::from(std::env::args_os().next().unwrap_or_default()),
-            std::ffi::OsString::from("--internal-owned-worker"),
-        ]
+    if std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--internal-owned-worker")])
     {
         return worker::run();
     }

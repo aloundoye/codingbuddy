@@ -755,50 +755,144 @@ fn git_resolve_all_and_stage_clears_conflicts() {
 }
 
 #[test]
-fn background_run_shell_attach_tail_and_stop_emit_json() {
-    let workspace = TempDir::new().expect("workspace");
+fn delivery_three_background_headless_denial_is_durable() {
+    let workspace = TempDir::new().unwrap();
     let started = run_json(
         workspace.path(),
-        &[
-            "--json",
-            "background",
-            "run-shell",
-            "echo",
-            "background-shell-ok",
-        ],
+        &["--json", "background", "run-shell", "echo", "must-not-run"],
     );
-    let job_id = started["job_id"].as_str().expect("job id");
-    let stdout_log = started["stdout_log"].as_str().expect("stdout log");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        let text = fs::read_to_string(stdout_log).unwrap_or_default();
-        if text.contains("background-shell-ok") {
+    let id = uuid::Uuid::parse_str(started["job_id"].as_str().unwrap()).unwrap();
+    let store = codingbuddy_store::Store::new(workspace.path()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let job = store.reconcile_background_job(id).unwrap().unwrap();
+        if !matches!(job.status.as_str(), "prepared" | "running" | "cancelling") {
+            assert_eq!(job.status, "failed", "{job:?}");
+            assert!(
+                job.metadata_json.contains("denied"),
+                "{}",
+                job.metadata_json
+            );
             break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "Background worker did not settle"
+        );
         thread::sleep(Duration::from_millis(50));
     }
-
-    let attached = run_json(
+    assert!(
+        fs::read_to_string(started["stdout_log"].as_str().unwrap())
+            .unwrap_or_default()
+            .is_empty()
+    );
+    let stopped = run_json(
         workspace.path(),
-        &[
+        &["--json", "background", "stop", &id.to_string()],
+    );
+    assert_eq!(stopped["stopped"], true);
+}
+
+#[test]
+fn delivery_three_background_private_bootstrap_survives_parent_exit() {
+    let workspace = TempDir::new().unwrap();
+    let ws = workspace.path();
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(ws, &mock.endpoint);
+    fs::write(ws.join("seed.txt"), "parent input").unwrap();
+    fs::write(ws.join(".gitignore"), ".codingbuddy/\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "--", "seed.txt", ".gitignore"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+    ] {
+        let output = StdCommand::new("git")
+            .current_dir(ws)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let index = fs::read(ws.join(".git/index")).unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("codingbuddy"))
+        .current_dir(ws)
+        .env("CODINGBUDDY_TRUST_WORKSPACE", ws)
+        .env("DEEPSEEK_API_KEY", "synthetic-provider-key")
+        .env(
+            "ARBITRARY_WORKER_SECRET",
+            "synthetic-bootstrap-must-stay-private",
+        )
+        .args([
             "--json",
             "background",
-            "attach",
-            job_id,
-            "--tail-lines",
-            "20",
-        ],
-    );
-    assert_eq!(attached["job_id"], job_id);
+            "run-agent",
+            "Describe the supplied repository",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let started: Value = serde_json::from_slice(&output).unwrap();
+    let id = uuid::Uuid::parse_str(started["job_id"].as_str().unwrap()).unwrap();
+    let store = codingbuddy_store::Store::new(ws).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let job = loop {
+        let job = store.reconcile_background_job(id).unwrap().unwrap();
+        if !matches!(job.status.as_str(), "prepared" | "running" | "cancelling") {
+            break job;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Worker did not finish after parent exit"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(job.status, "completed", "{}", job.metadata_json);
     assert!(
-        attached["log_tail"]["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("background-shell-ok")
+        job.metadata_json.contains("synthetic credential accepted"),
+        "Provider did not receive the private bootstrap key: {}",
+        job.metadata_json
     );
-
-    let stopped = run_json(workspace.path(), &["--json", "background", "stop", job_id]);
-    assert_eq!(stopped["stopped"], true);
+    assert!(mock.requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(fs::read(ws.join(".git/index")).unwrap(), index);
+    assert_eq!(
+        fs::read_to_string(ws.join("seed.txt")).unwrap(),
+        "parent input"
+    );
+    let mut pending = vec![ws.join(".codingbuddy")];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else if metadata.is_file() {
+            let bytes = fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("synthetic-provider-key")
+                    && !text.contains("synthetic-bootstrap-must-stay-private"),
+                "Credential leaked into {}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn run_json(workspace: &Path, args: &[&str]) -> Value {

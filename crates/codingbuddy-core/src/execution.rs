@@ -40,6 +40,7 @@ impl ExecutionContext {
 /// This owns lifecycle only; filesystem/network isolation remains the launcher's responsibility.
 pub struct OwnedChild {
     child: Child,
+    resources: Vec<Box<dyn std::any::Any + Send>>,
     #[cfg(unix)]
     group: bool,
     #[cfg(windows)]
@@ -53,6 +54,7 @@ impl OwnedChild {
             command.process_group(0);
             Ok(Self {
                 child: command.spawn()?,
+                resources: vec![],
                 group: true,
             })
         }
@@ -67,7 +69,14 @@ impl OwnedChild {
     }
     #[cfg(unix)]
     pub fn from_process_group(child: Child) -> Self {
-        Self { child, group: true }
+        Self {
+            child,
+            group: true,
+            resources: vec![],
+        }
+    }
+    pub fn retain_resource(&mut self, resource: impl std::any::Any + Send) {
+        self.resources.push(Box::new(resource));
     }
     pub fn terminate(&mut self) {
         #[cfg(unix)]
@@ -146,7 +155,11 @@ mod windows {
                 let _ = child.wait();
                 anyhow::bail!("Cannot attach child to owned process job");
             }
-            let mut owned = OwnedChild { child, job };
+            let mut owned = OwnedChild {
+                child,
+                job,
+                resources: vec![],
+            };
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             ensure!(
                 snapshot != INVALID_HANDLE_VALUE,
@@ -295,7 +308,7 @@ mod delivery_three_process {
     fn fixture() {
         match std::env::var("CODINGBUDDY_OWNED_FIXTURE").as_deref() {
             Ok("parent") => {
-                let _child = Command::new(std::env::current_exe().unwrap())
+                let mut child = Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", FIXTURE, "--nocapture"])
                     .env("CODINGBUDDY_OWNED_FIXTURE", "child")
                     .spawn()
@@ -307,6 +320,7 @@ mod delivery_three_process {
                     let _ = output.write_all(&bytes);
                 }
                 std::thread::sleep(Duration::from_secs(10));
+                let _ = child.wait();
             }
             Ok("child") => {
                 std::thread::sleep(Duration::from_millis(750));

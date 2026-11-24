@@ -794,6 +794,15 @@ pub(super) fn handle_task_stop(
     }
     .ok_or_else(|| anyhow!("no background job found for task {task_id}"))?;
 
+    let operation = store
+        .operation(background_job.job_id)
+        .map_err(|_| anyhow!("Legacy task has no owned cancellation channel"))?;
+    if !matches!(
+        operation.state.as_str(),
+        "prepared" | "running" | "cancelling"
+    ) {
+        return Ok(serde_json::json!({"task_id":task_id,"run_id":run.run_id,"background_job_id":background_job.job_id,"status":operation.state}).to_string());
+    }
     anyhow::ensure!(
         store.cancel_operation(background_job.job_id)? > 0,
         "Legacy task has no owned cancellation channel"

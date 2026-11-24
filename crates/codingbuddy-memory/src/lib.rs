@@ -437,19 +437,17 @@ impl MemoryManager {
             RewindAction::RestoreCodeAndConversation | RewindAction::RestoreConversationOnly
         );
 
-        let plan = self.preview_restore(checkpoint_id, &[])?;
-        if conversation_rewound {
-            anyhow::ensure!(
-                plan.session_id.is_some() && plan.cursor.is_some(),
-                "Checkpoint has no recorded conversation boundary"
-            );
-        }
-        if code_restored {
-            self.apply_restore(plan.id, true)?;
-        }
-        if conversation_rewound {
-            self.store
-                .fork_session_at_cursor(plan.session_id.unwrap(), plan.cursor.unwrap())?;
+        if code_restored || conversation_rewound {
+            let plan = self.preview_restore(checkpoint_id, &[])?;
+            self.complete_restore(
+                plan.id,
+                match (code_restored, conversation_rewound) {
+                    (true, true) => "both",
+                    (true, false) => "files",
+                    _ => "conversation",
+                },
+                true,
+            )?;
         }
 
         Ok(RewindResult {
@@ -462,10 +460,7 @@ impl MemoryManager {
 
     // ── Git Shadow Commits ───────────────────────────────────────────────────
 
-    /// Create a shadow commit on hidden ref `refs/codingbuddy-shadow/<id>`.
-    /// This is a lightweight alternative to full-file checkpointing that uses
-    /// git's object store directly. Falls back to file-based checkpoint if
-    /// not in a git repo.
+    /// Create a versioned shadow checkpoint without touching the parent Git index.
     pub fn create_shadow_commit(&self, reason: &str) -> Result<ShadowCommit> {
         let record = self.create_checkpoint(&format!("shadow:{reason}"))?;
         Ok(ShadowCommit {

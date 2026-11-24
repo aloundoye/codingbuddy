@@ -1,6 +1,7 @@
 //! Versioned, scoped, recoverable restore plans. Unrelated edits are never deleted.
 use super::*;
 use anyhow::Context;
+use codingbuddy_core::EventKind;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
@@ -16,6 +17,8 @@ pub struct CheckpointManifest {
     pub version: u32,
     pub created_at: String,
     pub files: BTreeMap<PathBuf, FileState>,
+    #[serde(default)]
+    pub skipped: Vec<PathBuf>,
     pub session_id: Option<Uuid>,
     pub cursor: Option<u64>,
 }
@@ -95,6 +98,7 @@ impl MemoryManager {
             .join(Uuid::now_v7().to_string());
         files.subdir(&files.relative(&root.join("fs"))?, true)?;
         let checkpoint_id = Uuid::parse_str(root.file_name().unwrap().to_str().unwrap())?;
+        let mut skipped = Vec::new();
         let selected: Vec<PathBuf> = if paths.is_empty() {
             let mut selected = Vec::new();
             for entry in WalkDir::new(files.root())
@@ -108,6 +112,7 @@ impl MemoryManager {
             {
                 let entry = entry?;
                 if entry.file_type().is_symlink() {
+                    skipped.push(entry.path().strip_prefix(files.root())?.to_owned());
                     continue;
                 }
                 if entry.file_type().is_file() {
@@ -133,6 +138,7 @@ impl MemoryManager {
             version: 2,
             created_at: Utc::now().to_rfc3339(),
             files: captured,
+            skipped,
             session_id: session,
             cursor,
         };
@@ -192,6 +198,7 @@ impl MemoryManager {
             )?,
         )?;
         anyhow::ensure!(manifest.version == 2, "Unsupported checkpoint manifest");
+        plan.preserved.extend(manifest.skipped.clone());
         plan.session_id = manifest.session_id;
         plan.cursor = manifest.cursor;
         let known = self
@@ -368,6 +375,75 @@ impl MemoryManager {
         }
         Ok(())
     }
+    pub fn complete_restore(
+        &self,
+        id: Uuid,
+        mode: &str,
+        approved: bool,
+    ) -> Result<(RestorePlan, Option<Uuid>)> {
+        anyhow::ensure!(approved, "Restore requires explicit local approval");
+        let operation = self.store.operation(id)?;
+        anyhow::ensure!(
+            operation.kind == "restore" && !operation.cancel_requested,
+            "Restore unavailable or cancelled"
+        );
+        let plan: RestorePlan = serde_json::from_value(operation.payload.clone())?;
+        if mode != "files" {
+            anyhow::ensure!(
+                plan.session_id.is_some() && plan.cursor.is_some(),
+                "Checkpoint lacks a recorded conversation cursor"
+            );
+        }
+        self.store.bind_restore_mode(id, mode)?;
+        let state = self.reconcile_restore(id)?;
+        anyhow::ensure!(
+            matches!(state.as_str(), "prepared" | "applied"),
+            "Restore needs local recovery"
+        );
+        if mode != "conversation" {
+            if state == "prepared" {
+                self.apply_restore(id, true)?;
+            } else {
+                anyhow::ensure!(state == "applied", "Restore needs local recovery");
+                let files = WorkspaceFs::open(&self.workspace)?;
+                for entry in &plan.entries {
+                    anyhow::ensure!(
+                        self.capture_state(&files, &entry.path)? == entry.target,
+                        "Applied restore has later edits; inspect before finishing the conversation fork"
+                    );
+                }
+            }
+        }
+        let fork = if mode != "files" {
+            Some(
+                self.store
+                    .fork_for_restore(id, plan.session_id.unwrap(), plan.cursor.unwrap())?
+                    .session_id,
+            )
+        } else {
+            None
+        };
+        if mode == "conversation" && state == "prepared" {
+            self.store.settle_operation_event(
+                id,
+                "prepared",
+                "applied",
+                &operation.payload,
+                plan.session_id
+                    .map(|session| {
+                        codingbuddy_store::NewEvent::new(
+                            session,
+                            EventKind::CheckpointRewound {
+                                checkpoint_id: plan.checkpoint_id,
+                                reason: "conversation fork".into(),
+                            },
+                        )
+                    })
+                    .as_ref(),
+            )?;
+        }
+        Ok((plan, fork))
+    }
     pub fn apply_restore(&self, id: Uuid, approved: bool) -> Result<RestorePlan> {
         let operation = self.store.operation(id)?;
         anyhow::ensure!(operation.kind == "restore", "Not a restore operation");
@@ -392,6 +468,11 @@ impl MemoryManager {
         let cfg = codingbuddy_core::AppConfig::load(files.root())?;
         let policy = codingbuddy_policy::PolicyEngine::from_app_config(&cfg.policy);
         for entry in &plan.entries {
+            #[cfg(not(unix))]
+            anyhow::ensure!(
+                entry.target.mode.is_none(),
+                "Unix file modes cannot be restored on this platform"
+            );
             anyhow::ensure!(
                 files.relative(&entry.path)? == entry.path && !has_ignored_component(&entry.path),
                 "Invalid restore scope"
@@ -461,11 +542,22 @@ impl MemoryManager {
                 return Err(error);
             }
         }
-        self.store.transition_operation(
+        self.store.settle_operation_event(
             id,
             "applying",
             "applied",
             &serde_json::to_value(&plan)?,
+            plan.session_id
+                .map(|session| {
+                    codingbuddy_store::NewEvent::new(
+                        session,
+                        EventKind::CheckpointRewound {
+                            checkpoint_id: plan.checkpoint_id,
+                            reason: format!("restore plan {id}"),
+                        },
+                    )
+                })
+                .as_ref(),
         )?;
         Ok(plan)
     }
@@ -484,8 +576,26 @@ impl MemoryManager {
             } else {
                 "recovery_required"
             };
-            self.store
-                .transition_operation(id, "applying", state, &operation.payload)?;
+            self.store.settle_operation_event(
+                id,
+                "applying",
+                state,
+                &operation.payload,
+                if complete {
+                    plan.session_id.map(|session| {
+                        codingbuddy_store::NewEvent::new(
+                            session,
+                            EventKind::CheckpointRewound {
+                                checkpoint_id: plan.checkpoint_id,
+                                reason: format!("reconciled restore {id}"),
+                            },
+                        )
+                    })
+                } else {
+                    None
+                }
+                .as_ref(),
+            )?;
             return Ok(state.into());
         }
         Ok(operation.state)
@@ -495,6 +605,58 @@ impl MemoryManager {
 #[cfg(test)]
 mod delivery_three {
     use super::*;
+    use codingbuddy_core::EventKind;
+    #[test]
+    fn conversation_restore_reuses_fork_receipt_and_preserves_private_same_route_history()
+    -> Result<()> {
+        use codingbuddy_core::{NativeParts, Session, SessionBudgets, SessionState, TransportPart};
+        let temp = tempfile::tempdir()?;
+        let manager = MemoryManager::new(temp.path())?;
+        let session = Uuid::now_v7();
+        manager.store.save_session(&Session {
+            session_id: session,
+            workspace_root: temp.path().to_string_lossy().into_owned(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 100,
+            },
+            active_plan_id: None,
+        })?;
+        manager.store.pin_route(session, "same-route")?;
+        manager.store.model_step(session,None,None,&[],&[TransportPart::Native(NativeParts {protocol:"anthropic-messages".into(),blocks:vec![serde_json::json!({"type":"thinking","signature":"private-fork-signature","thinking":"private"})]}),TransportPart::Text("checkpoint answer".into())])?;
+        let checkpoint = manager.create_checkpoint_linked("fork", &[], Some(session))?;
+        manager
+            .store
+            .append_event(&codingbuddy_store::NewEvent::new(
+                session,
+                EventKind::ChatTurn {
+                    message: codingbuddy_core::ChatMessage::User {
+                        content: "after checkpoint".into(),
+                    },
+                },
+            ))?;
+        let plan = manager.preview_restore(checkpoint.checkpoint_id, &[])?;
+        let (_, fork) = manager.complete_restore(plan.id, "conversation", true)?;
+        let (_, again) = manager.complete_restore(plan.id, "conversation", true)?;
+        assert_eq!(fork, again);
+        let fork = fork.unwrap();
+        assert_eq!(
+            manager.store.pinned_route(fork)?.as_deref(),
+            Some("same-route")
+        );
+        let portable =
+            serde_json::to_string(&manager.store.rebuild_from_events(fork)?.chat_messages)?;
+        assert!(
+            !portable.contains("private-fork-signature") && !portable.contains("after checkpoint")
+        );
+        let native = manager.store.provider_history(fork, "same-route")?;
+        assert!(native.chat_messages.iter().any(|message|matches!(message,codingbuddy_core::ChatMessage::Assistant {native_parts:Some(parts),..} if parts.blocks.iter().any(|block|block["signature"]=="private-fork-signature"))));
+        assert!(manager.store.provider_history(fork, "other-route").is_err());
+        assert_eq!(manager.store.list_sessions()?.len(), 2);
+        Ok(())
+    }
     fn own(manager: &MemoryManager, path: &str) -> Result<()> {
         let hash = fs::read(manager.workspace.join(path))
             .ok()
@@ -502,6 +664,48 @@ mod delivery_three {
         manager
             .store
             .record_postimage(Path::new(path), hash.as_deref())
+    }
+    #[test]
+    fn large_blob_rename_deletion_and_modes_restore_without_touching_user_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let ws = temp.path();
+        let bytes = vec![0xfe; 1_100_000];
+        fs::write(ws.join("original"), &bytes)?;
+        fs::write(ws.join("deleted"), "restore deletion")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(ws.join("original"), fs::Permissions::from_mode(0o755))?;
+            std::os::unix::fs::symlink("original", ws.join("preserved-link"))?;
+        }
+        let manager = MemoryManager::new(ws)?;
+        let checkpoint = manager.create_checkpoint("large fixture")?;
+        fs::rename(ws.join("original"), ws.join("renamed"))?;
+        fs::remove_file(ws.join("deleted"))?;
+        fs::write(ws.join("new-user"), "preserve")?;
+        for path in ["original", "renamed", "deleted"] {
+            own(&manager, path)?;
+        }
+        let plan = manager.preview_restore(checkpoint.checkpoint_id, &[])?;
+        assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
+        assert_eq!(plan.entries.len(), 3);
+        #[cfg(unix)]
+        assert!(plan.preserved.contains(&PathBuf::from("preserved-link")));
+        manager.apply_restore(plan.id, true)?;
+        assert_eq!(fs::read(ws.join("original"))?, bytes);
+        assert_eq!(fs::read_to_string(ws.join("deleted"))?, "restore deletion");
+        assert!(!ws.join("renamed").exists());
+        assert_eq!(fs::read_to_string(ws.join("new-user"))?, "preserve");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(ws.join("original"))?.permissions().mode() & 0o777,
+                0o755
+            );
+            assert!(fs::symlink_metadata(ws.join("preserved-link"))?.is_symlink());
+        }
+        Ok(())
     }
     #[test]
     fn binary_restore_preserves_unrelated_files_and_rejects_stale_plans() -> Result<()> {

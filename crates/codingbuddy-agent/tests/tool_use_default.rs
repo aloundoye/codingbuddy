@@ -1263,6 +1263,13 @@ fn task_stop_cancels_background_run() -> Result<()> {
         updated_at: now,
     })?;
 
+    store.begin_operation(
+        job_id,
+        Some(session.session_id),
+        None,
+        "background",
+        &serde_json::json!({}),
+    )?;
     let engine = build_engine(
         temp.path(),
         vec![
@@ -1285,11 +1292,15 @@ fn task_stop_cancels_background_run() -> Result<()> {
 
     assert!(output.contains("Stopped the task"));
     let task = store.load_task(task_id)?.expect("task");
-    assert_eq!(task.status, "cancelled");
+    assert_eq!(
+        task.status, "in_progress",
+        "Cancellation is pending until the worker acknowledges it"
+    );
     let run = store.load_subagent_run(run_id)?.expect("run");
-    assert_eq!(run.status, "stopped");
+    assert_eq!(run.status, "cancelling");
     let job = store.load_background_job(job_id)?.expect("job");
-    assert_eq!(job.status, "stopped");
+    assert_eq!(job.status, "cancelling");
+    assert!(store.operation(job_id)?.cancel_requested);
     Ok(())
 }
 
@@ -1769,5 +1780,76 @@ fn delivery_zero_explicit_deny_survives_bypass_and_hooks() -> Result<()> {
         assert_eq!(projection.denied_invocations.len(), 1);
         assert!(projection.approved_invocations.is_empty());
     }
+    Ok(())
+}
+
+#[test]
+fn delivery_three_worktree_executes_scoped_and_legacy_merge_only_stages() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let root = workspace.path();
+    init_workspace(root)?;
+    fs::write(root.join(".gitignore"), ".codingbuddy/\n")?;
+    for args in [
+        vec!["add", "--", "src/main.rs", ".gitignore"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::write(root.join("src/main.rs"), "fn current_input() {}\n")?;
+    let index = fs::read(root.join(".git/index"))?;
+    let config = AppConfig {
+        workspace_trust: Some(true),
+        ..Default::default()
+    };
+    let responses = vec![
+        tool_call_response(vec![(
+            "enter",
+            "enter_worktree",
+            r#"{"branch_name":"fixture"}"#,
+        )]),
+        tool_call_response(vec![(
+            "write",
+            "fs_write",
+            r#"{"path":"src/main.rs","content":"fn isolated_output() {}\n"}"#,
+        )]),
+        tool_call_response(vec![("exit", "exit_worktree", r#"{"action":"merge"}"#)]),
+        text_response("Output staged for local review."),
+    ];
+    let mut engine =
+        AgentEngine::new_with_config_and_llm(root, config, Box::new(ScriptedLlm::new(responses)))?;
+    engine.set_permission_mode("bypassPermissions");
+    engine.chat_with_options(
+        "Use an isolated worktree to update this Rust file, then stage its output.",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        fs::read_to_string(root.join("src/main.rs"))?,
+        "fn current_input() {}\n"
+    );
+    assert_eq!(fs::read(root.join(".git/index"))?, index);
+    let patches = codingbuddy_diff::PatchStore::new(root)?.list()?;
+    assert_eq!(patches.len(), 1);
+    assert!(patches[0].unified_diff.contains("isolated_output"));
+    assert!(!patches[0].applied);
     Ok(())
 }

@@ -103,11 +103,22 @@ pub(crate) fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) ->
 pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde_json::Value> {
     let store = Store::new(cwd)?;
     match cmd {
-        BackgroundCmd::List => Ok(serde_json::to_value(store.list_background_jobs()?)?),
+        BackgroundCmd::List => {
+            let jobs = store
+                .list_background_jobs()?
+                .into_iter()
+                .map(|job| {
+                    store
+                        .reconcile_background_job(job.job_id)
+                        .map(|updated| updated.unwrap_or(job))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(serde_json::to_value(jobs)?)
+        }
         BackgroundCmd::Attach(args) => {
             let job_id = Uuid::parse_str(&args.job_id)?;
             let job = store
-                .load_background_job(job_id)?
+                .reconcile_background_job(job_id)?
                 .ok_or_else(|| anyhow!("background job not found: {}", args.job_id))?;
             append_control_event(
                 cwd,
@@ -148,10 +159,14 @@ pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde
                 cancelled > 0,
                 "Legacy background job has no owned cancellation channel; inspect it locally before terminating any process"
             );
-            job.status = "cancelling".into();
+            let operation = store.operation(job_id)?;
+            let active = matches!(operation.state.as_str(), "prepared" | "running");
+            if active {
+                job.status = "cancelling".into();
+            }
             job.updated_at = Utc::now().to_rfc3339();
             store.upsert_background_job(&job)?;
-            Ok(json!({"job_id":job_id,"stopped":false,"status":"cancelling"}))
+            Ok(json!({"job_id":job_id,"stopped":!active,"status":job.status}))
         }
 
         BackgroundCmd::RunAgent(args) => {

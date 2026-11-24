@@ -56,6 +56,15 @@ pub struct PatchStore {
     root: PathBuf,
 }
 
+struct PatchLease(fs::File);
+
+impl Drop for PatchLease {
+    fn drop(&mut self) {
+        // A concurrent fork can retain a reference to the file until it execs.
+        let _ = self.0.unlock();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitApplyStrategy {
     /// Verify a clean application against the staged workspace state.
@@ -191,14 +200,14 @@ impl PatchStore {
         self.apply_locked(workspace, patch_id, strategy, check)
     }
 
-    fn patch_lease(&self) -> Result<fs::File> {
+    fn patch_lease(&self) -> Result<PatchLease> {
         let lease = WorkspaceFs::open(&self.root)?
             .open_lock_file(Path::new("apply.lock"))?
             .into_std();
         lease
             .try_lock()
             .map_err(|error| anyhow!("patch application is busy: {error}"))?;
-        Ok(lease)
+        Ok(PatchLease(lease))
     }
 
     fn apply_locked(
@@ -550,6 +559,20 @@ fn decode_git_path(path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_lease_releases_lock_while_another_descriptor_is_open() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let patches = PatchStore::new(directory.path())?;
+        let lease = patches.patch_lease()?;
+        let inherited = lease.0.try_clone()?;
+        assert!(patches.patch_lease().is_err());
+        drop(lease);
+        let _next = patches.patch_lease()?;
+        drop(inherited);
+        Ok(())
+    }
 
     #[test]
     fn delivery_one_retries_patch_settlement_without_reapplying_the_patch() -> Result<()> {

@@ -255,6 +255,7 @@ fn delivery_one_killed_writer_fixture() -> Result<()> {
                 session,
                 id,
                 &codingbuddy_store::InvocationReceipt::File {
+                    execution_root: None,
                     path: "local-effect".into(),
                     postimage_sha256: "fixture".into(),
                 },

@@ -14,5 +14,8 @@ serde_json.workspace = true
 uuid.workspace = true
 codingbuddy-policy = { path = "../codingbuddy-policy" }
 
+[target.'cfg(windows)'.dependencies]
+dunce = "1.0.5"
+
 [dev-dependencies]
 tempfile.workspace = true

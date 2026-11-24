@@ -2029,6 +2029,9 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Get the workspace path as a `Path` reference.
+    pub fn set_budget_limit(&mut self, limit: Option<f64>) {
+        self.cost_tracker.max_budget_usd = limit;
+    }
     fn execution_context(&self) -> codingbuddy_core::execution::ExecutionContext {
         codingbuddy_core::execution::ExecutionContext {
             session_id: self.durable_session.as_ref().map(|(_, session)| *session),

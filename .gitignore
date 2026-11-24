@@ -17,3 +17,8 @@ RFC.md
 loop.md
 *PLAN*.md
 docs/PROVIDER_AND_AGENT_AUDIT.md
+
+/extensions/vscode/node_modules/
+/extensions/vscode/out/
+
+/scripts/__pycache__/

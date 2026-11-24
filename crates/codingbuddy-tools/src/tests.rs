@@ -1354,3 +1354,97 @@ fn delivery_zero_denies_persisted_commands_mcp_and_batch_children() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn delivery_three_verification_does_not_turn_missing_approval_into_success() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    for trusted in [false, true] {
+        let cfg = AppConfig {
+            workspace_trust: Some(trusted),
+            ..Default::default()
+        };
+        let host = LocalToolHost::with_config(
+            workspace.path(),
+            PolicyEngine::from_app_config(&cfg.policy),
+            Arc::new(PlatformShellRunner),
+            &cfg,
+        )?;
+        let result = host.run_verification_command(
+            "echo must-not-run",
+            workspace.path(),
+            5,
+            Default::default(),
+        );
+        assert_eq!(result["success"], false);
+        assert_eq!(result["status"], "denied");
+        assert_eq!(result["stdout"], "");
+        let id = Uuid::parse_str(result["invocation_id"].as_str().unwrap())?;
+        assert_eq!(Store::new(workspace.path())?.operation(id)?.state, "denied");
+    }
+    Ok(())
+}
+
+#[test]
+fn delivery_three_verification_approval_is_fresh_and_explicit_denies_never_prompt() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut cfg = AppConfig {
+        workspace_trust: Some(false),
+        ..Default::default()
+    };
+    cfg.policy.allowlist.push("echo".into());
+    let host = LocalToolHost::with_config(
+        workspace.path(),
+        PolicyEngine::from_app_config(&cfg.policy),
+        Arc::new(PlatformShellRunner),
+        &cfg,
+    )?;
+    let mut prompts = 0;
+    let mut approve = |call: &ToolCall| {
+        prompts += 1;
+        assert_eq!(call.args["fresh_approval"], true);
+        assert!(call.args["effective_isolation"].is_string());
+        Ok(true)
+    };
+    let result = host.run_verification_with_approval(
+        "echo approved-once",
+        workspace.path(),
+        5,
+        Default::default(),
+        Some(&mut approve),
+    );
+    assert_eq!(result["status"], "passed", "{result}");
+    assert!(result["stdout"].as_str().unwrap().contains("approved-once"));
+    assert_eq!(
+        host.run_verification_command(
+            "echo approved-once",
+            workspace.path(),
+            5,
+            Default::default()
+        )["status"],
+        "denied"
+    );
+    assert_eq!(prompts, 1);
+    let mut policy = PolicyEngine::from_app_config(&cfg.policy);
+    policy.add_runtime_rule(codingbuddy_policy::PermissionRule {
+        rule: "Bash(echo forbidden)".into(),
+        decision: "deny".into(),
+    });
+    let host = LocalToolHost::with_config(
+        workspace.path(),
+        policy,
+        Arc::new(PlatformShellRunner),
+        &cfg,
+    )?;
+    let mut never =
+        |_: &ToolCall| -> Result<bool> { panic!("Explicit deny opened an approval prompt") };
+    let result = host.run_verification_with_approval(
+        "echo forbidden",
+        workspace.path(),
+        5,
+        Default::default(),
+        Some(&mut never),
+    );
+    assert_eq!(result["status"], "denied");
+    assert_eq!(result["stdout"], "");
+    Ok(())
+}

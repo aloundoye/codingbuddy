@@ -10,6 +10,8 @@ pub struct PendingInvocation {
 #[derive(Serialize, Deserialize)]
 pub enum InvocationReceipt {
     File {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_root: Option<PathBuf>,
         path: PathBuf,
         postimage_sha256: String,
     },

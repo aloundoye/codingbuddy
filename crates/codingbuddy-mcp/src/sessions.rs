@@ -13,17 +13,10 @@ use std::{
     },
 };
 
+#[derive(Default)]
 pub struct Sessions {
     entries: Mutex<BTreeMap<String, Arc<Mutex<Option<Session>>>>>,
     pub states: Mutex<BTreeMap<String, String>>,
-}
-impl Default for Sessions {
-    fn default() -> Self {
-        Self {
-            entries: Default::default(),
-            states: Default::default(),
-        }
-    }
 }
 impl Sessions {
     pub fn invalidated(&self, id: &str) -> bool {
@@ -92,6 +85,18 @@ impl Sessions {
                 }
             }
         }
+        if method == "tools/call" {
+            anyhow::ensure!(
+                guard.as_ref().unwrap().capabilities.get("tools").is_some(),
+                "MCP tools capability unavailable"
+            );
+        }
+        if method == "tools/call" {
+            anyhow::ensure!(
+                !guard.as_ref().unwrap().changed.load(Ordering::SeqCst),
+                "MCP tool registry changed before dispatch; refresh and approve again"
+            );
+        }
         let result = guard.as_mut().unwrap().request(method, params, context);
         if result.is_ok() && method == "tools/list" {
             guard
@@ -140,6 +145,7 @@ pub fn fingerprint(server: &McpServer) -> Result<Vec<u8>> {
     .to_vec())
 }
 struct Session {
+    capabilities: Value,
     fingerprint: Vec<u8>,
     transport: Transport,
     next: u64,
@@ -150,8 +156,9 @@ enum Transport {
         child: OwnedChild,
         input: std::process::ChildStdin,
         rx: mpsc::Receiver<Value>,
+        reader: Option<std::thread::JoinHandle<()>>,
     },
-    Remote(Remote),
+    Remote(Box<Remote>),
 }
 impl Session {
     fn connect(
@@ -171,23 +178,29 @@ impl Session {
                 let output = child.stdout.take().context("Missing MCP output")?;
                 let (tx, rx) = mpsc::sync_channel(64);
                 let notifications = changed.clone();
-                thread::spawn(move || {
+                let reader_thread = thread::spawn(move || {
                     let mut reader = BufReader::new(output);
                     while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
                         if value["method"] == "notifications/tools/list_changed" {
                             notifications.store(true, Ordering::SeqCst);
                             continue;
                         }
-                        if tx.send(value).is_err() {
+                        if tx.try_send(value).is_err() {
                             break;
                         }
                     }
                 });
-                Transport::Stdio { child, input, rx }
+                Transport::Stdio {
+                    child,
+                    input,
+                    rx,
+                    reader: Some(reader_thread),
+                }
             }
-            _ => Transport::Remote(Remote::new(server, context)?),
+            _ => Transport::Remote(Box::new(Remote::new(server, context, changed.clone())?)),
         };
         let mut session = Self {
+            capabilities: json!({}),
             fingerprint,
             transport,
             next: 1,
@@ -202,6 +215,11 @@ impl Session {
             matches!(version, "2025-06-18" | "2025-03-26" | "2024-11-05"),
             "Unsupported MCP version"
         );
+        session.capabilities = initialized
+            .pointer("/result/capabilities")
+            .filter(|value| value.is_object())
+            .cloned()
+            .context("MCP initialization lacks server capabilities")?;
         if let Transport::Remote(remote) = &mut session.transport {
             remote.version = version.to_owned();
         }
@@ -227,6 +245,15 @@ impl Session {
         context: &ExecutionContext,
     ) -> Result<Value> {
         context.check()?;
+        context.check()?;
+        if let Some((capability, _)) = method.split_once('/')
+            && matches!(capability, "tools" | "resources" | "prompts")
+        {
+            anyhow::ensure!(
+                self.capabilities.get(capability).is_some(),
+                "MCP method was not negotiated with this server"
+            );
+        }
         let id = self.next;
         self.next += 1;
         let value = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
@@ -271,9 +298,12 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Transport::Stdio { child, .. } = &mut self.transport {
+        if let Transport::Stdio { child, reader, .. } = &mut self.transport {
             child.terminate();
             let _ = child.wait();
+            if let Some(reader) = reader.take() {
+                let _ = reader.join();
+            }
         }
     }
 }
@@ -287,6 +317,7 @@ struct Remote {
     legacy: bool,
     events: Option<reqwest::Response>,
     buffer: Vec<u8>,
+    changed: Arc<AtomicBool>,
 }
 fn wait<T>(
     runtime: &tokio::runtime::Runtime,
@@ -306,7 +337,11 @@ fn wait<T>(
     })
 }
 impl Remote {
-    fn new(server: &McpServer, context: &ExecutionContext) -> Result<Self> {
+    fn new(
+        server: &McpServer,
+        context: &ExecutionContext,
+        changed: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let url = server
             .url
             .as_deref()
@@ -328,10 +363,11 @@ impl Remote {
             url: url.into(),
             headers: server.headers.clone(),
             session: None,
-            version: "2025-06-18".into(),
+            version: String::new(),
             legacy: server.transport == McpTransport::Sse,
             events: None,
             buffer: Vec::new(),
+            changed,
         };
         if remote.legacy {
             let response = wait(&remote.runtime, context, remote.builder(false).send())??
@@ -364,9 +400,10 @@ impl Remote {
         if let Some(session) = &self.session {
             request = request.header("Mcp-Session-Id", session);
         }
-        request
-            .header("MCP-Protocol-Version", &self.version)
-            .header("Accept", "application/json, text/event-stream")
+        if !self.version.is_empty() {
+            request = request.header("MCP-Protocol-Version", &self.version);
+        }
+        request.header("Accept", "application/json, text/event-stream")
     }
     fn notify(&mut self, value: Value, context: &ExecutionContext) -> Result<()> {
         wait(
@@ -463,6 +500,10 @@ impl Remote {
             loop {
                 let (_, data) = self.event(context)?;
                 let result: Value = serde_json::from_str(&data)?;
+                if result["method"] == "notifications/tools/list_changed" {
+                    self.changed.store(true, Ordering::SeqCst);
+                    continue;
+                }
                 if result.get("id").is_some() && result["id"] != id {
                     continue;
                 }

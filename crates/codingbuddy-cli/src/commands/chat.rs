@@ -637,6 +637,7 @@ pub(crate) fn run_chat(
                     run_rewind(
                         cwd,
                         RewindArgs {
+                            reconcile: false,
                             to_checkpoint,
                             yes,
                             preview: false,
