@@ -224,6 +224,10 @@ pub fn saved_approval_matches(pattern: &str, command: &str) -> bool {
     fixed.len() == fixed_len
         && fixed.iter().zip(&tokens).all(|(want, have)| want == have)
         && crate::is_single_plain_command(command)
+        // Quotes and escapes change how the shell splits and unquotes
+        // words (`"--config"` reaches cargo as `--config`), so a wildcard
+        // never applies to them; such commands only match exactly.
+        && !command.contains(['\'', '"', '\\'])
         && classify_bash_command(command) != BashSafety::Dangerous
         && arguments_are_safe(family, &tokens[fixed_len..])
 }
@@ -300,6 +304,9 @@ mod tests {
             ("npm test *", "npm test; rm -rf ~"),
             ("cargo test *", "/tmp/evil/cargo test"),
             ("python build.py", "python build.py --evil"),
+            ("cargo build *", "cargo build \"--config\" target.x.runner=sh"),
+            ("cargo build *", "cargo build '--config' x"),
+            ("cargo build *", "cargo build \\-\\-config x"),
         ] {
             assert!(
                 !saved_approval_matches(pattern, command),
