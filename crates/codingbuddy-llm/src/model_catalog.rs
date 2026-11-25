@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use codingbuddy_core::{LlmConfig, ModelCatalog, ModelCatalogCache, ModelCatalogSource};
-use reqwest::blocking::Client;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,15 +23,19 @@ pub struct ModelCatalogResolution {
 }
 
 pub fn fetch_models_dev_catalog(url: &str, timeout: Duration) -> Result<ModelCatalog> {
-    let client = Client::builder().timeout(timeout).build()?;
-    let value = client
-        .get(url)
-        .send()
-        .with_context(|| format!("failed to fetch model catalog from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("model catalog endpoint returned an error: {url}"))?
-        .json::<serde_json::Value>()
-        .context("failed to parse model catalog JSON")?;
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let value = codingbuddy_core::runtime::block_on(async move {
+        client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch model catalog from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("model catalog endpoint returned an error: {url}"))?
+            .json::<serde_json::Value>()
+            .await
+            .context("failed to parse model catalog JSON")
+    })?;
     ModelCatalog::from_models_dev_json(&value)
 }
 

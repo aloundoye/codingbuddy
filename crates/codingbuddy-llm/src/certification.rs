@@ -269,16 +269,19 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
             .base_url
             .trim_end_matches('/')
             .trim_end_matches("/v1");
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let models: Value = client
+        let client =
+            crate::chat_transport::build_http_client(std::time::Duration::from_secs(10))?;
+        let request = client
             .get(format!("{root}/api/tags"))
-            .headers(route.headers(cfg.api_key.as_deref())?)
-            .send()?
-            .error_for_status()?
-            .json()?;
+            .headers(route.headers(cfg.api_key.as_deref())?);
+        let models: Value = codingbuddy_core::runtime::block_on(async move {
+            request
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await
+        })?;
         Some(
             models["models"]
                 .as_array()
