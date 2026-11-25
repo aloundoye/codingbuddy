@@ -1,4 +1,5 @@
 //! E2E tests for multi-provider payload formats.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use codingbuddy_core::{
     ChatMessage, ChatRequest, FunctionDefinition, LlmToolCall, ToolChoice, ToolDefinition,

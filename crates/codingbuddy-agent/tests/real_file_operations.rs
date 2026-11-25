@@ -3,6 +3,7 @@
 //! These tests use ScriptedLlm to drive the agent through actual file
 //! read/write/edit operations on real temp directories, verifying that
 //! the tool pipeline works end-to-end.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::AgentEngine;

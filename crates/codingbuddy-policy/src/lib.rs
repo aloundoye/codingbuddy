@@ -771,7 +771,10 @@ impl PolicyEngine {
     /// Returns the rule for the caller to persist to settings.json if desired.
     pub fn add_runtime_rule(&mut self, rule: PermissionRule) -> &PermissionRule {
         self.cfg.permission_rules.push(rule);
-        self.cfg.permission_rules.last().unwrap()
+        self.cfg
+            .permission_rules
+            .last()
+            .expect("the rule was pushed just above")
     }
 
     /// Get all current permission rules (including defaults and runtime additions).

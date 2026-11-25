@@ -141,7 +141,7 @@ pub(crate) fn encode(req: &ChatRequest) -> Result<Value> {
             };
             last["content"]
                 .as_array_mut()
-                .unwrap()
+                .ok_or_else(|| failure(FailureKind::UnsupportedFeature))?
                 .push(json!({"image":{
                     "format":format,"source":{"bytes":image.base64_data}
                 }}));
@@ -457,16 +457,13 @@ fn append_part(value: &mut Value, key: &str, fragment: &str) -> Result<()> {
         *value = json!({});
     }
     ensure!(
-        value.is_object()
-            && value
-                .as_object()
-                .unwrap()
-                .keys()
-                .all(|existing| existing == key
-                    || matches!(
-                        (existing.as_str(), key),
-                        ("text", "signature") | ("signature", "text")
-                    )),
+        value
+            .as_object()
+            .is_some_and(|object| object.keys().all(|existing| existing == key
+                || matches!(
+                    (existing.as_str(), key),
+                    ("text", "signature") | ("signature", "text")
+                ))),
         failure(FailureKind::MalformedResponse)
     );
     let text = &mut value[key];

@@ -1,6 +1,7 @@
 //! Functional verification tests for v6 Phase 1.
 //!
 //! These tests verify that features actually WORK end-to-end, not just exist.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use anyhow::Result;
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};

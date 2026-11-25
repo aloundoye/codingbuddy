@@ -662,7 +662,10 @@ where
         if sigint_flag.swap(false, Ordering::Relaxed) {
             if is_processing {
                 if let Some(token) = &controls.cancellation {
-                    token.lock().unwrap().cancel();
+                    token
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cancel();
                 }
                 cancelled = true;
                 shell.active_tool = None;
@@ -906,7 +909,10 @@ where
         if key == bindings.exit {
             if is_processing {
                 if let Some(token) = &controls.cancellation {
-                    token.lock().unwrap().cancel();
+                    token
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cancel();
                 }
                 cancelled = true;
                 shell.active_tool = None;
@@ -1515,7 +1521,10 @@ where
             is_processing = true;
             cancelled = false;
             if let Some(token) = &controls.cancellation {
-                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+                *token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    codingbuddy_core::CancellationToken::new();
             }
             active_phase = None;
             last_phase_event_at = Instant::now();
@@ -1563,7 +1572,10 @@ where
             is_processing = true;
             cancelled = false;
             if let Some(token) = &controls.cancellation {
-                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+                *token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    codingbuddy_core::CancellationToken::new();
             }
             active_phase = None;
             last_phase_event_at = Instant::now();
@@ -1867,7 +1879,10 @@ where
             is_processing = true;
             cancelled = false;
             if let Some(token) = &controls.cancellation {
-                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+                *token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    codingbuddy_core::CancellationToken::new();
             }
             active_phase = None;
             last_phase_event_at = Instant::now();

@@ -1,5 +1,6 @@
 //! Tests covering features added in the v2 overhaul: agent profiles,
 //! provider normalization, MCP description capping, compaction template.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use codingbuddy_agent::agent_profiles;
 use codingbuddy_core::{ProviderKind, is_mcp_tool, normalize_provider_kind};

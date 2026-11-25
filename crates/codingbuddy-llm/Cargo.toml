@@ -50,3 +50,6 @@ version = "1.3"
 
 [dependencies.aws-smithy-eventstream]
 version = "0.61"
+
+[lints]
+workspace = true

@@ -19,3 +19,6 @@ codingbuddy-core = { path = "../codingbuddy-core" }
 
 [dev-dependencies]
 proptest = "1"
+
+[lints]
+workspace = true

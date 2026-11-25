@@ -1,3 +1,7 @@
+//! Test support: mocks, fixtures and cassettes. Panicking on bad fixtures is
+//! the right behaviour here, so `unwrap` is allowed.
+#![allow(clippy::unwrap_used)]
+
 pub mod cassette;
 
 use anyhow::Result;

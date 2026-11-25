@@ -16,3 +16,6 @@ codingbuddy-core = { path = "../codingbuddy-core" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

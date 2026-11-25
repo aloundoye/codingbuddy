@@ -3,6 +3,7 @@
 //! Every cassette under `cassettes/<provider>/<scenario>.json` is replayed on
 //! each test run, with no network and no keys. See `cassettes/README.md` for
 //! how to record new ones with `record_cassettes`.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use anyhow::{Context, Result, bail, ensure};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{AppConfig, StreamChunk};

@@ -160,7 +160,7 @@ impl McpManager {
             let current = self
                 .catalog_fingerprints
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&server.id)
                 .is_some_and(|fingerprint| {
                     sessions::fingerprint(&server).is_ok_and(|current| *fingerprint == current)
@@ -180,7 +180,11 @@ impl McpManager {
         Ok(states)
     }
     pub fn session_states(&self) -> BTreeMap<String, String> {
-        self.sessions.states.lock().unwrap().clone()
+        self.sessions
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn request_server(
@@ -259,7 +263,7 @@ impl McpManager {
         let (expected, tool) = self
             .catalog
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(alias)
             .cloned()
             .ok_or_else(|| anyhow!("MCP tool is not in the active registry"))?;
@@ -362,7 +366,7 @@ impl McpManager {
                 self.sessions
                     .states
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(server.id.clone(), "denied".into());
                 continue;
             }
@@ -370,7 +374,7 @@ impl McpManager {
                 self.sessions
                     .states
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(server.id.clone(), "disabled".into());
             }
             if !server.metadata.is_object() {
@@ -408,7 +412,7 @@ impl McpManager {
                         self.sessions
                             .states
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .insert(server.id.clone(), "authentication_required".into());
                         continue;
                     }
@@ -528,7 +532,7 @@ impl McpManager {
             let same_configuration = self
                 .catalog_fingerprints
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&server.id)
                 .is_some_and(|old| {
                     sessions::fingerprint(&server).is_ok_and(|current| *old == current)
@@ -567,9 +571,12 @@ impl McpManager {
                 Err(_) => {
                     self.catalog
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .retain(|_, (_, tool)| tool.server_id != server.id);
-                    self.catalog_fingerprints.lock().unwrap().remove(&server.id);
+                    self.catalog_fingerprints
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&server.id);
                     eprintln!(
                         "[mcp] Discovery failed for {}; no tools activated",
                         server.id
@@ -580,10 +587,13 @@ impl McpManager {
             let fingerprint = sessions::fingerprint(&server)?;
             self.catalog_fingerprints
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(server.id.clone(), fingerprint.clone());
             {
-                let mut catalog = self.catalog.lock().unwrap();
+                let mut catalog = self
+                    .catalog
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 catalog.retain(|_, (_, tool)| tool.server_id != server.id);
                 for tool in &discovered {
                     let alias = format!("mcp__{}__{}", server.id, tool.name);

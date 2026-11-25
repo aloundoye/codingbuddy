@@ -22,3 +22,6 @@ codingbuddy-policy = { path = "../codingbuddy-policy" }
 [dev-dependencies]
 rusqlite = { workspace = true }
 tempfile = "3"
+
+[lints]
+workspace = true

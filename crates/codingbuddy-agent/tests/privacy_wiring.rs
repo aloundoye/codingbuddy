@@ -1,4 +1,5 @@
 //! Tests for tool-output privacy and keyword search registration.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use codingbuddy_agent::tool_loop::{ToolLoopConfig, ToolUseLoop};
 use codingbuddy_core::{LlmResponse, LlmToolCall, StreamChunk, TokenUsage};

@@ -22,3 +22,6 @@ aws-smithy-eventstream = "0.61"
 aws-smithy-types = "1"
 codingbuddy-store = { path = "../codingbuddy-store" }
 reqwest = { workspace = true }
+
+[lints]
+workspace = true

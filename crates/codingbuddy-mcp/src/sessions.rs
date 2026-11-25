@@ -22,7 +22,7 @@ impl Sessions {
     pub fn invalidated(&self, id: &str) -> bool {
         self.entries
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
             .is_none_or(|slot| match slot.try_lock() {
                 Ok(guard) => guard
@@ -34,7 +34,10 @@ impl Sessions {
     }
 
     pub fn shutdown(&self) {
-        self.entries.lock().unwrap().clear();
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
     pub fn request(
         &self,
@@ -72,54 +75,54 @@ impl Sessions {
         if guard.is_none() {
             self.states
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(server.id.clone(), "connecting".into());
             match Session::connect(server, fingerprint, context) {
                 Ok(session) => *guard = Some(session),
                 Err(error) => {
                     self.states
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(server.id.clone(), "failed".into());
                     return Err(error);
                 }
             }
         }
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("MCP session is not connected"))?;
         if method == "tools/call" {
             anyhow::ensure!(
-                guard.as_ref().unwrap().capabilities.get("tools").is_some(),
+                session.capabilities.get("tools").is_some(),
                 "MCP tools capability unavailable"
             );
-        }
-        if method == "tools/call" {
             anyhow::ensure!(
-                !guard.as_ref().unwrap().changed.load(Ordering::SeqCst),
+                !session.changed.load(Ordering::SeqCst),
                 "MCP tool registry changed before dispatch; refresh and approve again"
             );
         }
-        let result = guard.as_mut().unwrap().request(method, params, context);
+        let result = session.request(method, params, context);
         if result.is_ok() && method == "tools/list" {
-            guard
-                .as_ref()
-                .unwrap()
-                .changed
-                .store(false, Ordering::SeqCst);
+            session.changed.store(false, Ordering::SeqCst);
         }
         if result.is_err() {
             *guard = None;
-            self.states.lock().unwrap().insert(
-                server.id.clone(),
-                if context.cancellation.is_cancelled() {
-                    "cancelled"
-                } else {
-                    "failed"
-                }
-                .into(),
-            );
+            self.states
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    server.id.clone(),
+                    if context.cancellation.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    }
+                    .into(),
+                );
         } else {
             self.states
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(server.id.clone(), "ready".into());
         }
         if result.is_err() && method == "tools/call" {

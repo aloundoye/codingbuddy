@@ -22,3 +22,6 @@ codingbuddy-store = { path = "../codingbuddy-store" }
 
 [dev-dependencies]
 uuid = { workspace = true }
+
+[lints]
+workspace = true

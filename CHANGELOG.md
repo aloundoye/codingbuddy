@@ -37,6 +37,10 @@ Move it under a version heading when you cut a release.
   calls. Model requests reuse connections across calls.
 
 ### Fixed
+- Fewer ways to crash: a panic in one part of the TUI or JSON-RPC server no
+  longer cascades through shared locks; a provider missing from settings,
+  an incomplete restore plan, or an unexpected Bedrock message now report
+  an error instead of panicking.
 - `WebFetch(domain:…)` and URL allow rules matched any URL that merely
   contained the text (for example `https://evil.com/?example.com`). Allow
   rules now match the parsed host or a URL prefix; deny rules still match

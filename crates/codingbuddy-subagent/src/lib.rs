@@ -244,7 +244,10 @@ impl BackgroundTaskRegistry {
         };
 
         {
-            let mut tasks = self.tasks.lock().expect("background registry lock");
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tasks.insert(id, entry);
         }
 
@@ -312,7 +315,10 @@ impl BackgroundTaskRegistry {
         };
 
         {
-            let mut tasks = self.tasks.lock().expect("background registry lock");
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tasks.insert(id, entry);
         }
 
@@ -757,7 +763,7 @@ impl TeamCoordinator {
     pub fn state(&self) -> TeamState {
         self.shared_state
             .lock()
-            .expect("subagent shared_state lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 

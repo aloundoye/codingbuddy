@@ -93,11 +93,11 @@ impl MemoryManager {
         session: Option<Uuid>,
     ) -> Result<CheckpointRecord> {
         let files = WorkspaceFs::open(&self.workspace)?;
+        let checkpoint_id = Uuid::now_v7();
         let root = runtime_dir(files.root())
             .join("checkpoints")
-            .join(Uuid::now_v7().to_string());
+            .join(checkpoint_id.to_string());
         files.subdir(&files.relative(&root.join("fs"))?, true)?;
-        let checkpoint_id = Uuid::parse_str(root.file_name().unwrap().to_str().unwrap())?;
         let mut skipped = Vec::new();
         let selected: Vec<PathBuf> = if paths.is_empty() {
             let mut selected = Vec::new();
@@ -417,7 +417,13 @@ impl MemoryManager {
         let fork = if mode != "files" {
             Some(
                 self.store
-                    .fork_for_restore(id, plan.session_id.unwrap(), plan.cursor.unwrap())?
+                    .fork_for_restore(
+                        id,
+                        plan.session_id
+                            .ok_or_else(|| anyhow!("restore plan has no session to fork"))?,
+                        plan.cursor
+                            .ok_or_else(|| anyhow!("restore plan has no conversation cursor"))?,
+                    )?
                     .session_id,
             )
         } else {

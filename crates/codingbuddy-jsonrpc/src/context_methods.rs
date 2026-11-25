@@ -7,7 +7,10 @@ impl IdeRpcHandler {
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-        let context_manager = self.context_manager.lock().expect("context_manager lock");
+        let context_manager = self
+            .context_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(manager) = context_manager.as_ref() {
             let suggestions = manager.suggest_relevant_files(query, limit);
@@ -38,7 +41,10 @@ impl IdeRpcHandler {
     }
 
     pub(crate) fn handle_context_analyze(&self, _params: Value) -> Result<Value> {
-        let mut context_manager = self.context_manager.lock().expect("context_manager lock");
+        let mut context_manager = self
+            .context_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(manager) = context_manager.as_mut() {
             match manager.analyze_workspace() {
@@ -66,7 +72,10 @@ impl IdeRpcHandler {
             .and_then(|v| v.as_u64())
             .unwrap_or(4000) as usize;
 
-        let context_manager = self.context_manager.lock().expect("context_manager lock");
+        let context_manager = self
+            .context_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(manager) = context_manager.as_ref() {
             let compressed = manager.compress_context(context, max_tokens);
@@ -122,7 +131,10 @@ impl IdeRpcHandler {
         let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
 
         let path = Path::new(file_path);
-        let context_manager = self.context_manager.lock().expect("context_manager lock");
+        let context_manager = self
+            .context_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(manager) = context_manager.as_ref() {
             let related = manager.get_related_files(path, depth);

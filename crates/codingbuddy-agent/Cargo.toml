@@ -53,3 +53,6 @@ tree-sitter-zig.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 codingbuddy-testkit = { path = "../codingbuddy-testkit" }
+
+[lints]
+workspace = true

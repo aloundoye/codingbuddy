@@ -2,6 +2,7 @@
 //!
 //! Uses `ScriptedLlm` to simulate tool-call responses from the LLM,
 //! and verifies that the AgentEngine correctly routes through the tool-use loop.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};

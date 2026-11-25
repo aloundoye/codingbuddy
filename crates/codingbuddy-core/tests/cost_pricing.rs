@@ -1,4 +1,5 @@
 //! E2E tests for model pricing lookup.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use codingbuddy_core::cost::get_pricing;
 

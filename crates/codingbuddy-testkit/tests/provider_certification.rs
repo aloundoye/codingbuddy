@@ -1,4 +1,5 @@
 //! Real transport, agent, and SQLite conformance for each certified route.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use anyhow::{Context, Result, ensure};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{AppConfig, ChatMessage, EventKind};

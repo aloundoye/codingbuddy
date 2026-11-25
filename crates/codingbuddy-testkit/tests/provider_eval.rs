@@ -1,4 +1,5 @@
 //! Fixed tasks for comparing routes without changing the workspace or tool policy.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use anyhow::{Context, Result, ensure};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{

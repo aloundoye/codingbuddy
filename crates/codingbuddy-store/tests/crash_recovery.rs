@@ -1,4 +1,5 @@
 //! E2E test: session survives simulated crash after a durable commit.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use anyhow::Result;
 use chrono::Utc;

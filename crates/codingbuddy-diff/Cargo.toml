@@ -15,3 +15,6 @@ uuid.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
 tempfile.workspace = true
 codingbuddy-store = { path = "../codingbuddy-store" }
+
+[lints]
+workspace = true

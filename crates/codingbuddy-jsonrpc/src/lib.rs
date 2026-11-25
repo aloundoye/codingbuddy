@@ -241,7 +241,7 @@ impl IdeRpcHandler {
         self.exposed_session = Some(id);
         self.http_sessions
             .lock()
-            .expect("HTTP sessions lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id);
         Ok(())
     }
@@ -285,7 +285,7 @@ impl IdeRpcHandler {
         let token = codingbuddy_core::CancellationToken::new();
         self.running
             .lock()
-            .expect("prompt cancellation lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, token.clone());
         let run = move |handler: &Self| {
             let result = handler.execute_prompt(params, id, Arc::clone(&lease), token.clone());
@@ -307,7 +307,7 @@ impl IdeRpcHandler {
             handler
                 .running
                 .lock()
-                .expect("prompt cancellation lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
             finished?;
             result
@@ -333,7 +333,7 @@ impl IdeRpcHandler {
         let writer_active = self
             .running
             .lock()
-            .expect("prompt cancellation lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(&id);
         let mut rows = self.store.prompt_events(id, cursor, limit + 1)?;
         let more = rows.len() > limit as usize;
@@ -356,7 +356,7 @@ impl IdeRpcHandler {
         if let Some(token) = self
             .running
             .lock()
-            .expect("prompt cancellation lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&id)
         {
             token.cancel();
@@ -416,7 +416,7 @@ impl IdeRpcHandler {
                     requested.filter(|id| {
                         self.http_sessions
                             .lock()
-                            .expect("HTTP sessions lock")
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .contains(id)
                     })
                 });
@@ -433,7 +433,7 @@ impl IdeRpcHandler {
                     self.handle_session_open(serde_json::json!({"workspace_root": workspace}))?;
                 self.http_sessions
                     .lock()
-                    .expect("HTTP sessions lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(require_uuid(&response, "session_id")?);
                 Ok(response)
             }
@@ -442,7 +442,7 @@ impl IdeRpcHandler {
                 anyhow::ensure!(
                     self.http_sessions
                         .lock()
-                        .expect("HTTP sessions lock")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .contains(&session_id),
                     "session was not opened by this HTTP server"
                 );
@@ -469,7 +469,7 @@ impl IdeRpcHandler {
                     };
                 self.http_prompts
                     .lock()
-                    .expect("HTTP prompts lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(require_uuid(&result, "prompt_id")?);
                 Ok(result)
             }
@@ -479,7 +479,7 @@ impl IdeRpcHandler {
                 anyhow::ensure!(
                     self.http_sessions
                         .lock()
-                        .expect("HTTP sessions lock")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .contains(&session),
                     "prompt is unavailable"
                 );
@@ -491,7 +491,10 @@ impl IdeRpcHandler {
             }
             _ => {
                 let prompt_id = require_uuid(&params, "prompt_id")?;
-                let mut prompts = self.http_prompts.lock().expect("HTTP prompts lock");
+                let mut prompts = self
+                    .http_prompts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 anyhow::ensure!(prompts.contains(&prompt_id), "prompt is unavailable");
                 let response = self.handle_prompt_stream_next(params)?;
                 if response["done"] == true {
@@ -887,7 +890,10 @@ impl IdeRpcHandler {
         let invocation_id = Uuid::parse_str(invocation_id_str)?;
 
         // Remove from pending approvals.
-        let mut approvals = self.approvals.lock().expect("approvals lock");
+        let mut approvals = self
+            .approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tool_name = approvals
             .get_mut(&session_id)
             .and_then(|pa| pa.pending.remove(invocation_id_str))
@@ -916,7 +922,10 @@ impl IdeRpcHandler {
             .ok_or_else(|| anyhow!("missing 'invocation_id' parameter"))?;
 
         // Remove from pending approvals.
-        let mut approvals = self.approvals.lock().expect("approvals lock");
+        let mut approvals = self
+            .approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tool_name = approvals
             .get_mut(&session_id)
             .and_then(|pa| pa.pending.remove(invocation_id_str))
@@ -1219,7 +1228,7 @@ impl IdeRpcHandler {
     pub fn add_pending_approval(&self, session_id: Uuid, invocation_id: &str, tool_name: &str) {
         self.approvals
             .lock()
-            .expect("approvals lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(session_id)
             .or_default()
             .pending
@@ -1258,15 +1267,20 @@ impl RpcHandler for IdeRpcHandler {
                 let id = if let Some(id) = params.get("prompt_id").and_then(Value::as_str) {
                     Uuid::parse_str(id)?
                 } else {
-                    let running = self.running.lock().unwrap();
+                    let running = self
+                        .running
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     anyhow::ensure!(
                         running.len() <= 1,
                         "Multiple active prompts; supply prompt_id"
                     );
-                    if running.is_empty() {
-                        return Ok(serde_json::json!({"cancelled":false,"status":"idle"}));
+                    match running.keys().next() {
+                        Some(prompt_id) => *prompt_id,
+                        None => {
+                            return Ok(serde_json::json!({"cancelled":false,"status":"idle"}));
+                        }
                     }
-                    *running.keys().next().unwrap()
                 };
                 let result = self.handle_prompt_cancel(serde_json::json!({"prompt_id":id}))?;
                 Ok(

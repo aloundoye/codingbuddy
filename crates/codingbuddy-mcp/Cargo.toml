@@ -30,3 +30,6 @@ features = ["rt", "time", "net", "macros"]
 
 [dependencies.jsonschema]
 workspace = true
+
+[lints]
+workspace = true

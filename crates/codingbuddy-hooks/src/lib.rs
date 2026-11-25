@@ -444,7 +444,10 @@ impl HookRuntime {
             // Skip once-fired hooks.
             if def.once {
                 let once_key = format!("{event_key}:{def_idx}");
-                let mut fired = self.once_fired.lock().expect("once_fired lock");
+                let mut fired = self
+                    .once_fired
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if fired.contains(&once_key) {
                     continue;
                 }

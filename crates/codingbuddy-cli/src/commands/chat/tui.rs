@@ -980,7 +980,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
             }
 
             let llm_config = {
-                let state = connection.lock().unwrap();
+                let state = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !state.ready {
                     let _ = tx.send(TuiStreamEvent::Error(
                         "Connect a provider with /connect.".into(),
@@ -989,7 +991,10 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 }
                 state.llm.clone()
             };
-            let token = turn_cancellation.lock().unwrap().clone();
+            let token = turn_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             // Agent prompt — expand @file mentions and set stream callback.
             let engine_clone = Arc::clone(&engine);
             let mut prompt = codingbuddy_ui::expand_at_mentions(prompt);
