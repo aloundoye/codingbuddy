@@ -417,7 +417,12 @@ pub(crate) fn url_host_matches(url: &str, domain: &str, strict: bool) -> bool {
     // `host:port` specifier (but not a bare IPv6 address, which has colons).
     let (wanted_host, wanted_port) = match wanted.rsplit_once(':') {
         Some((name, port)) if !name.contains(':') || name.ends_with(']') => {
-            (name.trim_end_matches(']'), port.parse::<u16>().ok())
+            match port.parse::<u16>() {
+                Ok(port) => (name.trim_end_matches(']'), Some(port)),
+                // A port that does not parse must not widen an allow rule
+                // to every port: the rule simply never matches.
+                Err(_) => return !strict && substring(),
+            }
         }
         _ => (wanted.trim_end_matches(']'), None),
     };

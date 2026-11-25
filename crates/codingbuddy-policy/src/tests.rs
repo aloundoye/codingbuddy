@@ -717,6 +717,19 @@ fn webfetch_domain_rules_handle_ports_and_ipv6() {
         Some("allow")
     );
     assert_eq!(ipv6_port.matches(&fetch("http://[::1]:4000/")), None);
+    // A malformed port never turns into "any port".
+    for bad in ["localhost:abc", "example.com:99999", "example.com:"] {
+        assert_eq!(
+            allow(bad).matches(&fetch("http://localhost:8080/")),
+            None,
+            "{bad}"
+        );
+        assert_eq!(
+            allow(bad).matches(&fetch("https://example.com/")),
+            None,
+            "{bad}"
+        );
+    }
 }
 
 #[test]
