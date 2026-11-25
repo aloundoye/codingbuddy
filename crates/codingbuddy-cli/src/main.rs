@@ -1091,6 +1091,21 @@ enum PermissionsCmd {
     Show,
     Set(PermissionsSetArgs),
     DryRun(PermissionsDryRunArgs),
+    /// List the "always allow" approvals saved for this project.
+    Approvals,
+    /// Remove saved approvals: one by tool and pattern, or all with --all.
+    Revoke(PermissionsRevokeArgs),
+}
+
+#[derive(Args, Default)]
+struct PermissionsRevokeArgs {
+    /// Tool the approval is for, e.g. `bash.run`.
+    tool: Option<String>,
+    /// The saved pattern, e.g. `npm *`.
+    pattern: Option<String>,
+    /// Remove every approval saved for this project.
+    #[arg(long, conflicts_with_all = ["tool", "pattern"])]
+    all: bool,
 }
 
 #[derive(Args)]

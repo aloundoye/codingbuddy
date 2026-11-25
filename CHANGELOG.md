@@ -31,6 +31,9 @@ Move it under a version heading when you cut a release.
   unknown models. Configure them under `agent_loop.heuristics`, globally or
   per provider; `codingbuddy doctor` shows what is active.
 
+- `codingbuddy permissions approvals` (and `/permissions approvals`) lists
+  the "always allow" approvals saved for a project;
+  `permissions revoke <tool> '<pattern>'` or `revoke --all` removes them.
 - `/rewind` can now undo changes made by shell commands (`mv`, `sed -i`,
   generators, formatters), not only by the file-editing tools. Mutating
   commands are checkpointed first and their changes recorded; read-only
@@ -41,6 +44,11 @@ Move it under a version heading when you cut a release.
   calls. Model requests reuse connections across calls.
 
 ### Fixed
+- "Always allow" for a shell command now works: saved approvals were never
+  matched, so the same command kept asking. They now cover that command
+  family (`npm *`) but never a chained, piped or redirected command.
+- Commands such as `npm test $(…)`, `cat a>b`, `cat x|sh` or `a & b` were
+  auto-approved as read-only in permissive modes; they now ask.
 - Fewer ways to crash: a panic in one part of the TUI or JSON-RPC server no
   longer cascades through shared locks; a provider missing from settings,
   an incomplete restore plan, or an unexpected Bedrock message now report
