@@ -10,6 +10,7 @@ pub mod config_watcher;
 pub mod cost;
 pub mod execution;
 mod llm_capabilities;
+pub mod logging;
 mod model_catalog;
 pub mod process_env;
 pub mod profiler;

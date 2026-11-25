@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
-    AppConfig, ChatMessage, ChatRequest, LlmResponse, StreamCallback, StreamChunk, ToolChoice,
+    AppConfig, ChatMessage, ChatRequest, LlmResponse, StreamCallback, ToolChoice,
 };
 use codingbuddy_llm::LlmClient;
 use std::path::Path;
@@ -62,91 +62,50 @@ pub fn analyze(
         (m, r)
     };
 
-    let enforce_profile_shape = matches!(options.mode, ChatMode::Ask | ChatMode::Context)
-        && bootstrap.enabled
-        && bootstrap.repoish;
-    let max_repairs = if enforce_profile_shape { 1 } else { 0 };
-
     let execution = codingbuddy_core::execution::ExecutionContext {
         cancellation: options.cancellation.clone().unwrap_or_default(),
         deadline: options.deadline,
         ..Default::default()
     };
-    for attempt in 0..=max_repairs {
-        execution.check()?;
-        codingbuddy_core::strip_prior_reasoning_content(&mut messages);
-        let request = ChatRequest {
-            model: model.clone(),
-            messages: messages.clone(),
-            tools: vec![],
-            tool_choice: ToolChoice::none(),
-            max_tokens: codingbuddy_core::max_output_tokens_for_model(
-                cfg.llm
-                    .active_provider_kind()
-                    .unwrap_or(codingbuddy_core::ProviderKind::Deepseek),
-                &model,
-                false,
-            ),
-            // Reasoner rejects temperature; deepseek-chat needs 0.0 for determinism
-            temperature: if is_reasoner { None } else { Some(0.0) },
-            top_p: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logprobs: None,
-            top_logprobs: None,
-            // Reasoner thinks natively — ThinkingConfig is only for deepseek-chat
-            thinking: if options.force_max_think && !is_reasoner {
-                Some(codingbuddy_core::ThinkingConfig::enabled(16_384))
-            } else {
-                None
-            },
-            images: options.images.clone(),
-            provider_options: Default::default(),
-            response_format: None,
-        };
-
-        let response = if let Some(ref cb) = stream_cb {
-            llm.complete_chat_streaming(&request, cb.clone())?
-        } else {
-            llm.complete_chat(&request)?
-        };
-        execution.check()?;
-        let violation = if enforce_profile_shape {
-            validate_analysis_shape(&response.text, bootstrap.vague_codebase_prompt)
+    execution.check()?;
+    codingbuddy_core::strip_prior_reasoning_content(&mut messages);
+    let request = ChatRequest {
+        model: model.clone(),
+        messages,
+        tools: vec![],
+        tool_choice: ToolChoice::none(),
+        max_tokens: codingbuddy_core::max_output_tokens_for_model(
+            cfg.llm
+                .active_provider_kind()
+                .unwrap_or(codingbuddy_core::ProviderKind::Deepseek),
+            &model,
+            false,
+        ),
+        // Reasoner rejects temperature; deepseek-chat needs 0.0 for determinism
+        temperature: if is_reasoner { None } else { Some(0.0) },
+        top_p: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logprobs: None,
+        top_logprobs: None,
+        // Reasoner thinks natively — ThinkingConfig is only for deepseek-chat
+        thinking: if options.force_max_think && !is_reasoner {
+            Some(codingbuddy_core::ThinkingConfig::enabled(16_384))
         } else {
             None
-        };
+        },
+        images: options.images.clone(),
+        provider_options: Default::default(),
+        response_format: None,
+    };
 
-        if let Some(reason) = violation
-            && attempt < max_repairs
-        {
-            if let Some(cb) = &stream_cb {
-                cb(StreamChunk::ClearStreamingText);
-            }
-            messages.push(ChatMessage::Assistant {
-                content: Some(response.text),
-                native_parts: None,
-                reasoning_content: None,
-                tool_calls: vec![],
-            });
-            messages.push(ChatMessage::User {
-                content: repair_prompt(bootstrap.vague_codebase_prompt, &reason),
-            });
-            continue;
-        }
-
-        return Ok(response);
-    }
-
-    Ok(LlmResponse {
-        text: String::new(),
-        finish_reason: "stop".to_string(),
-        reasoning_content: String::new(),
-        tool_calls: vec![],
-        usage: None,
-        transport_parts: Vec::new(),
-        compatibility: None,
-    })
+    let response = if let Some(cb) = stream_cb {
+        llm.complete_chat_streaming(&request, cb)?
+    } else {
+        llm.complete_chat(&request)?
+    };
+    execution.check()?;
+    Ok(response)
 }
 
 fn build_system_prompt(
@@ -169,14 +128,14 @@ fn build_system_prompt(
         let mut base = vec![
             role,
             "Assume you are operating inside the current repository unless explicitly told otherwise.",
-            "Use the project context below to inform your analysis. Respond immediately with findings.",
-            "Output sections in this exact order: Initial Analysis, Key Findings, Follow-ups.",
-            "Follow-ups must be targeted and capped to at most 2 questions.",
-            "Do not ask broad requests for more context before giving initial analysis.",
+            "Use the project context below to inform your answer. Answer the question directly.",
+            "Choose the structure that fits the question; do not add boilerplate section headings.",
+            "Ask at most 2 targeted follow-up questions, and only when they help.",
+            "Do not ask broad requests for more context before answering.",
         ];
         if vague_codebase_prompt {
             base.push(
-                "For vague codebase audit prompts, summarize baseline audit findings first and ask exactly 1 focused follow-up tied to the highest-risk area.",
+                "For vague codebase audit prompts, summarize the baseline audit findings first, then ask at most 1 focused follow-up about the highest-risk area.",
             );
         }
         base.join("\n")
@@ -200,99 +159,21 @@ fn build_user_prompt(prompt: &str, bootstrap: &gather_context::AutoContextBootst
     format!("{prompt}\n\n---\n{}", bootstrap.packet.trim_end())
 }
 
-fn validate_analysis_shape(text: &str, strict_single_followup: bool) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    if !(lower.contains("initial analysis") && lower.contains("key findings")) {
-        return Some("missing required sections".to_string());
-    }
-
-    let followups = extract_followups(text);
-    if strict_single_followup {
-        if followups.len() != 1 {
-            return Some(format!(
-                "expected exactly 1 focused follow-up, got {}",
-                followups.len()
-            ));
-        }
-    } else if followups.len() > 2 {
-        return Some(format!(
-            "follow-up budget exceeded; max 2, got {}",
-            followups.len()
-        ));
-    }
-
-    if lower.contains("need more details") || lower.contains("need more information") {
-        return Some("response asked generic clarification before analysis".to_string());
-    }
-
-    None
-}
-
-fn extract_followups(text: &str) -> Vec<String> {
-    let mut in_followups = false;
-    let mut followups = Vec::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("follow-ups") || lower.starts_with("followups") {
-            in_followups = true;
-            continue;
-        }
-        if in_followups
-            && (lower.starts_with("initial analysis") || lower.starts_with("key findings"))
-        {
-            break;
-        }
-
-        if !in_followups || trimmed.is_empty() {
-            continue;
-        }
-
-        let looks_like_followup = trimmed.starts_with('-')
-            || trimmed.starts_with('*')
-            || trimmed.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-            || trimmed.ends_with('?');
-        if looks_like_followup {
-            followups.push(trimmed.to_string());
-        }
-    }
-
-    followups
-}
-
-fn repair_prompt(strict_single_followup: bool, reason: &str) -> String {
-    if strict_single_followup {
-        format!(
-            "Repair required: {}. Re-answer using exactly these sections and order:\nInitial Analysis\nKey Findings\nFollow-ups\nInclude exactly 1 focused follow-up question in Follow-ups.",
-            reason
-        )
-    } else {
-        format!(
-            "Repair required: {}. Re-answer using exactly these sections and order:\nInitial Analysis\nKey Findings\nFollow-ups\nInclude no more than 2 focused follow-up questions.",
-            reason
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn extract_followups_detects_bullets() {
-        let text = "Initial Analysis\nA\nKey Findings\nB\nFollow-ups\n- one?\n- two?\n";
-        let followups = extract_followups(text);
-        assert_eq!(followups.len(), 2);
-    }
-
-    #[test]
-    fn validator_enforces_limits() {
-        let bad = "Initial Analysis\nA\nKey Findings\nB\nFollow-ups\n- q1\n- q2\n- q3\n";
-        assert!(validate_analysis_shape(bad, false).is_some());
-
-        let ok = "Initial Analysis\nA\nKey Findings\nB\nFollow-ups\n- q1\n";
-        assert!(validate_analysis_shape(ok, true).is_none());
+    fn system_prompt_does_not_force_section_headings() {
+        let options = ChatOptions {
+            mode: ChatMode::Ask,
+            ..Default::default()
+        };
+        for vague in [false, true] {
+            let prompt = build_system_prompt(&options, true, vague);
+            assert!(!prompt.contains("Initial Analysis"));
+            assert!(!prompt.contains("Key Findings"));
+        }
     }
 
     #[test]

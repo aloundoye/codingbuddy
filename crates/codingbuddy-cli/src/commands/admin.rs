@@ -159,10 +159,25 @@ pub(crate) fn parse_permission_mode(value: &str) -> Result<PermissionModeArg> {
 }
 
 pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Result<()> {
-    let payload = doctor_payload(cwd, &args)?;
+    let mut payload = doctor_payload(cwd, &args)?;
+    let bundle = if args.bundle {
+        Some(crate::commands::diagnostics_bundle::write_bundle(
+            cwd, &payload,
+        )?)
+    } else {
+        None
+    };
     if json_mode {
+        if let Some(path) = &bundle {
+            payload["bundle"] = json!(path);
+        }
         print_json(&payload)?;
         return Ok(());
+    }
+    if let Some(path) = &bundle {
+        // Printed first so it is not lost below the checklist.
+        println!("Diagnostics bundle written to {}", path.display());
+        println!("Review it, then attach it to your bug report.\n");
     }
 
     // ── Header ──
@@ -424,6 +439,21 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
     }
     println!();
 
+    // ── Logs ──
+    print_section("Logs");
+    match payload["logs"]["current_file"].as_str() {
+        Some(file) => print_check(true, &format!("Log file: {file}")),
+        None => match payload["logs"]["dir"].as_str() {
+            Some(dir) => print_info(&format!("No log file yet in {dir}")),
+            None => print_check(false, "No log directory (HOME is not set)"),
+        },
+    }
+    if let Some(crash) = payload["logs"]["latest_crash_report"].as_str() {
+        print_check(false, &format!("Last crash report: {crash}"));
+    }
+    print_info("Run `codingbuddy doctor --bundle` to package logs for a bug report");
+    println!();
+
     // ── Warnings ──
     if let Some(warnings) = payload["warnings"].as_array()
         && !warnings.is_empty()
@@ -465,6 +495,18 @@ fn print_check(ok: bool, msg: &str) {
 
 fn print_info(msg: &str) {
     println!("    \x1b[90m- {msg}\x1b[0m");
+}
+
+/// Where diagnostics live, so a user can find them without reading docs.
+fn logs_payload() -> serde_json::Value {
+    use codingbuddy_core::logging;
+    let dir = logging::effective_log_dir();
+    json!({
+        "dir": dir,
+        "current_file": dir.as_deref().and_then(logging::latest_log_file),
+        "latest_crash_report": dir.as_deref().and_then(logging::latest_crash_report),
+        "level_override": std::env::var(logging::LOG_ENV).ok(),
+    })
 }
 
 pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json::Value> {
@@ -673,6 +715,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         },
         "checks": checks,
         "warnings": warnings,
+        "logs": logs_payload(),
     });
 
     Ok(payload)
@@ -748,6 +791,14 @@ pub(crate) fn format_doctor_display(payload: &serde_json::Value) -> String {
         && n > 0
     {
         out.push_str(&format!("  \u{2713} Hooks            {n} configured\n"));
+    }
+
+    // Logs
+    if let Some(file) = payload["logs"]["current_file"].as_str() {
+        out.push_str(&format!("  \u{2713} Log file         {file}\n"));
+    }
+    if let Some(crash) = payload["logs"]["latest_crash_report"].as_str() {
+        out.push_str(&format!("  \u{2717} Last crash       {crash}\n"));
     }
 
     // Warnings
@@ -1339,6 +1390,7 @@ mod tests {
             cwd,
             &DoctorArgs {
                 model: Some("qwen2.5-coder:7b".to_string()),
+                ..Default::default()
             },
         )
         .unwrap();

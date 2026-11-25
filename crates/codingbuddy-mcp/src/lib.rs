@@ -227,6 +227,27 @@ impl McpManager {
         args: &serde_json::Value,
         context: codingbuddy_core::ToolExecutionContext<'_>,
     ) -> Result<serde_json::Value> {
+        let started = std::time::Instant::now();
+        let result = self.call_tool_untraced(alias, args, context);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => tracing::debug!(tool = alias, elapsed_ms, "MCP tool call finished"),
+            Err(error) => tracing::warn!(
+                tool = alias,
+                elapsed_ms,
+                error = %format!("{error:#}"),
+                "MCP tool call failed"
+            ),
+        }
+        result
+    }
+
+    fn call_tool_untraced(
+        &self,
+        alias: &str,
+        args: &serde_json::Value,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> Result<serde_json::Value> {
         let (expected, tool) = self
             .catalog
             .lock()

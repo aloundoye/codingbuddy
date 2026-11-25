@@ -4,6 +4,7 @@ pub(crate) mod autopilot;
 pub(crate) mod background;
 pub(crate) mod chat;
 pub(crate) mod compact;
+pub(crate) mod diagnostics_bundle;
 pub(crate) mod diff;
 pub(crate) mod exec;
 pub(crate) mod fork;

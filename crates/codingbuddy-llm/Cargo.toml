@@ -10,6 +10,7 @@ provider-fixtures = []
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
 keyring.workspace = true
 chrono.workspace = true
 reqwest.workspace = true

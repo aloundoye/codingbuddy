@@ -5,6 +5,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Engine-level diagnostics. Messages go to the process log
+/// (`codingbuddy_core::logging`); warnings are also appended to the
+/// workspace's `.codingbuddy/observe.log`, which `codingbuddy status` and
+/// `codingbuddy clean` still read.
+///
+/// Nothing is printed to stderr unless `--verbose` is on, because stderr
+/// output would corrupt the TUI.
 pub struct Observer {
     log_path: PathBuf,
     verbose: bool,
@@ -25,13 +32,17 @@ impl Observer {
     }
 
     pub fn verbose_log(&self, msg: &str) {
+        tracing::debug!(target: "codingbuddy_agent::observe", "{msg}");
         if self.verbose {
             eprintln!("[codingbuddy] {msg}");
         }
     }
 
     pub fn warn_log(&self, msg: &str) {
-        eprintln!("[codingbuddy WARN] {msg}");
+        tracing::warn!(target: "codingbuddy_agent::observe", "{msg}");
+        if self.verbose {
+            eprintln!("[codingbuddy WARN] {msg}");
+        }
         let _ = self.append_log_line(&format!("{} WARN {msg}", Utc::now().to_rfc3339()));
     }
 

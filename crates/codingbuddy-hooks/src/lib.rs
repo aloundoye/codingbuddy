@@ -484,7 +484,28 @@ impl HookRuntime {
                 {
                     continue;
                 }
+                let started = std::time::Instant::now();
                 let run = self.execute_handler(handler, input, &consumer, source, context);
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if run.success && !run.timed_out {
+                    tracing::debug!(
+                        event = event_key,
+                        hook = %consumer,
+                        elapsed_ms,
+                        blocked = run.blocked,
+                        "hook finished"
+                    );
+                } else {
+                    tracing::warn!(
+                        event = event_key,
+                        hook = %consumer,
+                        elapsed_ms,
+                        timed_out = run.timed_out,
+                        exit_code = ?run.exit_code,
+                        blocked = run.blocked,
+                        "hook failed"
+                    );
+                }
                 if run.blocked && event.supports_blocking() {
                     result.blocked = true;
                     result.block_reason = run

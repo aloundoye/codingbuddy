@@ -12,7 +12,10 @@ path = "src/main.rs"
 [dependencies]
 tempfile.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 chrono.workspace = true
+flate2.workspace = true
+tar.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 serde.workspace = true

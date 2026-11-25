@@ -81,6 +81,11 @@ jsonschema = "0.27"
 shell-words = "1.1"
 strsim = "0.11"
 tiny_http = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std", "registry"] }
+tracing-appender = "0.2"
+flate2 = "1"
+tar = "0.4"
 
 [profile.release]
 lto = "thin"

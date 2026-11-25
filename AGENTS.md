@@ -29,15 +29,15 @@ bash scripts/runtime_conformance_scan.sh
 17-crate Rust workspace. Edition 2024, rust-version 1.94.1, resolver v2.
 
 **Core execution crates:**
-- `codingbuddy-cli` — CLI entry point, clap dispatch, 24 subcommand handlers in `src/commands/`
-- `codingbuddy-agent` — Agent engine, tool-use loop, complexity classifier, prompt construction, team mode, phase loop
+- `codingbuddy-cli` — CLI entry point, clap dispatch, 29 subcommand handlers in `src/commands/`
+- `codingbuddy-agent` — Agent engine, tool-use loop, complexity classifier, prompt construction, team mode, phase loop. Also hosts context enrichment (`src/context/`, `gather_context.rs`, `repo_map.rs`), skill discovery (`src/skills.rs`) and the run log (`src/observe.rs`) — these are modules, not separate crates
 - `codingbuddy-core` — Shared types: `AppConfig`, `ChatRequest`, `LlmResponse`, `StreamChunk`, `TaskPhase`, `SessionState`, `EventEnvelope`
 - `codingbuddy-llm` — LLM client implementing `LlmClient` trait, streaming, prompt cache, cached API key resolution
 
 **Tool/policy crates:**
 - `codingbuddy-tools` — Tool definitions, plugin manager, shell runner, sandbox wrapping
 - `codingbuddy-policy` — Permission engine (denylist/allowlist), approval gates, output scanner, `ManagedSettings`, default deny rules, `BypassPermissions` mode
-- `codingbuddy-hooks` — 14 lifecycle events, `HookRuntime`, once/disabled fields, `PermissionDecision`
+- `codingbuddy-hooks` — 17 lifecycle events (`HookEvent`), `HookRuntime`, once/disabled fields, `PermissionDecision`
 
 **ML/Intelligence crates:**
 - `codingbuddy-lsp` — Post-edit validation: runs language-specific checks (`cargo check`, `tsc`, `py_compile`, `go vet`) after file edits and feeds parsed diagnostics back to the LLM for self-correction.
@@ -49,10 +49,7 @@ bash scripts/runtime_conformance_scan.sh
 - `codingbuddy-mcp` — MCP server management (JSON-RPC stdio/http), `list_prompts`, tool discovery
 - `codingbuddy-ui` — TUI rendering (ratatui/crossterm), autocomplete, vim mode, history suggestions
 - `codingbuddy-diff` — Unified diff parsing, patch staging, git-apply
-- `codingbuddy-context` — Context enrichment and analysis
-- `codingbuddy-skills` — Skill discovery, forked execution, frontmatter parsing
 - `codingbuddy-subagent` — Background tasks, worktree isolation, custom agent definitions
-- `codingbuddy-observe` — Structured logging
 - `codingbuddy-jsonrpc` — JSON-RPC server for IDE integration
 - `codingbuddy-testkit` — Test utilities
 
@@ -73,7 +70,7 @@ Key files:
 - `codingbuddy-agent/src/agent_profiles.rs` — Agent profiles (build/explore/plan), profile selection, tool filtering
 - `codingbuddy-agent/src/prompts.rs` — Per-model system prompts (chat/reasoner/qwen/gemini) + complexity-based planning injection
 
-The loop uses `PolicyEngine` + `LocalToolHost` for approval-gated tool execution. `StreamChunk` variants flow events (TextDelta, ToolCallStart/End, SecurityWarning, PhaseTransition, ModelChanged, Done) to the UI layer.
+The loop uses `PolicyEngine` + `LocalToolHost` for approval-gated tool execution. `StreamChunk` variants flow events (ContentDelta, ReasoningDelta, ToolCallStart/End, SecurityWarning, PhaseTransition, ModelChanged, Done) to the UI layer.
 
 **Intelligence layers (wired end-to-end):**
 - **Agent profiles**: `select_profile()` chooses build/explore/plan profile based on `ChatMode` + prompt keywords. `filter_by_profile()` applies allowlist/blocklist to tool definitions. MCP tools always pass through. Reduces the model's decision space from 39+ tools to task-relevant subset.
@@ -149,13 +146,22 @@ impl LlmClient for ScriptedToolLlm { /* pop_front on each call */ }
 ```
 
 **Integration tests** live in `crates/codingbuddy-agent/tests/`:
-- `tool_use_default.rs` (20 tests) — core tool-use loop behavior
+- `tool_use_default.rs` (40 tests) — core tool-use loop behavior
 - `privacy_wiring.rs` — privacy filtering and keyword search tool registration
-- `runtime_conformance.rs`, `analysis_bootstrap.rs`, `team_orchestration.rs`
+- `runtime_conformance.rs`, `analysis_bootstrap.rs`, `team_orchestration.rs`, `functional_verification.rs`, `real_file_operations.rs`, `feature_coverage.rs`, `coding_quality_benchmark.rs`
 
 **Unit tests**: Most crates use `#[cfg(test)] mod tests` at the bottom of `lib.rs`.
 
 **Environment safety**: Rust 2024 requires `unsafe` for `std::env::set_var`/`remove_var`. Tests that manipulate env vars must use `unsafe {}` blocks and avoid parallel access (combine related env tests or check return types rather than exact values).
+
+## Logging & Diagnostics
+
+- `codingbuddy_core::logging` owns process diagnostics. `init_logging()` is called once in `main` (`init_diagnostics`). Output goes **only to files** — never stdout/stderr, which would corrupt the TUI and `--json` output. Location: `CODINGBUDDY_LOG_DIR`, else `~/.codingbuddy/logs/codingbuddy.YYYY-MM-DD.log` (daily rotation, 7 kept).
+- Level: `CODINGBUDDY_LOG` (full `EnvFilter` syntax) > `--debug [categories]` (`--debug mcp,llm` → `codingbuddy_mcp=debug,codingbuddy_llm=debug`) > `info`. Noisy deps (aws, hyper, rustls, reqwest, tantivy) are capped at `warn`.
+- Use `tracing::{info,warn,debug}!` in library code, not `eprintln!`. Never log prompts, responses, tool arguments or keys — log names, ids, counts, timings. Existing spans: `turn` (tool loop), `tool{name,call_id}` (tool execution); request outcomes under `codingbuddy_llm::request`, retries under `codingbuddy_llm::retry`; MCP calls and hooks log their own outcome.
+- `install_crash_handler()` writes `crash-<ts>-<pid>.log` (panic, backtrace, last 200 log lines) next to the logs for every panic, including caught worker panics. A full-screen UI holds `claim_terminal()` so background-thread panics don't print over it; the TUI's own hook restores the terminal only for panics on the TUI thread.
+- `codingbuddy doctor` reports the log file and last crash; `doctor --bundle` writes a redacted `.tar.gz` (doctor payload, config, recent logs, crash reports) into the log directory. Redaction: secret-looking field names plus `OutputScanner`.
+- `CODINGBUDDY_DEBUG_PANIC=1` forces a panic at startup to verify crash reporting.
 
 ## Configuration Precedence
 
@@ -169,7 +175,7 @@ Settings merge in order (later wins):
 
 ## Key Conventions
 
-- `StreamChunk` enum is the universal event type (17 variants including `PhaseTransition` and `ModelChanged`). When adding variants, update all match sites in `codingbuddy-cli/src/commands/chat.rs` (JSON events, non-JSON streaming, TUI callback, text mode) and `stream_chunk_to_event_json()` in `codingbuddy-core/src/lib.rs`.
+- `StreamChunk` enum is the universal event type (22 variants including `PhaseTransition` and `ModelChanged`). When adding variants, update all match sites in `codingbuddy-cli/src/commands/chat.rs` (JSON events, non-JSON streaming, TUI callback, text mode) and `stream_chunk_to_event_json()` in `codingbuddy-core/src/lib.rs`.
 - Tool definitions in `codingbuddy-tools/src/lib.rs` use enriched descriptions (200-500 words of behavioral instructions per tool).
 - Anti-hallucination: per-question `tool_choice=required` (resets each turn, stripped for reasoner), nudge on long answers (>150 chars) only when no tool has run in the current turn (up to 3 attempts; earlier turns' tool use does not exempt a new question — a long answer after this turn's tool results is the grounded answer and must not be discarded), structural file-reference validation with 30+ extensions (threshold: 1+ unverified refs), shell command pattern detection (`contains_shell_command_pattern()`).
 - Thinking budgets: Simple 8K / Medium 16K / Complex 32K initial. Evidence-driven escalation on failures (+8K per failure, capped at 64K). De-escalation after 3 consecutive successes.

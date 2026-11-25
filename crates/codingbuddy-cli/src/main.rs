@@ -225,7 +225,10 @@ struct Cli {
     #[arg(long = "no-chrome")]
     no_chrome: bool,
 
-    /// Enable debug mode with optional category filtering (comma-separated).
+    /// Write debug-level diagnostics to the log file (~/.codingbuddy/logs or
+    /// CODINGBUDDY_LOG_DIR). Optional comma-separated categories limit debug
+    /// output to those crates, e.g. `--debug mcp,llm`. CODINGBUDDY_LOG
+    /// overrides the level entirely.
     #[arg(long = "debug")]
     debug: Option<Option<String>>,
 
@@ -673,6 +676,10 @@ struct DoctorArgs {
     /// Optional model id to include in capability resolution output.
     #[arg(long)]
     model: Option<String>,
+    /// Also write a redacted .tar.gz of diagnostics, config, recent logs and
+    /// crash reports to the log directory, for attaching to a bug report.
+    #[arg(long)]
+    bundle: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -1338,9 +1345,11 @@ fn migrate_legacy_config(workspace: &Path) {
 }
 
 fn main() {
+    codingbuddy_core::logging::install_crash_handler(env!("CARGO_PKG_VERSION"));
     match run() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
+            tracing::error!("command failed: {e:#}");
             // Get json mode from args
             if std::env::args_os().any(|arg| arg == "--internal-owned-worker") {
                 eprintln!("Worker failed: {e:#}");
@@ -1352,16 +1361,52 @@ fn main() {
     }
 }
 
+/// Start the file logger and record what started. Never fails: a missing or
+/// unwritable log directory just means no log file.
+fn init_diagnostics(debug: Option<&Option<String>>, role: &str) {
+    let categories = debug
+        .and_then(Option::as_deref)
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|category| !category.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let log_dir =
+        codingbuddy_core::logging::init_logging(codingbuddy_core::logging::LoggingOptions {
+            debug: debug.is_some(),
+            categories,
+            log_dir: None,
+        });
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        pid = std::process::id(),
+        role,
+        log_dir = ?log_dir,
+        "codingbuddy started"
+    );
+    // Hidden hook for verifying crash reporting end to end.
+    if std::env::var_os("CODINGBUDDY_DEBUG_PANIC").is_some_and(|value| value == "1") {
+        panic!("CODINGBUDDY_DEBUG_PANIC=1 requested a test panic");
+    }
+}
+
 fn run() -> Result<()> {
     if std::env::args_os()
         .skip(1)
         .eq([std::ffi::OsString::from("--internal-owned-worker")])
     {
+        init_diagnostics(None, "worker");
         return worker::run();
     }
     let mut prof = codingbuddy_core::profiler::StartupProfiler::new();
 
     let mut cli = Cli::parse();
+    init_diagnostics(cli.debug.as_ref(), "cli");
     prof.mark("cli_parse");
 
     validate_cli_flags(&cli)?;
