@@ -307,7 +307,8 @@ impl AgentEngine {
             return Err(anyhow!("prompt blocked by UserPromptSubmit hook"));
         }
 
-        let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
+        let prompt_enriched =
+            enrich_prompt_with_urls(prompt, options.detect_urls, Some(&execution.cancellation));
         let mut history = projection.chat_messages;
         // A prompt that failed, was cancelled, or whose process died leaves its
         // user turn (and possibly tool results) without a final answer. Close it

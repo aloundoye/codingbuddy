@@ -951,11 +951,8 @@ impl LocalToolHost {
                     .get("timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(30);
-                let (status, content_type, body) = http_get_cancellable(
-                    url,
-                    Duration::from_secs(timeout),
-                    context.cancellation,
-                )?;
+                let (status, content_type, body) =
+                    http_get_cancellable(url, Duration::from_secs(timeout), context.cancellation)?;
                 let truncated = body.len() > max_bytes;
                 let text = if truncated {
                     &body[..body.floor_char_boundary(max_bytes)]

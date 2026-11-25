@@ -993,7 +993,14 @@ fn should_run_team_orchestration(
     }
 }
 
-fn enrich_prompt_with_urls(prompt: &str, enabled: bool) -> String {
+/// Fetch up to three URLs named in the prompt, concurrently, and append
+/// their text. Gives up (returning the prompt unchanged) as soon as the turn
+/// is cancelled; failed fetches are skipped.
+fn enrich_prompt_with_urls(
+    prompt: &str,
+    enabled: bool,
+    cancellation: Option<&codingbuddy_core::CancellationToken>,
+) -> String {
     if !enabled {
         return prompt.to_string();
     }
@@ -1001,30 +1008,46 @@ fn enrich_prompt_with_urls(prompt: &str, enabled: bool) -> String {
     if urls.is_empty() {
         return prompt.to_string();
     }
-    let client = match reqwest::blocking::Client::builder()
+    let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("codingbuddy-cli/0.2")
+        .user_agent(concat!("codingbuddy-cli/", env!("CARGO_PKG_VERSION")))
         .build()
-    {
-        Ok(client) => client,
-        Err(_) => return prompt.to_string(),
+    else {
+        return prompt.to_string();
+    };
+    let fetched = codingbuddy_core::runtime::block_on_cancellable(cancellation, async move {
+        let tasks: Vec<_> = urls
+            .into_iter()
+            .map(|url| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let response = client.get(&url).send().await.ok()?;
+                    let status = response.status().as_u16();
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let body = response.text().await.ok()?;
+                    Some((url, status, content_type, body))
+                })
+            })
+            .collect();
+        let mut pages = Vec::new();
+        for task in tasks {
+            if let Ok(Some(page)) = task.await {
+                pages.push(page);
+            }
+        }
+        pages
+    });
+    let Ok(pages) = fetched else {
+        return prompt.to_string();
     };
 
     let mut rows = Vec::new();
-    for url in urls {
-        let Ok(resp) = client.get(&url).send() else {
-            continue;
-        };
-        let status = resp.status().as_u16();
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-        let Ok(body) = resp.text() else {
-            continue;
-        };
+    for (url, status, content_type, body) in pages {
         let max_bytes = 24_000usize;
         let truncated = body.len() > max_bytes;
         let clipped = if truncated {

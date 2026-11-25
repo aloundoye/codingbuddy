@@ -1163,6 +1163,7 @@ dependencies = [
  "sha2 0.10.9",
  "streaming-iterator",
  "tempfile",
+ "tokio",
  "tracing",
  "tree-sitter",
  "tree-sitter-c-sharp",
