@@ -420,8 +420,15 @@ pub(crate) fn url_host_matches(url: &str, domain: &str, strict: bool) -> bool {
             match port.parse::<u16>() {
                 Ok(port) => (name.trim_end_matches(']'), Some(port)),
                 // A port that does not parse must not widen an allow rule
-                // to every port: the rule simply never matches.
-                Err(_) => return !strict && substring(),
+                // to every port: the allow rule never matches. A deny/ask
+                // rule fails closed instead, matching the host on any port.
+                Err(_) => {
+                    if strict {
+                        return false;
+                    }
+                    let name = name.trim_end_matches(']');
+                    return host == name || host.ends_with(&format!(".{name}")) || substring();
+                }
             }
         }
         _ => (wanted.trim_end_matches(']'), None),

@@ -730,6 +730,15 @@ fn webfetch_domain_rules_handle_ports_and_ipv6() {
             "{bad}"
         );
     }
+    // A deny rule with a malformed port still denies the host on any port.
+    let deny = PermissionRule {
+        rule: "WebFetch(domain:internal.corp:abc)".to_string(),
+        decision: "deny".to_string(),
+    };
+    assert_eq!(
+        deny.matches(&fetch("https://api.internal.corp/")),
+        Some("deny")
+    );
 }
 
 #[test]
