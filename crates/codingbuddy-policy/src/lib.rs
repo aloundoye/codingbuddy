@@ -1,3 +1,4 @@
+pub mod approvals;
 pub mod bash_classifier;
 mod managed;
 pub mod output_scanner;
@@ -565,21 +566,19 @@ impl PolicyEngine {
             return decision != "allow";
         }
 
-        // Check persistent bash approvals (project-scoped, "always allow").
-        // Saved patterns are globs like `npm *`; they only cover a single
-        // plain command, never one chained or redirected into something else.
-        if call.name == "bash.run"
-            && let Some(cmd) = call
-                .args
-                .get("command")
-                .or_else(|| call.args.get("cmd"))
-                .and_then(|v| v.as_str())
-            && is_single_plain_command(cmd)
+        // Saved "always allow" approvals (project-scoped). See
+        // `approvals::saved_approval_matches` for what a pattern may cover.
+        // Plan and Locked modes always ask.
+        if !matches!(
+            self.permission_mode,
+            PermissionMode::Plan | PermissionMode::Locked
+        ) && call.name == "bash.run"
+            && let Some(cmd) = approvals::bash_command_arg(&call.args)
             && self
                 .cfg
                 .persistent_bash_approvals
                 .iter()
-                .any(|pattern| glob_command_matches(pattern, cmd))
+                .any(|pattern| approvals::saved_approval_matches(pattern, cmd))
         {
             return false;
         }
@@ -590,11 +589,7 @@ impl PolicyEngine {
             self.permission_mode,
             PermissionMode::Plan | PermissionMode::Locked
         ) && (call.name == "bash.run" || call.name == "bash_run")
-            && let Some(cmd) = call
-                .args
-                .get("cmd")
-                .or_else(|| call.args.get("command"))
-                .and_then(|v| v.as_str())
+            && let Some(cmd) = approvals::bash_command_arg(&call.args)
             && bash_classifier::classify_bash_command(cmd) == bash_classifier::BashSafety::Safe
         {
             return false;

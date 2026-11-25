@@ -1504,6 +1504,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "codingbuddy-core",
+ "codingbuddy-policy",
  "codingbuddy-store",
  "crossterm",
  "glob",

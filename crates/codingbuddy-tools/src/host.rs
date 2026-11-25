@@ -891,13 +891,11 @@ impl LocalToolHost {
                 }))
             }
             "bash.run" => {
-                // Accept both "cmd" (canonical) and "command" (model hallucination)
-                let cmd = call
-                    .args
-                    .get("cmd")
-                    .or_else(|| call.args.get("command"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("cmd missing — expected 'cmd' parameter"))?;
+                // Same extraction as the policy, so the approved string is
+                // the executed string; conflicting `cmd`/`command` are refused.
+                let cmd = codingbuddy_policy::approvals::bash_command_arg(&call.args).ok_or_else(
+                    || anyhow!("expected one `command` (or `cmd`); conflicting values are refused"),
+                )?;
 
                 // Structural command analysis via tree-sitter-bash AST.
                 let cmd_analysis = crate::bash_ast::analyze_command(cmd);

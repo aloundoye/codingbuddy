@@ -1973,13 +1973,8 @@ fn derive_approval_pattern(tool_name: &str, args_summary: &str) -> String {
         serde_json::from_str(args_summary).unwrap_or(serde_json::Value::Null);
 
     if tool_name.starts_with("bash") {
-        let cmd = parsed
-            .get("cmd")
-            .or_else(|| parsed.get("command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let first_word = cmd.split_whitespace().next().unwrap_or("*");
-        format!("{first_word} *")
+        let cmd = codingbuddy_policy::approvals::bash_command_arg(&parsed).unwrap_or("");
+        codingbuddy_policy::approvals::approval_pattern_for(cmd)
     } else {
         let path = parsed
             .get("path")
