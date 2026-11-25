@@ -24,6 +24,18 @@ pub enum SessionCmd {
     },
     /// List all sessions
     List,
+    /// Search past prompts and answers across sessions
+    Search {
+        /// Words that must all appear in a message (case-insensitive)
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Maximum number of matches to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// How many recent sessions to search
+        #[arg(long, default_value_t = 200)]
+        sessions: usize,
+    },
     /// Show details of a specific session
     Show {
         /// Session ID to show (defaults to latest)
@@ -149,6 +161,30 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                     summary.title
                 );
             }
+        }
+        SessionCmd::Search {
+            query,
+            limit,
+            sessions,
+        } => {
+            let hits = store.search_sessions(&query.join(" "), sessions, limit)?;
+            if _json {
+                println!("{}", serde_json::to_string(&hits)?);
+                return Ok(());
+            }
+            if hits.is_empty() {
+                println!("No matches.");
+                return Ok(());
+            }
+            let mut last = None;
+            for hit in hits {
+                if last != Some(hit.session_id) {
+                    println!("\n{}  {}", hit.session_id, hit.title);
+                    last = Some(hit.session_id);
+                }
+                println!("  {:<9} {}", format!("{}:", hit.role), hit.snippet);
+            }
+            println!("\nResume with: codingbuddy --resume <session id>");
         }
         SessionCmd::Show { id } => {
             let session = match id {

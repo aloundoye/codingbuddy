@@ -854,3 +854,88 @@ fn migration_versions_are_unique_and_never_collide_with_event_storage() {
         "a schema migration reuses EVENT_STORAGE_VERSION, which would skip the event migration"
     );
 }
+
+#[test]
+fn search_finds_messages_across_sessions() {
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let store = Store::new(workspace.path()).expect("store");
+    let mut ids = Vec::new();
+    for messages in [
+        vec![
+            codingbuddy_core::ChatMessage::User {
+                content: "Why does the Login test flake on CI?".to_string(),
+            },
+            codingbuddy_core::ChatMessage::Assistant {
+                content: Some("The login fixture races the token refresh.".to_string()),
+                native_parts: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+        ],
+        vec![codingbuddy_core::ChatMessage::User {
+            content: "Add a dark theme".to_string(),
+        }],
+    ] {
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.path().to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+        for message in messages {
+            store
+                .append_event(&NewEvent {
+                    event_id: Uuid::now_v7(),
+                    at: Utc::now(),
+                    session_id: session.session_id,
+                    kind: EventKind::ChatTurn { message },
+                })
+                .expect("append");
+        }
+        ids.push(session.session_id);
+    }
+
+    let hits = store.search_sessions("login", 50, 10).expect("search");
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(hits.iter().all(|hit| hit.session_id == ids[0]));
+    assert_eq!(hits[0].role, "user");
+    assert_eq!(hits[1].role, "assistant");
+
+    // Every word must match, in any order and case.
+    let hits = store
+        .search_sessions("TOKEN login", 50, 10)
+        .expect("search");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].snippet.contains("token refresh"),
+        "{}",
+        hits[0].snippet
+    );
+
+    assert_eq!(
+        store.search_sessions("dark", 50, 10).expect("search")[0].session_id,
+        ids[1]
+    );
+    assert!(
+        store
+            .search_sessions("nowhere", 50, 10)
+            .expect("search")
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_sessions("   ", 50, 10)
+            .expect("search")
+            .is_empty()
+    );
+    assert_eq!(
+        store.search_sessions("login", 50, 1).expect("search").len(),
+        1
+    );
+}

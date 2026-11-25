@@ -323,6 +323,19 @@ pub struct StoredEvent {
     pub payload: serde_json::Value,
 }
 
+/// One message that matched `session search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    pub session_id: Uuid,
+    /// The session's title, as in [`SessionSummary::title`].
+    pub title: String,
+    pub updated_at: String,
+    /// `user` or `assistant`.
+    pub role: String,
+    /// A single-line excerpt around the first matching word.
+    pub snippet: String,
+}
+
 /// A session as shown in pickers and `session list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {

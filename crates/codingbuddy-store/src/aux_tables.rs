@@ -1869,6 +1869,53 @@ impl Store {
         Ok(out)
     }
 
+    /// Messages across the most recent `max_sessions` sessions that contain
+    /// every word of `query` (case-insensitive), newest session first, at
+    /// most `limit` hits. Only user prompts and assistant answers are
+    /// searched; tool output is not.
+    pub fn search_sessions(
+        &self,
+        query: &str,
+        max_sessions: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionSearchHit>> {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut hits = Vec::new();
+        for summary in self.session_summaries(max_sessions)? {
+            let Ok(state) = self.rebuild_from_events(summary.session.session_id) else {
+                continue;
+            };
+            for message in state.chat_messages {
+                let (role, text) = match message {
+                    codingbuddy_core::ChatMessage::User { content } => ("user", content),
+                    codingbuddy_core::ChatMessage::Assistant {
+                        content: Some(content),
+                        ..
+                    } => ("assistant", content),
+                    _ => continue,
+                };
+                let lower = text.to_lowercase();
+                if !words.iter().all(|word| lower.contains(word.as_str())) {
+                    continue;
+                }
+                hits.push(SessionSearchHit {
+                    session_id: summary.session.session_id,
+                    title: summary.title.clone(),
+                    updated_at: summary.updated_at.clone(),
+                    role: role.to_string(),
+                    snippet: search_snippet(&text, &words[0]),
+                });
+                if hits.len() >= limit {
+                    return Ok(hits);
+                }
+            }
+        }
+        Ok(hits)
+    }
+
     fn first_prompt_title(&self, session_id: Uuid) -> String {
         let first = self
             .rebuild_from_events(session_id)
@@ -1892,4 +1939,28 @@ impl Store {
             line
         }
     }
+}
+
+/// About 100 characters of `text` on one line, centred on the first
+/// case-insensitive occurrence of `word` (already lowercase).
+fn search_snippet(text: &str, word: &str) -> String {
+    const RADIUS: usize = 50;
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    let needle: Vec<char> = word.chars().collect();
+    let at = (0..lower.len())
+        .find(|&i| lower[i..].starts_with(&needle))
+        .unwrap_or(0);
+    let start = at.saturating_sub(RADIUS);
+    let end = (at + needle.len() + RADIUS).min(chars.len());
+    let body: String = chars[start..end].iter().collect();
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "{}{body}{}",
+        if start > 0 { "…" } else { "" },
+        if end < chars.len() { "…" } else { "" }
+    )
 }
