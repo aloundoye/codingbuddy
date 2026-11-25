@@ -147,14 +147,22 @@ fn widenable_family(tokens: &[&str]) -> Option<(&'static Widenable, usize)> {
     }
 }
 
-/// Every argument after the fixed part is a safe flag or a plain value.
+/// A word the shell passes through unchanged: no quoting, escaping,
+/// expansion (`$ ~ * ? [ ] { }`), comments, negation or non-ASCII
+/// whitespace. Only such words are ever covered by a wildcard approval, so
+/// the words checked here are exactly the words the program receives.
+fn is_literal_word(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._/:+,@-".contains(&b))
+}
+
+/// Every argument after the fixed part is a literal word, and flags are on
+/// the family's safe list.
 fn arguments_are_safe(family: &Widenable, rest: &[&str]) -> bool {
     rest.iter().all(|token| {
-        if token.starts_with('-') {
-            family.flags.contains(token)
-        } else {
-            !token.contains(['=', '$', '{', '}', '*', '?', '~'])
-        }
+        is_literal_word(token) && (!token.starts_with('-') || family.flags.contains(token))
     })
 }
 
@@ -224,10 +232,10 @@ pub fn saved_approval_matches(pattern: &str, command: &str) -> bool {
     fixed.len() == fixed_len
         && fixed.iter().zip(&tokens).all(|(want, have)| want == have)
         && crate::is_single_plain_command(command)
-        // Quotes and escapes change how the shell splits and unquotes
-        // words (`"--config"` reaches cargo as `--config`), so a wildcard
-        // never applies to them; such commands only match exactly.
-        && !command.contains(['\'', '"', '\\'])
+        // Only plain ASCII spaces separate words; any other whitespace or
+        // quoting could split or unquote differently in the shell.
+        && command.bytes().all(|b| b == b' ' || !b.is_ascii_whitespace())
+        && tokens.iter().all(|token| is_literal_word(token))
         && classify_bash_command(command) != BashSafety::Dangerous
         && arguments_are_safe(family, &tokens[fixed_len..])
 }
@@ -310,6 +318,11 @@ mod tests {
             ),
             ("cargo build *", "cargo build '--config' x"),
             ("cargo build *", "cargo build \\-\\-config x"),
+            ("cargo build *", "cargo build [-]-config x"),
+            ("cargo build *", "cargo build !x"),
+            ("cargo test *", "cargo test #comment"),
+            ("cargo test *", "cargo test\tx"),
+            ("cargo test *", "cargo test caf\u{e9}"),
         ] {
             assert!(
                 !saved_approval_matches(pattern, command),
