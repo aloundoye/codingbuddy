@@ -495,4 +495,52 @@ mod tests {
         assert!(!out.timed_out);
         assert!(out.stdout.to_lowercase().contains("deepseek"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_command_kills_its_whole_process_group_promptly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pid_file = dir.path().join("grandchild.pid");
+        // The shell backgrounds a long sleep (a grandchild of ours) and waits.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > '{}'; wait",
+            pid_file.display()
+        ));
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            canceller.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = run_shell_launch(
+            command,
+            dir.path(),
+            Duration::from_secs(60),
+            Some(&token),
+            None,
+        )?;
+        assert!(result.cancelled, "result should report cancellation");
+        assert!(!result.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cancellation took {:?}",
+            started.elapsed()
+        );
+
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+        // The grandchild was in the killed group; allow a moment for reaping.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "background grandchild {pid} survived cancellation"
+        );
+        Ok(())
+    }
 }

@@ -269,8 +269,7 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
             .base_url
             .trim_end_matches('/')
             .trim_end_matches("/v1");
-        let client =
-            crate::chat_transport::build_http_client(std::time::Duration::from_secs(10))?;
+        let client = crate::chat_transport::build_http_client(std::time::Duration::from_secs(10))?;
         let request = client
             .get(format!("{root}/api/tags"))
             .headers(route.headers(cfg.api_key.as_deref())?);

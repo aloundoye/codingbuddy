@@ -308,7 +308,6 @@ impl Drop for Session {
     }
 }
 struct Remote {
-    runtime: tokio::runtime::Runtime,
     client: reqwest::Client,
     url: String,
     headers: Vec<(String, String)>,
@@ -319,21 +318,26 @@ struct Remote {
     buffer: Vec<u8>,
     changed: Arc<AtomicBool>,
 }
-fn wait<T>(
-    runtime: &tokio::runtime::Runtime,
-    context: &ExecutionContext,
-    future: impl Future<Output = T>,
-) -> Result<T> {
-    runtime.block_on(async {
-        let mut future = std::pin::pin!(future);
-        loop {
-            context.check()?;
-            if let Ok(value) =
-                tokio::time::timeout(Duration::from_millis(20), future.as_mut()).await
-            {
-                return Ok(value);
+/// Drive `future` on the shared runtime, stopping the moment the context is
+/// cancelled or its deadline passes (no polling). The error is whatever
+/// `context.check()` reports, so callers see the same messages as before.
+fn wait<T>(context: &ExecutionContext, future: impl Future<Output = T>) -> Result<T> {
+    codingbuddy_core::runtime::runtime().block_on(async {
+        context.check()?;
+        let deadline = async {
+            match context.deadline {
+                Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                None => std::future::pending().await,
             }
+        };
+        tokio::select! {
+            biased;
+            () = context.cancellation.cancelled() => {}
+            () = deadline => {}
+            value = future => return Ok(value),
         }
+        context.check()?;
+        Err(anyhow!("MCP request interrupted"))
     })
 }
 impl Remote {
@@ -354,9 +358,6 @@ impl Remote {
             "Invalid MCP endpoint"
         );
         let mut remote = Self {
-            runtime: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
@@ -370,8 +371,7 @@ impl Remote {
             changed,
         };
         if remote.legacy {
-            let response = wait(&remote.runtime, context, remote.builder(false).send())??
-                .error_for_status()?;
+            let response = wait(context, remote.builder(false).send())??.error_for_status()?;
             remote.events = Some(response);
             loop {
                 let (event, data) = remote.event(context)?;
@@ -406,12 +406,7 @@ impl Remote {
         request.header("Accept", "application/json, text/event-stream")
     }
     fn notify(&mut self, value: Value, context: &ExecutionContext) -> Result<()> {
-        wait(
-            &self.runtime,
-            context,
-            self.builder(true).json(&value).send(),
-        )??
-        .error_for_status()?;
+        wait(context, self.builder(true).json(&value).send())??.error_for_status()?;
         Ok(())
     }
     fn event(&mut self, context: &ExecutionContext) -> Result<(String, String)> {
@@ -449,8 +444,8 @@ impl Remote {
                 continue;
             }
             let response = self.events.as_mut().context("MCP event stream missing")?;
-            let bytes = wait(&self.runtime, context, response.chunk())??
-                .context("MCP stream closed before response")?;
+            let bytes =
+                wait(context, response.chunk())??.context("MCP stream closed before response")?;
             self.buffer.extend_from_slice(&bytes);
             anyhow::ensure!(
                 self.buffer.len() <= 16 * 1024 * 1024,
@@ -461,12 +456,8 @@ impl Remote {
     fn request(&mut self, value: Value, context: &ExecutionContext) -> Result<Value> {
         let id = value["id"].clone();
         let result = (|| {
-            let response = wait(
-                &self.runtime,
-                context,
-                self.builder(true).json(&value).send(),
-            )??
-            .error_for_status()?;
+            let response =
+                wait(context, self.builder(true).json(&value).send())??.error_for_status()?;
             if let Some(session) = response.headers().get("Mcp-Session-Id") {
                 self.session = Some(session.to_str()?.to_owned());
             }
@@ -478,7 +469,7 @@ impl Remote {
             if !self.legacy && !is_events {
                 let mut response = response;
                 let mut bytes = Vec::new();
-                while let Some(chunk) = wait(&self.runtime, context, response.chunk())?? {
+                while let Some(chunk) = wait(context, response.chunk())?? {
                     anyhow::ensure!(
                         bytes.len() + chunk.len() <= 16 * 1024 * 1024,
                         "MCP response limit exceeded"

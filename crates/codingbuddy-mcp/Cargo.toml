@@ -26,7 +26,7 @@ tempfile.workspace = true
 
 [dependencies.tokio]
 version = "1"
-features = ["rt", "time", "net"]
+features = ["rt", "time", "net", "macros"]
 
 [dependencies.jsonschema]
 workspace = true
