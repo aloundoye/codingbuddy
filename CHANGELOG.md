@@ -31,6 +31,10 @@ Move it under a version heading when you cut a release.
   unknown models. Configure them under `agent_loop.heuristics`, globally or
   per provider; `codingbuddy doctor` shows what is active.
 
+- `/rewind` can now undo changes made by shell commands (`mv`, `sed -i`,
+  generators, formatters), not only by the file-editing tools. Mutating
+  commands are checkpointed first and their changes recorded; read-only
+  commands skip the checkpoint. Edits you make afterwards stay protected.
 - Pressing Esc now stops a turn immediately in more places: during retry
   back-off (even with a long Retry-After), while `web_fetch`/`web_search`
   wait on a slow site, while prompt URLs are fetched, and in remote MCP

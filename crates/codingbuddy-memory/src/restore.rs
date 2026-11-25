@@ -157,6 +157,60 @@ impl MemoryManager {
         self.store.insert_checkpoint(&record)?;
         Ok(record)
     }
+    /// Workspace files whose content or presence differs from checkpoint
+    /// `checkpoint_id`: modified, deleted, and newly created files. Used to
+    /// attribute a shell command's changes to the agent so `/rewind` can
+    /// undo them (restore only reverts changes it can attribute).
+    pub fn changed_since_checkpoint(&self, checkpoint_id: Uuid) -> Result<Vec<PathBuf>> {
+        use sha2::Digest;
+        let files = WorkspaceFs::open(&self.workspace)?;
+        let private = files.subdir(Path::new(".codingbuddy"), false)?;
+        let manifest: CheckpointManifest = serde_json::from_slice(
+            &private.read(
+                Path::new("checkpoints")
+                    .join(checkpoint_id.to_string())
+                    .join("manifest.json")
+                    .as_path(),
+            )?,
+        )?;
+        anyhow::ensure!(manifest.version == 2, "Unsupported checkpoint manifest");
+
+        let mut current = BTreeMap::new();
+        for entry in WalkDir::new(files.root())
+            .into_iter()
+            .filter_entry(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(files.root())
+                    .is_ok_and(|path| !has_ignored_component(path))
+            })
+        {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path().strip_prefix(files.root())?.to_owned();
+            let hash = format!("{:x}", sha2::Sha256::digest(files.read(&path)?));
+            current.insert(path, hash);
+        }
+
+        let mut changed: Vec<PathBuf> = manifest
+            .files
+            .iter()
+            .filter(|(path, before)| current.get(*path) != before.hash.as_ref())
+            .map(|(path, _)| path.clone())
+            .collect();
+        changed.extend(
+            current
+                .keys()
+                .filter(|path| !manifest.files.contains_key(*path))
+                .cloned(),
+        );
+        changed.sort();
+        changed.dedup();
+        Ok(changed)
+    }
+
     pub fn preview_restore(
         &self,
         checkpoint_id: Uuid,

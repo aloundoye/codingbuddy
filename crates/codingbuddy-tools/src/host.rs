@@ -900,6 +900,20 @@ impl LocalToolHost {
                     .get("timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+                // Shell commands can change files the edit tools never see
+                // (rm, sed -i, generators, formatters). Checkpoint first so
+                // /rewind can undo them; read-only commands skip the cost.
+                // Best effort: a failed checkpoint is logged, not fatal.
+                let checkpoint = if codingbuddy_policy::bash_classifier::classify_bash_command(cmd)
+                    == codingbuddy_policy::bash_classifier::BashSafety::Safe
+                {
+                    None
+                } else {
+                    self.create_checkpoint("bash_run").unwrap_or_else(|error| {
+                        tracing::warn!(error = %format!("{error:#}"), "checkpoint before shell command failed");
+                        None
+                    })
+                };
                 let launched = shell
                     .ok_or_else(|| anyhow!("shell execution requires a prepared launch"))?
                     .run_with_progress(
@@ -915,8 +929,19 @@ impl LocalToolHost {
                             .and_then(|callback| callback.clone()),
                         context.cancellation,
                     )?;
+                // Record what the command changed so /rewind treats those
+                // changes as the agent's (and still protects later edits).
+                let changed_files = match checkpoint {
+                    Some(id) => self.record_shell_changes(id).unwrap_or_else(|error| {
+                        tracing::warn!(error = %format!("{error:#}"), "could not record shell command changes");
+                        0
+                    }),
+                    None => 0,
+                };
                 let mut result = json!({"status": launched.status, "stdout": launched.stdout,
-                    "stderr": launched.stderr, "timed_out": launched.timed_out, "cancelled":launched.cancelled});
+                    "stderr": launched.stderr, "timed_out": launched.timed_out, "cancelled":launched.cancelled,
+                    "checkpoint_id": checkpoint.map(|id| id.to_string()),
+                    "changed_files": changed_files});
 
                 // Annotate result with AST-derived security metadata.
                 if cmd_analysis.has_network_access
@@ -2202,6 +2227,16 @@ impl LocalToolHost {
         if let Err(e) = self.store.append_event(&event) {
             eprintln!("[codingbuddy] visual_artifact: failed to emit event: {e}");
         }
+    }
+
+    /// Record post-images for every file a shell command changed since
+    /// `checkpoint`. Returns how many files changed.
+    fn record_shell_changes(&self, checkpoint: Uuid) -> Result<usize> {
+        let changed = MemoryManager::new(&self.workspace)?.changed_since_checkpoint(checkpoint)?;
+        for path in &changed {
+            self.record_actual_postimage(&self.workspace.join(path))?;
+        }
+        Ok(changed.len())
     }
 
     fn create_checkpoint(&self, reason: &str) -> Result<Option<Uuid>> {

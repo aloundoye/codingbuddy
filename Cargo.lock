@@ -1488,6 +1488,7 @@ dependencies = [
  "strsim",
  "tempfile",
  "toml",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",

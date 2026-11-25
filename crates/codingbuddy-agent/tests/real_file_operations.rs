@@ -252,3 +252,72 @@ fn multi_tool_sequence_read_then_edit() {
     let content = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
     assert!(content.contains("multi-step"));
 }
+
+// ── Shell commands are rewindable ──
+
+#[cfg(unix)]
+#[test]
+fn file_moved_by_a_shell_command_can_be_rewound() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    fs::write(temp.path().join("notes.txt"), "keep me\n")?;
+    // Shell commands only run in a trusted workspace.
+    let mut cfg = codingbuddy_core::AppConfig {
+        workspace_trust: Some(true),
+        ..Default::default()
+    };
+    // The default policy only allows listed commands.
+    cfg.policy.allowlist = vec!["ls".to_string(), "mv".to_string()];
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(ScriptedLlm::new(vec![
+        tool_call_response(vec![("ls", "bash_run", r#"{"command":"ls"}"#)]),
+        tool_call_response(vec![(
+            "rm",
+            "bash_run",
+            r#"{"command":"mv notes.txt moved.txt"}"#,
+        )]),
+        text_response("Removed notes.txt."),
+    ]));
+    let mut engine = AgentEngine::new_with_config_and_llm(temp.path(), cfg, llm)?;
+    engine.set_permission_mode("bypassPermissions");
+    // Unsandboxed commands always ask; approve them here.
+    engine.set_approval_handler(Box::new(|_| Ok(true)));
+    engine.chat_with_options(
+        "delete notes.txt",
+        codingbuddy_agent::ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(
+        !temp.path().join("notes.txt").exists(),
+        "precondition: the command ran"
+    );
+
+    let memory = codingbuddy_memory::MemoryManager::new(temp.path())
+        .map_err(|e| anyhow!("memory manager: {e:#}"))?;
+    let shell_checkpoints: Vec<_> = memory
+        .list_checkpoints()
+        .map_err(|e| anyhow!("list checkpoints: {e:#}"))?
+        .into_iter()
+        .filter(|record| record.reason == "bash_run")
+        .collect();
+    assert_eq!(
+        shell_checkpoints.len(),
+        1,
+        "only the mutating command is checkpointed, not the read-only `ls`"
+    );
+
+    memory
+        .rewind_to_checkpoint(shell_checkpoints[0].checkpoint_id)
+        .map_err(|e| anyhow!("rewind failed: {e:#}"))?;
+    assert_eq!(
+        fs::read_to_string(temp.path().join("notes.txt"))
+            .map_err(|e| anyhow!("notes.txt after rewind: {e}"))?,
+        "keep me\n"
+    );
+    assert!(
+        !temp.path().join("moved.txt").exists(),
+        "files the command created are removed by the rewind"
+    );
+    Ok(())
+}
