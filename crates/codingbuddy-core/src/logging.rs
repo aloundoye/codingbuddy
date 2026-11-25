@@ -73,6 +73,32 @@ pub struct LoggingOptions {
     pub log_dir: Option<PathBuf>,
 }
 
+/// Create `dir` (and parents) and make it private to the current user, so
+/// logs, crash reports and bundles are not readable by other local users.
+/// An existing directory is tightened too, since it belongs to CodingBuddy.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Create a new file readable only by the current user. Fails if anything,
+/// including a symlink, already exists at `path`, so it cannot be redirected.
+pub fn create_private_file(path: &Path) -> std::io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// `CODINGBUDDY_LOG_DIR`, otherwise `~/.codingbuddy/logs`.
 pub fn default_log_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(LOG_DIR_ENV).filter(|dir| !dir.is_empty()) {
@@ -95,7 +121,9 @@ pub fn active_log_dir() -> Option<&'static Path> {
 /// design: diagnostics must never stop the CLI from starting.
 pub fn init_logging(options: LoggingOptions) -> Option<PathBuf> {
     let dir = options.log_dir.or_else(default_log_dir)?;
-    fs::create_dir_all(&dir).ok()?;
+    // Log files inherit the default umask; a private directory keeps them
+    // unreadable by other users regardless of their own mode.
+    create_private_dir(&dir).ok()?;
     let appender = RollingBuilder::new()
         .rotation(Rotation::DAILY)
         .filename_prefix(LOG_PREFIX)
@@ -275,14 +303,18 @@ fn render_crash_report(details: &CrashDetails<'_>) -> String {
 }
 
 fn write_crash_report(dir: &Path, contents: &str) -> Option<PathBuf> {
-    fs::create_dir_all(dir).ok()?;
+    use std::io::Write;
+    create_private_dir(dir).ok()?;
     let name = format!(
         "{CRASH_PREFIX}{}-{}.log",
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
         std::process::id()
     );
     let path = dir.join(name);
-    fs::write(&path, contents).ok()?;
+    create_private_file(&path)
+        .ok()?
+        .write_all(contents.as_bytes())
+        .ok()?;
     Some(path)
 }
 
@@ -413,6 +445,28 @@ mod tests {
         let path = write_crash_report(dir.path(), &report).expect("report written");
         assert_eq!(latest_crash_report(dir.path()), Some(path.clone()));
         assert_eq!(fs::read_to_string(path)?, report);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_files_are_private_and_never_follow_symlinks() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("logs");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+
+        let path = write_crash_report(&dir, "report").expect("report written");
+        assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+
+        let target = root.path().join("target.txt");
+        fs::write(&target, "original")?;
+        let link = dir.join("planted.log");
+        std::os::unix::fs::symlink(&target, &link)?;
+        assert!(create_private_file(&link).is_err());
+        assert_eq!(fs::read_to_string(&target)?, "original");
         Ok(())
     }
 

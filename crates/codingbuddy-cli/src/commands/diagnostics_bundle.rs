@@ -108,7 +108,7 @@ fn file_name(path: &Path) -> String {
 pub(crate) fn write_bundle(cwd: &Path, doctor_payload: &Value) -> Result<PathBuf> {
     let log_dir = logging::effective_log_dir()
         .context("no log directory: set HOME or CODINGBUDDY_LOG_DIR")?;
-    std::fs::create_dir_all(&log_dir)
+    logging::create_private_dir(&log_dir)
         .with_context(|| format!("could not create {}", log_dir.display()))?;
     let bundle_path = log_dir.join(format!(
         "codingbuddy-diagnostics-{}.tar.gz",
@@ -125,7 +125,7 @@ fn build_bundle(
     bundle_path: &Path,
 ) -> Result<()> {
     let scanner = OutputScanner::new();
-    let file = File::create(bundle_path)
+    let file = logging::create_private_file(bundle_path)
         .with_context(|| format!("could not create {}", bundle_path.display()))?;
     let mut archive = tar::Builder::new(GzEncoder::new(file, Compression::default()));
 
