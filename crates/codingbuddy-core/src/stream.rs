@@ -272,6 +272,8 @@ pub struct CancellationToken {
 struct CancellationState {
     cancelled: std::sync::atomic::AtomicBool,
     parent: Option<std::sync::Arc<CancellationState>>,
+    /// Wakes tasks awaiting [`CancellationToken::cancelled`] on this link.
+    notify: tokio::sync::Notify,
 }
 
 impl CancellationToken {
@@ -280,6 +282,7 @@ impl CancellationToken {
             state: std::sync::Arc::new(CancellationState {
                 cancelled: false.into(),
                 parent: None,
+                notify: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -289,6 +292,7 @@ impl CancellationToken {
             state: std::sync::Arc::new(CancellationState {
                 cancelled: false.into(),
                 parent: Some(self.state.clone()),
+                notify: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -296,6 +300,42 @@ impl CancellationToken {
         self.state
             .cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.notify.notify_waiters();
+    }
+
+    /// Resolves once this token or any ancestor is cancelled. Wakes as soon
+    /// as `cancel()` runs; nothing polls.
+    pub async fn cancelled(&self) {
+        loop {
+            // Register on every link before re-checking the flags, so a
+            // cancel that lands between the check and the await still wakes
+            // us (notify_waiters only wakes registered waiters).
+            let mut chain = Vec::new();
+            let mut state = Some(self.state.as_ref());
+            while let Some(current) = state {
+                chain.push(current);
+                state = current.parent.as_deref();
+            }
+            let mut waits: Vec<_> = chain
+                .iter()
+                .map(|link| Box::pin(link.notify.notified()))
+                .collect();
+            for wait in &mut waits {
+                wait.as_mut().enable();
+            }
+            if self.is_cancelled() {
+                return;
+            }
+            std::future::poll_fn(|cx| {
+                for wait in &mut waits {
+                    if wait.as_mut().poll(cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+        }
     }
     pub fn is_cancelled(&self) -> bool {
         let mut state = Some(self.state.as_ref());

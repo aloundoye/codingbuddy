@@ -18,6 +18,7 @@ mod model_catalog;
 pub mod process_env;
 pub mod profiler;
 pub mod prompts;
+pub mod runtime;
 mod stream;
 mod tool_metadata;
 pub mod workspace_fs;
