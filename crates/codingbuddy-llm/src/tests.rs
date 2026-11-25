@@ -1,4 +1,3 @@
-
 use super::*;
 use codingbuddy_core::ChatMessage;
 use std::io::{Read, Write};
