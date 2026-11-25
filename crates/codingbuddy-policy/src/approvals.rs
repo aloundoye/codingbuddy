@@ -6,86 +6,156 @@
 //! (saving) so all three agree on the exact command string.
 
 use crate::bash_classifier::{BashSafety, classify_bash_command};
-use crate::rules::glob_command_matches;
 use serde_json::Value;
 
-/// Commands whose arguments can run, fetch or delete anything. A saved
-/// approval for them is never widened with a wildcard: it covers only the
-/// exact command the user approved.
-pub const NEVER_WIDEN_COMMANDS: &[&str] = &[
-    // shells and interpreters
-    "bash",
-    "sh",
-    "zsh",
-    "fish",
-    "dash",
-    "ksh",
-    "csh",
-    "tcsh",
-    "pwsh",
-    "powershell",
-    "cmd",
-    "python",
-    "python2",
-    "python3",
-    "node",
-    "deno",
-    "bun",
-    "perl",
-    "ruby",
-    "php",
-    "lua",
-    "awk",
-    "osascript",
-    "eval",
-    "exec",
-    "source",
-    ".",
-    // wrappers that run another command
-    "env",
-    "sudo",
-    "doas",
-    "su",
-    "xargs",
-    "find",
-    "nohup",
-    "timeout",
-    "watch",
-    "nice",
-    "time",
-    "command",
-    "builtin",
-    "npx",
-    "uvx",
-    "pipx",
-    "make",
-    // destructive, network or configurable-to-run-anything
-    "rm",
-    "dd",
-    "chmod",
-    "chown",
-    "curl",
-    "wget",
-    "ssh",
-    "scp",
-    "rsync",
-    "nc",
-    "ncat",
-    "socat",
-    "git",
-    "docker",
-    "kubectl",
-    "sed",
-    "tee",
+/// Command families a saved approval may widen, with the flags a widened
+/// approval accepts. Everything else is approved only as the exact command
+/// the user saw: an allowlist, because no denylist of "dangerous" programs
+/// is ever complete (interpreters, wrappers, `npm exec`, `cargo --config`).
+struct Widenable {
+    program: &'static str,
+    /// `None`: no subcommand (e.g. `pytest -q`). `Some`: these subcommands.
+    subcommands: Option<&'static [&'static str]>,
+    /// Flags allowed after the fixed part. Values that follow a flag are
+    /// plain tokens and are accepted when they do not look like flags.
+    flags: &'static [&'static str],
+}
+
+const CARGO_FLAGS: &[&str] = &[
+    "--release",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--lib",
+    "--bins",
+    "--tests",
+    "--benches",
+    "--examples",
+    "-p",
+    "--package",
+    "--bin",
+    "--test",
+    "--locked",
+    "--offline",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+    "--",
+    "--nocapture",
+    "--no-fail-fast",
+    "--check",
+    "--all",
+    "--doc",
+    "--no-deps",
+];
+const JS_TEST_FLAGS: &[&str] = &["--", "--silent", "--watch", "--coverage", "-u", "--ci"];
+const GO_FLAGS: &[&str] = &["-v", "-race", "-run", "-count", "-short", "-cover", "./..."];
+const PYTEST_FLAGS: &[&str] = &["-q", "-v", "-x", "-k", "-s", "--lf", "--ff", "-m"];
+const LIST_FLAGS: &[&str] = &["-l", "-a", "-la", "-al", "-lh", "-R", "-1"];
+
+const WIDENABLE: &[Widenable] = &[
+    Widenable {
+        program: "cargo",
+        subcommands: Some(&[
+            "build", "test", "check", "clippy", "fmt", "doc", "bench", "nextest",
+        ]),
+        flags: CARGO_FLAGS,
+    },
+    Widenable {
+        program: "npm",
+        subcommands: Some(&["test"]),
+        flags: JS_TEST_FLAGS,
+    },
+    Widenable {
+        program: "pnpm",
+        subcommands: Some(&["test"]),
+        flags: JS_TEST_FLAGS,
+    },
+    Widenable {
+        program: "yarn",
+        subcommands: Some(&["test"]),
+        flags: JS_TEST_FLAGS,
+    },
+    Widenable {
+        program: "bun",
+        subcommands: Some(&["test"]),
+        flags: JS_TEST_FLAGS,
+    },
+    Widenable {
+        program: "go",
+        subcommands: Some(&["build", "test", "vet"]),
+        flags: GO_FLAGS,
+    },
+    Widenable {
+        program: "pytest",
+        subcommands: None,
+        flags: PYTEST_FLAGS,
+    },
+    Widenable {
+        program: "tsc",
+        subcommands: None,
+        flags: &["--noEmit", "-p", "--pretty"],
+    },
+    Widenable {
+        program: "jest",
+        subcommands: None,
+        flags: JS_TEST_FLAGS,
+    },
+    Widenable {
+        program: "vitest",
+        subcommands: None,
+        flags: JS_TEST_FLAGS,
+    },
+    Widenable {
+        program: "ls",
+        subcommands: None,
+        flags: LIST_FLAGS,
+    },
 ];
 
-fn never_widen(first_token: &str) -> bool {
-    let name = first_token
-        .rsplit('/')
+/// `C:\Tools\Cargo.EXE` → `cargo`.
+fn program_name(token: &str) -> String {
+    let name = token
+        .rsplit(['/', '\\'])
         .next()
-        .unwrap_or(first_token)
+        .unwrap_or(token)
         .to_ascii_lowercase();
-    NEVER_WIDEN_COMMANDS.contains(&name.as_str())
+    for suffix in [".exe", ".cmd", ".bat"] {
+        if let Some(stem) = name.strip_suffix(suffix) {
+            return stem.to_string();
+        }
+    }
+    name
+}
+
+/// The widenable family `tokens` belongs to, and how many leading tokens
+/// form its fixed part (program, or program + subcommand).
+fn widenable_family(tokens: &[&str]) -> Option<(&'static Widenable, usize)> {
+    let program = program_name(tokens.first()?);
+    // Only a bare program name may be widened, never a path to one.
+    if program != tokens.first()?.to_ascii_lowercase() {
+        return None;
+    }
+    let family = WIDENABLE.iter().find(|family| family.program == program)?;
+    match family.subcommands {
+        None => Some((family, 1)),
+        Some(allowed) => {
+            let sub = tokens.get(1)?;
+            allowed.contains(sub).then_some((family, 2))
+        }
+    }
+}
+
+/// Every argument after the fixed part is a safe flag or a plain value.
+fn arguments_are_safe(family: &Widenable, rest: &[&str]) -> bool {
+    rest.iter().all(|token| {
+        if token.starts_with('-') {
+            family.flags.contains(token)
+        } else {
+            !token.contains(['=', '$', '{', '}', '*', '?', '~'])
+        }
+    })
 }
 
 /// The command a `bash.run` call will execute, read in the host's order
@@ -108,24 +178,20 @@ fn normalized(command: &str) -> String {
 
 /// The pattern to save when the user chooses "always allow" for `command`.
 ///
-/// * `npm test --watch` → `npm test *` (the subcommand stays fixed)
-/// * `ls` → `ls *`
-/// * anything else (shells, interpreters, wrappers, destructive commands,
-///   flags before a subcommand, chained or redirected commands) → the exact
-///   command, so only that precise string is approved again.
+/// * a known build/test family keeps its fixed part: `npm test --watch` →
+///   `npm test *`, `cargo build --release` → `cargo build *`, `pytest -q` →
+///   `pytest *`
+/// * anything else → the exact command, so only that string is approved
+///   again (interpreters, wrappers, `npm exec`, chained commands, ...).
 pub fn approval_pattern_for(command: &str) -> String {
     let exact = normalized(command);
     if !crate::is_single_plain_command(command) {
         return exact;
     }
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    match tokens.as_slice() {
-        [first, ..] if never_widen(first) => exact,
-        [first] => format!("{first} *"),
-        [first, second, ..] if !second.starts_with('-') && !second.contains(['=', '/', '*']) => {
-            format!("{first} {second} *")
-        }
-        _ => exact,
+    match widenable_family(&tokens) {
+        Some((_, fixed)) => format!("{} *", tokens[..fixed].join(" ")),
+        None => exact,
     }
 }
 
@@ -144,17 +210,22 @@ pub fn saved_approval_matches(pattern: &str, command: &str) -> bool {
     if !pattern.ends_with('*') {
         return normalized(pattern) == normalized(command);
     }
-    let tokens: Vec<&str> = pattern.split_whitespace().collect();
-    let Some(first) = tokens.first() else {
+    // A wildcard pattern must be exactly `<fixed part> *` of a widenable
+    // family; anything else (including legacy `npm *`) approves nothing.
+    let fixed: Vec<&str> = pattern
+        .strip_suffix('*')
+        .unwrap_or(pattern)
+        .split_whitespace()
+        .collect();
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let Some((family, fixed_len)) = widenable_family(&tokens) else {
         return false;
     };
-    if first.contains('*') || pattern.contains('=') || never_widen(first) {
-        return false;
-    }
-    crate::is_single_plain_command(command)
-        && !command.contains(['$', '{', '}'])
+    fixed.len() == fixed_len
+        && fixed.iter().zip(&tokens).all(|(want, have)| want == have)
+        && crate::is_single_plain_command(command)
         && classify_bash_command(command) != BashSafety::Dangerous
-        && glob_command_matches(pattern, command)
+        && arguments_are_safe(family, &tokens[fixed_len..])
 }
 
 #[cfg(test)]
@@ -178,45 +249,56 @@ mod tests {
     }
 
     #[test]
-    fn saved_patterns_keep_the_subcommand_and_never_widen_interpreters() {
+    fn only_known_build_and_test_families_are_widened() {
         assert_eq!(approval_pattern_for("npm test --watch"), "npm test *");
-        assert_eq!(approval_pattern_for("cargo build"), "cargo build *");
-        assert_eq!(approval_pattern_for("ls"), "ls *");
-        assert_eq!(approval_pattern_for("python build.py"), "python build.py");
         assert_eq!(
-            approval_pattern_for("/usr/bin/env FOO=1 make"),
-            "/usr/bin/env FOO=1 make"
+            approval_pattern_for("cargo build --release"),
+            "cargo build *"
         );
-        assert_eq!(
-            approval_pattern_for("git push origin main"),
-            "git push origin main"
-        );
-        assert_eq!(
-            approval_pattern_for("npm --prefix x test"),
-            "npm --prefix x test"
-        );
-        assert_eq!(
-            approval_pattern_for("npm test | tee out"),
-            "npm test | tee out"
-        );
+        assert_eq!(approval_pattern_for("pytest -q tests/"), "pytest *");
+        assert_eq!(approval_pattern_for("ls -la"), "ls *");
+        for exact in [
+            "python build.py",
+            "pypy run.py",
+            "gawk 1 x",
+            "npm exec cowsay",
+            "npm run deploy",
+            "npx something",
+            "/usr/bin/cargo build",
+            "git push origin main",
+            "npm test | tee out",
+        ] {
+            assert_eq!(
+                approval_pattern_for(exact),
+                exact,
+                "{exact} must stay exact"
+            );
+        }
     }
 
     #[test]
     fn wildcards_cannot_reach_beyond_the_approved_command_family() {
-        assert!(saved_approval_matches("npm test *", "npm test --watch"));
+        assert!(saved_approval_matches("npm test *", "npm test -- --watch"));
+        assert!(saved_approval_matches(
+            "cargo test *",
+            "cargo test -p core --release"
+        ));
+        assert!(!saved_approval_matches("CARGO.EXE test *", "cargo test"));
         assert!(saved_approval_matches(
             "python build.py",
             "python  build.py"
         ));
         for (pattern, command) in [
             ("npm test *", "npm exec evil"),
+            ("npm *", "npm install"),
             ("python *", "python -c \"__import__('os').system('id')\""),
-            ("bash *", "bash -c id"),
             ("* *", "anything"),
-            ("env *", "env FOO=1 sh"),
-            ("npm test *", "npm test ${HOME}"),
+            ("cargo build *", "cargo build --config target.x.runner=sh"),
+            ("cargo build *", "cargo build -Zunstable-options"),
+            ("npm test *", "npm test --script-shell=evil"),
             ("npm test *", "npm test $HOME"),
             ("npm test *", "npm test; rm -rf ~"),
+            ("cargo test *", "/tmp/evil/cargo test"),
             ("python build.py", "python build.py --evil"),
         ] {
             assert!(
