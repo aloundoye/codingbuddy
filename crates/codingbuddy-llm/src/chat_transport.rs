@@ -60,14 +60,18 @@ impl ChatTransport {
         headers: reqwest::header::HeaderMap,
         payload: &serde_json::Value,
     ) -> Result<Result<reqwest::Response, reqwest::Error>> {
-        self.wait(async {
-            self.client
-                .post(endpoint)
-                .headers(headers)
-                .json(payload)
-                .send()
-                .await
-        })
+        // Strip the URL like the sibling methods: query-key providers put
+        // the API key in it, and the error may be displayed or logged.
+        Ok(self
+            .wait(async {
+                self.client
+                    .post(endpoint)
+                    .headers(headers)
+                    .json(payload)
+                    .send()
+                    .await
+            })?
+            .map_err(reqwest::Error::without_url))
     }
 
     pub fn post_bytes(

@@ -764,7 +764,14 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
+                        // Never log `e` itself: its Display includes the request URL,
+                        // which carries the API key for query-key providers (Gemini).
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format_transport_error(&e),
+                        );
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -1263,7 +1270,14 @@ impl ApiClient {
                             .into(),
                     );
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
+                        // Never log `e` itself: its Display includes the request URL,
+                        // which carries the API key for query-key providers (Gemini).
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format_transport_error(&e),
+                        );
                         self.wait_before_retry(retry_delay_ms(
                             NETWORK_RETRY_BASE_MS,
                             attempt,
@@ -1327,7 +1341,14 @@ impl ApiClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
+                        // Never log `e` itself: its Display includes the request URL,
+                        // which carries the API key for query-key providers (Gemini).
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format_transport_error(&e),
+                        );
                         std::thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -1463,7 +1484,14 @@ impl ApiClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
+                        // Never log `e` itself: its Display includes the request URL,
+                        // which carries the API key for query-key providers (Gemini).
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format_transport_error(&e),
+                        );
                         std::thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -1904,7 +1932,14 @@ impl ApiClient {
                             .into(),
                     );
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
+                        // Never log `e` itself: its Display includes the request URL,
+                        // which carries the API key for query-key providers (Gemini).
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format_transport_error(&e),
+                        );
                         self.wait_before_retry(retry_delay_ms(
                             NETWORK_RETRY_BASE_MS,
                             attempt,
@@ -2277,7 +2312,14 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
+                        // Never log `e` itself: its Display includes the request URL,
+                        // which carries the API key for query-key providers (Gemini).
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format_transport_error(&e),
+                        );
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -4341,6 +4383,22 @@ mod tests {
         );
         // P9: no cache_control annotations — DeepSeek uses server-side prefix caching
         assert!(messages[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn transport_error_text_never_contains_the_request_url() {
+        // Port 1 on loopback refuses the connection immediately.
+        let error = reqwest::blocking::Client::new()
+            .post("http://127.0.0.1:1/v1beta/models/m:generateContent?key=SECRET-KEY-123")
+            .send()
+            .expect_err("connection must fail");
+        assert!(
+            error.to_string().contains("SECRET-KEY-123"),
+            "precondition: reqwest's own Display includes the URL"
+        );
+        let logged = format!("{:#}", format_transport_error(&error));
+        assert!(!logged.contains("SECRET-KEY-123"), "{logged}");
+        assert!(!logged.contains("127.0.0.1:1"), "{logged}");
     }
 
     #[test]
