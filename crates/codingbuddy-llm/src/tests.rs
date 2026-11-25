@@ -1422,7 +1422,7 @@ fn complete_returns_clear_instructions_on_401() {
 
 fn local_mock_client(cfg: LlmConfig) -> ApiClient {
     let mut client = ApiClient::new(cfg).expect("client");
-    client.client = Client::builder()
+    client.client = reqwest::Client::builder()
         .no_proxy()
         .timeout(StdDuration::from_secs(5))
         .build()
@@ -2084,4 +2084,57 @@ fn google_provider_payload_uses_correct_model() {
         payload.get("generationConfig").is_some(),
         "Google native format should have generationConfig"
     );
+}
+
+#[test]
+fn cancelling_during_retry_backoff_returns_immediately() {
+    // The server asks for a 30 s back-off; cancelling must not wait it out.
+    let server = start_mock_retry_server(vec![
+        MockHttpResponse {
+            status: 503,
+            body: r#"{"error":"busy"}"#.to_string(),
+            retry_after: Some("30".to_string()),
+        },
+        MockHttpResponse {
+            status: 200,
+            body: r#"{"choices":[{"message":{"content":"too late"}}]}"#.to_string(),
+            retry_after: None,
+        },
+    ]);
+    let cfg = LlmConfig {
+        endpoint: server.endpoint.clone(),
+        stream: false,
+        providers: std::collections::HashMap::new(),
+        api_key: Some("test-key".to_string()),
+        max_retries: 3,
+        retry_base_ms: 1,
+        ..LlmConfig::default()
+    };
+    let mut client = local_mock_client(cfg);
+    let token = CancellationToken::new();
+    client.set_cancel_token(token.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(StdDuration::from_millis(150));
+        token.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let error = client
+        .complete(&LlmRequest {
+            unit: codingbuddy_core::LlmUnit::Planner,
+            prompt: "hello".to_string(),
+            model: "deepseek-chat".to_string(),
+            max_tokens: 64,
+            non_urgent: false,
+            images: vec![],
+            provider_options: Default::default(),
+        })
+        .expect_err("cancelled request must fail");
+    assert!(
+        started.elapsed() < StdDuration::from_secs(3),
+        "cancellation waited {:?}",
+        started.elapsed()
+    );
+    assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
+    assert_eq!(server.request_count(), 1, "no retry after cancellation");
 }

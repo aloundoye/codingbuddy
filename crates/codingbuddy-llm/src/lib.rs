@@ -13,14 +13,13 @@ use codingbuddy_core::{
     TransportPart, max_output_tokens_for_model,
 };
 use reqwest::StatusCode;
-use reqwest::blocking::Client;
 use reqwest::header::RETRY_AFTER;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::io::BufRead;
 use std::ops::Deref;
-use std::thread;
+
 use std::time::Duration;
 
 mod connection;
@@ -97,7 +96,9 @@ pub trait LlmClient {
 #[derive(Clone)]
 pub struct ApiClient {
     cfg: LlmConfig,
-    client: Client,
+    /// Async HTTP client shared by every request from this ApiClient, so the
+    /// connection pool is reused across calls.
+    client: reqwest::Client,
     /// Optional cancellation token — checked between SSE reads during streaming.
     /// When cancelled, returns partial response with content accumulated so far.
     cancel_token: Option<CancellationToken>,
@@ -119,10 +120,7 @@ impl std::fmt::Debug for ApiClient {
 
 impl ApiClient {
     pub fn new(cfg: LlmConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(cfg.timeout_seconds))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let client = chat_transport::build_http_client(Duration::from_secs(cfg.timeout_seconds))?;
         if cfg.active_provider().cloud.is_some() {
             route::ChatRoute::resolve(&cfg, &cfg.active_base_model(), false)?;
         }
@@ -215,19 +213,6 @@ impl ApiClient {
         Ok(())
     }
 
-    fn wait_before_retry(&self, delay: Duration) -> Result<()> {
-        if self.cancel_token.is_none() {
-            thread::sleep(delay);
-            return Ok(());
-        }
-        let started = std::time::Instant::now();
-        while let Some(remaining) = delay.checked_sub(started.elapsed()) {
-            self.check_cancellation()?;
-            thread::sleep(remaining.min(Duration::from_millis(40)));
-        }
-        self.check_cancellation()
-    }
-
     /// Attach a cancellation token that will be checked during streaming.
     pub fn set_cancel_token(&mut self, token: CancellationToken) {
         self.cancel_token = Some(token);
@@ -272,20 +257,31 @@ impl ApiClient {
             base
         };
         let url = format!("{base}{path}");
-        let mut req =
-            self.apply_auth_for_protocol(self.client.get(url), self.api_key.as_deref(), protocol);
+        let Ok(mut headers) = self.auth_headers_for_protocol(self.api_key.as_deref(), protocol)
+        else {
+            return Vec::new();
+        };
         if protocol == protocol::ChatProtocol::GeminiGenerateContent
             && let Some(key) = &self.api_key
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(key)
         {
-            req = req.header("x-goog-api-key", key);
+            headers.insert("x-goog-api-key", value);
         }
-        let resp = match req.timeout(Duration::from_secs(5)).send() {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        let body: serde_json::Value = match resp.json() {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
+        let client = self.client.clone();
+        let fetched = self
+            .transport()
+            .wait_with_timeout(Duration::from_secs(5), async move {
+                client
+                    .get(url)
+                    .headers(headers)
+                    .send()
+                    .await?
+                    .json::<serde_json::Value>()
+                    .await
+            });
+        let body = match fetched {
+            Ok(Ok(Ok(body))) => body,
+            _ => return Vec::new(),
         };
         body.get("data")
             .or_else(|| body.get("models"))
@@ -316,53 +312,76 @@ impl ApiClient {
         self.cfg.active_provider()
     }
 
-    fn apply_auth(
-        &self,
-        builder: reqwest::blocking::RequestBuilder,
-        api_key: Option<&str>,
-    ) -> reqwest::blocking::RequestBuilder {
-        self.apply_auth_for_protocol(builder, api_key, protocol::ChatProtocol::OpenAiChat)
+    /// A transport sharing this client's connection pool and cancellation.
+    fn transport(&self) -> chat_transport::ChatTransport {
+        chat_transport::ChatTransport::with_client(self.client.clone(), self.cancel_token.clone())
     }
 
-    fn apply_auth_for_protocol(
+    fn retry_policy<'a>(
+        &'a self,
+        progress: Option<&'a StreamCallback>,
+    ) -> chat_transport::RetryPolicy<'a> {
+        chat_transport::RetryPolicy {
+            provider: &self.cfg.provider,
+            max_retries: self.cfg.max_retries,
+            retry_base_ms: self.cfg.retry_base_ms,
+            progress,
+        }
+    }
+
+    fn auth_headers(&self, api_key: Option<&str>) -> Result<reqwest::header::HeaderMap> {
+        self.auth_headers_for_protocol(api_key, protocol::ChatProtocol::OpenAiChat)
+    }
+
+    /// Authentication and provider headers for the legacy (non-route) paths.
+    fn auth_headers_for_protocol(
         &self,
-        builder: reqwest::blocking::RequestBuilder,
         api_key: Option<&str>,
         chat_protocol: protocol::ChatProtocol,
-    ) -> reqwest::blocking::RequestBuilder {
+    ) -> Result<reqwest::header::HeaderMap> {
+        use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
         let provider_config = self.provider_config();
         let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
         let auth_strategy =
             protocol::select_auth_strategy(&provider_config, provider, chat_protocol);
-        let mut builder = if provider == ProviderKind::Anthropic
+        let mut headers = HeaderMap::new();
+        if provider == ProviderKind::Anthropic
             || chat_protocol == protocol::ChatProtocol::AnthropicMessages
         {
-            builder
-                .header("anthropic-version", providers::anthropic::ANTHROPIC_VERSION)
-                .header(
-                    "anthropic-beta",
-                    "prompt-caching-2024-07-31,output-128k-2025-02-19",
-                )
-                .header("content-type", "application/json")
-        } else {
-            builder
+            headers.insert(
+                "anthropic-version",
+                HeaderValue::from_static(providers::anthropic::ANTHROPIC_VERSION),
+            );
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_static("prompt-caching-2024-07-31,output-128k-2025-02-19"),
+            );
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+        let key = api_key.filter(|key| !key.trim().is_empty());
+        let secret = |value: String| -> Result<HeaderValue> {
+            let mut value = HeaderValue::from_str(&value)
+                .map_err(|_| anyhow!("API key contains characters not allowed in a header"))?;
+            value.set_sensitive(true);
+            Ok(value)
         };
-        builder = match auth_strategy {
-            protocol::AuthStrategy::Bearer => match api_key {
-                Some(key) if !key.trim().is_empty() => builder.bearer_auth(key),
-                _ => builder,
-            },
-            protocol::AuthStrategy::XApiKey => match api_key {
-                Some(key) if !key.trim().is_empty() => builder.header("x-api-key", key),
-                _ => builder,
-            },
+        match auth_strategy {
+            protocol::AuthStrategy::Bearer => {
+                if let Some(key) = key {
+                    headers.insert(AUTHORIZATION, secret(format!("Bearer {key}"))?);
+                }
+            }
+            protocol::AuthStrategy::XApiKey => {
+                if let Some(key) = key {
+                    headers.insert("x-api-key", secret(key.to_string())?);
+                }
+            }
             protocol::AuthStrategy::QueryApiKey
                 if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent
                     && provider_config.auth_strategy.is_none() =>
             {
-                match api_key {
-                    Some(key) => builder.header("x-goog-api-key", key),
-                    None => builder,
+                if let Some(key) = api_key {
+                    headers.insert("x-goog-api-key", secret(key.to_string())?);
                 }
             }
             protocol::AuthStrategy::QueryApiKey
@@ -370,20 +389,12 @@ impl ApiClient {
             | protocol::AuthStrategy::AzureApiKey
             | protocol::AuthStrategy::AzureEntra
             | protocol::AuthStrategy::GoogleAdc
-            | protocol::AuthStrategy::None => builder,
-        };
-        self.apply_custom_provider_headers(builder, &provider_config)
-    }
-
-    fn apply_custom_provider_headers(
-        &self,
-        builder: reqwest::blocking::RequestBuilder,
-        provider: &codingbuddy_core::ProviderConfig,
-    ) -> reqwest::blocking::RequestBuilder {
-        match route::custom_headers(provider) {
-            Ok(headers) => builder.headers(headers),
-            Err(_) => builder,
+            | protocol::AuthStrategy::None => {}
         }
+        if let Ok(custom) = route::custom_headers(&provider_config) {
+            headers.extend(custom);
+        }
+        Ok(headers)
     }
 
     fn resolve_request_api_key(&self) -> Result<Option<String>> {
@@ -422,85 +433,35 @@ impl ApiClient {
 
     fn complete_inner(&self, req: &LlmRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let prepared = self.build_payload(req);
-
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut attempt: u8 = 0;
-        while attempt <= self.cfg.max_retries {
-            let response = self
-                .apply_auth(
-                    self.client
-                        .post(self.resolved_endpoint(false, false, false)),
-                    api_key,
+        let transport = self.transport();
+        let endpoint = self.resolved_endpoint(false, false, false);
+        let headers = self.auth_headers(api_key)?;
+        let max_retries = self.cfg.max_retries;
+        let response = transport.send_with_retry(
+            &self.retry_policy(None),
+            || transport.post(&endpoint, headers.clone(), &prepared.payload),
+            |status, body, attempt| {
+                with_compatibility_context(
+                    format_api_error(status, &redact_key(body, api_key), attempt, max_retries),
+                    &prepared.compatibility,
                 )
-                .json(&prepared.payload)
-                .send();
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after(resp.headers());
-                    let body = resp.text().map_err(reqwest::Error::without_url)?;
-                    if status.is_success() {
-                        let mut parsed = if self.cfg.stream {
-                            parse_streaming_payload(&body)?
-                        } else {
-                            parse_non_streaming_payload(&body)?
-                        };
-                        if !prepared.compatibility.transforms.is_empty()
-                            || !prepared.compatibility.degraded_inputs.is_empty()
-                        {
-                            parsed.compatibility = Some(prepared.compatibility.clone());
-                        }
-                        return Ok(parsed);
-                    }
-
-                    last_err = Some(with_compatibility_context(
-                        format_api_error(
-                            status,
-                            &redact_key(&body, api_key),
-                            attempt,
-                            self.cfg.max_retries,
-                        ),
-                        &prepared.compatibility,
-                    ));
-                    if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        log_retry(
-                            &self.cfg.provider,
-                            attempt,
-                            self.cfg.max_retries,
-                            &format!("HTTP {status}"),
-                        );
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(with_compatibility_context(
-                        format_transport_error(&e),
-                        &prepared.compatibility,
-                    ));
-                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        // Never log `e` itself: its Display includes the request URL,
-                        // which carries the API key for query-key providers (Gemini).
-                        log_retry(
-                            &self.cfg.provider,
-                            attempt,
-                            self.cfg.max_retries,
-                            &format_transport_error(&e),
-                        );
-                        thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
-            }
+            },
+            |error| {
+                with_compatibility_context(format_transport_error(error), &prepared.compatibility)
+            },
+        )?;
+        let body = transport.text(response)?;
+        let mut parsed = if self.cfg.stream {
+            parse_streaming_payload(&body)?
+        } else {
+            parse_non_streaming_payload(&body)?
+        };
+        if !prepared.compatibility.transforms.is_empty()
+            || !prepared.compatibility.degraded_inputs.is_empty()
+        {
+            parsed.compatibility = Some(prepared.compatibility.clone());
         }
-
-        Err(last_err.unwrap_or_else(|| anyhow!("deepseek request failed without detailed error")))
+        Ok(parsed)
     }
 
     fn complete_native_adapter(
@@ -513,7 +474,7 @@ impl ApiClient {
         let prepared = self.build_chat_payload_for_route(req, route)?;
         let bytes = serde_json::to_vec(&prepared.payload)?;
         let timeout = Duration::from_secs(self.cfg.timeout_seconds);
-        let transport = chat_transport::ChatTransport::new(timeout, self.cancel_token.clone())?;
+        let transport = self.transport();
         let headers = adapter.authenticate(
             &extension::ProviderRequest {
                 route,
@@ -552,10 +513,7 @@ impl ApiClient {
         let capabilities = &route.capabilities;
         let chat_protocol = route.protocol;
         let endpoint = &route.endpoint;
-        let transport = chat_transport::ChatTransport::new(
-            Duration::from_secs(self.cfg.timeout_seconds),
-            self.cancel_token.clone(),
-        )?;
+        let transport = self.transport();
         if let Some(deployment) = &route.deployment {
             prepared.payload["model"] = json!(deployment);
         }
@@ -566,164 +524,56 @@ impl ApiClient {
             _ => None,
         };
         let headers = route.headers(cloud_token.as_deref().or(api_key))?;
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut attempt: u8 = 0;
-        while attempt <= self.cfg.max_retries {
-            self.check_cancellation()?;
-            let response = transport.post(endpoint, headers.clone(), &prepared.payload)?;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after(resp.headers());
-                    let body = transport.text(resp)?;
-                    if status.is_success() {
-                        let envelope: Value = serde_json::from_str(&body)?;
-                        if !envelope["error"].is_null() {
-                            return Err(error::ProviderError::http(
-                                chat_protocol,
-                                status.as_u16(),
-                                &body,
-                            )
-                            .into());
-                        }
-                        let response = match chat_protocol {
-                            protocol::ChatProtocol::OpenAiResponses => {
-                                providers::responses::parse_response(&serde_json::from_str(&body)?)?
-                            }
-                            protocol::ChatProtocol::AnthropicMessages => {
-                                providers::anthropic::parse_response(&body)?
-                            }
-                            protocol::ChatProtocol::GeminiGenerateContent => {
-                                providers::google::parse_response(&body)?
-                            }
-                            _ => {
-                                let r = parse_non_streaming_payload(&body)?;
-                                provider_transform::postprocess_chat_response_with_compatibility(
-                                    r,
-                                    capabilities,
-                                    &req.tools,
-                                    prepared.compatibility.clone(),
-                                )
-                            }
-                        };
-                        return Ok(response);
-                    }
-                    last_err = Some(
-                        error::ProviderError::http(chat_protocol, status.as_u16(), &body).into(),
-                    );
-                    if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        log_retry(
-                            &self.cfg.provider,
-                            attempt,
-                            self.cfg.max_retries,
-                            &format!("HTTP {status}"),
-                        );
-                        self.wait_before_retry(retry_delay_ms(
-                            self.cfg.retry_base_ms,
-                            attempt,
-                            retry_after,
-                        ))?;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(
-                        error::ProviderError::new(chat_protocol, error::FailureKind::Transport)
-                            .into(),
-                    );
-                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        // Never log `e` itself: its Display includes the request URL,
-                        // which carries the API key for query-key providers (Gemini).
-                        log_retry(
-                            &self.cfg.provider,
-                            attempt,
-                            self.cfg.max_retries,
-                            &format_transport_error(&e),
-                        );
-                        self.wait_before_retry(retry_delay_ms(
-                            NETWORK_RETRY_BASE_MS,
-                            attempt,
-                            None,
-                        ))?;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
-            }
+        let response = transport.send_with_retry(
+            &self.retry_policy(None),
+            || transport.post(endpoint, headers.clone(), &prepared.payload),
+            |status, body, _| {
+                error::ProviderError::http(chat_protocol, status.as_u16(), body).into()
+            },
+            |_| error::ProviderError::new(chat_protocol, error::FailureKind::Transport).into(),
+        )?;
+        let status = response.status();
+        let body = transport.text(response)?;
+        let envelope: Value = serde_json::from_str(&body)?;
+        if !envelope["error"].is_null() {
+            return Err(error::ProviderError::http(chat_protocol, status.as_u16(), &body).into());
         }
-        Err(last_err.unwrap_or_else(|| anyhow!("chat request failed")))
+        let response = match chat_protocol {
+            protocol::ChatProtocol::OpenAiResponses => {
+                providers::responses::parse_response(&serde_json::from_str(&body)?)?
+            }
+            protocol::ChatProtocol::AnthropicMessages => {
+                providers::anthropic::parse_response(&body)?
+            }
+            protocol::ChatProtocol::GeminiGenerateContent => {
+                providers::google::parse_response(&body)?
+            }
+            _ => {
+                let r = parse_non_streaming_payload(&body)?;
+                provider_transform::postprocess_chat_response_with_compatibility(
+                    r,
+                    capabilities,
+                    &req.tools,
+                    prepared.compatibility.clone(),
+                )
+            }
+        };
+        Ok(response)
     }
 
     fn complete_fim_inner(&self, req: &FimRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let payload = self.build_fim_payload(req);
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut attempt: u8 = 0;
-        while attempt <= self.cfg.max_retries {
-            let response = self
-                .apply_auth(
-                    self.client.post(self.resolved_endpoint(false, true, false)),
-                    api_key,
-                )
-                .json(&payload)
-                .send();
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
-                    let retry_after = parse_retry_after(resp.headers());
-                    let body = resp.text().map_err(reqwest::Error::without_url)?;
-                    if status.is_success() {
-                        return parse_fim_non_streaming_payload(&body);
-                    }
-                    last_err = Some(format_api_error(
-                        status,
-                        &body,
-                        attempt,
-                        self.cfg.max_retries,
-                    ));
-                    if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        log_retry(
-                            &self.cfg.provider,
-                            attempt,
-                            self.cfg.max_retries,
-                            &format!("HTTP {status}"),
-                        );
-                        std::thread::sleep(retry_delay_ms(
-                            self.cfg.retry_base_ms,
-                            attempt,
-                            retry_after,
-                        ));
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(format_transport_error(&e));
-                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        // Never log `e` itself: its Display includes the request URL,
-                        // which carries the API key for query-key providers (Gemini).
-                        log_retry(
-                            &self.cfg.provider,
-                            attempt,
-                            self.cfg.max_retries,
-                            &format_transport_error(&e),
-                        );
-                        std::thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("fim request failed")))
+        let transport = self.transport();
+        let endpoint = self.resolved_endpoint(false, true, false);
+        let headers = self.auth_headers(api_key)?;
+        let max_retries = self.cfg.max_retries;
+        let response = transport.send_with_retry(
+            &self.retry_policy(None),
+            || transport.post(&endpoint, headers.clone(), &payload),
+            |status, body, attempt| format_api_error(status, body, attempt, max_retries),
+            format_transport_error,
+        )?;
+        parse_fim_non_streaming_payload(&transport.text(response)?)
     }
 
     fn resolve_api_key(&self) -> Option<String> {
