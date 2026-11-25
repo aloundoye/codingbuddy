@@ -142,10 +142,7 @@ fn repoish_prompt_injects_auto_context_bootstrap_packet() -> Result<()> {
     build_workspace(temp.path())?;
 
     let state = Arc::new(Mutex::new(CaptureState {
-        responses: VecDeque::from(vec![
-            "Initial Analysis\nRepo looks healthy.\nKey Findings\n- one\nFollow-ups\n- Any priority area?"
-                .to_string(),
-        ]),
+        responses: VecDeque::from(vec!["The repo looks healthy.".to_string()]),
         chat_requests: Vec::new(),
     }));
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(CapturingLlm::new(state.clone()));
@@ -160,7 +157,7 @@ fn repoish_prompt_injects_auto_context_bootstrap_packet() -> Result<()> {
         },
     )?;
 
-    assert!(output.contains("Initial Analysis"));
+    assert_eq!(output, "The repo looks healthy.");
 
     let guard = state.lock().map_err(|_| anyhow!("state poisoned"))?;
     assert_eq!(guard.chat_requests.len(), 1);
@@ -171,15 +168,14 @@ fn repoish_prompt_injects_auto_context_bootstrap_packet() -> Result<()> {
 }
 
 #[test]
-fn vague_codebase_prompt_runs_audit_and_repairs_followup_budget() -> Result<()> {
+fn vague_codebase_prompt_runs_audit_and_streams_answer_once() -> Result<()> {
     let temp = tempfile::tempdir()?;
     build_workspace(temp.path())?;
 
+    // An answer without any fixed section headings is accepted as-is.
+    let answer = "Baseline checked: TODO/FIXME entries exist.\n\n- q1?\n- q2?\n- q3?";
     let state = Arc::new(Mutex::new(CaptureState {
-        responses: VecDeque::from(vec![
-            "Initial Analysis\nA\nKey Findings\nB\nFollow-ups\n- q1\n- q2\n- q3".to_string(),
-            "Initial Analysis\nRepo baseline checked.\nKey Findings\n- TODO/FIXME entries exist\nFollow-ups\n- Should I prioritize dependency hygiene or test hardening first?".to_string(),
-        ]),
+        responses: VecDeque::from(vec![answer.to_string(), "unused".to_string()]),
         chat_requests: Vec::new(),
     }));
 
@@ -200,15 +196,11 @@ fn vague_codebase_prompt_runs_audit_and_repairs_followup_budget() -> Result<()> 
             ..Default::default()
         },
     )?;
-
-    assert!(output.contains("Initial Analysis"));
-    assert!(output.contains("Follow-ups"));
+    assert_eq!(output, answer);
 
     assert!(matches!(
         chunks.lock().unwrap().as_slice(),
-        [StreamChunk::ContentDelta(first), StreamChunk::ClearStreamingText,
-         StreamChunk::ContentDelta(repaired), StreamChunk::Done { .. }]
-            if first.contains("q3") && repaired == &output
+        [StreamChunk::ContentDelta(text), StreamChunk::Done { .. }] if text == answer
     ));
 
     // Resume after the first delta, as an RPC client would after reconnecting.
@@ -217,34 +209,18 @@ fn vague_codebase_prompt_runs_audit_and_repairs_followup_budget() -> Result<()> 
     let prompt = store.latest_prompt(session.session_id)?.unwrap();
     let replayed = store.prompt_events_by_offset(prompt.prompt_id, 1, 10)?;
     assert_eq!(prompt.status, "completed");
-    assert_eq!(replayed.len(), 3);
-    assert_eq!(replayed[0]["type"], "clear_streaming_text");
-    assert_eq!(replayed[1]["text"], output);
     assert_eq!(
-        replayed[2],
-        serde_json::json!({"type": "done", "status": "completed"})
+        replayed,
+        [serde_json::json!({"type": "done", "status": "completed"})]
     );
 
     let guard = state.lock().map_err(|_| anyhow!("state poisoned"))?;
-    assert_eq!(guard.chat_requests.len(), 2, "expected one repair retry");
+    assert_eq!(guard.chat_requests.len(), 1, "no repair retry");
 
     let first_user = first_user_message(&guard.chat_requests[0]);
     assert!(first_user.contains("Codebase audit findings:"));
     assert!(first_user.contains("TODOs and FIXMEs:"));
     assert!(first_user.contains("Dependencies:"));
-
-    let second = &guard.chat_requests[1];
-    let repair_user = second
-        .messages
-        .iter()
-        .filter_map(|message| match message {
-            ChatMessage::User { content } => Some(content.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(repair_user.contains("Repair required"));
-    assert!(repair_user.contains("exactly 1 focused follow-up"));
     Ok(())
 }
 
