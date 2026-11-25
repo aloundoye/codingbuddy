@@ -47,6 +47,18 @@ fn parse_uuid_or_nil(s: &str) -> Uuid {
     })
 }
 
+/// Key for project-scoped data such as saved "always allow" approvals.
+///
+/// Keep this algorithm: changing it would orphan every approval already
+/// saved. (`DefaultHasher` output can change between Rust releases; if that
+/// ever happens, migrate the stored keys rather than silently losing them.)
+pub fn project_hash(workspace: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    workspace.to_string_lossy().as_bytes().hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 #[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,

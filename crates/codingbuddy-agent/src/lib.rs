@@ -212,12 +212,7 @@ impl AgentEngine {
         let observer = Observer::new(workspace, &cfg.telemetry)?;
         let mut policy = PolicyEngine::from_app_config(&cfg.policy);
 
-        let project_hash = format!("{:x}", {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            workspace.to_string_lossy().as_bytes().hash(&mut h);
-            h.finish()
-        });
+        let project_hash = codingbuddy_store::project_hash(workspace);
         if let Ok(approvals) = store.list_persistent_approvals(&project_hash) {
             let bash_approvals: Vec<String> = approvals
                 .iter()

@@ -148,12 +148,7 @@ where
     let mut terminal = Terminal::new(backend)?;
 
     let workspace_path = PathBuf::from(status.working_directory.clone());
-    let project_hash_cached = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        workspace_path.to_string_lossy().as_bytes().hash(&mut h);
-        format!("{:x}", h.finish())
-    };
+    let project_hash_cached = codingbuddy_store::project_hash(&workspace_path);
     let app_cfg = codingbuddy_core::AppConfig::load(&workspace_path).unwrap_or_default();
     let ui_cfg = app_cfg.ui.clone();
     let detailed_status = ui_cfg.statusline_mode == "detailed";

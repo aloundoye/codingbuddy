@@ -565,10 +565,21 @@ impl PolicyEngine {
             return decision != "allow";
         }
 
-        // Check persistent bash approvals (project-scoped, "don't ask again").
+        // Check persistent bash approvals (project-scoped, "always allow").
+        // Saved patterns are globs like `npm *`; they only cover a single
+        // plain command, never one chained or redirected into something else.
         if call.name == "bash.run"
-            && let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
-            && self.cfg.persistent_bash_approvals.iter().any(|p| p == cmd)
+            && let Some(cmd) = call
+                .args
+                .get("command")
+                .or_else(|| call.args.get("cmd"))
+                .and_then(|v| v.as_str())
+            && is_single_plain_command(cmd)
+            && self
+                .cfg
+                .persistent_bash_approvals
+                .iter()
+                .any(|pattern| glob_command_matches(pattern, cmd))
         {
             return false;
         }
@@ -935,6 +946,15 @@ fn allow_pattern_matches(pattern: &str, cmd_tokens: &[&str]) -> bool {
         }
     }
     true
+}
+
+/// True when `cmd` is one command with no chaining, piping, substitution,
+/// redirection or backgrounding, so a saved approval for its first words
+/// cannot be stretched to cover a second command.
+pub(crate) fn is_single_plain_command(cmd: &str) -> bool {
+    !cmd.trim().is_empty()
+        && !cmd.contains(['\n', ';', '|', '&', '`', '>', '<'])
+        && !cmd.contains("$(")
 }
 
 fn split_pipeline_segments(cmd: &str) -> Result<Vec<&str>, PolicyError> {
