@@ -390,24 +390,40 @@ pub fn evaluate_permission_rules(rules: &[PermissionRule], call: &ToolCall) -> O
 /// `domain:` rules compare against the URL's host: an exact match or a
 /// subdomain at a dot boundary. Matching the raw URL text would let
 /// `https://evil.com/?example.com` or `https://example.com.evil.net/`
-/// satisfy an allow rule for `example.com`.
+/// satisfy an allow rule for `example.com`. A specifier with a port
+/// (`example.com:8080`) also requires that port; IPv6 brackets are ignored.
+///
+/// Deny/ask rules (`strict == false`) additionally keep the original
+/// substring match, so tightening allow rules never weakens a deny.
 pub(crate) fn url_host_matches(url: &str, domain: &str, strict: bool) -> bool {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     if domain.is_empty() {
         return false;
     }
-    match url::Url::parse(url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
-    {
-        Some(host) => {
-            let host = host.trim_end_matches('.');
-            host == domain || host.ends_with(&format!(".{domain}"))
+    let substring = || url.to_ascii_lowercase().contains(&domain);
+    let Ok(parsed) = url::Url::parse(url) else {
+        // An unparseable URL never satisfies an allow rule.
+        return !strict && substring();
+    };
+    let Some(host) = parsed.host_str() else {
+        return !strict && substring();
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let wanted = domain.trim_start_matches('[');
+    // `host:port` specifier (but not a bare IPv6 address, which has colons).
+    let (wanted_host, wanted_port) = match wanted.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') || name.ends_with(']') => {
+            (name.trim_end_matches(']'), port.parse::<u16>().ok())
         }
-        // An unparseable URL never satisfies an allow rule; a deny rule
-        // still catches it by substring.
-        None => !strict && url.to_ascii_lowercase().contains(&domain),
-    }
+        _ => (wanted.trim_end_matches(']'), None),
+    };
+    let host_ok = host == wanted_host || host.ends_with(&format!(".{wanted_host}"));
+    let port_ok = wanted_port.is_none_or(|port| parsed.port_or_known_default() == Some(port));
+    (host_ok && port_ok) || (!strict && substring())
 }
 
 /// URL rules match as a prefix that ends at a path boundary, so

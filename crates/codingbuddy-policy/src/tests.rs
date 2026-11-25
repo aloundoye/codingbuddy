@@ -680,6 +680,43 @@ fn webfetch_deny_rules_still_match_broadly() {
         deny.matches(&fetch("internal.corp:8080/admin")),
         Some("deny")
     );
+    // A parseable URL that only mentions the domain is still denied.
+    assert_eq!(
+        deny.matches(&fetch("https://proxy.example/?u=internal.corp")),
+        Some("deny")
+    );
+}
+
+#[test]
+fn webfetch_domain_rules_handle_ports_and_ipv6() {
+    let fetch = |url: &str| ToolCall {
+        name: "web.fetch".to_string(),
+        args: json!({ "url": url }),
+        requires_approval: false,
+    };
+    let allow = |rule: &str| PermissionRule {
+        rule: format!("WebFetch(domain:{rule})"),
+        decision: "allow".to_string(),
+    };
+    let with_port = allow("localhost:8080");
+    assert_eq!(
+        with_port.matches(&fetch("http://localhost:8080/x")),
+        Some("allow")
+    );
+    assert_eq!(with_port.matches(&fetch("http://localhost:9090/x")), None);
+    let https_default = allow("example.com:443");
+    assert_eq!(
+        https_default.matches(&fetch("https://example.com/")),
+        Some("allow")
+    );
+    let ipv6 = allow("::1");
+    assert_eq!(ipv6.matches(&fetch("http://[::1]:3000/")), Some("allow"));
+    let ipv6_port = allow("[::1]:3000");
+    assert_eq!(
+        ipv6_port.matches(&fetch("http://[::1]:3000/")),
+        Some("allow")
+    );
+    assert_eq!(ipv6_port.matches(&fetch("http://[::1]:4000/")), None);
 }
 
 #[test]
