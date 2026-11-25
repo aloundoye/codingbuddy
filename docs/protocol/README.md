@@ -14,6 +14,9 @@ regenerate it:
 CODINGBUDDY_UPDATE_SCHEMA=1 cargo test -p codingbuddy-jsonrpc published_schema
 ```
 
+For Node.js, [`sdk/typescript`](../../sdk/typescript/README.md) wraps the stdio
+transport in a typed client.
+
 ## Transports
 
 | Transport | Start | Framing |

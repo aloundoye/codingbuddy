@@ -1,0 +1,29 @@
+{
+  "name": "codingbuddy-sdk",
+  "version": "0.5.0",
+  "description": "Drive the CodingBuddy agent from Node.js over its JSON-RPC protocol",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aloundoye/codingbuddy",
+    "directory": "sdk/typescript"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

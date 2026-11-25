@@ -69,6 +69,38 @@ jobs:
         with:
           command: check
 
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build codingbuddy
+        run: cargo build --bin codingbuddy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build and test the SDK against the binary
+        working-directory: sdk/typescript
+        run: |
+          npm ci
+          npm test
+
   unattended:
     name: unattended (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
