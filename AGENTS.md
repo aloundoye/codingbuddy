@@ -116,7 +116,10 @@ Production-ready enhancements in the tool-use loop (`codingbuddy-agent/src/tool_
 
 ## Architecture: Streaming & UX
 
-- **CancellationToken**: `Arc<AtomicBool>` in `codingbuddy-core`. `ApiClient.set_cancel_token()` — checked between SSE reads, returns partial response with `reason: "cancelled"`.
+- **CancellationToken** (`codingbuddy-core/src/stream.rs`): hierarchical (`child_token()` sees ancestors), sync `is_cancelled()` plus `async fn cancelled()` that wakes immediately on `cancel()`. `ApiClient.set_cancel_token()` attaches it to model requests.
+- **Async runtime** (`codingbuddy_core::runtime`): one shared multi-threaded tokio runtime for all I/O. From sync code use `block_on` / `block_on_cancellable`; in async code use `with_cancellation` and `sleep_cancellable`. Never build a per-call runtime, never `thread::sleep` for retry backoff, and never use `reqwest::blocking` on the turn path — `scripts/check_async_boundaries.sh` (CI) enforces this. Standalone commands (update, plugin install, MCP OAuth/serve) may block.
+- **Model requests**: `ChatTransport` (llm) wraps the shared `reqwest::Client` of an `ApiClient` (pool reused across calls). All routes retry through `ChatTransport::send_with_retry` (retryable statuses with Retry-After, transient network errors, 429 → `StreamChunk::RateLimited`, cancellable backoff); each call site passes closures that build its own error. Do not add another retry loop.
+- **Subprocesses**: shell, hooks, LSP and stdio MCP use the owned-process runner (`codingbuddy_core::execution`): process groups on Unix, Job objects on Windows, cancellation and timeout kill the whole tree.
 - **StreamChunk::UsageUpdate**: Real-time cost/progress tracking — `input_tokens`, `output_tokens`, `cache_hit_tokens`, `estimated_cost_usd`. JSON-serialized via `stream_chunk_to_event_json()`.
 - **StreamChunk::PhaseTransition**: Emitted when the explicit phase loop transitions (e.g. Explore→Plan). Contains `from`/`to` phase names.
 - **StreamChunk::ModelChanged**: Emitted when the active model changes mid-session (via `/model` command). Contains new model name.

@@ -61,6 +61,9 @@ jobs:
       - name: AGENTS.md crate list matches Cargo.toml
         run: bash scripts/check_agents_md.sh
 
+      - name: No blocking HTTP on the turn path
+        run: bash scripts/check_async_boundaries.sh
+
       - name: cargo deny (advisories, licenses, bans, sources)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

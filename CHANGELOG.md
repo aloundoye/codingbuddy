@@ -31,7 +31,16 @@ Move it under a version heading when you cut a release.
   unknown models. Configure them under `agent_loop.heuristics`, globally or
   per provider; `codingbuddy doctor` shows what is active.
 
+- Pressing Esc now stops a turn immediately in more places: during retry
+  back-off (even with a long Retry-After), while `web_fetch`/`web_search`
+  wait on a slow site, while prompt URLs are fetched, and in remote MCP
+  calls. Model requests reuse connections across calls.
+
 ### Fixed
+- `WebFetch(domain:…)` and URL allow rules matched any URL that merely
+  contained the text (for example `https://evil.com/?example.com`). Allow
+  rules now match the parsed host or a URL prefix; deny rules still match
+  broadly.
 - A correct answer that names files mentioned in a tool's output (for
   example a summary of a checklist that lists `Cargo.toml`) is no longer
   discarded and erased from the screen as an "unverified file reference".
