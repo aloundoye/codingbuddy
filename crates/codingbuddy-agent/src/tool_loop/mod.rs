@@ -57,10 +57,12 @@ use uuid::Uuid;
 
 use crate::tool_bridge;
 
+#[cfg(test)]
+use anti_hallucination::has_unverified_file_references;
 use anti_hallucination::{
     HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS, SHELL_COMMAND_NUDGE,
     check_response_consistency, extract_shell_commands, extract_user_directives,
-    has_unverified_file_references,
+    has_unverified_file_references_given_outputs,
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
@@ -1337,7 +1339,19 @@ impl<'a> ToolUseLoop<'a> {
                 // hallucination on a new question. Unverified file references are
                 // always checked against this turn's tool calls.
                 let has_unverified_refs = if nudge_count < MAX_NUDGE_ATTEMPTS {
-                    has_unverified_file_references(&text, &tool_calls_made)
+                    let tool_outputs: Vec<&str> = self
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    has_unverified_file_references_given_outputs(
+                        &text,
+                        &tool_calls_made,
+                        &tool_outputs,
+                    )
                 } else {
                     false
                 };

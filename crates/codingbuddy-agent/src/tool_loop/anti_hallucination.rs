@@ -146,9 +146,22 @@ fn path_is_covered(mentioned: &str, accessed_paths: &[AccessedPath]) -> bool {
 /// Detect when the model mentions file paths without having called fs_read/fs_glob first.
 /// Uses path-specific verification: reading file A does NOT verify claims about file B.
 /// Returns true if the text references paths that haven't been verified by tool calls.
+#[cfg(test)]
 pub(crate) fn has_unverified_file_references(
     text: &str,
     tool_calls_made: &[ToolCallRecord],
+) -> bool {
+    has_unverified_file_references_given_outputs(text, tool_calls_made, &[])
+}
+
+/// True when `text` names a file that no tool touched and no tool output
+/// mentioned. A name that appears in a tool's output (a file listing, grep
+/// hits, or a document that refers to other files) is grounded: the model
+/// read it there, so an answer repeating it is not a hallucination.
+pub(crate) fn has_unverified_file_references_given_outputs(
+    text: &str,
+    tool_calls_made: &[ToolCallRecord],
+    tool_outputs: &[&str],
 ) -> bool {
     use std::sync::LazyLock;
     // Match file-like references: word chars, dots, slashes, hyphens with a 1-6 char extension.
@@ -169,6 +182,7 @@ pub(crate) fn has_unverified_file_references(
                 // Exclude version-like patterns (1.0, 2.34, etc.)
                 && !p.chars().next().is_some_and(|c| c.is_ascii_digit())
         })
+        .filter(|path| !tool_outputs.iter().any(|output| output.contains(path)))
         .collect();
 
     if mentioned_paths.is_empty() {
@@ -414,6 +428,36 @@ pub(crate) fn split_sentences(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_names_seen_in_tool_output_are_grounded() {
+        // notes.txt was read and lists other files. Summarising it must not
+        // count those names as hallucinated.
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_read".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: "notes.txt".to_string(),
+            success: true,
+            duration_ms: 1,
+            args_json: Some(r#"{"path":"notes.txt"}"#.to_string()),
+            result_preview: None,
+        }];
+        let answer = "Bump the version in Cargo.toml, then update CHANGELOG.md.";
+        let notes = "- Bump the version in Cargo.toml\n- Update CHANGELOG.md\n";
+        assert!(!has_unverified_file_references_given_outputs(
+            answer,
+            &tool_calls,
+            &[notes]
+        ));
+        // Without that output the same answer is still flagged.
+        assert!(has_unverified_file_references(answer, &tool_calls));
+        // A name that appears nowhere in tool output is still flagged.
+        assert!(has_unverified_file_references_given_outputs(
+            "Also check build.rs.",
+            &tool_calls,
+            &[notes]
+        ));
+    }
 
     #[test]
     fn test_unverified_refs_path_specific() {
