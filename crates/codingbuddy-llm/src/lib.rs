@@ -1516,7 +1516,6 @@ impl ApiClient {
                         let mut gemini_blocks = Vec::new();
                         let mut native_usage = None;
                         let mut anthropic_usage = json!({});
-                        let mut gemini_finished = false;
                         let mut responses = providers::responses::Stream::default();
                         let mut reader = std::io::BufReader::new(transport.reader(resp));
                         while let Some(frame) = chat_transport::next_frame(&mut reader)
@@ -1609,22 +1608,11 @@ impl ApiClient {
                                     native_usage =
                                         Some(providers::google::parse_gemini_usage(&value));
                                 }
-                                if value.pointer("/candidates/0/content/parts").is_some() {
-                                    anyhow::ensure!(
-                                        !gemini_finished,
-                                        "Gemini content after terminal event"
-                                    );
-                                }
-                                if let Some(reason) = value
-                                    .pointer("/candidates/0/finishReason")
-                                    .and_then(Value::as_str)
-                                {
-                                    gemini_finished = true;
-                                    anyhow::ensure!(
-                                        reason == "STOP",
-                                        "Provider response incomplete"
-                                    );
-                                }
+                                anyhow::ensure!(
+                                    native_state.finish_reason.is_none()
+                                        || value.pointer("/candidates/0").is_none(),
+                                    "Gemini candidate after terminal event"
+                                );
                                 if let Some(parts) = value
                                     .pointer("/candidates/0/content/parts")
                                     .and_then(Value::as_array)
@@ -1761,6 +1749,19 @@ impl ApiClient {
                             "Provider stream ended before a terminal response"
                         );
 
+                        if chat_protocol == protocol::ChatProtocol::GeminiGenerateContent
+                            && !matches!(
+                                native_state.finish_reason.as_deref(),
+                                Some("stop" | "tool_calls")
+                            )
+                        {
+                            return Err(error::ProviderError::new(
+                                chat_protocol,
+                                error::FailureKind::IncompleteResponse,
+                            )
+                            .into());
+                        }
+
                         let mut tool_calls = Vec::new();
                         let mut transport_parts = Vec::new();
                         for part in order {
@@ -1798,6 +1799,12 @@ impl ApiClient {
                                 })
                                 .collect();
                             reasoning_out = native_state.reasoning;
+                            if protocol == native_parts::GEMINI
+                                && native_state.finish_reason.as_deref() == Some("stop")
+                                && !tool_calls.is_empty()
+                            {
+                                native_state.finish_reason = Some("tool_calls".into());
+                            }
                             finish_reason = native_state.finish_reason;
                             usage = native_usage.or(native_state.usage);
                         }
@@ -2343,18 +2350,11 @@ impl LlmClient for ApiClient {
             self.validate_chat_request_for_route(&normalized_req, &route)?;
             self.validate_thinking_params(&normalized_req, &route)?;
             if !self.cfg.stream {
-                let response = confirmed_chat_response(
+                return confirmed_chat_response(
                     self.complete_chat_inner(&normalized_req, key.as_deref(), &route)?,
                     protocol,
                     &normalized_req.tools,
-                )?;
-                if !response.text.is_empty() {
-                    cb(StreamChunk::ContentDelta(response.text.clone()));
-                }
-                cb(StreamChunk::Done {
-                    reason: Some(response.finish_reason.clone()),
-                });
-                return Ok(response);
+                );
             }
             confirmed_chat_response(
                 self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb, &route)?,
@@ -2372,6 +2372,9 @@ impl LlmClient for ApiClient {
             error
         });
         if let Ok(response) = &result {
+            if !visible.load(std::sync::atomic::Ordering::SeqCst) && !response.text.is_empty() {
+                terminal_cb(StreamChunk::ContentDelta(response.text.clone()));
+            }
             terminal_cb(StreamChunk::Done {
                 reason: Some(response.finish_reason.clone()),
             });

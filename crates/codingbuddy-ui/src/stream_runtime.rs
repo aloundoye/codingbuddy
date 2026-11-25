@@ -100,6 +100,7 @@ pub(crate) fn handle_stream_event(
             args_summary,
         } => {
             state.shell.is_thinking = false;
+            state.shell.commit_streaming();
             state.shell.push_tool_call(&tool_name, &args_summary);
             state.shell.active_tool = Some(tool_name);
             StreamEventResult::Continue
@@ -110,6 +111,7 @@ pub(crate) fn handle_stream_event(
             summary,
             success,
         } => {
+            state.shell.commit_streaming();
             let is_denied = summary.contains("denied");
             let marker = if success {
                 "✓"
@@ -125,6 +127,9 @@ pub(crate) fn handle_stream_event(
             StreamEventResult::Continue
         }
         TuiStreamEvent::ModeTransition { from, to, reason } => {
+            if reason == "phase" {
+                state.shell.commit_streaming();
+            }
             state.shell.agent_mode = to.clone();
             let label = format!("mode transition {from} -> {to} ({reason})");
             state.shell.push_system(label);
@@ -235,6 +240,7 @@ pub(crate) fn handle_stream_event(
             args_summary,
             response_tx,
         } => {
+            state.shell.commit_streaming();
             let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
             let explanation = approval_explanation(&tool_name, &args_summary);
             let detail =

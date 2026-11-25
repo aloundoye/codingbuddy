@@ -18,6 +18,7 @@ use codingbuddy_ui::{
 use serde_json::json;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -1562,6 +1563,13 @@ pub(crate) fn run_chat(
         }
 
         // Set up streaming callback for real-time token output
+        let styled = !json_mode && !json_events && std::io::stdout().is_terminal();
+        let plain_stream = PlainStream::default();
+        let md_renderer = styled.then(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::md_render::StreamingMdRenderer::new(),
+            ))
+        });
         if json_events {
             engine.set_stream_callback(std::sync::Arc::new(|chunk: codingbuddy_core::StreamChunk| {
                 use std::io::Write as _;
@@ -1620,19 +1628,23 @@ pub(crate) fn run_chat(
                 }
                 let _ = handle.flush();
             }));
-        } else if !json_mode {
-            let md_renderer = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::md_render::StreamingMdRenderer::new(),
-            ));
+        } else if let Some(md_renderer) = &md_renderer {
             let md_clone = md_renderer.clone();
             engine.set_stream_callback(std::sync::Arc::new(move |chunk: codingbuddy_core::StreamChunk| {
-                match chunk {
-                    codingbuddy_core::StreamChunk::ContentDelta(text) => {
-                        if let Ok(mut renderer) = md_clone.lock() {
-                            renderer.push(&text);
-                        }
+                use codingbuddy_core::StreamChunk;
+                if let Ok(mut renderer) = md_clone.lock() {
+                    match &chunk {
+                        StreamChunk::ContentDelta(text) => renderer.push(text),
+                        StreamChunk::ClearStreamingText => renderer.clear(),
+                        StreamChunk::ReasoningDelta(_)
+                        | StreamChunk::UsageUpdate { .. }
+                        | StreamChunk::SnapshotRecorded { .. }
+                        | StreamChunk::ToolCallReady { .. } => {}
+                        _ => renderer.finish(),
                     }
-                    codingbuddy_core::StreamChunk::ReasoningDelta(_) => {}
+                }
+                match chunk {
+                    StreamChunk::ContentDelta(_) | StreamChunk::ReasoningDelta(_) => {}
                     codingbuddy_core::StreamChunk::ToolCallStart { tool_name, args_summary } => {
                         crate::md_render::print_phase("⚡", &tool_name, &args_summary);
                     }
@@ -1743,18 +1755,16 @@ pub(crate) fn run_chat(
                         let _ = write!(handle, "  \x1b[90m[{tool_name}]\x1b[0m {data}");
                         let _ = handle.flush();
                     }
-                    codingbuddy_core::StreamChunk::Done { .. } => {
-                        // Flush any remaining partial line from the renderer
-                        if let Ok(mut renderer) = md_clone.lock() {
-                            renderer.flush_remaining();
-                        }
-                    }
+                    StreamChunk::Done { .. } => {}
                 }
             }));
+        } else if !json_mode {
+            let stream = plain_stream.clone();
+            engine.set_stream_callback(Arc::new(move |chunk| stream.event(chunk)));
         }
 
         let images_for_turn = std::mem::take(&mut pending_images);
-        if !json_mode && !json_events {
+        if styled {
             crate::md_render::print_role_header(
                 "assistant",
                 &active_model_for_display(&cfg, active_model_spec.as_deref(), force_max_think),
@@ -1778,14 +1788,21 @@ pub(crate) fn run_chat(
                 model_spec: active_model_spec.clone(),
                 ..Default::default()
             },
-        )?;
+        );
+        if let Some(renderer) = md_renderer
+            && let Ok(mut renderer) = renderer.lock()
+        {
+            renderer.finish();
+        }
+        plain_stream.event(StreamChunk::Done { reason: None });
+        let output = output?;
         if selected_session_id.is_none() {
             selected_session_id = Store::new(cwd)?
                 .load_latest_session()?
                 .map(|session| session.session_id);
         }
         last_assistant_response = Some(output.clone());
-        if !json_mode && !json_events {
+        if styled {
             crate::md_render::print_role_footer();
         }
         let mut ui_status = current_ui_status(cwd, &cfg, force_max_think, selected_session_id)?;
@@ -1919,7 +1936,7 @@ pub(crate) fn run_resume(cwd: &Path, args: RunArgs, json_mode: bool) -> Result<S
 
 pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     use codingbuddy_core::StreamChunk;
-    use std::io::{IsTerminal, Read, Write as _, stdin, stdout};
+    use std::io::{Read, stdin};
 
     let prompt = if !cli.prompt_args.is_empty() {
         cli.prompt_args.join(" ")
@@ -1962,132 +1979,23 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
         prompt
     };
 
-    // Set up streaming callback for real-time output
-    if is_text || is_stream_json {
-        let stream_json = is_stream_json;
-        engine.set_stream_callback(std::sync::Arc::new(move |chunk: StreamChunk| {
-            let out = stdout();
-            let mut handle = out.lock();
-            if stream_json {
-                let event = stream_chunk_to_event_json(&chunk);
-                let _ = serde_json::to_writer(&mut handle, &event);
-                let _ = writeln!(handle);
-                let _ = handle.flush();
-                return;
-            }
-            match chunk {
-                StreamChunk::ContentDelta(text) => {
-                    let _ = write!(handle, "{text}");
-                    let _ = handle.flush();
-                }
-                StreamChunk::ReasoningDelta(text) => {
-                    let _ = text;
-                    // In text mode, reasoning is not shown
-                }
-                StreamChunk::ToolCallStart {
-                    tool_name,
-                    args_summary,
-                } => {
-                    let _ = writeln!(handle, "\n[tool: {tool_name}] {args_summary}");
-                    let _ = handle.flush();
-                }
-                StreamChunk::ToolCallEnd {
-                    tool_name,
-                    duration_ms,
-                    success,
-                    summary,
-                } => {
-                    let status = if success { "ok" } else { "error" };
-                    let _ = writeln!(
-                        handle,
-                        "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}"
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::ModeTransition { from, to, reason } => {
-                    let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::SubagentSpawned { run_id, name, goal } => {
-                    let _ = writeln!(handle, "[subagent:spawned] {name} ({run_id}) {goal}");
-                    let _ = handle.flush();
-                }
-                StreamChunk::SubagentCompleted {
-                    run_id,
-                    name,
-                    summary,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[subagent:completed] {name} ({run_id}) {}",
-                        summary.replace('\n', " ")
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::SubagentFailed {
-                    run_id,
-                    name,
-                    error,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[subagent:failed] {name} ({run_id}) {}",
-                        error.replace('\n', " ")
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::ImageData { label, .. } => {
-                    let _ = writeln!(handle, "[image: {label}]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::WatchTriggered { comment_count, .. } => {
-                    let _ = writeln!(handle, "[watch: {comment_count} comment(s) detected]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::SecurityWarning { message } => {
-                    let _ = writeln!(handle, "[security warning: {message}]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::Error { message, .. } => {
-                    let _ = writeln!(handle, "[error: {message}]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::PhaseTransition { from, to } => {
-                    let _ = writeln!(handle, "[phase: {from} -> {to}]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::ModelChanged { model } => {
-                    let _ = writeln!(handle, "[model changed: {model}]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::ConfigReloaded { path } => {
-                    eprintln!("  \x1b[33m\u{27f3}\x1b[0m  Config reloaded: {path}");
-                }
-                StreamChunk::RateLimited { wait_seconds, attempt, max_attempts, provider } => {
-                    let _ = writeln!(handle, "[rate limited by {provider}: retrying in {wait_seconds}s ({attempt}/{max_attempts})]");
-                    let _ = handle.flush();
-                }
-                StreamChunk::UsageUpdate { .. } => {}
-                StreamChunk::ClearStreamingText => {
-                    // In non-TUI mode, nothing to clear — text already
-                    // written to stdout.
-                }
-                StreamChunk::SnapshotRecorded { .. } => {}
-                StreamChunk::ToolCallReady { .. } => {}
-                StreamChunk::ToolProgress { tool_name, data } => {
-                    let _ = write!(handle, "[{tool_name}] {data}");
-                    let _ = handle.flush();
-                }
-                StreamChunk::Done { .. } => {
-                    let _ = writeln!(handle);
-                    let _ = handle.flush();
-                }
-            }
+    let plain_stream = PlainStream::default();
+    if is_stream_json {
+        engine.set_stream_callback(Arc::new(|chunk| {
+            let mut handle = std::io::stdout().lock();
+            let _ = serde_json::to_writer(&mut handle, &stream_chunk_to_event_json(&chunk));
+            let _ = writeln!(handle);
+            let _ = handle.flush();
         }));
+    } else if is_text {
+        let stream = plain_stream.clone();
+        engine.set_stream_callback(Arc::new(move |chunk| stream.event(chunk)));
     }
 
     let options = chat_options_from_cli(cli, true, ChatMode::Code);
-    let output = engine.chat_with_options(&prompt, options)?;
+    let output = engine.chat_with_options(&prompt, options);
+    plain_stream.event(StreamChunk::Done { reason: None });
+    let output = output?;
 
     match cli.output_format.as_str() {
         "json" => {
@@ -2129,6 +2037,108 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Default)]
+struct PlainStream(Arc<std::sync::Mutex<bool>>);
+
+impl PlainStream {
+    fn event(&self, chunk: StreamChunk) {
+        if let Ok(mut line_open) = self.0.lock() {
+            let mut writer = std::io::stdout().lock();
+            Self::write_event(&mut writer, &mut line_open, chunk);
+            let _ = writer.flush();
+        }
+    }
+
+    fn write_event(writer: &mut impl Write, line_open: &mut bool, chunk: StreamChunk) {
+        let status = match chunk {
+            StreamChunk::ContentDelta(text) => {
+                if !text.is_empty() {
+                    let _ = write!(writer, "{text}");
+                    *line_open = !text.ends_with('\n');
+                }
+                return;
+            }
+            StreamChunk::ToolCallStart {
+                tool_name,
+                args_summary,
+            } => format!("[tool: {tool_name}] {args_summary}"),
+            StreamChunk::ToolCallEnd {
+                tool_name,
+                duration_ms,
+                success,
+                summary,
+            } => {
+                let status = if success { "ok" } else { "error" };
+                format!("[tool: {tool_name}] {status} ({duration_ms}ms) {summary}")
+            }
+            StreamChunk::ModeTransition { from, to, reason } => {
+                format!("[mode: {from} -> {to}: {reason}]")
+            }
+            StreamChunk::SubagentSpawned { run_id, name, goal } => {
+                format!("[subagent:spawned] {name} ({run_id}) {goal}")
+            }
+            StreamChunk::SubagentCompleted {
+                run_id,
+                name,
+                summary,
+            } => format!(
+                "[subagent:completed] {name} ({run_id}) {}",
+                summary.replace('\n', " ")
+            ),
+            StreamChunk::SubagentFailed {
+                run_id,
+                name,
+                error,
+            } => format!(
+                "[subagent:failed] {name} ({run_id}) {}",
+                error.replace('\n', " ")
+            ),
+            StreamChunk::ImageData { label, .. } => format!("[image: {label}]"),
+            StreamChunk::WatchTriggered { comment_count, .. } => {
+                format!("[watch: {comment_count} comment(s) detected]")
+            }
+            StreamChunk::SecurityWarning { message } => format!("[security warning: {message}]"),
+            StreamChunk::Error { message, .. } => format!("[error: {message}]"),
+            StreamChunk::PhaseTransition { from, to } => format!("[phase: {from} -> {to}]"),
+            StreamChunk::ModelChanged { model } => format!("[model changed: {model}]"),
+            StreamChunk::ConfigReloaded { path } => {
+                eprintln!("Config reloaded: {path}");
+                return;
+            }
+            StreamChunk::RateLimited {
+                wait_seconds,
+                provider,
+                attempt,
+                max_attempts,
+            } => format!(
+                "[rate limited by {provider}: retrying in {wait_seconds}s ({attempt}/{max_attempts})]"
+            ),
+            StreamChunk::ToolProgress { tool_name, data } => {
+                if !*line_open {
+                    let _ = write!(writer, "[{tool_name}] ");
+                }
+                let _ = write!(writer, "{data}");
+                *line_open = !data.ends_with('\n');
+                return;
+            }
+            StreamChunk::ClearStreamingText | StreamChunk::Done { .. } => {
+                if std::mem::take(line_open) {
+                    let _ = writeln!(writer);
+                }
+                return;
+            }
+            StreamChunk::ReasoningDelta(_)
+            | StreamChunk::UsageUpdate { .. }
+            | StreamChunk::SnapshotRecorded { .. }
+            | StreamChunk::ToolCallReady { .. } => return,
+        };
+        if std::mem::take(line_open) {
+            let _ = writeln!(writer);
+        }
+        let _ = writeln!(writer, "{status}");
+    }
 }
 
 fn print_resume_banner(session: &codingbuddy_core::Session, turn_count: usize) {

@@ -2337,6 +2337,57 @@ mod tests {
     }
 
     #[test]
+    fn prompt_stream_resume_replays_a_draft_reset_and_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let handler = IdeRpcHandler::new(temp.path())?;
+        let opened = handler.handle("session/open", json!({}))?;
+        let session = require_uuid(&opened, "session_id")?;
+        let lease = handler.store.session_lease(session)?;
+        let prompt = handler
+            .store
+            .start_prompt(&lease, session, Uuid::now_v7(), &json!({}))?;
+        handler.store.append_prompt_event(
+            prompt,
+            &stream_chunk_to_event_json(&StreamChunk::ContentDelta("Discarded".into())),
+        )?;
+        let first = handler.handle(
+            "prompt/stream_next",
+            json!({"prompt_id": prompt, "cursor": 0}),
+        )?;
+        assert_eq!(first["done"], false);
+        assert_eq!(first["chunks"][0]["delta"], "Discarded");
+        for chunk in [
+            StreamChunk::ClearStreamingText,
+            StreamChunk::ContentDelta("Replacement".into()),
+        ] {
+            handler
+                .store
+                .append_prompt_event(prompt, &stream_chunk_to_event_json(&chunk))?;
+        }
+        handler
+            .store
+            .finish_prompt(prompt, "completed", Some("Replacement"), None)?;
+        drop(lease);
+
+        let reconnected = IdeRpcHandler::new(temp.path())?;
+        let remainder = reconnected.handle(
+            "prompt/stream_next",
+            json!({
+                "prompt_id": prompt, "cursor": first["next_cursor"]
+            }),
+        )?;
+        assert_eq!(remainder["chunks"][0]["type"], "clear_streaming_text");
+        assert_eq!(remainder["chunks"][1]["delta"], "Replacement");
+        assert_eq!(
+            remainder["chunks"][2]["event"],
+            json!({"type": "done", "status": "completed"})
+        );
+        assert_eq!(remainder["next_cursor"], 4);
+        assert_eq!(remainder["done"], true);
+        Ok(())
+    }
+
+    #[test]
     fn ide_handler_handoff_export_import_remote_resume() {
         let tmp = tempfile::tempdir().unwrap();
         let handler = IdeRpcHandler::new(tmp.path()).unwrap();

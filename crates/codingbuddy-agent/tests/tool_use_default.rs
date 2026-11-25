@@ -138,6 +138,156 @@ fn build_engine_with_shared_llm(path: &Path, llm: Arc<ScriptedLlm>) -> Result<Ag
     AgentEngine::new_with_llm(path, llm)
 }
 
+/// Stream the scripted responses the same way as a live provider, including per-step Done.
+struct StreamingScript(ScriptedLlm);
+
+impl LlmClient for StreamingScript {
+    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        self.0.complete(req)
+    }
+
+    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
+        self.0.complete_streaming(req, cb)
+    }
+
+    fn complete_fim(&self, req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+        self.0.complete_fim(req)
+    }
+
+    fn complete_fim_streaming(
+        &self,
+        req: &codingbuddy_core::FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_fim_streaming(req, cb)
+    }
+
+    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.0.complete_chat(req)
+    }
+
+    fn complete_chat_streaming(
+        &self,
+        req: &ChatRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let response = self.complete_chat(req)?;
+        cb(StreamChunk::ContentDelta(response.text.clone()));
+        cb(StreamChunk::Done {
+            reason: Some(response.finish_reason.clone()),
+        });
+        Ok(response)
+    }
+}
+
+#[test]
+fn prompt_stream_replaces_discarded_draft_and_completes_after_tools() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    let engine = AgentEngine::new_with_llm(
+        temp.path(),
+        Box::new(StreamingScript(ScriptedLlm::new(vec![
+            text_response(&"Discard this draft. ".repeat(25)),
+            tool_call_response_with_text(
+                "Reading now.",
+                vec![("read", "fs_read", r#"{"path":"src/main.rs"}"#)],
+            ),
+            text_response("Read it."),
+        ]))),
+    )?;
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    engine.set_stream_callback(Arc::new({
+        let chunks = chunks.clone();
+        move |chunk| chunks.lock().unwrap().push(chunk)
+    }));
+
+    assert_eq!(engine.chat("Read the main source")?, "Read it.");
+    let chunks = chunks.lock().unwrap();
+    let presentation: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            StreamChunk::ContentDelta(text) if text.starts_with("Discard") => Some("draft"),
+            StreamChunk::ContentDelta(text) => Some(text.as_str()),
+            StreamChunk::ClearStreamingText => Some("clear"),
+            StreamChunk::ToolCallStart { .. } => Some("start"),
+            StreamChunk::ToolCallEnd { .. } => Some("end"),
+            StreamChunk::Done { .. } => Some("done"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        presentation,
+        [
+            "draft",
+            "clear",
+            "Reading now.",
+            "start",
+            "end",
+            "Read it.",
+            "done"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_and_cancelled_prompts_do_not_emit_done() -> Result<()> {
+    for cancelled in [false, true] {
+        let temp = tempfile::tempdir()?;
+        init_workspace(temp.path())?;
+        let responses = if cancelled {
+            vec![text_response("Partial reply")]
+        } else {
+            vec![text_response(&"Draft that requires a retry. ".repeat(25))]
+        };
+        let engine = AgentEngine::new_with_llm(
+            temp.path(),
+            Box::new(StreamingScript(ScriptedLlm::new(responses))),
+        )?;
+        let cancellation = codingbuddy_core::CancellationToken::new();
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        engine.set_stream_callback(Arc::new({
+            let chunks = chunks.clone();
+            let cancellation = cancellation.clone();
+            move |chunk| {
+                if cancelled && matches!(chunk, StreamChunk::ContentDelta(_)) {
+                    cancellation.cancel();
+                }
+                chunks.lock().unwrap().push(chunk);
+            }
+        }));
+        let result = engine.chat_with_options(
+            "Read the main source",
+            ChatOptions {
+                tools: true,
+                cancellation: Some(cancellation),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        let chunks = chunks.lock().unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::ContentDelta(_)))
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
+        );
+
+        let store = Store::new(temp.path())?;
+        let session = store.load_latest_session()?.unwrap();
+        let prompt = store.latest_prompt(session.session_id)?.unwrap();
+        assert_eq!(
+            prompt.status,
+            if cancelled { "cancelled" } else { "failed" }
+        );
+    }
+    Ok(())
+}
+
 // ── Tests ──
 
 /// Default ChatMode::Code routes to the tool-use loop (not the old pipeline).
@@ -789,7 +939,7 @@ fn default_tool_loop_has_thinking_enabled() -> Result<()> {
         text_response("Done."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
-    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+    let engine = AgentEngine::new_with_config_and_llm(temp.path(), AppConfig::default(), llm)?;
 
     let _output = engine.chat_with_options(
         "What's in this project?",
@@ -824,7 +974,7 @@ fn force_max_think_overrides_budget() -> Result<()> {
         text_response("Done."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
-    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+    let engine = AgentEngine::new_with_config_and_llm(temp.path(), AppConfig::default(), llm)?;
 
     let _output = engine.chat_with_options(
         "fix typo",

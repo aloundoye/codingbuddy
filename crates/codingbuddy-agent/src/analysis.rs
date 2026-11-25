@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
-    AppConfig, ChatMessage, ChatRequest, LlmResponse, StreamCallback, ToolChoice,
+    AppConfig, ChatMessage, ChatRequest, LlmResponse, StreamCallback, StreamChunk, ToolChoice,
 };
 use codingbuddy_llm::LlmClient;
 use std::path::Path;
@@ -67,7 +67,13 @@ pub fn analyze(
         && bootstrap.repoish;
     let max_repairs = if enforce_profile_shape { 1 } else { 0 };
 
+    let execution = codingbuddy_core::execution::ExecutionContext {
+        cancellation: options.cancellation.clone().unwrap_or_default(),
+        deadline: options.deadline,
+        ..Default::default()
+    };
     for attempt in 0..=max_repairs {
+        execution.check()?;
         codingbuddy_core::strip_prior_reasoning_content(&mut messages);
         let request = ChatRequest {
             model: model.clone(),
@@ -99,18 +105,12 @@ pub fn analyze(
             response_format: None,
         };
 
-        // First attempt: use streaming so the renderer can display tokens in real-time.
-        // Repair attempts fall back to blocking since the first-pass stream already completed.
-        let response = if attempt == 0 {
-            if let Some(ref cb) = stream_cb {
-                llm.complete_chat_streaming(&request, cb.clone())?
-            } else {
-                llm.complete_chat(&request)?
-            }
+        let response = if let Some(ref cb) = stream_cb {
+            llm.complete_chat_streaming(&request, cb.clone())?
         } else {
-            // Repair pass: stream already done, use blocking to avoid double output
             llm.complete_chat(&request)?
         };
+        execution.check()?;
         let violation = if enforce_profile_shape {
             validate_analysis_shape(&response.text, bootstrap.vague_codebase_prompt)
         } else {
@@ -120,6 +120,9 @@ pub fn analyze(
         if let Some(reason) = violation
             && attempt < max_repairs
         {
+            if let Some(cb) = &stream_cb {
+                cb(StreamChunk::ClearStreamingText);
+            }
             messages.push(ChatMessage::Assistant {
                 content: Some(response.text),
                 native_parts: None,

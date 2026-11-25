@@ -588,3 +588,19 @@ fn mcp_interactive_menu_lists_servers() {
         "json mode should NOT trigger interactive menu"
     );
 }
+
+#[test]
+fn plain_stream_uses_one_line_boundary_and_never_rewrites_output() {
+    let mut output = Vec::new();
+    let mut line_open = false;
+    for chunk in [
+        StreamChunk::ContentDelta("Draft".into()),
+        StreamChunk::ClearStreamingText,
+        StreamChunk::ContentDelta("Answer\n".into()),
+        StreamChunk::Done { reason: None },
+        StreamChunk::Done { reason: None },
+    ] {
+        PlainStream::write_event(&mut output, &mut line_open, chunk);
+    }
+    assert_eq!(output, b"Draft\nAnswer\n");
+}

@@ -25,6 +25,7 @@ reqwest.workspace = true
 glob.workspace = true
 regex.workspace = true
 crossterm.workspace = true
+unicode-width.workspace = true
 base64.workspace = true
 termimad = "0.30"
 codingbuddy-agent = { path = "../codingbuddy-agent" }

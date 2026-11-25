@@ -186,11 +186,7 @@ where
     let mut cancelled = false;
     let mut transcript_scroll = 0usize;
     let mut transcript_page = 1usize;
-    let mut transcript_lines = Vec::new();
-    let mut transcript_heights = Vec::new();
-    let mut transcript_width = 0;
-    let mut transcript_rows = 0usize;
-    let mut transcript_key = (0, String::new(), String::new(), false);
+    let mut transcript_cache = TranscriptRenderCache::default();
     let mut mission_control_visible = false;
     let mut artifacts_visible = false;
     let mut plan_collapsed = false;
@@ -227,6 +223,7 @@ where
                     controls.needs_connection = !ready;
                     if let Some(theme) = theme {
                         theme::init_theme(TuiTheme::from_preference(&theme));
+                        transcript_cache = TranscriptRenderCache::default();
                     }
                     if let Some(updated) = refresh_status() {
                         status = updated;
@@ -238,6 +235,11 @@ where
             if cancelled && matches!(ev, TuiStreamEvent::Done(_) | TuiStreamEvent::Error(_)) {
                 is_processing = false;
                 shell.finalize_streaming("");
+                shell.is_thinking = false;
+                shell.thinking_buffer.clear();
+                shell.active_tool = None;
+                active_phase = None;
+                pending_approval = None;
                 info_line = "Interrupted".into();
             }
             let Some(ev) = filter_stream_event(ev, &mut cancelled) else {
@@ -308,25 +310,6 @@ where
             last_mission_refresh_at = Instant::now();
         }
 
-        let last_text = shell
-            .transcript
-            .last()
-            .map_or("", |entry| entry.text.as_str());
-        if transcript_key.0 != shell.transcript.len()
-            || transcript_key.1 != last_text
-            || transcript_key.2 != shell.streaming_text
-            || transcript_key.3 != plan_collapsed
-        {
-            transcript_lines = render_transcript(&shell, plan_collapsed);
-            transcript_width = 0;
-            transcript_key = (
-                shell.transcript.len(),
-                last_text.to_owned(),
-                shell.streaming_text.clone(),
-                plan_collapsed,
-            );
-        }
-
         terminal.draw(|frame| {
             let area = frame.area();
             if area.width == 0 || area.height < 5 {
@@ -378,8 +361,8 @@ where
                     width,
                 )
             } else {
-                let before = &input[..cursor_pos.min(input.len())];
-                wrapped_text_rows(&format!("{prompt_str}{before}{cursor_ch}"), width)
+                let (before, after) = input.split_at(cursor_pos.min(input.len()));
+                wrapped_text_rows(&format!("{prompt_str}{before}{cursor_ch}{after}"), width)
             };
             let (stream_height, input_height) =
                 compute_inline_heights(area.height, desired_input_rows);
@@ -402,37 +385,13 @@ where
                     stream_area,
                 );
             } else {
-                if transcript_width != width {
-                    transcript_heights = transcript_lines
-                        .iter()
-                        .map(|line| wrapped_line_height(line, width))
-                        .collect();
-                    transcript_rows = transcript_heights.iter().sum();
-                    transcript_width = width;
-                }
-                let max_scroll = transcript_rows.saturating_sub(usize::from(stream_height));
-                transcript_scroll = transcript_scroll.min(max_scroll);
-                let mut skip = max_scroll - transcript_scroll;
-                let start = transcript_heights
-                    .iter()
-                    .position(|&rows| {
-                        if skip < rows {
-                            true
-                        } else {
-                            skip -= rows;
-                            false
-                        }
-                    })
-                    .unwrap_or(transcript_lines.len());
-                let visible = transcript_lines[start..]
-                    .iter()
-                    .take(usize::from(stream_height))
-                    .cloned()
-                    .collect::<Vec<_>>();
+                transcript_cache.update(&shell, plan_collapsed, width);
+                let (visible, skip) =
+                    transcript_cache.visible(stream_height, &mut transcript_scroll);
                 frame.render_widget(
                     Paragraph::new(visible)
                         .wrap(Wrap { trim: false })
-                        .scroll((skip.min(u16::MAX as usize) as u16, 0)),
+                        .scroll((skip, 0)),
                     stream_area,
                 );
             }
@@ -545,10 +504,10 @@ where
                     input_area.height,
                 );
                 let mut spans = vec![
-                    Span::styled(prompt_str.to_string(), prompt_style),
-                    Span::raw(before.to_string()),
-                    Span::raw(cursor_ch.to_string()),
-                    Span::raw(after.to_string()),
+                    Span::styled(prompt_str, prompt_style),
+                    Span::raw(before),
+                    Span::raw(cursor_ch),
+                    Span::raw(after),
                 ];
                 // Ghost text priority: ML suggestion > history ghost > none
                 if input.is_empty() && !is_processing && !controls.needs_connection {
@@ -568,7 +527,7 @@ where
                     ));
                 }
                 frame.render_widget(
-                    Paragraph::new(Line::from(spans))
+                    Paragraph::new(prompt_input_lines(spans))
                         .wrap(Wrap { trim: false })
                         .scroll((scroll_y, 0)),
                     input_area,
@@ -1636,8 +1595,7 @@ where
         }
         // Ctrl+L — clear terminal screen
         if key == bindings.clear_screen {
-            shell.transcript.clear();
-            shell.clear_streaming_text();
+            shell.reset_transcript();
             transcript_scroll = 0;
             info_line = "screen cleared".to_string();
             continue;

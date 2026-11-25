@@ -1088,6 +1088,7 @@ impl<'a> ToolUseLoop<'a> {
                     }
                     Err(e) => format!("(Summary generation failed: {e})"),
                 };
+                self.check_cancellation()?;
                 if !summary_text.is_empty() {
                     self.emit(StreamChunk::ContentDelta(summary_text.clone()));
                 }
@@ -1148,8 +1149,10 @@ impl<'a> ToolUseLoop<'a> {
                         self.emit(StreamChunk::Done {
                             reason: Some("context window full".to_string()),
                         });
+                        let response = "Context window is full. Please start a new conversation or use /compact.".to_string();
+                        self.emit(StreamChunk::ContentDelta(response.clone()));
                         return Ok(ToolLoopResult {
-                            response: "Context window is full. Please start a new conversation or use /compact.".to_string(),
+                            response,
                             tool_calls_made,
                             finish_reason: "context_overflow".to_string(),
                             usage: total_usage,
@@ -1169,7 +1172,15 @@ impl<'a> ToolUseLoop<'a> {
             }
 
             let response = if let Some(ref cb) = self.stream_cb {
-                self.llm.complete_chat_streaming(&request, cb.clone())?
+                let cb = cb.clone();
+                self.llm.complete_chat_streaming(
+                    &request,
+                    Arc::new(move |chunk| {
+                        if !matches!(chunk, StreamChunk::Done { .. }) {
+                            cb(chunk);
+                        }
+                    }),
+                )?
             } else {
                 self.llm.complete_chat(&request)?
             };
@@ -1230,9 +1241,6 @@ impl<'a> ToolUseLoop<'a> {
             // Shell command nudge: if the model outputs bash code blocks as
             // text instead of using the bash_run tool, nudge it to retry with
             // tools. This runs once before the general hallucination nudge.
-            // Unlike auto-conversion (which clears streamed text and creates
-            // synthetic tool calls that need approval), this just asks the
-            // model to retry — simpler and doesn't break the TUI flow.
             if response.tool_calls.is_empty()
                 && shell_nudge_count == 0
                 && !extract_shell_commands(&response.text).is_empty()
@@ -1253,6 +1261,7 @@ impl<'a> ToolUseLoop<'a> {
                 self.messages.push(ChatMessage::User {
                     content: SHELL_COMMAND_NUDGE.to_string(),
                 });
+                self.emit(StreamChunk::ClearStreamingText);
                 continue;
             }
 
@@ -1280,6 +1289,7 @@ impl<'a> ToolUseLoop<'a> {
                         tool_calls: vec![],
                     });
                 }
+                self.emit(StreamChunk::ClearStreamingText);
                 continue; // Retry the LLM call
             }
 
@@ -1310,7 +1320,7 @@ impl<'a> ToolUseLoop<'a> {
                     && (text.len() > HALLUCINATION_NUDGE_THRESHOLD || has_unverified_refs);
 
                 if should_nudge {
-                    // Don't emit this attempt — inject a nudge and retry
+                    // Discard this draft before asking the model to retry.
                     nudge_count += 1;
                     let trigger = if has_unverified_refs {
                         "unverified_file_ref"
@@ -1332,6 +1342,7 @@ impl<'a> ToolUseLoop<'a> {
                     self.messages.push(ChatMessage::User {
                         content: HALLUCINATION_NUDGE.to_string(),
                     });
+                    self.emit(StreamChunk::ClearStreamingText);
                     continue;
                 }
 
@@ -1364,6 +1375,7 @@ impl<'a> ToolUseLoop<'a> {
                                  Keep responses under 200 words unless showing code. Rewrite concisely."
                             ),
                         });
+                        self.emit(StreamChunk::ClearStreamingText);
                         continue;
                     }
                 }

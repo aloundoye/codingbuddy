@@ -845,7 +845,7 @@ pub(crate) fn render_diff_line(line: &str) -> Line<'static> {
 pub(crate) const DIFF_CONTEXT_COLLAPSE_THRESHOLD: usize = 12;
 pub(crate) const DIFF_CONTEXT_KEEP_HEAD: usize = 2;
 pub(crate) const DIFF_CONTEXT_KEEP_TAIL: usize = 2;
-pub(crate) const INPUT_MIN_HEIGHT: u16 = 1;
+pub(crate) const INPUT_MIN_HEIGHT: u16 = 2;
 pub(crate) const INPUT_MAX_HEIGHT: u16 = 4;
 pub(crate) const STREAM_MIN_HEIGHT: u16 = 1;
 #[cfg(test)]
@@ -892,16 +892,26 @@ pub(crate) fn wrapped_line_height(line: &Line<'_>, width: u16) -> usize {
 }
 
 pub(crate) fn wrapped_text_rows(text: &str, width: u16) -> usize {
-    if width == 0 {
-        return 0;
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+pub(crate) fn prompt_input_lines(spans: Vec<Span<'_>>) -> Vec<Line<'_>> {
+    let mut lines = Vec::new();
+    let mut row = Vec::new();
+    for span in spans {
+        let mut parts = span.content.split('\n');
+        if let Some(first) = parts.next() {
+            row.push(Span::styled(first.to_owned(), span.style));
+        }
+        for part in parts {
+            lines.push(Line::from(std::mem::take(&mut row)));
+            row.push(Span::styled(part.to_owned(), span.style));
+        }
     }
-    let width = width as usize;
-    let mut rows = 0usize;
-    for segment in text.split('\n') {
-        let len = segment.chars().count();
-        rows = rows.saturating_add((len.saturating_sub(1) / width) + 1);
-    }
-    rows.max(1)
+    lines.push(Line::from(row));
+    lines
 }
 
 pub(crate) fn scroll_to_keep_row_visible(row: usize, viewport_rows: u16) -> u16 {
@@ -925,7 +935,7 @@ pub(crate) fn compute_inline_heights(total_height: u16, desired_input_rows: usiz
     let desired_input =
         desired_input_rows.clamp(INPUT_MIN_HEIGHT as usize, INPUT_MAX_HEIGHT as usize) as u16;
     let max_input_by_space = dynamic_rows.saturating_sub(STREAM_MIN_HEIGHT);
-    let input_height = desired_input.min(max_input_by_space).max(INPUT_MIN_HEIGHT);
+    let input_height = desired_input.min(max_input_by_space);
     let stream_height = dynamic_rows
         .saturating_sub(input_height)
         .max(STREAM_MIN_HEIGHT);
@@ -1383,113 +1393,282 @@ pub(crate) fn is_plan_list_line(line: &str) -> bool {
     false
 }
 
-/// Render the conversation using the same Markdown and diff styles as live output.
-pub(crate) fn render_transcript(shell: &ChatShell, collapse_plan: bool) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+fn render_transcript_entry(
+    kind: MessageKind,
+    text: &str,
+    collapse_plan: bool,
+    lines: &mut Vec<Line<'static>>,
+    collapsed_plan_lines: &mut usize,
+) {
     let mut in_code_block = false;
     let mut in_diff_block = false;
     let mut code_block_lang = String::new();
     let mut diff_context_run = Vec::new();
-    let mut collapsed_plan_lines = 0usize;
-    let streaming = (!shell.streaming_text.is_empty()).then(|| TranscriptEntry {
-        kind: MessageKind::Assistant,
-        text: shell.streaming_text.clone(),
-    });
-    for entry in shell.transcript.iter().chain(streaming.iter()) {
-        if entry.kind == MessageKind::User && !lines.is_empty() {
-            lines.push(Line::default());
-        }
-        let mut rendered_first_line = false;
-        for sub_text in entry.text.split('\n') {
-            let logical_lines = if entry.kind == MessageKind::Assistant && !in_code_block {
-                split_inline_markdown_blocks(sub_text)
-            } else {
-                vec![sub_text.to_string()]
+    if kind == MessageKind::User && !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    let mut rendered_first_line = false;
+    for sub_text in text.split('\n') {
+        let logical_lines = if kind == MessageKind::Assistant && !in_code_block {
+            split_inline_markdown_blocks(sub_text)
+        } else {
+            vec![sub_text.to_string()]
+        };
+        for logical_text in logical_lines {
+            let sub_entry = TranscriptEntry {
+                kind,
+                text: logical_text,
             };
-            for logical_text in logical_lines {
-                let sub_entry = TranscriptEntry {
-                    kind: entry.kind,
-                    text: logical_text,
-                };
-                if collapse_plan
-                    && sub_entry.kind == MessageKind::Assistant
-                    && !in_code_block
-                    && is_plan_list_line(&sub_entry.text)
-                {
-                    collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
-                    continue;
-                }
-                let is_fence =
-                    sub_entry.kind == MessageKind::Assistant && sub_entry.text.starts_with("```");
-                if is_fence
-                    || sub_entry.kind != MessageKind::Assistant
-                    || !in_code_block
-                    || !in_diff_block
-                {
-                    flush_diff_context_run(
-                        &mut diff_context_run,
-                        &mut lines,
-                        DIFF_CONTEXT_COLLAPSE_THRESHOLD,
-                        DIFF_CONTEXT_KEEP_HEAD,
-                        DIFF_CONTEXT_KEEP_TAIL,
-                    );
-                }
-                if sub_entry.kind == MessageKind::Assistant
-                    && in_code_block
-                    && in_diff_block
-                    && sub_entry.text.starts_with(' ')
-                    && !is_fence
-                {
-                    diff_context_run.push(sub_entry.text.clone());
-                    continue;
-                }
-                if sub_entry.kind == MessageKind::Assistant && is_fence {
-                    if !in_code_block {
-                        in_code_block = true;
-                        in_diff_block = code_fence_starts_diff(&sub_entry.text);
-                        code_block_lang = extract_fence_lang(&sub_entry.text).to_string();
-                    } else {
-                        in_code_block = false;
-                        in_diff_block = false;
-                        code_block_lang.clear();
-                    }
-                }
-                if !rendered_first_line {
-                    lines.push(style_transcript_line(
-                        &sub_entry,
-                        in_code_block,
-                        in_diff_block,
-                        &code_block_lang,
-                    ));
-                    rendered_first_line = true;
+            if collapse_plan
+                && sub_entry.kind == MessageKind::Assistant
+                && !in_code_block
+                && is_plan_list_line(&sub_entry.text)
+            {
+                *collapsed_plan_lines += 1;
+                continue;
+            }
+            let is_fence =
+                sub_entry.kind == MessageKind::Assistant && sub_entry.text.starts_with("```");
+            if is_fence
+                || sub_entry.kind != MessageKind::Assistant
+                || !in_code_block
+                || !in_diff_block
+            {
+                flush_diff_context_run(
+                    &mut diff_context_run,
+                    lines,
+                    DIFF_CONTEXT_COLLAPSE_THRESHOLD,
+                    DIFF_CONTEXT_KEEP_HEAD,
+                    DIFF_CONTEXT_KEEP_TAIL,
+                );
+            }
+            if sub_entry.kind == MessageKind::Assistant
+                && in_code_block
+                && in_diff_block
+                && sub_entry.text.starts_with(' ')
+                && !is_fence
+            {
+                diff_context_run.push(sub_entry.text.clone());
+                continue;
+            }
+            if sub_entry.kind == MessageKind::Assistant && is_fence {
+                if !in_code_block {
+                    in_code_block = true;
+                    in_diff_block = code_fence_starts_diff(&sub_entry.text);
+                    code_block_lang = extract_fence_lang(&sub_entry.text).to_string();
                 } else {
-                    lines.push(style_continuation_line(
-                        &sub_entry,
-                        in_code_block,
-                        in_diff_block,
-                        &code_block_lang,
-                    ));
+                    in_code_block = false;
+                    in_diff_block = false;
+                    code_block_lang.clear();
                 }
+            }
+            if !rendered_first_line {
+                lines.push(style_transcript_line(
+                    &sub_entry,
+                    in_code_block,
+                    in_diff_block,
+                    &code_block_lang,
+                ));
+                rendered_first_line = true;
+            } else {
+                lines.push(style_continuation_line(
+                    &sub_entry,
+                    in_code_block,
+                    in_diff_block,
+                    &code_block_lang,
+                ));
             }
         }
     }
     flush_diff_context_run(
         &mut diff_context_run,
-        &mut lines,
+        lines,
         DIFF_CONTEXT_COLLAPSE_THRESHOLD,
         DIFF_CONTEXT_KEEP_HEAD,
         DIFF_CONTEXT_KEEP_TAIL,
     );
-    if collapsed_plan_lines > 0 {
-        lines.push(Line::from(vec![Span::styled(
-            format!(
-                "… {} plan lines hidden (Ctrl+P to expand)",
-                collapsed_plan_lines
-            ),
+}
+
+fn hidden_plan_line(count: usize) -> Option<Line<'static>> {
+    (count > 0).then(|| {
+        Line::from(vec![Span::styled(
+            format!("… {count} plan lines hidden (Ctrl+P to expand)"),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
-        )]));
+        )])
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct TranscriptRenderCache {
+    revision: u64,
+    entries: usize,
+    collapse_plan: bool,
+    width: u16,
+    committed_lines: Vec<Line<'static>>,
+    committed_heights: Vec<usize>,
+    committed_rows: usize,
+    committed_hidden: usize,
+    draft_text: String,
+    draft_lines: Vec<Line<'static>>,
+    draft_heights: Vec<usize>,
+    draft_hidden: usize,
+}
+
+impl TranscriptRenderCache {
+    pub(crate) fn update(&mut self, shell: &ChatShell, collapse_plan: bool, width: u16) {
+        if shell.transcript_revision != self.revision
+            || collapse_plan != self.collapse_plan
+            || self.entries > shell.transcript.len()
+        {
+            *self = Self {
+                revision: shell.transcript_revision,
+                collapse_plan,
+                ..Self::default()
+            };
+        }
+
+        for entry in &shell.transcript[self.entries..] {
+            render_transcript_entry(
+                entry.kind,
+                &entry.text,
+                collapse_plan,
+                &mut self.committed_lines,
+                &mut self.committed_hidden,
+            );
+        }
+        self.entries = shell.transcript.len();
+
+        let resized = self.width != width;
+        if resized {
+            self.width = width;
+            self.committed_heights.clear();
+            self.committed_rows = 0;
+        }
+        for line in &self.committed_lines[self.committed_heights.len()..] {
+            let rows = wrapped_line_height(line, width);
+            self.committed_rows += rows;
+            self.committed_heights.push(rows);
+        }
+
+        let draft_changed = self.draft_text != shell.streaming_text;
+        if draft_changed {
+            self.draft_text.clone_from(&shell.streaming_text);
+            self.draft_lines.clear();
+            self.draft_hidden = 0;
+            if !self.draft_text.is_empty() {
+                render_transcript_entry(
+                    MessageKind::Assistant,
+                    &self.draft_text,
+                    collapse_plan,
+                    &mut self.draft_lines,
+                    &mut self.draft_hidden,
+                );
+            }
+        }
+        if resized || draft_changed {
+            self.draft_heights.clear();
+            self.draft_heights.extend(
+                self.draft_lines
+                    .iter()
+                    .map(|line| wrapped_line_height(line, width)),
+            );
+        }
     }
-    lines
+
+    pub(crate) fn visible(&self, height: u16, scroll: &mut usize) -> (Vec<Line<'static>>, u16) {
+        let hidden = hidden_plan_line(self.committed_hidden + self.draft_hidden);
+        let hidden_rows = hidden
+            .as_ref()
+            .map(|line| wrapped_line_height(line, self.width));
+        let rows = self.committed_rows
+            + self.draft_heights.iter().sum::<usize>()
+            + hidden_rows.unwrap_or_default();
+        let max_scroll = rows.saturating_sub(usize::from(height));
+        *scroll = (*scroll).min(max_scroll);
+        let mut skip = max_scroll - *scroll;
+        let mut lines = self
+            .committed_lines
+            .iter()
+            .chain(&self.draft_lines)
+            .chain(&hidden);
+        let heights = self
+            .committed_heights
+            .iter()
+            .copied()
+            .chain(self.draft_heights.iter().copied())
+            .chain(hidden_rows);
+        for rows in heights {
+            if skip < rows {
+                break;
+            }
+            skip -= rows;
+            lines.next();
+        }
+        (
+            lines.take(usize::from(height)).cloned().collect(),
+            skip.min(usize::from(u16::MAX)) as u16,
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn render_transcript(shell: &ChatShell, collapse_plan: bool) -> Vec<Line<'static>> {
+    let mut cache = TranscriptRenderCache::default();
+    cache.update(shell, collapse_plan, 80);
+    cache
+        .committed_lines
+        .into_iter()
+        .chain(cache.draft_lines)
+        .chain(hidden_plan_line(
+            cache.committed_hidden + cache.draft_hidden,
+        ))
+        .collect()
+}
+
+#[cfg(test)]
+mod transcript_cache_tests {
+    use super::*;
+
+    #[test]
+    fn draft_updates_reuse_committed_markdown_and_wrap_measurements() {
+        let mut shell = ChatShell::default();
+        for _ in 0..128 {
+            shell.push_transcript("Previously rendered content with **Markdown**.");
+        }
+        let mut cache = TranscriptRenderCache::default();
+        cache.update(&shell, false, 80);
+        let lines = cache.committed_lines.as_ptr();
+        let heights = cache.committed_heights.as_ptr();
+        let original_rows = cache.committed_rows;
+        shell.append_streaming("Live **draft");
+        cache.update(&shell, false, 80);
+        shell.append_streaming("**");
+        cache.update(&shell, false, 80);
+        assert_eq!(cache.committed_lines.as_ptr(), lines);
+        assert_eq!(cache.committed_heights.as_ptr(), heights);
+        assert_eq!(cache.committed_rows, original_rows);
+        let (visible, _) = cache.visible(4, &mut 0);
+        assert!(visible.last().unwrap().to_string().contains("Live draft"));
+
+        cache.update(&shell, false, 20);
+        assert!(cache.committed_rows > original_rows);
+        shell.reset_transcript();
+        cache.update(&shell, false, 20);
+        assert!(cache.committed_lines.is_empty());
+        assert!(cache.draft_lines.is_empty());
+    }
+
+    #[test]
+    fn unfinished_code_block_does_not_style_the_next_message_as_code() {
+        let mut shell = ChatShell::default();
+        shell.append_streaming("```rust\nfn main() {}");
+        shell.commit_streaming();
+        shell.append_streaming("**Next answer**");
+        let lines = render_transcript(&shell, false);
+        let next = lines.last().unwrap().to_string();
+        assert!(next.contains("Next answer"));
+        assert!(!next.contains("**"));
+    }
 }
