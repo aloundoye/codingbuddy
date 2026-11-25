@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 glob.workspace = true
+url.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }

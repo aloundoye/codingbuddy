@@ -209,14 +209,14 @@ impl PermissionRule {
             }
             "web.fetch" => {
                 let url = targets.url.as_deref().unwrap_or("");
-                if let Some(domain) = specifier.strip_prefix("domain:") {
-                    if url.contains(domain) {
-                        return Some(&self.decision);
-                    }
-                } else if url.contains(&specifier) {
-                    return Some(&self.decision);
-                }
-                None
+                // Allow rules must match precisely; deny/ask rules may
+                // over-match, which only means more prompting.
+                let strict = self.decision == "allow";
+                let matched = match specifier.strip_prefix("domain:") {
+                    Some(domain) => url_host_matches(url, domain, strict),
+                    None => url_prefix_matches(url, &specifier, strict),
+                };
+                matched.then_some(self.decision.as_str())
             }
             "spawn_task" => {
                 let agent = targets.agent.as_deref().unwrap_or("");
@@ -385,4 +385,46 @@ pub fn evaluate_permission_rules(rules: &[PermissionRule], call: &ToolCall) -> O
         }
     }
     result.map(|s| s.to_string())
+}
+
+/// `domain:` rules compare against the URL's host: an exact match or a
+/// subdomain at a dot boundary. Matching the raw URL text would let
+/// `https://evil.com/?example.com` or `https://example.com.evil.net/`
+/// satisfy an allow rule for `example.com`.
+pub(crate) fn url_host_matches(url: &str, domain: &str, strict: bool) -> bool {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    match url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    {
+        Some(host) => {
+            let host = host.trim_end_matches('.');
+            host == domain || host.ends_with(&format!(".{domain}"))
+        }
+        // An unparseable URL never satisfies an allow rule; a deny rule
+        // still catches it by substring.
+        None => !strict && url.to_ascii_lowercase().contains(&domain),
+    }
+}
+
+/// URL rules match as a prefix that ends at a path boundary, so
+/// `https://docs.rs` covers `https://docs.rs/serde` but not
+/// `https://docs.rs.evil.net` or a URL that merely mentions it. Deny/ask
+/// rules keep substring matching.
+pub(crate) fn url_prefix_matches(url: &str, specifier: &str, strict: bool) -> bool {
+    if specifier.is_empty() {
+        return false;
+    }
+    if !strict {
+        return url.contains(specifier);
+    }
+    match url.strip_prefix(specifier) {
+        Some(rest) => {
+            specifier.ends_with('/') || rest.is_empty() || rest.starts_with(['/', '?', '#'])
+        }
+        None => false,
+    }
 }

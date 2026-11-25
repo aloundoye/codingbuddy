@@ -617,6 +617,72 @@ fn permission_rule_matches_webfetch_domain() {
 }
 
 #[test]
+fn webfetch_allow_rules_cannot_be_satisfied_by_lookalike_urls() {
+    let fetch = |url: &str| ToolCall {
+        name: "web.fetch".to_string(),
+        args: json!({ "url": url }),
+        requires_approval: false,
+    };
+    let domain = PermissionRule {
+        rule: "WebFetch(domain:example.com)".to_string(),
+        decision: "allow".to_string(),
+    };
+    for allowed in [
+        "https://example.com/api",
+        "https://docs.example.com/x",
+        "https://EXAMPLE.com./",
+    ] {
+        assert_eq!(domain.matches(&fetch(allowed)), Some("allow"), "{allowed}");
+    }
+    for rejected in [
+        "https://evil.com/?next=example.com",
+        "https://example.com.evil.net/",
+        "https://notexample.com/",
+        "https://evil.com/example.com/page",
+        "not a url example.com",
+    ] {
+        assert_eq!(domain.matches(&fetch(rejected)), None, "{rejected}");
+    }
+
+    let prefix = PermissionRule {
+        rule: "WebFetch(https://docs.rs)".to_string(),
+        decision: "allow".to_string(),
+    };
+    assert_eq!(
+        prefix.matches(&fetch("https://docs.rs/serde")),
+        Some("allow")
+    );
+    assert_eq!(prefix.matches(&fetch("https://docs.rs")), Some("allow"));
+    assert_eq!(prefix.matches(&fetch("https://docs.rs.evil.net/")), None);
+    assert_eq!(
+        prefix.matches(&fetch("https://evil.com/?u=https://docs.rs")),
+        None
+    );
+}
+
+#[test]
+fn webfetch_deny_rules_still_match_broadly() {
+    let fetch = |url: &str| ToolCall {
+        name: "web.fetch".to_string(),
+        args: json!({ "url": url }),
+        requires_approval: false,
+    };
+    let deny = PermissionRule {
+        rule: "WebFetch(domain:internal.corp)".to_string(),
+        decision: "deny".to_string(),
+    };
+    assert_eq!(
+        deny.matches(&fetch("https://api.internal.corp/x")),
+        Some("deny")
+    );
+    // Unparseable input is still denied by substring.
+    assert_eq!(
+        deny.matches(&fetch("internal.corp:8080/admin")),
+        Some("deny")
+    );
+}
+
+#[test]
 fn evaluate_rules_deny_wins_over_allow() {
     let rules = vec![
         PermissionRule {
