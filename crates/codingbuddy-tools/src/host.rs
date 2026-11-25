@@ -77,6 +77,25 @@ pub fn batch_children(args: &serde_json::Value) -> Result<Vec<(&str, &serde_json
         .collect()
 }
 
+/// When a file last changed. `mv` keeps the modification time, so on Unix
+/// the later of mtime and ctime (which a rename, chmod or write updates)
+/// is used.
+fn last_changed(metadata: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    let modified = metadata.modified().ok();
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        u64::try_from(metadata.ctime()).ok().map(|secs| {
+            std::time::UNIX_EPOCH
+                + Duration::from_secs(secs)
+                + Duration::from_nanos(u64::try_from(metadata.ctime_nsec()).unwrap_or(0))
+        })
+    };
+    #[cfg(not(unix))]
+    let changed = None;
+    modified.max(changed)
+}
+
 /// GET `url` on the shared runtime, abandoning the request the moment the
 /// tool call is cancelled. Returns (status, content type, body).
 fn http_get_cancellable(
@@ -914,6 +933,7 @@ impl LocalToolHost {
                         None
                     })
                 };
+                let command_started = std::time::SystemTime::now();
                 let launched = shell
                     .ok_or_else(|| anyhow!("shell execution requires a prepared launch"))?
                     .run_with_progress(
@@ -931,8 +951,11 @@ impl LocalToolHost {
                     )?;
                 // Record what the command changed so /rewind treats those
                 // changes as the agent's (and still protects later edits).
+                let command_finished = std::time::SystemTime::now();
                 let changed_files = match checkpoint {
-                    Some(id) => self.record_shell_changes(id).unwrap_or_else(|error| {
+                    Some(id) => self
+                        .record_shell_changes(id, command_started, command_finished)
+                        .unwrap_or_else(|error| {
                         tracing::warn!(error = %format!("{error:#}"), "could not record shell command changes");
                         0
                     }),
@@ -2229,14 +2252,40 @@ impl LocalToolHost {
         }
     }
 
-    /// Record post-images for every file a shell command changed since
-    /// `checkpoint`. Returns how many files changed.
-    fn record_shell_changes(&self, checkpoint: Uuid) -> Result<usize> {
+    /// Record post-images for the files a shell command changed since
+    /// `checkpoint`, so `/rewind` can undo them. Returns how many were
+    /// attributed.
+    ///
+    /// Only changes the command could have made are attributed: a file
+    /// that still exists must have been modified inside the command's run
+    /// window. Anything else (an editor autosave, the user's own edit) stays
+    /// unattributed, and restore keeps protecting it. Deleted files have no
+    /// timestamp and are attributed; restoring one recreates it.
+    fn record_shell_changes(
+        &self,
+        checkpoint: Uuid,
+        started: std::time::SystemTime,
+        finished: std::time::SystemTime,
+    ) -> Result<usize> {
+        // Coarse filesystem timestamps (1-2 s on some volumes) need slack.
+        let earliest = started - Duration::from_secs(2);
+        let latest = finished + Duration::from_secs(1);
         let changed = MemoryManager::new(&self.workspace)?.changed_since_checkpoint(checkpoint)?;
+        let mut attributed = 0;
         for path in &changed {
-            self.record_actual_postimage(&self.workspace.join(path))?;
+            let full = self.workspace.join(path);
+            let in_window = match std::fs::symlink_metadata(&full) {
+                Ok(metadata) => last_changed(&metadata)
+                    .is_some_and(|changed| changed >= earliest && changed <= latest),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            if in_window {
+                self.record_actual_postimage(&full)?;
+                attributed += 1;
+            }
         }
-        Ok(changed.len())
+        Ok(attributed)
     }
 
     fn create_checkpoint(&self, reason: &str) -> Result<Option<Uuid>> {
