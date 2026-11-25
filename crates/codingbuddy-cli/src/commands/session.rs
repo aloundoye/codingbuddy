@@ -120,20 +120,33 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
             }
         }
         SessionCmd::List => {
-            let sessions = store.list_sessions()?;
+            let sessions = store.session_summaries(50)?;
+            if _json {
+                println!("{}", serde_json::to_string(&sessions)?);
+                return Ok(());
+            }
             if sessions.is_empty() {
                 println!("No sessions found.");
                 return Ok(());
             }
-
-            println!("{:<40} | {:<20} | WORKSPACE", "SESSION ID", "STATUS");
-            println!("{:-<40}-+-{:-<20}-+-{:-<40}", "", "", "");
-            for s in sessions {
+            println!(
+                "{:<36}  {:<16}  {:<18}  TITLE",
+                "SESSION ID", "LAST ACTIVE", "STATUS"
+            );
+            for summary in sessions {
+                let when = chrono::DateTime::parse_from_rfc3339(&summary.updated_at)
+                    .map(|at| {
+                        at.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "{:<40} | {:<20} | {}",
-                    s.session_id.to_string(),
-                    format!("{:?}", s.status),
-                    s.workspace_root
+                    "{:<36}  {:<16}  {:<18}  {}",
+                    summary.session.session_id,
+                    when,
+                    format!("{:?}", summary.session.status),
+                    summary.title
                 );
             }
         }

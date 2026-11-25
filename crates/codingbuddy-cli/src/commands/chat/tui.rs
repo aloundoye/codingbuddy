@@ -799,7 +799,14 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         }
                         SlashCommand::Rename(name) => {
                             if let Some(n) = name {
-                                format!("Session renamed to: {n}")
+                                let current = active_session_for_closure
+                                    .lock()
+                                    .map(|guard| *guard)
+                                    .unwrap_or(None);
+                                match rename_session(cwd, current, &n) {
+                                    Ok(()) => format!("Session renamed to: {n}"),
+                                    Err(error) => format!("Could not rename session: {error:#}"),
+                                }
                             } else {
                                 "Usage: /rename <name>".to_string()
                             }

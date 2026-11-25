@@ -105,6 +105,22 @@ pub(crate) fn run_setup_menu(cwd: &Path) -> Result<()> {
     })
 }
 
+/// Save a name for `session` (or the latest session) so pickers and
+/// `codingbuddy session list` show it.
+pub(crate) fn rename_session(cwd: &Path, session: Option<Uuid>, name: &str) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let session = match session {
+        Some(id) => id,
+        None => {
+            store
+                .load_latest_session()?
+                .ok_or_else(|| anyhow!("no session to rename yet; send a prompt first"))?
+                .session_id
+        }
+    };
+    store.set_session_title(session, name)
+}
+
 pub(crate) fn run_chat(
     cwd: &Path,
     json_mode: bool,
@@ -1248,7 +1264,7 @@ pub(crate) fn run_chat(
                 }
                 SlashCommand::Rename(name) => {
                     if let Some(name) = name {
-                        // Store session rename in metadata
+                        rename_session(cwd, selected_session_id, &name)?;
                         if json_mode {
                             print_json(&json!({"renamed": name}))?;
                         } else {

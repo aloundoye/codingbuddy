@@ -31,6 +31,13 @@ Move it under a version heading when you cut a release.
   unknown models. Configure them under `agent_loop.heuristics`, globally or
   per provider; `codingbuddy doctor` shows what is active.
 
+- `/rename` now saves the session name (it only printed a message before),
+  and `codingbuddy session list` shows each session's title (its name, or
+  its first prompt) and when it was last active.
+- `codingbuddy update` installs new releases for standalone installs after
+  verifying the archive checksum and that the new binary runs, keeping a
+  `.bak` of the previous one; Homebrew, npm and source installs are told
+  their own upgrade command. It no longer runs `git pull` in your project.
 - `codingbuddy permissions approvals` (and `/permissions approvals`) lists
   the "always allow" approvals saved for a project;
   `permissions revoke <tool> '<pattern>'` or `revoke --all` removes them.

@@ -362,4 +362,13 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
          CREATE INDEX IF NOT EXISTS idx_subagent_runs_session ON subagent_runs(session_id);
          CREATE INDEX IF NOT EXISTS idx_cost_ledger_session ON cost_ledger(session_id);",
     ),
+    // 14 is taken by EVENT_STORAGE_VERSION, which shares this ledger.
+    (
+        15,
+        "CREATE TABLE IF NOT EXISTS session_titles (
+            session_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );",
+    ),
 ];

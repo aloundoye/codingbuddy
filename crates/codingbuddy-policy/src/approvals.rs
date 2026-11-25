@@ -304,7 +304,10 @@ mod tests {
             ("npm test *", "npm test; rm -rf ~"),
             ("cargo test *", "/tmp/evil/cargo test"),
             ("python build.py", "python build.py --evil"),
-            ("cargo build *", "cargo build \"--config\" target.x.runner=sh"),
+            (
+                "cargo build *",
+                "cargo build \"--config\" target.x.runner=sh",
+            ),
             ("cargo build *", "cargo build '--config' x"),
             ("cargo build *", "cargo build \\-\\-config x"),
         ] {

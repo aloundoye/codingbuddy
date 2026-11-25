@@ -788,3 +788,69 @@ fn gc_returns_storage_size() {
     assert_eq!(deleted, 0);
     assert!(size > 0, "db file should have non-zero size");
 }
+
+#[test]
+fn session_titles_come_from_rename_or_the_first_prompt() {
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let store = Store::new(workspace.path()).expect("store");
+    let session = Session {
+        session_id: Uuid::now_v7(),
+        workspace_root: workspace.path().to_string_lossy().to_string(),
+        baseline_commit: None,
+        status: SessionState::Idle,
+        budgets: SessionBudgets {
+            per_turn_seconds: 30,
+            max_think_tokens: 1000,
+        },
+        active_plan_id: None,
+    };
+    store.save_session(&session).expect("save session");
+    let prompt = format!(
+        "Fix the flaky   login test\nand {}",
+        "explain why ".repeat(10)
+    );
+    store
+        .append_event(&NewEvent {
+            event_id: Uuid::now_v7(),
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::ChatTurn {
+                message: codingbuddy_core::ChatMessage::User { content: prompt },
+            },
+        })
+        .expect("append");
+
+    let summary = &store.session_summaries(10).expect("summaries")[0];
+    assert!(!summary.renamed);
+    assert!(
+        summary
+            .title
+            .starts_with("Fix the flaky login test and explain")
+    );
+    assert!(summary.title.chars().count() <= 60, "{}", summary.title);
+
+    store
+        .set_session_title(session.session_id, "  login flake  ")
+        .expect("rename");
+    let summary = &store.session_summaries(10).expect("summaries")[0];
+    assert!(summary.renamed);
+    assert_eq!(summary.title, "login flake");
+
+    store
+        .set_session_title(session.session_id, "")
+        .expect("clear");
+    assert!(!store.session_summaries(10).expect("summaries")[0].renamed);
+}
+
+#[test]
+fn migration_versions_are_unique_and_never_collide_with_event_storage() {
+    let mut versions: Vec<i64> = crate::schema::MIGRATIONS.iter().map(|(v, _)| *v).collect();
+    let count = versions.len();
+    versions.sort_unstable();
+    versions.dedup();
+    assert_eq!(versions.len(), count, "duplicate migration version");
+    assert!(
+        !versions.contains(&crate::projection::EVENT_STORAGE_VERSION),
+        "a schema migration reuses EVENT_STORAGE_VERSION, which would skip the event migration"
+    );
+}

@@ -322,3 +322,14 @@ pub struct StoredEvent {
     pub kind: String,
     pub payload: serde_json::Value,
 }
+
+/// A session as shown in pickers and `session list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session: Session,
+    /// The name set with `/rename`, else the first prompt (shortened).
+    pub title: String,
+    /// True when `title` was set explicitly.
+    pub renamed: bool,
+    pub updated_at: String,
+}

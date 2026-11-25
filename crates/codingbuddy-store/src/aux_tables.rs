@@ -1805,4 +1805,91 @@ impl Store {
     }
 
     // --- Sessions by workspace (for --continue) ---
+
+    /// Name a session (`/rename`). An empty title clears the name.
+    pub fn set_session_title(&self, session_id: Uuid, title: &str) -> Result<()> {
+        let title = title.trim();
+        let conn = self.db()?;
+        if title.is_empty() {
+            conn.execute(
+                "DELETE FROM session_titles WHERE session_id = ?1",
+                params![session_id.to_string()],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO session_titles(session_id, title, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET title = excluded.title,
+                 updated_at = excluded.updated_at",
+                params![session_id.to_string(), title, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The most recent sessions with a readable title: the `/rename` name,
+    /// else the first prompt shortened to one line.
+    pub fn session_summaries(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        let conn = self.db()?;
+        let mut named = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT session_id, title FROM session_titles")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, title) = row?;
+                named.insert(id, title);
+            }
+        }
+        let mut updated = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT session_id, updated_at FROM sessions")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, at) = row?;
+                updated.insert(id, at);
+            }
+        }
+        let mut out = Vec::new();
+        for session in self.list_sessions()?.into_iter().take(limit) {
+            let key = session.session_id.to_string();
+            let (title, renamed) = match named.get(&key) {
+                Some(title) => (title.clone(), true),
+                None => (self.first_prompt_title(session.session_id), false),
+            };
+            out.push(SessionSummary {
+                updated_at: updated.get(&key).cloned().unwrap_or_default(),
+                session,
+                title,
+                renamed,
+            });
+        }
+        Ok(out)
+    }
+
+    fn first_prompt_title(&self, session_id: Uuid) -> String {
+        let first = self
+            .rebuild_from_events(session_id)
+            .ok()
+            .and_then(|history| {
+                history
+                    .chat_messages
+                    .into_iter()
+                    .find_map(|message| match message {
+                        codingbuddy_core::ChatMessage::User { content } => Some(content),
+                        _ => None,
+                    })
+            });
+        let Some(text) = first else {
+            return "(no prompts yet)".to_string();
+        };
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.chars().count() > 60 {
+            format!("{}…", line.chars().take(59).collect::<String>())
+        } else {
+            line
+        }
+    }
 }
