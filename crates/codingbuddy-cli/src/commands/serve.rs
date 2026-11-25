@@ -27,6 +27,13 @@ pub(crate) fn run_completions(args: CompletionsArgs) -> Result<()> {
 }
 
 pub(crate) fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
+    if args.print_schema {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codingbuddy_jsonrpc::protocol::protocol_schema())?
+        );
+        return Ok(());
+    }
     match args.transport.as_str() {
         "stdio" => {
             if json_mode {

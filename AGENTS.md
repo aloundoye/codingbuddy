@@ -50,7 +50,7 @@ bash scripts/runtime_conformance_scan.sh
 - `codingbuddy-ui` — TUI rendering (ratatui/crossterm), autocomplete, vim mode, history suggestions
 - `codingbuddy-diff` — Unified diff parsing, patch staging, git-apply
 - `codingbuddy-subagent` — Background tasks, worktree isolation, custom agent definitions
-- `codingbuddy-jsonrpc` — JSON-RPC server for IDE integration
+- `codingbuddy-jsonrpc` — JSON-RPC server for IDE integration. Method params are typed in `src/protocol.rs`; the generated schema lives in `docs/protocol/jsonrpc.schema.json` (see `docs/protocol/README.md`). Adding a method or param means updating `protocol.rs` and regenerating the schema
 - `codingbuddy-testkit` — Test utilities
 
 ## Architecture: Tool-Use Loop

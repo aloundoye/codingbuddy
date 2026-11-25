@@ -775,6 +775,9 @@ struct ServeArgs {
     /// Expose one saved session to the authenticated browser for this launch.
     #[arg(long)]
     expose_session: Option<uuid::Uuid>,
+    /// Print the JSON Schema of the JSON-RPC protocol and exit.
+    #[arg(long)]
+    print_schema: bool,
 }
 
 #[derive(Args)]

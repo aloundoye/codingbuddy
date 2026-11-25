@@ -20,6 +20,7 @@ use codingbuddy_agent::context::ContextManager;
 mod context_methods;
 mod handoff;
 mod helpers;
+pub mod protocol;
 use helpers::*;
 
 /// JSON-RPC 2.0 request.
@@ -1238,6 +1239,12 @@ impl IdeRpcHandler {
 
 impl RpcHandler for IdeRpcHandler {
     fn handle(&self, method: &str, params: Value) -> Result<Value> {
+        // Every call made by the test suite must match the published
+        // protocol, so `docs/protocol/jsonrpc.schema.json` cannot drift.
+        #[cfg(test)]
+        if let Err(problem) = protocol::check_params(method, &params) {
+            panic!("{problem}: {params}");
+        }
         match method {
             // Basic lifecycle
             "initialize" => Ok(serde_json::json!({

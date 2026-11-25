@@ -1,0 +1,1032 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "JSON-RPC 2.0 over stdio (one JSON object per line) or HTTP. Each entry is a method name with the schema of its `params` object. Results are JSON objects; see docs/protocol/README.md.",
+  "methods": {
+    "cancel": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "prompt_id": {
+            "description": "The prompt to cancel. Optional when exactly one prompt is running.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Cancel a running prompt."
+    },
+    "checkpoint/apply": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "approved": {
+            "description": "Must be `true` to apply a plan that needs approval.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`files` (default) or another restore mode.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_id": {
+            "description": "The plan returned by `checkpoint/preview`.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Carry out a restore plan."
+    },
+    "checkpoint/preview": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "description": "Preview restoring this checkpoint.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "paths": {
+            "description": "Limit the restore to these paths.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "step_id": {
+            "description": "Preview undoing one step. Takes precedence over `checkpoint_id`.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Plan a restore and report what it would change."
+    },
+    "checkpoint/reconcile": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "plan_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Re-check an interrupted restore."
+    },
+    "config/get": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "description": "A dotted key; omit for the whole configuration.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Read configuration."
+    },
+    "config/set": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "description": "A dotted key, written to `.codingbuddy/settings.local.json`.",
+            "type": "string"
+          },
+          "value": true
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "summary": "Write a project-local setting."
+    },
+    "context/analyze": {
+      "params": {
+        "additionalProperties": false,
+        "description": "A method that takes no parameters (`params` may be omitted or `{}`).",
+        "type": "object"
+      },
+      "summary": "Workspace overview."
+    },
+    "context/compress": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Shrink a block of context to a token budget."
+    },
+    "context/debug": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "repo_root": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "tools": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "summary": "Show the context a prompt would be sent with."
+    },
+    "context/related": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "depth": {
+            "description": "Import-graph depth (default 1).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "file_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Files related to a file through imports."
+    },
+    "context/suggest": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Default 10.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Files relevant to a query."
+    },
+    "diagnostics/list": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Diagnostics recorded for a session."
+    },
+    "events/poll": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "after_seq": {
+            "description": "Return events after this sequence number (default 0).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "1-500 (default 50).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Session events after a sequence number."
+    },
+    "initialize": {
+      "params": {
+        "additionalProperties": false,
+        "description": "A method that takes no parameters (`params` may be omitted or `{}`).",
+        "type": "object"
+      },
+      "summary": "Server name, version and capability list."
+    },
+    "model/list": {
+      "params": {
+        "additionalProperties": false,
+        "description": "A method that takes no parameters (`params` may be omitted or `{}`).",
+        "type": "object"
+      },
+      "summary": "Available models."
+    },
+    "patch/apply": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "patch_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "patch_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Apply a staged patch."
+    },
+    "patch/preview": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "patch_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "patch_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Show a staged patch."
+    },
+    "prompt/cancel": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "prompt_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Cancel a prompt."
+    },
+    "prompt/events": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "description": "Offset of the first event to return (default 0).",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Maximum events to return, 1-127 (default 32).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "prompt_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Page through a prompt's durable events."
+    },
+    "prompt/execute": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "additional_dirs": {
+            "description": "Extra directories the agent may read.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "debug_context": {
+            "description": "Include the context-assembly digest in the result.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "force_max_think": {
+            "description": "Use the maximum thinking budget. `thinking_enabled` is an alias.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "include_partial_messages": {
+            "description": "Stream partial assistant messages as events.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "mock_output": {
+            "description": "Testing only: skip the model and return this text.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`code` (default), `ask`, `context` or `plan`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "The user's prompt. Must not be blank.",
+            "type": "string"
+          },
+          "repo_root": {
+            "description": "Repository root, when it differs from the session workspace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "description": "Idempotency key. Required by `prompt/start`; a retried request with\nthe same key returns the existing prompt.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "teammate_mode": {
+            "description": "Team-mode setting passed to the agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thinking_enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "tools": {
+            "description": "Allow tool use (default true).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "summary": "Run a prompt and wait for the result."
+    },
+    "prompt/start": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "additional_dirs": {
+            "description": "Extra directories the agent may read.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "debug_context": {
+            "description": "Include the context-assembly digest in the result.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "force_max_think": {
+            "description": "Use the maximum thinking budget. `thinking_enabled` is an alias.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "include_partial_messages": {
+            "description": "Stream partial assistant messages as events.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "mock_output": {
+            "description": "Testing only: skip the model and return this text.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`code` (default), `ask`, `context` or `plan`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "The user's prompt. Must not be blank.",
+            "type": "string"
+          },
+          "repo_root": {
+            "description": "Repository root, when it differs from the session workspace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "description": "Idempotency key. Required by `prompt/start`; a retried request with\nthe same key returns the existing prompt.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "teammate_mode": {
+            "description": "Team-mode setting passed to the agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thinking_enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "tools": {
+            "description": "Allow tool use (default true).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "summary": "Start a prompt in the background (requires request_id)."
+    },
+    "prompt/stream_next": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_chunks": {
+            "description": "Maximum chunks to return, 1-128 (default 8).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "prompt_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Next stream chunks of a prompt."
+    },
+    "session/fork": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Copy a session into a new one."
+    },
+    "session/handoff_export": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "output_path": {
+            "description": "Where to write the bundle (default: the store's handoff directory).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "description": "Session to export (default: the latest session).",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Write a portable session bundle."
+    },
+    "session/handoff_import": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_path": {
+            "description": "Bundle to import. `handoff_path` is accepted as an alias.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handoff_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resume": {
+            "description": "Resume the imported session immediately.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "workspace_root": {
+            "description": "Workspace to import into (default: the bundle's workspace).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Import a session bundle."
+    },
+    "session/handoff_link_consume": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "handoff_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "token": {
+            "description": "The one-time token from the link.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "handoff_id",
+          "token"
+        ],
+        "type": "object"
+      },
+      "summary": "Redeem a handoff link."
+    },
+    "session/handoff_link_create": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "base_url": {
+            "description": "Base URL the link is built on.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_minutes": {
+            "description": "Link lifetime in minutes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Export a bundle and create a one-time link to it."
+    },
+    "session/list": {
+      "params": {
+        "additionalProperties": false,
+        "description": "A method that takes no parameters (`params` may be omitted or `{}`).",
+        "type": "object"
+      },
+      "summary": "List sessions."
+    },
+    "session/open": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline_commit": {
+            "description": "Git commit the session starts from.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "description": "HTTP transport only: reopen this existing session.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_root": {
+            "description": "Workspace the session works in (default `.`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Create a session."
+    },
+    "session/remote_resume": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_path": {
+            "description": "Import this bundle and resume it. `handoff_path` is an alias.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handoff_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resume": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "session_id": {
+            "description": "Resume this session when no bundle is given.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_root": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "Resume a session, importing a bundle first if given."
+    },
+    "session/resume": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Load a session's state."
+    },
+    "session/timeline": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Maximum number of events (default 100).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "summary": "A session's event history."
+    },
+    "shutdown": {
+      "params": {
+        "additionalProperties": false,
+        "description": "A method that takes no parameters (`params` may be omitted or `{}`).",
+        "type": "object"
+      },
+      "summary": "Stop the server after replying."
+    },
+    "status": {
+      "params": {
+        "additionalProperties": false,
+        "description": "A method that takes no parameters (`params` may be omitted or `{}`).",
+        "type": "object"
+      },
+      "summary": "Whether the server is ready."
+    },
+    "task/list": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "description": "Only tasks of this session.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "summary": "List tasks."
+    },
+    "task/update": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "outcome": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "summary": "Change a task's status."
+    },
+    "tool/approve": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "invocation_id": {
+            "description": "The pending tool invocation.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "invocation_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Approve a pending tool call."
+    },
+    "tool/deny": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "invocation_id": {
+            "description": "The pending tool invocation.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "invocation_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Deny a pending tool call."
+    },
+    "tool/progress": {
+      "params": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "prompt_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt_id"
+        ],
+        "type": "object"
+      },
+      "summary": "Live tool progress events of a prompt."
+    }
+  },
+  "title": "CodingBuddy JSON-RPC protocol"
+}

@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 sha2.workspace = true
+schemars = { version = "1", features = ["uuid1"] }
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-diff = { path = "../codingbuddy-diff" }
 codingbuddy-memory = { path = "../codingbuddy-memory" }

@@ -361,10 +361,7 @@ fn ide_handler_handoff_export_import_remote_resume() {
     assert!(!imported_id.is_empty());
 
     let remote = handler
-        .handle(
-            "session/remote_resume",
-            json!({"session_id": imported_id, "transport": "stdio"}),
-        )
+        .handle("session/remote_resume", json!({"session_id": imported_id}))
         .expect("remote_resume");
     assert_eq!(remote["remote"], true);
     assert_eq!(remote["session_id"], imported_id);
@@ -607,5 +604,56 @@ mod delivery_three {
         }
         assert!(token.is_cancelled());
         Ok(())
+    }
+}
+
+#[test]
+fn published_schema_is_up_to_date() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/protocol/jsonrpc.schema.json");
+    let generated =
+        serde_json::to_string_pretty(&crate::protocol::protocol_schema()).unwrap() + "\n";
+    if std::env::var_os("CODINGBUDDY_UPDATE_SCHEMA").is_some() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &generated).unwrap();
+    }
+    let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        checked_in == generated,
+        "docs/protocol/jsonrpc.schema.json is stale; regenerate with \
+         CODINGBUDDY_UPDATE_SCHEMA=1 cargo test -p codingbuddy-jsonrpc published_schema"
+    );
+}
+
+#[test]
+fn every_advertised_method_is_published() {
+    let tmp = tempfile::tempdir().unwrap();
+    let handler = IdeRpcHandler::new(tmp.path()).unwrap();
+    let init = handler.handle("initialize", json!({})).unwrap();
+    let published: std::collections::BTreeSet<&str> = crate::protocol::method_names().collect();
+    for capability in init["capabilities"].as_array().unwrap() {
+        let name = capability.as_str().unwrap();
+        // Feature flags (`prompt.v2`) and notifications (`stream/chunk`) are not methods.
+        if name.contains('.') || name == "stream/chunk" {
+            continue;
+        }
+        assert!(
+            published.contains(name),
+            "{name} is advertised but not in the protocol"
+        );
+    }
+    for name in published {
+        if name == "initialize" {
+            continue;
+        }
+        let advertised = init["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == name);
+        assert!(
+            advertised,
+            "{name} is published but not advertised by initialize"
+        );
     }
 }
