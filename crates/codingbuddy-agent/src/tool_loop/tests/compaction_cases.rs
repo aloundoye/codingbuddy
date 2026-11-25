@@ -385,3 +385,31 @@ fn compaction_injects_active_work_state_snapshot() {
     assert!(snapshot.contains("Harden authentication middleware"));
     assert!(snapshot.contains("Patch auth middleware"));
 }
+
+#[test]
+fn context_warning_fires_once_per_crossing() {
+    let llm = ScriptedLlm::new(vec![]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host,
+        ToolLoopConfig::default(),
+        "system".to_string(),
+        default_tools(),
+    );
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    loop_.set_stream_callback(Arc::new(move |chunk| {
+        if let StreamChunk::ContextWarning { used_pct, .. } = chunk {
+            sink.lock().unwrap().push(used_pct);
+        }
+    }));
+    // Usable budget 1000 tokens → compaction threshold 950.
+    loop_.maybe_warn_context_filling(500, 950);
+    loop_.maybe_warn_context_filling(750, 950);
+    loop_.maybe_warn_context_filling(800, 950);
+    // Compaction brings usage down; the next crossing warns again.
+    loop_.maybe_warn_context_filling(300, 950);
+    loop_.maybe_warn_context_filling(720, 950);
+    assert_eq!(*seen.lock().unwrap(), vec![75, 72]);
+}

@@ -89,6 +89,14 @@ pub enum StreamChunk {
         max_attempts: u8,
         provider: String,
     },
+    /// The conversation is filling the context window and will be compacted
+    /// soon. Sent once per crossing of the warning threshold.
+    ContextWarning {
+        /// Estimated share of the usable input budget in use, 0-100.
+        used_pct: u8,
+        /// Share at which automatic compaction starts, 0-100.
+        compact_at_pct: u8,
+    },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -173,6 +181,14 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
         StreamChunk::SecurityWarning { message } => serde_json::json!({
             "type": "security_warning",
             "message": message,
+        }),
+        StreamChunk::ContextWarning {
+            used_pct,
+            compact_at_pct,
+        } => serde_json::json!({
+            "type": "context_warning",
+            "used_pct": used_pct,
+            "compact_at_pct": compact_at_pct,
         }),
         StreamChunk::ToolCallReady {
             id,

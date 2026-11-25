@@ -1117,6 +1117,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 StreamChunk::SecurityWarning { message } => {
                     let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: format!("Security: {message}"), error: true });
                 }
+                StreamChunk::ContextWarning { used_pct, compact_at_pct } => {
+                    let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: format!("Context {used_pct}% full; older messages will be compacted at {compact_at_pct}%. Use /compact to do it now."), error: false });
+                }
                 StreamChunk::Error { message, .. } => {
                     let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: message, error: true });
                 }

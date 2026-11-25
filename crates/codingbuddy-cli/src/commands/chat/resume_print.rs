@@ -187,6 +187,10 @@ impl PlainStream {
                 format!("[watch: {comment_count} comment(s) detected]")
             }
             StreamChunk::SecurityWarning { message } => format!("[security warning: {message}]"),
+            StreamChunk::ContextWarning {
+                used_pct,
+                compact_at_pct,
+            } => format!("[context {used_pct}% full; compacting at {compact_at_pct}%]"),
             StreamChunk::Error { message, .. } => format!("[error: {message}]"),
             StreamChunk::PhaseTransition { from, to } => format!("[phase: {from} -> {to}]"),
             StreamChunk::ModelChanged { model } => format!("[model changed: {model}]"),

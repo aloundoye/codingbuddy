@@ -95,6 +95,10 @@ pub const PRUNE_THRESHOLD_PCT: f64 = 0.80;
 /// Context window usage percentage that triggers full compaction (Phase 2).
 pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
 
+/// Context window usage percentage at which the user is told compaction is
+/// coming, so they can `/compact` or start fresh on their own terms.
+pub const CONTEXT_WARNING_PCT: f64 = 0.70;
+
 /// Minimum usable input budget during compaction to avoid zero-token edge cases.
 const MIN_COMPACTION_INPUT_BUDGET_TOKENS: u64 = 1024;
 
@@ -172,6 +176,9 @@ pub struct ToolUseLoop<'a> {
     recent_errors: VecDeque<String>,
     /// Whether error recovery guidance has been injected this escalation cycle.
     recovery_injected: bool,
+    /// Whether the user was warned that compaction is near. Cleared when
+    /// usage drops back under the warning threshold (after compaction).
+    context_warned: bool,
     /// Pre-compiled output scanner for injection/secret detection.
     output_scanner: codingbuddy_policy::output_scanner::OutputScanner,
     /// Cache for read-only tool results (see [`cache::ToolCache`]).
@@ -285,6 +292,7 @@ impl<'a> ToolUseLoop<'a> {
             escalation: codingbuddy_core::complexity::EscalationSignals::default(),
             recent_errors: VecDeque::new(),
             recovery_injected: false,
+            context_warned: false,
             output_scanner: codingbuddy_policy::output_scanner::OutputScanner::new(),
             tool_cache: cache::ToolCache::new(),
             circuit_breaker: HashMap::new(),
@@ -562,6 +570,26 @@ impl<'a> ToolUseLoop<'a> {
             compact_threshold.max(1),
             compact_target.max(1),
         )
+    }
+
+    /// Emit [`StreamChunk::ContextWarning`] once when usage crosses
+    /// [`CONTEXT_WARNING_PCT`] of the usable budget. `compact_threshold` is
+    /// [`COMPACTION_THRESHOLD_PCT`] of that budget.
+    fn maybe_warn_context_filling(&mut self, estimated_tokens: u64, compact_threshold: u64) {
+        let usable = (compact_threshold as f64 / COMPACTION_THRESHOLD_PCT).max(1.0);
+        let used = estimated_tokens as f64 / usable;
+        if used < CONTEXT_WARNING_PCT {
+            self.context_warned = false;
+            return;
+        }
+        if self.context_warned {
+            return;
+        }
+        self.context_warned = true;
+        self.emit(StreamChunk::ContextWarning {
+            used_pct: (used * 100.0).round().min(100.0) as u8,
+            compact_at_pct: (COMPACTION_THRESHOLD_PCT * 100.0).round() as u8,
+        });
     }
 
     fn is_active_task_status(status: &str) -> bool {
@@ -1145,6 +1173,8 @@ impl<'a> ToolUseLoop<'a> {
             let estimated_tokens = message_tokens + tool_def_tokens;
             let (prune_threshold, compact_threshold, compact_target) =
                 self.compaction_budget_for_next_turn(tool_def_tokens);
+
+            self.maybe_warn_context_filling(estimated_tokens, compact_threshold);
 
             if estimated_tokens > prune_threshold {
                 // Phase 1: Lightweight pruning — trim old tool outputs

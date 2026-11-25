@@ -1611,6 +1611,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::ImageData { .. } => "ImageData",
                         codingbuddy_core::StreamChunk::WatchTriggered { .. } => "WatchTriggered",
                         codingbuddy_core::StreamChunk::SecurityWarning { .. } => "SecurityWarning",
+                        codingbuddy_core::StreamChunk::ContextWarning { .. } => "ContextWarning",
                         codingbuddy_core::StreamChunk::UsageUpdate { .. } => "UsageUpdate",
                         codingbuddy_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
                         codingbuddy_core::StreamChunk::SnapshotRecorded { .. } => "SnapshotRecorded",
@@ -1731,6 +1732,13 @@ pub(crate) fn run_chat(
                         let out = std::io::stdout();
                         let mut handle = out.lock();
                         let _ = writeln!(handle, "  \x1b[33m⚠ Security:\x1b[0m {message}");
+                        let _ = handle.flush();
+                    }
+                    codingbuddy_core::StreamChunk::ContextWarning { used_pct, compact_at_pct } => {
+                        use std::io::Write as _;
+                        let err = std::io::stderr();
+                        let mut handle = err.lock();
+                        let _ = writeln!(handle, "  \x1b[33m◔\x1b[0m Context {used_pct}% full; older messages will be compacted at {compact_at_pct}%. Use /compact to do it now.");
                         let _ = handle.flush();
                     }
                     codingbuddy_core::StreamChunk::Error { message, .. } => {
