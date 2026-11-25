@@ -231,6 +231,81 @@ fn prompt_stream_replaces_discarded_draft_and_completes_after_tools() -> Result<
 }
 
 #[test]
+fn long_answer_after_tools_is_kept_on_screen() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    let answer = "The main source prints a greeting and exits. ".repeat(10);
+    let engine = AgentEngine::new_with_llm(
+        temp.path(),
+        Box::new(StreamingScript(ScriptedLlm::new(vec![
+            tool_call_response_with_text(
+                "Reading now.",
+                vec![("read", "fs_read", r#"{"path":"src/main.rs"}"#)],
+            ),
+            text_response(&answer),
+        ]))),
+    )?;
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    engine.set_stream_callback(Arc::new({
+        let chunks = chunks.clone();
+        move |chunk| chunks.lock().unwrap().push(chunk)
+    }));
+
+    assert_eq!(engine.chat("Read the main source")?, answer);
+    let chunks = chunks.lock().unwrap();
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::ClearStreamingText)),
+        "grounded answer after tool use must not be discarded"
+    );
+    assert!(matches!(chunks.last(), Some(StreamChunk::Done { .. })));
+    Ok(())
+}
+
+#[test]
+fn failed_prompt_is_closed_before_the_next_prompt() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    let mut truncated = text_response("Partial");
+    truncated.finish_reason = "length".to_string();
+    let llm = Arc::new(ScriptedLlm::new(vec![truncated, text_response("Done.")]));
+    let engine = AgentEngine::new_with_llm(temp.path(), Box::new(SharedScriptedLlm(llm.clone())))?;
+
+    assert!(engine.chat("Explain lifetimes").is_err());
+    assert_eq!(engine.chat("Say done")?, "Done.");
+
+    let captured = llm.captured_messages();
+    let second = captured.last().unwrap();
+    let stale = second
+        .iter()
+        .position(
+            |m| matches!(m, ChatMessage::User { content } if content.contains("Explain lifetimes")),
+        )
+        .expect("failed prompt stays in history");
+    assert!(
+        matches!(
+            &second[stale + 1],
+            ChatMessage::Assistant { content: Some(text), tool_calls, .. }
+                if tool_calls.is_empty() && text.contains("interrupted")
+        ),
+        "failed prompt must be followed by an interrupted marker, got {:?}",
+        second[stale + 1]
+    );
+
+    // The marker is persisted, so a third prompt does not add another one.
+    let store = Store::new(temp.path())?;
+    let session = store.load_latest_session()?.unwrap();
+    let history = store.rebuild_from_events(session.session_id)?.chat_messages;
+    let markers = history
+        .iter()
+        .filter(|m| matches!(m, ChatMessage::Assistant { content: Some(t), .. } if t.contains("interrupted")))
+        .count();
+    assert_eq!(markers, 1);
+    Ok(())
+}
+
+#[test]
 fn failed_and_cancelled_prompts_do_not_emit_done() -> Result<()> {
     for cancelled in [false, true] {
         let temp = tempfile::tempdir()?;

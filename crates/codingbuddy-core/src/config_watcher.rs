@@ -21,6 +21,14 @@ impl ConfigWatcher {
     /// Only watches files that exist; silently skips missing ones.
     pub fn watch(paths: &[PathBuf]) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel::<PathBuf>();
+        // Missing files are watched through their parent directory, which also
+        // reports unrelated siblings (e.g. the session store's SQLite WAL files).
+        // Only forward events for the requested file names.
+        let names: Vec<_> = paths
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(ToOwned::to_owned)
+            .collect();
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res
@@ -30,7 +38,12 @@ impl ConfigWatcher {
                 )
             {
                 for path in event.paths {
-                    let _ = tx.send(path);
+                    if path
+                        .file_name()
+                        .is_some_and(|name| names.iter().any(|n| n == name))
+                    {
+                        let _ = tx.send(path);
+                    }
                 }
             }
         })?;

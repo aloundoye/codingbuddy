@@ -1544,7 +1544,29 @@ impl AgentEngine {
         }
 
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
-        options.chat_history = projection.chat_messages;
+        let mut history = projection.chat_messages;
+        // A prompt that failed, was cancelled, or whose process died leaves its
+        // user turn (and possibly tool results) without a final answer. Close it
+        // so the model keeps the context but does not answer the stale request
+        // alongside the new one.
+        if previous_turn_unfinished(&history) {
+            let marker = ChatMessage::Assistant {
+                content: Some(INTERRUPTED_TURN_MARKER.to_string()),
+                native_parts: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+            };
+            self.store
+                .append_event(&codingbuddy_store::NewEvent::new(
+                    session.session_id,
+                    EventKind::ChatTurn {
+                        message: marker.clone(),
+                    },
+                ))
+                .context("persist interrupted turn marker")?;
+            history.push(marker);
+        }
+        options.chat_history = history;
         self.store.append_event(&codingbuddy_store::NewEvent {
             event_id: uuid::Uuid::now_v7(),
             at: Utc::now(),
@@ -1686,6 +1708,17 @@ impl AgentEngine {
             projection.step_status.len()
         ))
     }
+}
+
+const INTERRUPTED_TURN_MARKER: &str = "[Previous request was interrupted before a final answer. It is abandoned unless the user asks to continue it.]";
+
+/// True when the stored history ends mid-turn: a user request or tool result
+/// with no assistant answer after it.
+fn previous_turn_unfinished(history: &[ChatMessage]) -> bool {
+    matches!(
+        history.last(),
+        Some(ChatMessage::User { .. } | ChatMessage::Tool { .. })
+    )
 }
 
 fn prompt_grants_plan_approval(prompt: &str) -> bool {
