@@ -22,6 +22,15 @@ Move it under a version heading when you cut a release.
   `codingbuddy doctor --bundle` packages redacted diagnostics for a bug
   report.
 
+### Changed
+- Corrective prompt heuristics (rejecting long answers written without
+  tools, unread file names, shell commands printed as text, recovery
+  guidance, checklist and verbosity nudges) are now off by default for
+  Claude, GPT and Gemini models, which saves requests and stops correct
+  answers from being discarded. They stay on for DeepSeek, Qwen, local and
+  unknown models. Configure them under `agent_loop.heuristics`, globally or
+  per provider; `codingbuddy doctor` shows what is active.
+
 ### Fixed
 - A correct answer that names files mentioned in a tool's output (for
   example a summary of a checklist that lists `Cargo.toml`) is no longer

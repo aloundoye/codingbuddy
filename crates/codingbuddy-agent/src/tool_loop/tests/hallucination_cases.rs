@@ -598,3 +598,45 @@ fn unverified_refs_ignores_dot_access() {
         &[]
     ));
 }
+
+#[test]
+fn disabled_heuristics_keep_the_first_answer() {
+    // With heuristics off (the default for Claude, GPT and Gemini), a long
+    // answer without tools, an unread file name, shell text and a very long
+    // answer are all returned as-is in a single request.
+    let answer = format!(
+        "Check src/never_read.rs first.\n\n```bash\ngrep version Cargo.toml\necho done\n```\n\n{}",
+        "word ".repeat(450)
+    );
+    let llm = ScriptedLlm::new(vec![make_text_response(&answer)]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let config = ToolLoopConfig {
+        heuristics: codingbuddy_core::heuristics::ResolvedHeuristics::all(false),
+        ..ToolLoopConfig::default()
+    };
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host,
+        config,
+        "system".to_string(),
+        default_tools(),
+    );
+
+    let result = loop_.run("explain the build").unwrap();
+    assert_eq!(result.response, answer);
+    assert_eq!(result.turns, 1, "no corrective retry should be requested");
+    assert!(
+        !result
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::User { content } if content.starts_with("STOP."))),
+        "no nudge message should be injected"
+    );
+}
+
+#[test]
+fn engine_resolves_heuristics_from_model_family() {
+    let config = codingbuddy_core::heuristics::HeuristicsConfig::default();
+    assert!(!config.resolve("google", "gemini-2.5-pro").grounding_nudge);
+    assert!(config.resolve("deepseek", "deepseek-chat").grounding_nudge);
+}

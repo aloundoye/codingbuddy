@@ -968,7 +968,17 @@ impl AgentEngine {
             } else {
                 None
             },
+            heuristics: cfg
+                .agent_loop
+                .heuristics
+                .resolve(&cfg.llm.provider, &active_base_model),
         };
+        tracing::debug!(
+            model = %active_base_model,
+            provider = %cfg.llm.provider,
+            heuristics = ?config.heuristics,
+            "tool loop configured"
+        );
 
         // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.
         let builtin_tools =

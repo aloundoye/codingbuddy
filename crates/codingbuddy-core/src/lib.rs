@@ -9,6 +9,7 @@ pub mod complexity;
 pub mod config_watcher;
 pub mod cost;
 pub mod execution;
+pub mod heuristics;
 mod llm_capabilities;
 pub mod logging;
 mod model_catalog;
@@ -3605,6 +3606,10 @@ pub struct AgentLoopConfig {
     /// Default: false. When false, all tools are available at all times.
     #[serde(default)]
     pub phase_loop_enabled: bool,
+    /// Corrective prompt heuristics; defaults depend on the model family.
+    /// See [`heuristics`].
+    #[serde(default)]
+    pub heuristics: heuristics::HeuristicsConfig,
 }
 
 impl Default for AgentLoopConfig {
@@ -3639,6 +3644,7 @@ impl Default for AgentLoopConfig {
             lint: LintConfig::default(),
             tool_loop_max_turns: default_tool_loop_max_turns(),
             phase_loop_enabled: false,
+            heuristics: heuristics::HeuristicsConfig::default(),
         }
     }
 }

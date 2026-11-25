@@ -143,6 +143,8 @@ pub struct ToolLoopConfig {
     pub session_id: Option<Uuid>,
     /// Optional post-edit validator for LSP-like diagnostics (Phase 4).
     pub edit_validator: Option<Arc<codingbuddy_lsp::EditValidator>>,
+    /// Which corrective prompt heuristics run for this model and provider.
+    pub heuristics: codingbuddy_core::heuristics::ResolvedHeuristics,
 }
 
 impl Default for ToolLoopConfig {
@@ -178,6 +180,7 @@ impl Default for ToolLoopConfig {
             initial_phase: None,
             session_id: None,
             edit_validator: None,
+            heuristics: codingbuddy_core::heuristics::ResolvedHeuristics::default(),
         }
     }
 }

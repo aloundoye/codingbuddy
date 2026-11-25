@@ -1264,7 +1264,8 @@ impl<'a> ToolUseLoop<'a> {
             // Shell command nudge: if the model outputs bash code blocks as
             // text instead of using the bash_run tool, nudge it to retry with
             // tools. This runs once before the general hallucination nudge.
-            if response.tool_calls.is_empty()
+            if self.config.heuristics.shell_command_nudge
+                && response.tool_calls.is_empty()
                 && shell_nudge_count == 0
                 && !extract_shell_commands(&response.text).is_empty()
             {
@@ -1338,7 +1339,9 @@ impl<'a> ToolUseLoop<'a> {
                 // Earlier turns' tool use does not count — the model can revert to
                 // hallucination on a new question. Unverified file references are
                 // always checked against this turn's tool calls.
-                let has_unverified_refs = if nudge_count < MAX_NUDGE_ATTEMPTS {
+                let has_unverified_refs = if self.config.heuristics.unverified_file_refs
+                    && nudge_count < MAX_NUDGE_ATTEMPTS
+                {
                     let tool_outputs: Vec<&str> = self
                         .messages
                         .iter()
@@ -1355,8 +1358,9 @@ impl<'a> ToolUseLoop<'a> {
                 } else {
                     false
                 };
-                let ungrounded_long_answer =
-                    tool_calls_made.is_empty() && text.len() > HALLUCINATION_NUDGE_THRESHOLD;
+                let ungrounded_long_answer = self.config.heuristics.grounding_nudge
+                    && tool_calls_made.is_empty()
+                    && text.len() > HALLUCINATION_NUDGE_THRESHOLD;
                 let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
                     && (ungrounded_long_answer || has_unverified_refs);
 
@@ -1399,7 +1403,10 @@ impl<'a> ToolUseLoop<'a> {
                 // Nudge up to 2 times per turn, then let it through.
                 // Fast path: skip the strip_code_blocks allocation if total word count
                 // (including code) is under the threshold — most responses are short.
-                if verbosity_nudge_count < 2 && text.split_whitespace().count() > 400 {
+                if self.config.heuristics.verbosity_nudge
+                    && verbosity_nudge_count < 2
+                    && text.split_whitespace().count() > 400
+                {
                     let prose = helpers::strip_code_blocks(&text);
                     let word_count = prose.split_whitespace().count();
                     if word_count > 400 {
@@ -1552,7 +1559,9 @@ impl<'a> ToolUseLoop<'a> {
             let batch_had_success = records.iter().any(|record| record.success);
             let batch_had_failure = records.iter().any(|record| !record.success);
             tool_calls_made.extend(records);
-            self.maybe_inject_complex_checklist_nudge(&response.tool_calls);
+            if self.config.heuristics.complex_checklist_nudge {
+                self.maybe_inject_complex_checklist_nudge(&response.tool_calls);
+            }
 
             // Update escalation signals based on batch outcome
             if batch_had_success {
@@ -1563,7 +1572,9 @@ impl<'a> ToolUseLoop<'a> {
                 self.escalation.record_failure();
 
                 // Error recovery: inject guidance on first escalation transition
-                if self.escalation.should_escalate()
+                let guidance = self.config.heuristics.error_recovery_guidance;
+                if guidance
+                    && self.escalation.should_escalate()
                     && !was_escalated_before_batch
                     && !self.recovery_injected
                 {
@@ -1581,7 +1592,7 @@ impl<'a> ToolUseLoop<'a> {
 
                 // Stuck detection: same error 3+ times → stronger nudge
                 let repeated_count = self.repeated_error_count();
-                if repeated_count >= 3 {
+                if guidance && repeated_count >= 3 {
                     if let Some(ref cb) = self.event_cb {
                         cb(EventKind::ErrorRecoveryTriggered {
                             level: "stuck".to_string(),

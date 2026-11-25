@@ -84,6 +84,24 @@ fn init_workspace(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Engine whose corrective heuristics are on regardless of which provider the
+/// machine's user settings select (they default to off for Claude/GPT/Gemini).
+fn engine_with_heuristics(
+    path: &Path,
+    llm: Box<dyn codingbuddy_llm::LlmClient + Send + Sync>,
+) -> Result<AgentEngine> {
+    let mut cfg = AppConfig::ensure(path)?;
+    cfg.agent_loop.heuristics.overrides = codingbuddy_core::heuristics::HeuristicOverrides {
+        grounding_nudge: Some(true),
+        unverified_file_refs: Some(true),
+        shell_command_nudge: Some(true),
+        error_recovery_guidance: Some(true),
+        complex_checklist_nudge: Some(true),
+        verbosity_nudge: Some(true),
+    };
+    AgentEngine::new_with_config_and_llm(path, cfg, llm)
+}
+
 fn phase_loop_config() -> AppConfig {
     let mut config = AppConfig::default();
     config.agent_loop.phase_loop_enabled = true;
@@ -184,7 +202,7 @@ impl LlmClient for StreamingScript {
 fn prompt_stream_replaces_discarded_draft_and_completes_after_tools() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
-    let engine = AgentEngine::new_with_llm(
+    let engine = engine_with_heuristics(
         temp.path(),
         Box::new(StreamingScript(ScriptedLlm::new(vec![
             text_response(&"Discard this draft. ".repeat(25)),
@@ -315,7 +333,7 @@ fn failed_and_cancelled_prompts_do_not_emit_done() -> Result<()> {
         } else {
             vec![text_response(&"Draft that requires a retry. ".repeat(25))]
         };
-        let engine = AgentEngine::new_with_llm(
+        let engine = engine_with_heuristics(
             temp.path(),
             Box::new(StreamingScript(ScriptedLlm::new(responses))),
         )?;

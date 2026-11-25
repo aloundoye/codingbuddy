@@ -716,6 +716,10 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         "checks": checks,
         "warnings": warnings,
         "logs": logs_payload(),
+        "heuristics": cfg
+            .agent_loop
+            .heuristics
+            .resolve(&cfg.llm.provider, &cfg.llm.active_base_model()),
     });
 
     Ok(payload)
