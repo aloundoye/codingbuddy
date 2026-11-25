@@ -195,6 +195,10 @@ pub struct PolicyEngine {
     workspace_root: Option<std::path::PathBuf>,
     /// Audit trail for auto-approved tool calls.
     audit_log: std::sync::Mutex<Vec<AuditEntry>>,
+    /// Saved "always allow" bash patterns. Shared by every clone of this
+    /// engine (agent, tool host), so a pattern saved mid-session applies to
+    /// the very next call instead of after a restart.
+    bash_approvals: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl Clone for PolicyEngine {
@@ -213,6 +217,7 @@ impl Clone for PolicyEngine {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
             ),
+            bash_approvals: std::sync::Arc::clone(&self.bash_approvals),
         }
     }
 }
@@ -238,12 +243,16 @@ impl PolicyEngine {
         let mut merged_rules = default_deny_rules();
         let builtin_rule_count = merged_rules.len();
         merged_rules.extend(cfg.permission_rules.clone());
+        let bash_approvals = std::sync::Arc::new(std::sync::RwLock::new(
+            cfg.persistent_bash_approvals.clone(),
+        ));
         let cfg = PolicyConfig {
             permission_rules: merged_rules,
             ..cfg
         };
         Self {
             cfg,
+            bash_approvals,
             managed_rule_count: 0,
             builtin_rule_count,
             configured_denials: Vec::new(),
@@ -575,8 +584,9 @@ impl PolicyEngine {
         ) && call.name == "bash.run"
             && let Some(cmd) = approvals::bash_command_arg(&call.args)
             && self
-                .cfg
-                .persistent_bash_approvals
+                .bash_approvals
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .any(|pattern| approvals::saved_approval_matches(pattern, cmd))
         {
@@ -768,8 +778,18 @@ impl PolicyEngine {
     }
 
     /// Inject persistent bash command approvals (loaded from project store).
+    /// Replaces the list for this engine and every clone sharing it.
     pub fn set_persistent_bash_approvals(&mut self, approvals: Vec<String>) {
-        self.cfg.persistent_bash_approvals = approvals;
+        self.replace_bash_approvals(approvals);
+    }
+
+    /// Like [`Self::set_persistent_bash_approvals`] but through `&self`, for
+    /// callers that hold a shared engine (reloading after a mid-session save).
+    pub fn replace_bash_approvals(&self, approvals: Vec<String>) {
+        *self
+            .bash_approvals
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = approvals;
     }
 
     /// Add a persistent permission rule at runtime (e.g. "always allow" from user choice).

@@ -1121,6 +1121,21 @@ fn policy_with_persistent_approvals_skips_prompt() {
 }
 
 #[test]
+fn approval_saved_mid_session_reaches_every_clone() {
+    let agent_policy = PolicyEngine::new(PolicyConfig::default());
+    // The tool host holds its own clone, taken before the approval exists.
+    let host_policy = agent_policy.clone();
+    let bash = ToolCall {
+        name: "bash.run".to_string(),
+        args: serde_json::json!({"cmd": "cargo build --release"}),
+        requires_approval: false,
+    };
+    assert!(host_policy.requires_approval(&bash));
+    agent_policy.replace_bash_approvals(vec!["cargo build *".to_string()]);
+    assert!(!host_policy.requires_approval(&bash));
+}
+
+#[test]
 fn saved_glob_approvals_cover_single_commands_but_never_chains() {
     // The TUI saves "always allow" as a glob of the command's first word.
     let policy = PolicyEngine::new(PolicyConfig {

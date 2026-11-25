@@ -930,7 +930,8 @@ where
             );
             let always = matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'));
             if let Some((tool_name, args_summary, response_tx)) = pending_approval.take() {
-                let _ = response_tx.send(approved);
+                // Persist before answering: the agent reloads saved
+                // approvals as soon as it gets the answer.
                 if always && approved && !fresh_approval(&args_summary) {
                     let pattern = derive_approval_pattern(&tool_name, &args_summary);
                     let persisted = codingbuddy_store::Store::new(&workspace_path)
@@ -952,6 +953,7 @@ where
                 } else {
                     info_line = format!("denied `{tool_name}`");
                 }
+                let _ = response_tx.send(approved);
             }
             continue;
         }

@@ -212,16 +212,8 @@ impl AgentEngine {
         let observer = Observer::new(workspace, &cfg.telemetry)?;
         let mut policy = PolicyEngine::from_app_config(&cfg.policy);
 
-        let project_hash = codingbuddy_store::project_hash(workspace);
-        if let Ok(approvals) = store.list_persistent_approvals(&project_hash) {
-            let bash_approvals: Vec<String> = approvals
-                .iter()
-                .filter(|a| a.tool_name == "bash.run")
-                .map(|a| a.command_pattern.clone())
-                .collect();
-            if !bash_approvals.is_empty() {
-                policy.set_persistent_bash_approvals(bash_approvals);
-            }
+        if let Some(bash_approvals) = saved_bash_approvals(&store, workspace) {
+            policy.set_persistent_bash_approvals(bash_approvals);
         }
 
         let mut tool_host = LocalToolHost::with_config(
@@ -400,6 +392,20 @@ impl AgentEngine {
 
     pub fn set_verbose(&mut self, verbose: bool) {
         self.observer.set_verbose(verbose);
+    }
+
+    /// A callback that re-reads this project's saved "always allow"
+    /// approvals into the live policy. Front-ends call it after the user
+    /// saves one, so it applies to the next call in the same session.
+    pub fn approval_reloader(&self) -> impl Fn() + Send + Sync + 'static {
+        let store = self.store.clone();
+        let policy = self.policy.clone();
+        let workspace = self.workspace.clone();
+        move || {
+            if let Some(approvals) = saved_bash_approvals(&store, &workspace) {
+                policy.replace_bash_approvals(approvals);
+            }
+        }
     }
 
     pub fn set_approval_handler(&self, handler: ApprovalHandler) {
@@ -1131,3 +1137,17 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// This project's saved `bash.run` approval patterns, or `None` when the
+/// store cannot be read (the current list is then left as it is).
+fn saved_bash_approvals(store: &Store, workspace: &Path) -> Option<Vec<String>> {
+    let project_hash = codingbuddy_store::project_hash(workspace);
+    let approvals = store.list_persistent_approvals(&project_hash).ok()?;
+    Some(
+        approvals
+            .into_iter()
+            .filter(|a| a.tool_name == "bash.run")
+            .map(|a| a.command_pattern)
+            .collect(),
+    )
+}

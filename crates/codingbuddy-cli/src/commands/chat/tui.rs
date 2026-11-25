@@ -84,6 +84,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     // Set approval handler that routes through the TUI channel.
     {
         let approval_tx = tx.clone();
+        let reload_approvals = engine.approval_reloader();
         engine.set_approval_handler(Box::new(move |call| {
             let (resp_tx, resp_rx) = mpsc::channel();
             let compact_args = serde_json::to_string(&call.args)
@@ -94,9 +95,14 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 response_tx: resp_tx,
             });
             // Block agent thread waiting for TUI user response.
-            resp_rx
+            let approved = resp_rx
                 .recv()
-                .map_err(|e| anyhow!("approval channel closed: {e}"))
+                .map_err(|e| anyhow!("approval channel closed: {e}"))?;
+            if approved {
+                // "Always" was saved before the answer was sent.
+                reload_approvals();
+            }
+            Ok(approved)
         }));
     }
 
