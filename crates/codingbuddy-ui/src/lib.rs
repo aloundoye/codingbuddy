@@ -117,20 +117,28 @@ where
     }
 
     // Set a panic hook that restores the terminal before printing the panic.
+    // Only a panic on this (the render) thread ends the TUI. Agent turns run
+    // on worker threads that catch their own panics and keep the TUI alive,
+    // so tearing the terminal down for those would leave a running TUI in
+    // cooked mode on the main screen.
+    let tui_thread = std::thread::current().id();
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = crossterm::execute!(
-            io::stdout(),
-            crossterm::event::DisableBracketedPaste,
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        );
+        if std::thread::current().id() == tui_thread {
+            let _ = disable_raw_mode();
+            let _ = crossterm::execute!(
+                io::stdout(),
+                crossterm::event::DisableBracketedPaste,
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::cursor::Show
+            );
+        }
         prev_hook(info);
     }));
 
     enable_raw_mode()?;
     let _guard = TerminalGuard;
+    let _terminal_claim = codingbuddy_core::logging::claim_terminal();
     crossterm::execute!(
         io::stdout(),
         crossterm::terminal::EnterAlternateScreen,

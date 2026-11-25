@@ -9,7 +9,24 @@ Move it under a version heading when you cut a release.
 
 ## [Unreleased]
 
+### Added
+- Diagnostic log files in `~/.codingbuddy/logs` (or `CODINGBUDDY_LOG_DIR`),
+  rotated daily and kept for 7 days. They record each turn, model request,
+  retry, tool call, MCP call and hook with timings, and never the prompt,
+  response or tool arguments.
+- `--debug` now raises the log level, and `--debug mcp,llm` limits debug
+  output to those areas. `CODINGBUDDY_LOG` sets the level directly.
+- A crash report with the panic, backtrace and recent log lines is saved on
+  any crash, and its path is printed.
+- `codingbuddy doctor` shows the log file and the last crash report.
+  `codingbuddy doctor --bundle` packages redacted diagnostics for a bug
+  report.
+
 ### Fixed
+- A panic caught inside an agent turn no longer drops the TUI out of
+  full-screen mode or prints over it.
+- Engine warnings no longer print to stderr during a TUI session unless
+  `--verbose` is set; they go to the log file.
 - Streamed text that arrived before a tool call is no longer erased, and the
   turn completes cleanly after the stream ends.
 - A long answer written after this turn's tool results is kept instead of

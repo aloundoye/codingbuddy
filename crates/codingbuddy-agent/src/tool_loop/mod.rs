@@ -993,7 +993,28 @@ impl<'a> ToolUseLoop<'a> {
 
         self.collect_directives(user_message);
 
-        self.execute_loop()
+        let _span = tracing::info_span!("turn", continuation = is_continuation).entered();
+        let started = std::time::Instant::now();
+        let result = self.execute_loop();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(outcome) => tracing::info!(
+                elapsed_ms,
+                llm_turns = outcome.turns,
+                tool_calls = outcome.tool_calls_made.len(),
+                failed_tool_calls = outcome
+                    .tool_calls_made
+                    .iter()
+                    .filter(|record| !record.success)
+                    .count(),
+                finish_reason = %outcome.finish_reason,
+                prompt_tokens = outcome.usage.prompt_tokens,
+                completion_tokens = outcome.usage.completion_tokens,
+                "turn finished"
+            ),
+            Err(error) => tracing::warn!(elapsed_ms, error = %format!("{error:#}"), "turn failed"),
+        }
+        result
     }
 
     /// Extract user directives from a message and add them to the pinned set.

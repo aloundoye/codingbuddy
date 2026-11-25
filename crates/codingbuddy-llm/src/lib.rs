@@ -746,6 +746,12 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format!("HTTP {status}"),
+                        );
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -758,6 +764,7 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -1234,6 +1241,12 @@ impl ApiClient {
                         error::ProviderError::http(chat_protocol, status.as_u16(), &body).into(),
                     );
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format!("HTTP {status}"),
+                        );
                         self.wait_before_retry(retry_delay_ms(
                             self.cfg.retry_base_ms,
                             attempt,
@@ -1250,6 +1263,7 @@ impl ApiClient {
                             .into(),
                     );
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
                         self.wait_before_retry(retry_delay_ms(
                             NETWORK_RETRY_BASE_MS,
                             attempt,
@@ -1294,6 +1308,12 @@ impl ApiClient {
                         self.cfg.max_retries,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format!("HTTP {status}"),
+                        );
                         std::thread::sleep(retry_delay_ms(
                             self.cfg.retry_base_ms,
                             attempt,
@@ -1307,6 +1327,7 @@ impl ApiClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
                         std::thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -1423,6 +1444,12 @@ impl ApiClient {
                         ));
                     }
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format!("HTTP {status}"),
+                        );
                         std::thread::sleep(retry_delay_ms(
                             self.cfg.retry_base_ms,
                             attempt,
@@ -1436,6 +1463,7 @@ impl ApiClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
                         std::thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -1854,6 +1882,12 @@ impl ApiClient {
                         error::ProviderError::http(chat_protocol, status.as_u16(), &body).into(),
                     );
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format!("HTTP {status}"),
+                        );
                         self.wait_before_retry(retry_delay_ms(
                             self.cfg.retry_base_ms,
                             attempt,
@@ -1870,6 +1904,7 @@ impl ApiClient {
                             .into(),
                     );
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
                         self.wait_before_retry(retry_delay_ms(
                             NETWORK_RETRY_BASE_MS,
                             attempt,
@@ -2215,6 +2250,12 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        log_retry(
+                            &self.cfg.provider,
+                            attempt,
+                            self.cfg.max_retries,
+                            &format!("HTTP {status}"),
+                        );
                         let delay = retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after);
                         if status == StatusCode::TOO_MANY_REQUESTS {
                             cb(StreamChunk::RateLimited {
@@ -2236,6 +2277,7 @@ impl ApiClient {
                         &prepared.compatibility,
                     ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        log_retry(&self.cfg.provider, attempt, self.cfg.max_retries, &e);
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -2251,6 +2293,48 @@ impl ApiClient {
 
 // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 // annotate_cache_control / apply_cache_annotations / payload_rejects_cache_control removed in P9.
+
+/// One log line per model request: route, size of the outcome, and timing.
+/// Never logs prompt or response text, only lengths and counts.
+fn log_llm_outcome(
+    kind: &'static str,
+    provider: &str,
+    model: &str,
+    started: std::time::Instant,
+    result: &Result<LlmResponse>,
+) {
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(response) => {
+            let usage = response.usage.clone().unwrap_or_default();
+            tracing::info!(
+                target: "codingbuddy_llm::request",
+                kind,
+                provider,
+                model,
+                elapsed_ms,
+                finish_reason = %response.finish_reason,
+                text_chars = response.text.len(),
+                tool_calls = response.tool_calls.len(),
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                cache_hit_tokens = usage.prompt_cache_hit_tokens,
+                "model request completed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "codingbuddy_llm::request",
+                kind,
+                provider,
+                model,
+                elapsed_ms,
+                error = %format!("{error:#}"),
+                "model request failed"
+            );
+        }
+    }
+}
 
 impl LlmClient for ApiClient {
     fn with_cancellation(
@@ -2287,13 +2371,14 @@ impl LlmClient for ApiClient {
     }
 
     fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        let started = std::time::Instant::now();
         let protocol = protocol::select_chat_protocol(
             &self.cfg.active_provider(),
             self.cfg
                 .active_provider_kind()
                 .unwrap_or(ProviderKind::OpenAiCompatible),
         );
-        (|| {
+        let result = (|| {
             let _provider = self.provider_kind()?;
             let mut normalized_req = req.clone();
             normalized_req.model = self.resolve_request_model(&req.model)?;
@@ -2311,7 +2396,9 @@ impl LlmClient for ApiClient {
                 &normalized_req.tools,
             )
         })()
-        .map_err(|error| error::ProviderError::classify(protocol, error))
+        .map_err(|error| error::ProviderError::classify(protocol, error));
+        log_llm_outcome("chat", &self.cfg.provider, &req.model, started, &result);
+        result
     }
 
     fn complete_chat_streaming(
@@ -2319,6 +2406,7 @@ impl LlmClient for ApiClient {
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
+        let started = std::time::Instant::now();
         let protocol = protocol::select_chat_protocol(
             &self.cfg.active_provider(),
             self.cfg
@@ -2379,6 +2467,13 @@ impl LlmClient for ApiClient {
                 reason: Some(response.finish_reason.clone()),
             });
         }
+        log_llm_outcome(
+            "chat_stream",
+            &self.cfg.provider,
+            &req.model,
+            started,
+            &result,
+        );
         result
     }
 
@@ -2579,6 +2674,19 @@ fn with_compatibility_context(
     } else {
         anyhow!("{err}. {}", compatibility_error_context(compatibility))
     }
+}
+
+/// Logged at every retry site so a slow or flaky provider shows up in the log
+/// even when the request eventually succeeds.
+fn log_retry(provider: &str, attempt: u8, max_attempts: u8, reason: &dyn std::fmt::Display) {
+    tracing::warn!(
+        target: "codingbuddy_llm::retry",
+        provider,
+        attempt = attempt + 1,
+        max_attempts,
+        reason = %reason,
+        "retrying model request"
+    );
 }
 
 fn should_retry_status(status: StatusCode) -> bool {

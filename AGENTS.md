@@ -154,6 +154,15 @@ impl LlmClient for ScriptedToolLlm { /* pop_front on each call */ }
 
 **Environment safety**: Rust 2024 requires `unsafe` for `std::env::set_var`/`remove_var`. Tests that manipulate env vars must use `unsafe {}` blocks and avoid parallel access (combine related env tests or check return types rather than exact values).
 
+## Logging & Diagnostics
+
+- `codingbuddy_core::logging` owns process diagnostics. `init_logging()` is called once in `main` (`init_diagnostics`). Output goes **only to files** — never stdout/stderr, which would corrupt the TUI and `--json` output. Location: `CODINGBUDDY_LOG_DIR`, else `~/.codingbuddy/logs/codingbuddy.YYYY-MM-DD.log` (daily rotation, 7 kept).
+- Level: `CODINGBUDDY_LOG` (full `EnvFilter` syntax) > `--debug [categories]` (`--debug mcp,llm` → `codingbuddy_mcp=debug,codingbuddy_llm=debug`) > `info`. Noisy deps (aws, hyper, rustls, reqwest, tantivy) are capped at `warn`.
+- Use `tracing::{info,warn,debug}!` in library code, not `eprintln!`. Never log prompts, responses, tool arguments or keys — log names, ids, counts, timings. Existing spans: `turn` (tool loop), `tool{name,call_id}` (tool execution); request outcomes under `codingbuddy_llm::request`, retries under `codingbuddy_llm::retry`; MCP calls and hooks log their own outcome.
+- `install_crash_handler()` writes `crash-<ts>-<pid>.log` (panic, backtrace, last 200 log lines) next to the logs for every panic, including caught worker panics. A full-screen UI holds `claim_terminal()` so background-thread panics don't print over it; the TUI's own hook restores the terminal only for panics on the TUI thread.
+- `codingbuddy doctor` reports the log file and last crash; `doctor --bundle` writes a redacted `.tar.gz` (doctor payload, config, recent logs, crash reports) into the log directory. Redaction: secret-looking field names plus `OutputScanner`.
+- `CODINGBUDDY_DEBUG_PANIC=1` forces a panic at startup to verify crash reporting.
+
 ## Configuration Precedence
 
 Settings merge in order (later wins):

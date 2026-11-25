@@ -127,6 +127,42 @@ impl ToolUseLoop<'_> {
         llm_call: &LlmToolCall,
         batch_child: bool,
     ) -> Result<Vec<ToolCallRecord>> {
+        // Arguments are not logged: they can hold file contents or secrets.
+        let _span = tracing::info_span!(
+            "tool",
+            name = %llm_call.name,
+            call_id = %llm_call.id,
+        )
+        .entered();
+        let started = Instant::now();
+        let result = self.execute_tool_call_untraced(llm_call, batch_child);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(records) => {
+                let failed = records.iter().filter(|record| !record.success).count();
+                if failed == 0 {
+                    tracing::debug!(elapsed_ms, records = records.len(), "tool call finished");
+                } else {
+                    tracing::info!(
+                        elapsed_ms,
+                        records = records.len(),
+                        failed,
+                        "tool call failed"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(elapsed_ms, error = %format!("{error:#}"), "tool call aborted");
+            }
+        }
+        result
+    }
+
+    fn execute_tool_call_untraced(
+        &mut self,
+        llm_call: &LlmToolCall,
+        batch_child: bool,
+    ) -> Result<Vec<ToolCallRecord>> {
         let host_scope = self.worktree_tool_host.clone();
         let host = host_scope.unwrap_or_else(|| self.tool_host.clone());
 
