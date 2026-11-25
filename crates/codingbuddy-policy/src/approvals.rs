@@ -153,6 +153,9 @@ fn widenable_family(tokens: &[&str]) -> Option<(&'static Widenable, usize)> {
 /// the words checked here are exactly the words the program receives.
 fn is_literal_word(token: &str) -> bool {
     !token.is_empty()
+        // A leading `@` or `+` means "read arguments from a file" or
+        // "select a toolchain" to many tools (pytest @args, cargo +nightly).
+        && !token.starts_with(['@', '+'])
         && token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._/:+,@-".contains(&b))
@@ -232,10 +235,14 @@ pub fn saved_approval_matches(pattern: &str, command: &str) -> bool {
     fixed.len() == fixed_len
         && fixed.iter().zip(&tokens).all(|(want, have)| want == have)
         && crate::is_single_plain_command(command)
-        // Only plain ASCII spaces separate words; any other whitespace or
-        // quoting could split or unquote differently in the shell.
-        && command.bytes().all(|b| b == b' ' || !b.is_ascii_whitespace())
-        && tokens.iter().all(|token| is_literal_word(token))
+        // Only plain ASCII spaces separate words, as in the shell; any other
+        // whitespace (tabs, NBSP, ...) disqualifies the command, and words
+        // are re-split on spaces alone so nothing slips between them.
+        && command.chars().all(|c| c == ' ' || !c.is_whitespace())
+        && command
+            .split(' ')
+            .filter(|word| !word.is_empty())
+            .all(is_literal_word)
         && classify_bash_command(command) != BashSafety::Dangerous
         && arguments_are_safe(family, &tokens[fixed_len..])
 }
@@ -323,6 +330,9 @@ mod tests {
             ("cargo test *", "cargo test #comment"),
             ("cargo test *", "cargo test\tx"),
             ("cargo test *", "cargo test caf\u{e9}"),
+            ("cargo test *", "cargo test\u{a0}-Zx"),
+            ("pytest *", "pytest @args.txt"),
+            ("cargo build *", "cargo build +nightly"),
         ] {
             assert!(
                 !saved_approval_matches(pattern, command),
