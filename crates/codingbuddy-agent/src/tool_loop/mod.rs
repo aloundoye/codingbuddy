@@ -1309,15 +1309,21 @@ impl<'a> ToolUseLoop<'a> {
                 // Fires in ALL modes including Ask/read-only — that's where users
                 // ask about the codebase and hallucination is most harmful.
                 // Allows up to MAX_NUDGE_ATTEMPTS nudges per turn before letting through.
-                // NOTE: No `tool_calls_made.is_empty()` guard — the model can revert to
-                // hallucination at any point, even after using tools earlier.
+                // The length trigger only applies before any tool has run in this
+                // turn: a long answer that follows tool results is the grounded
+                // final answer, and discarding it would erase the streamed response.
+                // Earlier turns' tool use does not count — the model can revert to
+                // hallucination on a new question. Unverified file references are
+                // always checked against this turn's tool calls.
                 let has_unverified_refs = if nudge_count < MAX_NUDGE_ATTEMPTS {
                     has_unverified_file_references(&text, &tool_calls_made)
                 } else {
                     false
                 };
+                let ungrounded_long_answer =
+                    tool_calls_made.is_empty() && text.len() > HALLUCINATION_NUDGE_THRESHOLD;
                 let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
-                    && (text.len() > HALLUCINATION_NUDGE_THRESHOLD || has_unverified_refs);
+                    && (ungrounded_long_answer || has_unverified_refs);
 
                 if should_nudge {
                     // Discard this draft before asking the model to retry.
