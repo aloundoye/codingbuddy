@@ -175,7 +175,6 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     }
     if let Some(callback) = engine.prompt_stream_callback(options.prompt_id) {
         callback(StreamChunk::ContentDelta(response.clone()));
-        callback(StreamChunk::Done { reason: None });
     }
     Ok(response)
 }

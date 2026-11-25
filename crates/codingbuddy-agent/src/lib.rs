@@ -681,6 +681,12 @@ impl AgentEngine {
     }
 
     pub fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        let result = self.analyze_prompt(prompt, options)?;
+        self.stream(StreamChunk::Done { reason: None });
+        Ok(result)
+    }
+
+    fn analyze_prompt(&self, prompt: &str, options: ChatOptions) -> Result<String> {
         let cfg = self.effective_config(&options);
         let routed_llm = self.routed_llm_for_options(&cfg, &options)?;
         let llm = match routed_llm.as_ref() {
@@ -726,12 +732,6 @@ impl AgentEngine {
                 &[],
                 &response.transport_parts,
             )?;
-        }
-        // If we streamed token-by-token, complete_chat_streaming already emitted Done.
-        // Only emit bulk ContentDelta + Done for the non-streaming fallback path.
-        if stream_cb.is_none() {
-            self.stream(StreamChunk::ContentDelta(response.text.clone()));
-            self.stream(StreamChunk::Done { reason: None });
         }
         Ok(response.text)
     }
@@ -1217,7 +1217,10 @@ impl AgentEngine {
         }
         let store = self.store.clone();
         Some(Arc::new(move |chunk: StreamChunk| {
-            if matches!(chunk, StreamChunk::ReasoningDelta(_)) {
+            if matches!(
+                chunk,
+                StreamChunk::ReasoningDelta(_) | StreamChunk::Done { .. }
+            ) {
                 return;
             }
             if let Some(id) = prompt_id
@@ -1260,7 +1263,9 @@ impl AgentEngine {
             None => Arc::new(self.store.session_lease(session.session_id)?),
         };
         if !owned_prompt {
-            return self.execute_session_prompt(prompt, options, session, &lease);
+            let output = self.execute_session_prompt(prompt, options, session, &lease)?;
+            self.stream(StreamChunk::Done { reason: None });
+            return Ok(output);
         }
         let id = self.store.start_prompt(
             &lease,
@@ -1295,6 +1300,9 @@ impl AgentEngine {
         };
         self.store
             .finish_prompt(id, status, output, error.as_deref())?;
+        if result.is_ok() {
+            self.stream(StreamChunk::Done { reason: None });
+        }
         result
     }
 
@@ -1564,7 +1572,7 @@ impl AgentEngine {
             && (options.cancellation.is_some()
                 || !should_run_team_orchestration(self, &prompt_enriched, &options));
         let result = if !options.tools {
-            self.analyze_with_options(&prompt_enriched, options)
+            self.analyze_prompt(&prompt_enriched, options)
         } else if !tool_loop {
             team::run(self, &prompt_enriched, &options)
         } else {

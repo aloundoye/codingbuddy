@@ -40,6 +40,8 @@ impl VimMode {
 pub struct ChatShell {
     pub transcript: Vec<TranscriptEntry>,
     pub(crate) streaming_text: String,
+    pub(crate) transcript_revision: u64,
+    pub(crate) last_stream_commit: Option<usize>,
     pub plan_lines: Vec<String>,
     pub tool_lines: Vec<String>,
     pub mission_control_lines: Vec<String>,
@@ -69,6 +71,10 @@ impl ChatShell {
         if self.transcript.len() >= TRANSCRIPT_MAX_CAPACITY {
             let drain_count = TRANSCRIPT_MAX_CAPACITY / 5;
             self.transcript.drain(..drain_count);
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            self.last_stream_commit = self
+                .last_stream_commit
+                .and_then(|index| index.checked_sub(drain_count));
         }
     }
 
@@ -161,21 +167,44 @@ impl ChatShell {
     }
 
     pub fn append_streaming(&mut self, text: &str) {
-        self.streaming_text.push_str(text);
+        if !text.is_empty() {
+            self.last_stream_commit = None;
+            self.streaming_text.push_str(text);
+        }
     }
 
     pub fn clear_streaming_text(&mut self) {
         self.streaming_text.clear();
     }
 
+    pub(crate) fn reset_transcript(&mut self) {
+        self.transcript.clear();
+        self.clear_streaming_text();
+        self.last_stream_commit = None;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn commit_streaming(&mut self) {
+        if !self.streaming_text.is_empty() {
+            let text = std::mem::take(&mut self.streaming_text);
+            self.push_transcript(text);
+            self.last_stream_commit = Some(self.transcript.len() - 1);
+        }
+    }
+
     pub fn finalize_streaming(&mut self, final_output: &str) {
         let streamed = std::mem::take(&mut self.streaming_text);
+        let previous = self.last_stream_commit.take();
         let output = if final_output.is_empty() {
             &streamed
         } else {
             final_output
         };
-        if !output.is_empty() {
+        if !output.is_empty()
+            && (previous
+                .and_then(|index| self.transcript.get(index))
+                .is_none_or(|entry| entry.text != *output))
+        {
             self.push_transcript(output);
         }
     }

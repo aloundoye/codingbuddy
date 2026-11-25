@@ -6,6 +6,8 @@
 
 use std::io::{self, Write};
 
+use unicode_width::UnicodeWidthChar;
+
 // ── ANSI escape helpers ─────────────────────────────────────────────────
 
 const RESET: &str = "\x1b[0m";
@@ -26,14 +28,14 @@ const BG_GRAY: &str = "\x1b[48;5;236m";
 
 /// Incremental markdown-to-ANSI renderer.
 ///
-/// Feed streaming tokens via [`push`]. Complete lines are rendered immediately
-/// with ANSI formatting. Call [`flush_remaining`] after streaming ends to emit
+/// Feed streaming tokens via [`Self::push`]. Complete lines are rendered immediately
+/// with ANSI formatting. Call [`Self::finish`] after streaming ends to emit
 /// any trailing partial line.
 pub struct StreamingMdRenderer {
     buffer: String,
     in_code_block: bool,
     code_lang: String,
-    line_count: usize,
+    preview_visible: bool,
 }
 
 impl StreamingMdRenderer {
@@ -42,40 +44,113 @@ impl StreamingMdRenderer {
             buffer: String::new(),
             in_code_block: false,
             code_lang: String::new(),
-            line_count: 0,
+            preview_visible: false,
         }
     }
 
-    /// Feed streaming text into the renderer. Complete lines are rendered
-    /// immediately; partial lines are buffered.
+    /// Commit complete lines and redraw the unfinished line on a terminal.
     pub fn push(&mut self, text: &str) {
-        self.buffer.push_str(text);
-        self.flush_complete_lines();
-    }
-
-    /// Render any remaining buffered text (partial line at end of stream).
-    pub fn flush_remaining(&mut self) {
-        if !self.buffer.is_empty() {
-            let line = std::mem::take(&mut self.buffer);
-            self.render_line(&line);
-        }
-    }
-
-    /// Flush and render all complete lines (text before the last `\n`).
-    fn flush_complete_lines(&mut self) {
-        while let Some(nl_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..nl_pos].to_string();
-            self.buffer = self.buffer[nl_pos + 1..].to_string();
-            self.render_line(&line);
-        }
-    }
-
-    /// Render a single complete line with markdown-to-ANSI formatting.
-    fn render_line(&mut self, line: &str) {
         let out = io::stdout();
-        let mut w = out.lock();
-        self.line_count += 1;
+        let mut writer = out.lock();
+        let preview_width = crossterm::terminal::size()
+            .ok()
+            .map(|(width, _)| usize::from(width));
+        self.push_to(&mut writer, text, preview_width);
+    }
 
+    fn push_to(&mut self, writer: &mut impl Write, text: &str, preview_width: Option<usize>) {
+        if text.is_empty() {
+            return;
+        }
+        self.clear_preview(writer);
+        for chunk in text.split_inclusive('\n') {
+            let line = chunk.strip_suffix('\n');
+            self.buffer.extend(
+                line.unwrap_or(chunk)
+                    .chars()
+                    .filter(|ch| !ch.is_control() || *ch == '\t'),
+            );
+            if line.is_some() {
+                let complete = std::mem::take(&mut self.buffer);
+                self.render_line(&mut *writer, &complete);
+            }
+        }
+        if let Some(width) = preview_width {
+            self.show_preview(writer, width);
+        }
+        let _ = writer.flush();
+    }
+
+    /// Finish the current response block and reset Markdown state for the next one.
+    pub fn finish(&mut self) {
+        let out = io::stdout();
+        let mut writer = out.lock();
+        self.finish_to(&mut writer, false);
+    }
+
+    pub fn clear(&mut self) {
+        let out = io::stdout();
+        let mut writer = out.lock();
+        self.finish_to(&mut writer, true);
+    }
+
+    fn finish_to(&mut self, writer: &mut impl Write, discard: bool) {
+        self.clear_preview(writer);
+        let line = std::mem::take(&mut self.buffer);
+        if !discard && !line.is_empty() {
+            self.render_line(&mut *writer, &line);
+        }
+        if self.in_code_block {
+            let _ = writeln!(writer, "  {DIM}{GRAY}└────────{RESET}");
+            self.in_code_block = false;
+            self.code_lang.clear();
+        }
+        let _ = writer.flush();
+    }
+
+    fn clear_preview(&mut self, writer: &mut impl Write) {
+        if self.preview_visible {
+            let _ = write!(writer, "\x1b[J");
+            self.preview_visible = false;
+        }
+    }
+
+    fn show_preview(&mut self, writer: &mut impl Write, columns: usize) {
+        if self.buffer.is_empty() || columns <= 3 {
+            return;
+        }
+        // Show the most recent text and leave the last column clear to prevent wrapping.
+        let budget = columns - 3;
+        let mut start = self.buffer.len();
+        let mut used = 0;
+        for (index, ch) in self.buffer.char_indices().rev() {
+            let width = ch.width().unwrap_or(0);
+            if used + width > budget {
+                break;
+            }
+            start = index;
+            used += width;
+        }
+        let clipped = start != 0;
+        if clipped && used == budget {
+            for ch in self.buffer[start..].chars() {
+                start += ch.len_utf8();
+                if ch.width().unwrap_or(0) > 0 {
+                    break;
+                }
+            }
+        }
+        let _ = write!(writer, "  {}", if clipped { "…" } else { "" });
+        for ch in self.buffer[start..].chars().filter(|ch| !ch.is_control()) {
+            let _ = write!(writer, "{ch}");
+        }
+        // Leave the cursor at the preview's start so a resize can reflow the
+        // preview without moving the start of the area that will be erased.
+        let _ = write!(writer, "\r");
+        self.preview_visible = true;
+    }
+
+    fn render_line(&mut self, mut w: impl Write, line: &str) {
         // ── Code fence toggle ───────────────────────────────────────
         if line.starts_with("```") {
             if !self.in_code_block {
@@ -445,44 +520,47 @@ mod tests {
     }
 
     #[test]
-    fn streaming_code_block() {
+    fn preview_is_replaced_then_committed_as_markdown() {
         let mut renderer = StreamingMdRenderer::new();
-        renderer.push("hello\n```rust\nfn main() {}\n```\nbye\n");
-        assert_eq!(renderer.line_count, 5);
-        assert!(!renderer.in_code_block);
-    }
-
-    #[test]
-    fn streaming_partial_lines() {
-        let mut renderer = StreamingMdRenderer::new();
-        renderer.push("hel");
-        assert_eq!(renderer.line_count, 0);
-        assert_eq!(renderer.buffer, "hel");
-        renderer.push("lo\nworld\n");
-        assert_eq!(renderer.line_count, 2);
+        let mut output = Vec::new();
+        renderer.push_to(&mut output, "**界", Some(10));
+        assert_eq!(String::from_utf8_lossy(&output), "  **界\r");
+        output.clear();
+        renderer.push_to(&mut output, "**\r", Some(10));
+        assert!(String::from_utf8_lossy(&output).starts_with("\x1b[J"));
+        output.clear();
+        renderer.push_to(&mut output, "\n", Some(10));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!("{BOLD}界")));
+        assert!(output.ends_with('\n'));
         assert!(renderer.buffer.is_empty());
     }
 
     #[test]
-    fn heading_levels() {
+    fn preview_respects_new_width_and_clear_discards_the_tail() {
         let mut renderer = StreamingMdRenderer::new();
-        renderer.push("# H1\n## H2\n### H3\n#### H4\n");
-        assert_eq!(renderer.line_count, 4);
+        let mut output = Vec::new();
+        renderer.push_to(&mut output, "界界界界", Some(7));
+        assert_eq!(String::from_utf8_lossy(&output), "  …界\r");
+        output.clear();
+        renderer.push_to(&mut output, "suffix", Some(5));
+        assert_eq!(String::from_utf8_lossy(&output), "\x1b[J  …x\r");
+        output.clear();
+        renderer.finish_to(&mut output, true);
+        assert_eq!(String::from_utf8_lossy(&output), "\x1b[J");
+        assert!(renderer.buffer.is_empty());
     }
 
     #[test]
-    fn list_rendering() {
+    fn finishing_an_open_fence_resets_the_next_response() {
         let mut renderer = StreamingMdRenderer::new();
-        renderer.push("- item one\n- item two\n1. numbered\n");
-        assert_eq!(renderer.line_count, 3);
-    }
-
-    #[test]
-    fn flush_remaining_partial() {
-        let mut renderer = StreamingMdRenderer::new();
-        renderer.push("partial line no newline");
-        assert_eq!(renderer.line_count, 0);
-        renderer.flush_remaining();
-        assert_eq!(renderer.line_count, 1);
+        let mut output = Vec::new();
+        renderer.push_to(&mut output, "```rust\nfn main() {}", None);
+        assert!(renderer.in_code_block);
+        renderer.finish_to(&mut output, false);
+        assert!(!renderer.in_code_block);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("fn main() {}"));
+        assert!(output.contains("└"));
     }
 }

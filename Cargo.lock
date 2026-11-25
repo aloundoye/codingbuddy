@@ -1214,6 +1214,7 @@ dependencies = [
  "tempfile",
  "termimad",
  "tiny_http",
+ "unicode-width 0.2.3",
  "uuid",
 ]
 

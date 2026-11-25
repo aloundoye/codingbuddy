@@ -1247,6 +1247,20 @@ fn wrapped_text_rows_counts_soft_wrap_and_newlines() {
 }
 
 #[test]
+fn prompt_input_lines_render_newlines_on_each_side_of_the_cursor() {
+    let lines = prompt_input_lines(vec![
+        Span::raw("❯ "),
+        Span::raw("first\n"),
+        Span::raw("█"),
+        Span::raw("second\nthird"),
+    ]);
+    assert_eq!(
+        lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["❯ first", "█second", "third"]
+    );
+}
+
+#[test]
 fn scroll_to_keep_row_visible_tracks_cursor_row() {
     assert_eq!(scroll_to_keep_row_visible(0, 3), 0);
     assert_eq!(scroll_to_keep_row_visible(2, 3), 0);
@@ -1258,8 +1272,8 @@ fn scroll_to_keep_row_visible_tracks_cursor_row() {
 fn compute_inline_heights_supports_input_growth() {
     assert_eq!(
         compute_inline_heights(INLINE_VIEWPORT_HEIGHT, 1),
-        (4, 1),
-        "empty/short input should keep a compact 1-line input area"
+        (3, 2),
+        "empty/short input should reserve two input rows"
     );
     assert_eq!(
         compute_inline_heights(INLINE_VIEWPORT_HEIGHT, 99),
@@ -1772,6 +1786,56 @@ fn clearing_streamed_tool_preamble_preserves_completed_messages() {
     let transcript = render(&shell);
     assert!(transcript.contains("Previous reply"));
     assert!(transcript.contains("Final reply"));
+}
+
+#[test]
+fn streamed_preamble_appears_before_approval_and_tool_and_survives_a_reset() {
+    let mut shell = ChatShell::default();
+    shell.append_streaming("I'll read the source.");
+    let mut active_phase = None;
+    let mut pending_approval = None;
+    let mut info_line = String::new();
+    let mut is_processing = true;
+    let (response_tx, _) = mpsc::channel();
+    {
+        let mut state = StreamRuntimeState {
+            shell: &mut shell,
+            active_phase: &mut active_phase,
+            pending_approval: &mut pending_approval,
+            info_line: &mut info_line,
+            is_processing: &mut is_processing,
+        };
+        for event in [
+            TuiStreamEvent::ApprovalNeeded {
+                tool_name: "fs_read".into(),
+                args_summary: "{}".into(),
+                response_tx,
+            },
+            TuiStreamEvent::ToolCallStart {
+                tool_name: "fs_read".into(),
+                args_summary: "{}".into(),
+            },
+            TuiStreamEvent::ToolCallEnd {
+                tool_name: "fs_read".into(),
+                duration_ms: 1,
+                summary: "Read complete".into(),
+                success: true,
+            },
+            TuiStreamEvent::ContentDelta("Discarded answer".into()),
+            TuiStreamEvent::ClearStreamingText,
+            TuiStreamEvent::ContentDelta("Final reply".into()),
+        ] {
+            handle_stream_event(event, &mut state);
+        }
+    }
+    shell.finalize_streaming("Final reply");
+    let entries = &shell.transcript;
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0].text, "I'll read the source.");
+    assert!(entries[1].text.contains("Allow fs_read"));
+    assert_eq!(entries[2].kind, MessageKind::ToolCall);
+    assert_eq!(entries[3].kind, MessageKind::ToolResult);
+    assert_eq!(entries[4].text, "Final reply");
 }
 
 #[test]

@@ -506,10 +506,11 @@ fn delivery_one_requires_complete_calls_and_preserves_interleaving() {
     }
 }
 
-fn delivery_one_loopback(events: &'static str) -> (String, std::thread::JoinHandle<()>) {
+fn delivery_one_loopback(events: impl Into<String>) -> (String, std::thread::JoinHandle<()>) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let events = events.into();
     let worker = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
@@ -532,6 +533,122 @@ fn delivery_one_loopback(events: &'static str) -> (String, std::thread::JoinHand
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
     });
     (endpoint, worker)
+}
+
+#[test]
+fn gemini_stream_preserves_terminal_text_usage_and_tool_order() {
+    use codingbuddy_core::{StreamChunk, TransportPart};
+    use codingbuddy_llm::{ApiClient, LlmClient};
+
+    let first = json!({"candidates": [{"content": {"parts": [
+        {"thought": true, "text": "private"},
+        {"text": "Reading. "},
+        {"functionCall": {"name": "fs_read", "args": {"path": "src/main.rs"}},
+         "thoughtSignature": "signed"}
+    ]}}]});
+    let last = json!({
+        "candidates": [{"content": {"parts": [{"text": "One moment."}]}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 7}
+    });
+    let (endpoint, server) = delivery_one_loopback(format!("data: {first}\n\ndata: {last}\n\n"));
+    let mut config = codingbuddy_core::LlmConfig::default();
+    config.select_provider("google");
+    config.providers.get_mut("google").unwrap().base_url = endpoint;
+    config.api_key = Some("fixture-key".into());
+    let request = make_request(
+        &config.active_base_model(),
+        vec![ChatMessage::User {
+            content: "Test".into(),
+        }],
+        vec![sample_tool()],
+    );
+    let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = chunks.clone();
+    let response = ApiClient::new(config)
+        .unwrap()
+        .complete_chat_streaming(
+            &request,
+            std::sync::Arc::new(move |event| {
+                captured.lock().unwrap().push(event);
+            }),
+        )
+        .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(response.finish_reason, "tool_calls");
+    assert_eq!(response.text, "Reading. One moment.");
+    assert_eq!(response.usage.unwrap().completion_tokens, 7);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert!(matches!(
+        response.transport_parts.as_slice(),
+        [TransportPart::Text(_), TransportPart::Call(_), TransportPart::Text(_), TransportPart::Native(native)]
+            if native.blocks[2]["thoughtSignature"] == "signed"
+    ));
+    assert!(matches!(
+        chunks.lock().unwrap().as_slice(),
+        [StreamChunk::ContentDelta(first), StreamChunk::ContentDelta(last), StreamChunk::Done { reason: Some(reason) }]
+            if first == "Reading. " && last == "One moment." && reason == "tool_calls"
+    ));
+}
+
+#[test]
+fn gemini_incomplete_stream_emits_visible_text_without_completion() {
+    use codingbuddy_core::StreamChunk;
+    use codingbuddy_llm::{ApiClient, LlmClient, error};
+
+    for finish in [Some("MAX_TOKENS"), Some("SAFETY"), None] {
+        let mut frame = json!({"candidates": [{"content": {"parts": [
+            {"text": "Partial"},
+            {"functionCall": {"name": "fs_read", "args": {"path": "src/main.rs"}}}
+        ]}}]});
+        if let Some(reason) = finish {
+            frame["candidates"][0]["finishReason"] = json!(reason);
+        }
+        if finish == Some("MAX_TOKENS") {
+            frame["candidates"][0]["content"]["parts"][1]["functionCall"]["args"] =
+                json!("partial");
+        }
+        let (endpoint, server) = delivery_one_loopback(format!("data: {frame}\n\n"));
+        let mut config = codingbuddy_core::LlmConfig::default();
+        config.select_provider("google");
+        config.providers.get_mut("google").unwrap().base_url = endpoint;
+        config.api_key = Some("fixture-key".into());
+        let request = make_request(
+            &config.active_base_model(),
+            vec![ChatMessage::User {
+                content: "Test".into(),
+            }],
+            vec![sample_tool()],
+        );
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = chunks.clone();
+        let failure = ApiClient::new(config)
+            .unwrap()
+            .complete_chat_streaming(
+                &request,
+                std::sync::Arc::new(move |event| {
+                    captured.lock().unwrap().push(event);
+                }),
+            )
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(
+            failure
+                .downcast_ref::<error::ProviderError>()
+                .unwrap()
+                .category,
+            if finish.is_some() {
+                error::FailureKind::IncompleteResponse
+            } else {
+                error::FailureKind::IncompleteStream
+            }
+        );
+        assert!(matches!(
+            chunks.lock().unwrap().as_slice(),
+            [StreamChunk::ContentDelta(text)] if text == "Partial"
+        ));
+    }
 }
 
 #[test]
@@ -891,6 +1008,59 @@ fn responses_errors_are_typed_and_sanitized_over_real_transport() {
             expected
         );
     }
+}
+
+#[test]
+fn responses_publish_confirmed_text_when_the_provider_sends_no_text_deltas() {
+    use codingbuddy_core::StreamChunk;
+    use codingbuddy_llm::{ApiClient, LlmClient};
+
+    let item = json!({
+        "id": "message", "type": "message", "status": "completed",
+        "content": [{"type": "output_text", "text": "Complete response."}]
+    });
+    let events = [
+        json!({"type": "response.output_item.added", "output_index": 0, "item": {
+            "id": "message", "type": "message", "content": []
+        }}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+        json!({"type": "response.completed", "response": {"status": "completed", "output": [item]}}),
+    ];
+    let (base, worker) = delivery_one_loopback(
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>(),
+    );
+    let mut cfg = codingbuddy_core::LlmConfig::default();
+    cfg.select_provider("openai-compatible");
+    let provider = cfg.providers.get_mut("openai-compatible").unwrap();
+    provider.base_url = base;
+    provider.chat_protocol = Some("openai-responses".into());
+    cfg.api_key = Some("fixture-key".into());
+    let req = make_request(
+        "gpt-4.1-mini",
+        vec![ChatMessage::User {
+            content: "hello".into(),
+        }],
+        vec![],
+    );
+    let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = chunks.clone();
+
+    let response = ApiClient::new(cfg)
+        .unwrap()
+        .complete_chat_streaming(
+            &req,
+            std::sync::Arc::new(move |chunk| captured.lock().unwrap().push(chunk)),
+        )
+        .unwrap();
+    worker.join().unwrap();
+    assert!(matches!(
+        chunks.lock().unwrap().as_slice(),
+        [StreamChunk::ContentDelta(text), StreamChunk::Done { .. }] if text == &response.text
+    ));
+    assert_eq!(response.text, "Complete response.");
 }
 
 #[test]

@@ -186,6 +186,12 @@ fn vague_codebase_prompt_runs_audit_and_repairs_followup_budget() -> Result<()> 
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(CapturingLlm::new(state.clone()));
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    engine.set_stream_callback(Arc::new({
+        let chunks = chunks.clone();
+        move |chunk| chunks.lock().unwrap().push(chunk)
+    }));
+
     let output = engine.chat_with_options(
         "check the codebase",
         ChatOptions {
@@ -197,6 +203,27 @@ fn vague_codebase_prompt_runs_audit_and_repairs_followup_budget() -> Result<()> 
 
     assert!(output.contains("Initial Analysis"));
     assert!(output.contains("Follow-ups"));
+
+    assert!(matches!(
+        chunks.lock().unwrap().as_slice(),
+        [StreamChunk::ContentDelta(first), StreamChunk::ClearStreamingText,
+         StreamChunk::ContentDelta(repaired), StreamChunk::Done { .. }]
+            if first.contains("q3") && repaired == &output
+    ));
+
+    // Resume after the first delta, as an RPC client would after reconnecting.
+    let store = codingbuddy_store::Store::new(temp.path())?;
+    let session = store.load_latest_session()?.unwrap();
+    let prompt = store.latest_prompt(session.session_id)?.unwrap();
+    let replayed = store.prompt_events_by_offset(prompt.prompt_id, 1, 10)?;
+    assert_eq!(prompt.status, "completed");
+    assert_eq!(replayed.len(), 3);
+    assert_eq!(replayed[0]["type"], "clear_streaming_text");
+    assert_eq!(replayed[1]["text"], output);
+    assert_eq!(
+        replayed[2],
+        serde_json::json!({"type": "done", "status": "completed"})
+    );
 
     let guard = state.lock().map_err(|_| anyhow!("state poisoned"))?;
     assert_eq!(guard.chat_requests.len(), 2, "expected one repair retry");
