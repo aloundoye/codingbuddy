@@ -50,6 +50,22 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  hygiene:
+    name: hygiene (deny + docs)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AGENTS.md crate list matches Cargo.toml
+        run: bash scripts/check_agents_md.sh
+
+      - name: cargo deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   unattended:
     name: unattended (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

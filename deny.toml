@@ -3,13 +3,26 @@ all-features = true
 
 [advisories]
 yanked = "warn"
-ignore = []
+# Only "unmaintained" notices are ignored here, never vulnerabilities.
+# Each one needs a reason and should be removed once the dependency is replaced.
+ignore = [
+  # chrono: direct dependency across most crates; replace with `jiff` or `time` in a dedicated change.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained notice; migration to a maintained date/time crate tracked separately" },
+  # bincode 1.x and yaml-rust: pulled in by syntect (codingbuddy-ui syntax highlighting).
+  { id = "RUSTSEC-2025-0141", reason = "transitive via syntect; no fix until syntect drops bincode 1.x" },
+  { id = "RUSTSEC-2024-0320", reason = "transitive via syntect; no fix until syntect drops yaml-rust" },
+  # fxhash: pulled in by selectors (HTML parsing in codingbuddy-tools web fetch).
+  { id = "RUSTSEC-2025-0057", reason = "transitive via selectors; no maintained release available" },
+  # ttf-parser: pulled in by lopdf (PDF reading in codingbuddy-tools).
+  { id = "RUSTSEC-2026-0192", reason = "transitive via lopdf; no maintained release available" },
+]
 
 [licenses]
 version = 2
 confidence-threshold = 0.8
 allow = [
   "MIT",
+  "MIT-0",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
