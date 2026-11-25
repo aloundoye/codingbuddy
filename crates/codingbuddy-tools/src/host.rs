@@ -77,6 +77,33 @@ pub fn batch_children(args: &serde_json::Value) -> Result<Vec<(&str, &serde_json
         .collect()
 }
 
+/// GET `url` on the shared runtime, abandoning the request the moment the
+/// tool call is cancelled. Returns (status, content type, body).
+fn http_get_cancellable(
+    url: &str,
+    timeout: Duration,
+    cancellation: Option<&codingbuddy_core::CancellationToken>,
+) -> Result<(u16, String, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!("codingbuddy-cli/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let url = url.to_string();
+    let fetched = codingbuddy_core::runtime::block_on_cancellable(cancellation, async move {
+        let response = client.get(url).send().await?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let body = response.text().await?;
+        Ok::<_, reqwest::Error>((status, content_type, body))
+    })?;
+    Ok(fetched?)
+}
+
 fn is_review_blocked(tool_name: &str) -> bool {
     codingbuddy_core::ToolName::from_internal_name(tool_name).is_some_and(|t| t.is_review_blocked())
 }
@@ -924,19 +951,11 @@ impl LocalToolHost {
                     .get("timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(30);
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(timeout))
-                    .user_agent("codingbuddy-cli/0.2")
-                    .build()?;
-                let resp = client.get(url).send()?;
-                let status = resp.status().as_u16();
-                let content_type = resp
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let body = resp.text()?;
+                let (status, content_type, body) = http_get_cancellable(
+                    url,
+                    Duration::from_secs(timeout),
+                    context.cancellation,
+                )?;
                 let truncated = body.len() > max_bytes;
                 let text = if truncated {
                     &body[..body.floor_char_boundary(max_bytes)]
@@ -990,12 +1009,11 @@ impl LocalToolHost {
                     "https://html.duckduckgo.com/html/?q={}",
                     url_encode_query(query)
                 );
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(15))
-                    .user_agent("codingbuddy-cli/0.2")
-                    .build()?;
-                let resp = client.get(&search_url).send()?;
-                let body = resp.text()?;
+                let (_, _, body) = http_get_cancellable(
+                    &search_url,
+                    Duration::from_secs(15),
+                    context.cancellation,
+                )?;
 
                 // Parse search results from HTML
                 let results = parse_search_results(&body, max_results);
@@ -2364,5 +2382,37 @@ impl LocalToolHost {
             })
             .collect::<Vec<_>>();
         result["verification"] = json!(checks);
+    }
+}
+
+#[cfg(test)]
+mod web_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn web_requests_stop_as_soon_as_the_tool_call_is_cancelled() {
+        // A server that accepts the connection and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/slow", listener.local_addr().expect("addr"));
+        let _server = std::thread::spawn(move || {
+            let _held = listener.accept();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let token = codingbuddy_core::CancellationToken::new();
+        let canceller = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            canceller.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = http_get_cancellable(&url, Duration::from_secs(30), Some(&token))
+            .expect_err("cancelled fetch must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "fetch kept running for {:?}",
+            started.elapsed()
+        );
+        assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
     }
 }
