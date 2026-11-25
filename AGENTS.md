@@ -150,6 +150,8 @@ impl LlmClient for ScriptedToolLlm { /* pop_front on each call */ }
 - `privacy_wiring.rs` — privacy filtering and keyword search tool registration
 - `runtime_conformance.rs`, `analysis_bootstrap.rs`, `team_orchestration.rs`, `functional_verification.rs`, `real_file_operations.rs`, `feature_coverage.rs`, `coding_quality_benchmark.rs`
 
+**Provider cassettes**: `crates/codingbuddy-testkit/cassettes/<provider>/<scenario>.json` hold provider HTTP traffic (real recordings, or `"source": "synthetic"` stand-ins). `tests/provider_replay.rs` replays every cassette through the real `ApiClient` + `AgentEngine` and checks request count/paths, tool sequence, final answer, and that the on-screen answer after the last tool call equals the output. `codingbuddy_testkit::cassette` has `ReplayServer` and `RecordingProxy`. Record with `record_cassettes` (ignored, needs `CODINGBUDDY_RECORD=1`); see `cassettes/README.md`. A failing cassette means behaviour changed on identical provider bytes.
+
 **Unit tests**: Most crates use `#[cfg(test)] mod tests` at the bottom of `lib.rs`.
 
 **Environment safety**: Rust 2024 requires `unsafe` for `std::env::set_var`/`remove_var`. Tests that manipulate env vars must use `unsafe {}` blocks and avoid parallel access (combine related env tests or check return types rather than exact values).

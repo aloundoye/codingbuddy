@@ -1,3 +1,5 @@
+pub mod cassette;
+
 use anyhow::Result;
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{

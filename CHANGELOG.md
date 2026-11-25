@@ -23,6 +23,11 @@ Move it under a version heading when you cut a release.
   report.
 
 ### Fixed
+- A correct answer that names files mentioned in a tool's output (for
+  example a summary of a checklist that lists `Cargo.toml`) is no longer
+  discarded and erased from the screen as an "unverified file reference".
+- Retry log lines no longer include the request URL, which carries the API
+  key for providers such as Gemini.
 - A panic caught inside an agent turn no longer drops the TUI out of
   full-screen mode or prints over it.
 - Engine warnings no longer print to stderr during a TUI session unless
