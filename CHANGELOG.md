@@ -45,6 +45,8 @@ Move it under a version heading when you cut a release.
   to the file the first time they are used. `CODINGBUDDY_CREDENTIALS_FILE`
   points the store elsewhere; `CODINGBUDDY_NO_KEYCHAIN=1` skips that
   migration.
+- An API key entered in `/connect` is saved by default (Enter saves and
+  connects); Ctrl+O uses it for the current session only.
 - A provider that answers 503 now reports that the model is overloaded (not
   a key problem), and a 404 that the model is not available to the key,
   instead of a generic failure. `GEMINI_API_KEY` is accepted for Google, and
