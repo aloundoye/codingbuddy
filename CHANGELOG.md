@@ -10,6 +10,13 @@ Move it under a version heading when you cut a release.
 ## [Unreleased]
 
 ### Added
+- A warning when the conversation reaches 70% of the context window, before
+  older messages are compacted (`context_warning` in JSON output).
+- `codingbuddy session search <words>` finds past prompts and answers across
+  sessions.
+- A published JSON Schema for the JSON-RPC protocol
+  (`docs/protocol/jsonrpc.schema.json`, also `codingbuddy serve
+  --print-schema`), protocol docs, and a TypeScript SDK in `sdk/typescript`.
 - Diagnostic log files in `~/.codingbuddy/logs` (or `CODINGBUDDY_LOG_DIR`),
   rotated daily and kept for 7 days. They record each turn, model request,
   retry, tool call, MCP call and hook with timings, and never the prompt,
@@ -30,6 +37,15 @@ Move it under a version heading when you cut a release.
   answers from being discarded. They stay on for DeepSeek, Qwen, local and
   unknown models. Configure them under `agent_loop.heuristics`, globally or
   per provider; `codingbuddy doctor` shows what is active.
+- The agent is async end to end: model requests, tool execution, the tool
+  loop and the engine's chat API are awaited on one shared runtime, and
+  TUI turns, JSON-RPC background prompts, team lanes and subagents run as
+  runtime tasks. Esc during a running shell command stops the turn and kills
+  the command within seconds.
+- Checkpoints taken before shell commands are much faster (about 30 s →
+  0.35 s for 8,000 files): they skip `.gitignore`d folders such as
+  `node_modules`, reuse stored copies of unchanged files and flush them in
+  one batch.
 
 - `/rename` now saves the session name (it only printed a message before),
   and `codingbuddy session list` shows each session's title (its name, or
@@ -51,6 +67,8 @@ Move it under a version heading when you cut a release.
   calls. Model requests reuse connections across calls.
 
 ### Fixed
+- An "always allow" approval now applies to the very next command in the
+  same session instead of after a restart.
 - "Always allow" for a shell command now works: saved approvals were never
   matched, so the same command kept asking. They now cover that command
   family (`npm *`) but never a chained, piped or redirected command.
