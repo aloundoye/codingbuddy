@@ -288,8 +288,10 @@ impl IdeRpcHandler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, token.clone());
-        let run = move |handler: &Self| {
-            let result = handler.execute_prompt(params, id, Arc::clone(&lease), token.clone());
+        let run = async move |handler: &Self| {
+            let result = handler
+                .execute_prompt(params, id, Arc::clone(&lease), token.clone())
+                .await;
             let (status, output, error) = match &result {
                 Ok(row) => (
                     row["status"].as_str().unwrap_or("failed"),
@@ -316,14 +318,14 @@ impl IdeRpcHandler {
         if background {
             let mut worker = Self::from_store(Arc::clone(&self.store));
             worker.running = Arc::clone(&self.running);
-            std::thread::spawn(move || {
-                let _ = run(&worker);
+            codingbuddy_core::runtime::runtime().spawn(async move {
+                let _ = run(&worker).await;
             });
             return Ok(
                 serde_json::json!({"prompt_id":id,"session_id":session_id,"status":"running"}),
             );
         }
-        run(self)
+        codingbuddy_core::runtime::block_on(run(self))
     }
 
     fn handle_prompt_events(&self, params: Value) -> Result<Value> {
@@ -593,7 +595,7 @@ impl IdeRpcHandler {
 
     // -- Prompt methods --
 
-    fn execute_prompt(
+    async fn execute_prompt(
         &self,
         params: Value,
         prompt_id: Uuid,
@@ -693,9 +695,7 @@ impl IdeRpcHandler {
                 ..Default::default()
             };
 
-            match codingbuddy_core::runtime::block_on(
-                engine.chat_with_options(&prompt, chat_options),
-            ) {
+            match engine.chat_with_options(&prompt, chat_options).await {
                 Ok(output) => ("completed".to_string(), output, None),
                 Err(err) => {
                     provider_error =

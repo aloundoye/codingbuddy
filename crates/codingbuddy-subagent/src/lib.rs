@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -252,22 +251,20 @@ impl BackgroundTaskRegistry {
         }
 
         let tasks_ref = self.tasks.clone();
-        thread::spawn(move || {
-            let (status, result, error) =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)) {
-                    Ok(Ok(output)) => (BackgroundTaskStatus::Completed, Some(output), None),
-                    Ok(Err(e)) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
-                    Err(panic) => {
-                        let panic_msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = panic.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "subagent worker panicked".to_string()
-                        };
-                        (BackgroundTaskStatus::Failed, None, Some(panic_msg))
-                    }
-                };
+        // The worker runs a child agent synchronously on the blocking pool;
+        // a small task records its outcome, including a panic.
+        let runtime = codingbuddy_core::runtime::runtime();
+        let work = runtime.spawn_blocking(worker);
+        runtime.spawn(async move {
+            let (status, result, error) = match work.await {
+                Ok(Ok(output)) => (BackgroundTaskStatus::Completed, Some(output), None),
+                Ok(Err(e)) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
+                Err(join_error) => (
+                    BackgroundTaskStatus::Failed,
+                    None,
+                    Some(panic_message(join_error)),
+                ),
+            };
             let finished_at = chrono::Utc::now();
             if let Ok(mut tasks) = tasks_ref.lock()
                 && let Some(entry) = tasks.get_mut(&id)
@@ -324,30 +321,26 @@ impl BackgroundTaskRegistry {
 
         let tasks_ref = self.tasks.clone();
         let progress_cb = std::sync::Arc::new(on_progress);
-        thread::spawn(move || {
+        let runtime = codingbuddy_core::runtime::runtime();
+        let work = runtime.spawn_blocking(move || {
             let progress_fn = {
                 let cb = progress_cb.clone();
                 move |msg: &str| {
                     cb(id, msg);
                 }
             };
-            let (status, result, error) =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker(&progress_fn)
-                })) {
-                    Ok(Ok(output)) => (BackgroundTaskStatus::Completed, Some(output), None),
-                    Ok(Err(e)) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
-                    Err(panic) => {
-                        let panic_msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = panic.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "subagent worker panicked".to_string()
-                        };
-                        (BackgroundTaskStatus::Failed, None, Some(panic_msg))
-                    }
-                };
+            worker(&progress_fn)
+        });
+        runtime.spawn(async move {
+            let (status, result, error) = match work.await {
+                Ok(Ok(output)) => (BackgroundTaskStatus::Completed, Some(output), None),
+                Ok(Err(e)) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
+                Err(join_error) => (
+                    BackgroundTaskStatus::Failed,
+                    None,
+                    Some(panic_message(join_error)),
+                ),
+            };
             let finished_at = chrono::Utc::now();
             if let Ok(mut tasks) = tasks_ref.lock()
                 && let Some(entry) = tasks.get_mut(&id)
@@ -577,7 +570,7 @@ impl SubagentManager {
             for task in chunk {
                 let worker = Arc::clone(&worker);
                 let retries = self.max_retries_per_task;
-                handles.push(thread::spawn(move || {
+                handles.push(codingbuddy_core::runtime::runtime().spawn_blocking(move || {
                     let run_id = task.run_id;
                     let mut attempts = 0usize;
                     let mut current_task = task.clone();
@@ -624,7 +617,7 @@ impl SubagentManager {
                 }));
             }
             for handle in handles {
-                if let Ok(result) = handle.join() {
+                if let Ok(result) = codingbuddy_core::runtime::block_on(handle) {
                     out.push(result);
                 }
             }
@@ -775,10 +768,26 @@ impl TeamCoordinator {
     }
 }
 
+/// The message of a panicked blocking task.
+fn panic_message(error: tokio::task::JoinError) -> String {
+    if !error.is_panic() {
+        return "subagent worker cancelled".to_string();
+    }
+    let panic = error.into_panic();
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "subagent worker panicked".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::Duration;
 
     fn run_git(repo: &Path, args: &[&str]) -> std::process::Output {

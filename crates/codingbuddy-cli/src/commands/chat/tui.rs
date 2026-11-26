@@ -1170,30 +1170,42 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
 
             let connection_for_turn = Arc::clone(&connection);
             let prompt_repo_root_override = repo_root_override.clone();
-            thread::spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    codingbuddy_core::runtime::block_on(engine_clone.chat_with_options(
-                        &prompt,
-                        ChatOptions {
-                            tools: allow_tools
-                                && !read_only_for_turn
-                                && mode_for_turn == ChatMode::Code,
-                            force_max_think: max_think,
-                            additional_dirs: prompt_additional_dirs,
-                            repo_root_override: prompt_repo_root_override.clone(),
-                            debug_context,
-                            mode: mode_for_turn,
-                            teammate_mode: teammate_mode_for_turn.clone(),
-                            detect_urls,
-                            watch_files: watch_files_enabled,
-                            images: images_for_turn,
-                            session_id: session_id_for_turn,
-                            llm_config: Some(llm_config),
-                            cancellation: Some(token),
-                            ..Default::default()
-                        },
-                    ))
-                }));
+            // The turn is a task on the shared runtime; the UI thread only
+            // reads events. Esc cancels `token`, which the agent awaits on.
+            let runtime = codingbuddy_core::runtime::runtime();
+            runtime.spawn(async move {
+                let turn = runtime.spawn(async move {
+                    engine_clone
+                        .chat_with_options(
+                            &prompt,
+                            ChatOptions {
+                                tools: allow_tools
+                                    && !read_only_for_turn
+                                    && mode_for_turn == ChatMode::Code,
+                                force_max_think: max_think,
+                                additional_dirs: prompt_additional_dirs,
+                                repo_root_override: prompt_repo_root_override.clone(),
+                                debug_context,
+                                mode: mode_for_turn,
+                                teammate_mode: teammate_mode_for_turn.clone(),
+                                detect_urls,
+                                watch_files: watch_files_enabled,
+                                images: images_for_turn,
+                                session_id: session_id_for_turn,
+                                llm_config: Some(llm_config),
+                                cancellation: Some(token),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                let result = turn.await.map_err(|join_error| {
+                    if join_error.is_panic() {
+                        join_error.into_panic()
+                    } else {
+                        Box::new("turn task cancelled".to_string())
+                    }
+                });
                 match result {
                     Ok(Ok(output)) => {
                         let _ = tx_done.send(TuiStreamEvent::Done(output));

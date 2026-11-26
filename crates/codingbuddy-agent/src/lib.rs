@@ -804,7 +804,8 @@ impl AgentEngine {
             let mut h = handler
                 .lock()
                 .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
-            return h(call);
+            // Waits for the user; release the worker meanwhile.
+            return codingbuddy_core::runtime::blocking_section(|| h(call));
         }
         Ok(false)
     }

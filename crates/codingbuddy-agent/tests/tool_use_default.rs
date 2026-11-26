@@ -2121,3 +2121,95 @@ fn delivery_three_worktree_executes_scoped_and_legacy_merge_only_stages() -> Res
     assert!(!patches[0].applied);
     Ok(())
 }
+
+/// Esc during a long shell command ends the async turn promptly and kills
+/// the command.
+#[cfg(unix)]
+#[test]
+fn cancelling_a_turn_stops_a_running_shell_command() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    // An unusual duration so the process can be found by its command line.
+    let command = "sleep 4321";
+    let mut cfg = AppConfig::ensure(temp.path())?;
+    cfg.workspace_trust = Some(true);
+    cfg.policy.allowlist.push("sleep".to_string());
+    let engine = AgentEngine::new_with_config_and_llm(
+        temp.path(),
+        cfg,
+        Box::new(ScriptedLlm::new(vec![
+            tool_call_response(vec![(
+                "call_1",
+                "bash_run",
+                &format!(r#"{{"command":"{command}"}}"#),
+            )]),
+            text_response("done"),
+        ])),
+    )?;
+    engine.set_approval_handler(Box::new(|_| Ok(true)));
+    let cancellation = codingbuddy_core::CancellationToken::new();
+    let cancelled_at = Arc::new(Mutex::new(None));
+    engine.set_stream_callback(Arc::new({
+        let cancellation = cancellation.clone();
+        let cancelled_at = cancelled_at.clone();
+        move |chunk| {
+            if matches!(chunk, StreamChunk::ToolCallStart { .. }) {
+                let cancellation = cancellation.clone();
+                let cancelled_at = cancelled_at.clone();
+                std::thread::spawn(move || {
+                    // Let the shell start before pressing Esc.
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    *cancelled_at.lock().unwrap() = Some(std::time::Instant::now());
+                    cancellation.cancel();
+                });
+            }
+        }
+    }));
+    let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
+        "Wait for the build",
+        ChatOptions {
+            tools: true,
+            cancellation: Some(cancellation),
+            ..Default::default()
+        },
+    ));
+    let Some(cancelled_at) = *cancelled_at.lock().unwrap() else {
+        let store = Store::new(temp.path())?;
+        let session = store.load_latest_session()?.unwrap();
+        let events = store.session_events(session.session_id)?;
+        panic!(
+            "the shell command never ran: {result:?} {:?}",
+            events
+                .iter()
+                .map(|e| format!("{:?}", e.kind))
+                .filter(|k| k.contains("Tool"))
+                .collect::<Vec<_>>()
+        );
+    };
+    assert!(
+        result.is_err(),
+        "a cancelled turn must not complete: {result:?}"
+    );
+    let stop = cancelled_at.elapsed();
+    assert!(
+        stop < std::time::Duration::from_secs(3),
+        "turn took {stop:?} to stop after Esc"
+    );
+    // The kill is delivered when the turn stops; give the OS a moment to
+    // reap the process group.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let running = std::process::Command::new("pgrep")
+            .args(["-f", command])
+            .output()?;
+        if running.stdout.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shell command survived cancellation"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}

@@ -669,7 +669,7 @@ impl Menus {
             &format!("Verifying {}/{}…", llm.provider, llm.active_base_model()),
             Vec::new(),
         ));
-        thread::spawn(move || {
+        codingbuddy_core::runtime::runtime().spawn_blocking(move || {
             let result = codingbuddy_llm::probe_provider(&llm);
             if result.is_ok() {
                 let _ = codingbuddy_store::Store::new(&controller.cwd)

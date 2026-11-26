@@ -17,7 +17,7 @@ pub(crate) fn refresh_model_catalog_background(cwd: &Path, cfg: &AppConfig) {
     }
     let llm = cfg.llm.clone();
     let runtime = runtime_dir(cwd);
-    thread::spawn(move || {
+    codingbuddy_core::runtime::runtime().spawn_blocking(move || {
         let _ = codingbuddy_llm::model_catalog::resolve_model_catalog(&llm, &runtime);
     });
 }
