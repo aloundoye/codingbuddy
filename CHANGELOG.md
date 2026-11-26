@@ -38,6 +38,17 @@ Move it under a version heading when you cut a release.
   report.
 
 ### Changed
+- Saved provider keys and MCP OAuth tokens are stored in private files
+  (`~/.codingbuddy/credentials.json` and `~/.codingbuddy/mcp-tokens/`,
+  mode 0600) instead of the OS keychain, so CodingBuddy no longer asks for
+  your login password. Keys saved in the keychain by older versions are moved
+  to the file the first time they are used. `CODINGBUDDY_CREDENTIALS_FILE`
+  points the store elsewhere; `CODINGBUDDY_NO_KEYCHAIN=1` skips that
+  migration.
+- A provider that answers 503 now reports that the model is overloaded (not
+  a key problem), and a 404 that the model is not available to the key,
+  instead of a generic failure. `GEMINI_API_KEY` is accepted for Google, and
+  Google's `AQ.` API keys are masked in tool output and diagnostics.
 - Corrective prompt heuristics (rejecting long answers written without
   tools, unread file names, shell commands printed as text, recovery
   guidance, checklist and verbosity nudges) are now off by default for

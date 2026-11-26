@@ -78,7 +78,7 @@ A restore preserves unrelated edits and flags conflicts with newer changes. Use 
 
 ## Workspace trust and approvals
 
-User settings live in `~/.codingbuddy/settings.json`. Keep provider credentials there, in your environment, or in the keyring. Project and local project settings can configure runtime behavior after you trust the repository. Use its canonical absolute path.
+User settings live in `~/.codingbuddy/settings.json`. Keep provider credentials in your environment, or let `/connect` save them to `~/.codingbuddy/credentials.json` (readable only by you, mode 0600). Project and local project settings can configure runtime behavior after you trust the repository. Use its canonical absolute path.
 
 ```bash
 CODINGBUDDY_TRUST_WORKSPACE="$(pwd -P)" codingbuddy chat

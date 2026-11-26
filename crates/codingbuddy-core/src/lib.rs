@@ -65,6 +65,16 @@ pub fn max_output_tokens_for_model(
     }
 }
 
+/// True when `CODINGBUDDY_NO_KEYCHAIN` is set (to anything but `0`): keys
+/// older versions saved in the OS keychain are not migrated from it. Cargo
+/// sets it for this repository (`.cargo/config.toml`) so test and dev
+/// binaries, which macOS sees as new apps after every rebuild, never ask for
+/// the login password.
+pub fn keychain_disabled() -> bool {
+    std::env::var_os("CODINGBUDDY_NO_KEYCHAIN")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 pub fn runtime_dir(workspace: &Path) -> PathBuf {
     workspace.join(".codingbuddy")
 }

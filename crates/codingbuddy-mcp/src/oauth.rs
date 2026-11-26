@@ -41,36 +41,36 @@ pub(crate) fn mcp_token_binding(server: &McpServer) -> Result<String> {
     ))
 }
 
-/// Store an OAuth token for an MCP server.
-/// Tries system keychain first, falls back to file-based storage.
+/// Store an OAuth token for an MCP server in a private file
+/// (`~/.codingbuddy/mcp-tokens/<hash>.json`, mode 0600).
 pub fn store_mcp_token(server_id: &str, token: &McpOAuthToken) -> Result<()> {
     let json = serde_json::to_string(token)?;
-
-    if let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id)
-        && entry.set_password(&json).is_ok()
-    {
-        return Ok(());
-    }
-
     store_token_file(server_id, &json)
 }
 
-/// Load a stored OAuth token for an MCP server.
-/// Tries system keychain first, falls back to file-based storage.
+/// Load a stored OAuth token for an MCP server. Tokens older versions kept
+/// in the OS keychain are moved into the token file on first use.
 pub fn load_mcp_token(server_id: &str) -> Result<Option<McpOAuthToken>> {
-    if let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id)
+    if let Some(token) = load_token_file(server_id)? {
+        return Ok(Some(token));
+    }
+    if !codingbuddy_core::keychain_disabled()
+        && let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id)
         && let Ok(json) = entry.get_password()
         && let Ok(token) = serde_json::from_str::<McpOAuthToken>(&json)
     {
+        store_token_file(server_id, &json)?;
+        let _ = entry.delete_credential();
         return Ok(Some(token));
     }
-
-    load_token_file(server_id)
+    Ok(None)
 }
 
 /// Delete a stored OAuth token from both keychain and file.
 pub fn delete_mcp_token(server_id: &str) -> Result<()> {
-    if let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id) {
+    if !codingbuddy_core::keychain_disabled()
+        && let Ok(entry) = keyring::Entry::new("codingbuddy-mcp", server_id)
+    {
         let _ = entry.delete_credential();
     }
     delete_token_file(server_id)
@@ -84,15 +84,25 @@ pub(crate) fn token_dir() -> Result<PathBuf> {
 }
 
 pub(crate) fn store_token_file(server_id: &str, json: &str) -> Result<()> {
+    use std::io::Write;
     let dir = token_dir()?;
-    fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{:x}.json", Sha256::digest(server_id.as_bytes())));
-    fs::write(&path, json)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        builder.mode(0o700);
+        options.mode(0o600);
+        // An existing file keeps its mode on open, so tighten it first.
+        if path.exists() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
     }
+    builder.create(&dir)?;
+    options.open(&path)?.write_all(json.as_bytes())?;
     Ok(())
 }
 

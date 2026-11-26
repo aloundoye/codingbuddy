@@ -160,6 +160,8 @@ impl LlmClient for ScriptedToolLlm { /* pop_front on each call */ }
 
 **Unit tests**: Most crates use `#[cfg(test)] mod tests` at the bottom of `lib.rs`.
 
+**Credentials in tests**: `.cargo/config.toml` sets `CODINGBUDDY_NO_KEYCHAIN=1` and points `CODINGBUDDY_CREDENTIALS_FILE` at `target/test-credentials/`, so cargo-run binaries never read the developer's saved keys or trigger macOS keychain password prompts. Saved keys live in `~/.codingbuddy/credentials.json` (0600, `codingbuddy_llm::credentials`); the keychain is only read to migrate keys from older versions.
+
 **Environment safety**: Rust 2024 requires `unsafe` for `std::env::set_var`/`remove_var`. Tests that manipulate env vars must use `unsafe {}` blocks and avoid parallel access (combine related env tests or check return types rather than exact values).
 
 ## Logging & Diagnostics
