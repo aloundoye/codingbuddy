@@ -9,6 +9,8 @@ Move it under a version heading when you cut a release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-26
+
 ### Added
 - Session memory: decisions, preferences and corrections from each
   compaction summary are kept in `.codingbuddy/session_memory/` and shown to
@@ -74,7 +76,6 @@ Move it under a version heading when you cut a release.
   0.35 s for 8,000 files): they skip `.gitignore`d folders such as
   `node_modules`, reuse stored copies of unchanged files and flush them in
   one batch.
-
 - `/rename` now saves the session name (it only printed a message before),
   and `codingbuddy session list` shows each session's title (its name, or
   its first prompt) and when it was last active.
@@ -176,6 +177,7 @@ See the GitHub release notes for
 [v0.2.0](https://github.com/aloundoye/codingbuddy/releases/tag/v0.2.0) and
 [v0.1.8](https://github.com/aloundoye/codingbuddy/releases/tag/v0.1.8).
 
-[Unreleased]: https://github.com/aloundoye/codingbuddy/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/aloundoye/codingbuddy/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/aloundoye/codingbuddy/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/aloundoye/codingbuddy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/aloundoye/codingbuddy/compare/v0.3.0...v0.4.0
