@@ -9,10 +9,10 @@ pub(super) async fn handle_agent_level_tool(
 ) -> Result<Vec<ToolCallRecord>> {
     let start = Instant::now();
     let args: serde_json::Value = serde_json::from_str(&llm_call.arguments).unwrap_or_else(|e| {
-        eprintln!(
+        codingbuddy_core::logging::notice(format_args!(
             "[tool_loop] failed to parse agent tool arguments for '{}': {e}",
             llm_call.name
-        );
+        ));
         serde_json::json!({})
     });
 

@@ -414,11 +414,9 @@ impl HookRuntime {
     /// [`HookRuntime::fire_with_context`] for standalone, synchronous
     /// callers. Async code awaits `fire_with_context` instead.
     pub fn fire_blocking(&self, event: HookEvent, input: &HookInput) -> HookResult {
-        codingbuddy_core::runtime::block_on(self.fire_with_context(
-            event,
-            input,
-            &ExecutionContext::default(),
-        ))
+        let context = ExecutionContext::default();
+        let fire = self.fire_with_context(event, input, &context);
+        codingbuddy_core::runtime::block_on(fire) // guard: allow (sync wrapper)
     }
 
     /// Fire hooks for an event. Hook commands run as async child processes,
@@ -826,12 +824,9 @@ impl HookRuntime {
         ctx: &HookContext,
         timeout: Duration,
     ) -> Result<Vec<HookRun>> {
-        codingbuddy_core::runtime::block_on(Self::run_legacy_with_context(
-            paths,
-            ctx,
-            timeout,
-            &ExecutionContext::default(),
-        ))
+        let context = ExecutionContext::default();
+        let run = Self::run_legacy_with_context(paths, ctx, timeout, &context);
+        codingbuddy_core::runtime::block_on(run) // guard: allow (sync wrapper)
     }
     pub async fn run_legacy_with_context(
         paths: &[PathBuf],

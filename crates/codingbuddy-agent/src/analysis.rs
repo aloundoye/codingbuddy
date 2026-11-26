@@ -40,7 +40,7 @@ pub async fn analyze(
     }
 
     if gather_context::debug_context_enabled(options.debug_context) {
-        eprintln!("{}", bootstrap.debug_digest("InspectRepo", options.mode));
+        eprintln!("{}", bootstrap.debug_digest("InspectRepo", options.mode)); // guard: allow (--debug-context output)
     }
 
     let system_prompt =

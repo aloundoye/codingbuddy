@@ -369,7 +369,9 @@ impl AgentEngine {
                 if let Err(error) =
                     store.append_event(&codingbuddy_store::NewEvent::new(session_id, kind))
                 {
-                    eprintln!("[agent] failed to persist tool event: {error}");
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[agent] failed to persist tool event: {error}"
+                    ));
                 }
             }
         }));
@@ -497,7 +499,9 @@ impl AgentEngine {
                 && let Err(error) = store
                     .append_prompt_event(id, &codingbuddy_core::stream_chunk_to_event_json(&chunk))
             {
-                eprintln!("[agent] failed to persist prompt event: {error}");
+                codingbuddy_core::logging::notice(format_args!(
+                    "[agent] failed to persist prompt event: {error}"
+                ));
             }
             if let Some(callback) = &callback {
                 callback(chunk);

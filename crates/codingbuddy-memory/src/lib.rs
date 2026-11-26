@@ -528,7 +528,9 @@ impl MemoryManager {
             let id = match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(e) => {
-                    eprintln!("[memory] warning: invalid UUID in ref {ref_name}: {e}");
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[memory] warning: invalid UUID in ref {ref_name}: {e}"
+                    ));
                     continue;
                 }
             };

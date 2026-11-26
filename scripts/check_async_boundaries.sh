@@ -23,9 +23,15 @@ check() {
   fi
 }
 
-# Only the code above each file's test module counts.
+# Only the code above each file's inline test module counts (a
+# `#[cfg(test)]` on a single item or `mod tests;` declaration does not end it).
 strip_tests() {
-  awk '/^#\[cfg\(test\)\]/{exit} {print FILENAME":"FNR":"$0}' "$@"
+  awk 'FNR==1 {held=""; skip=0}
+       skip {next}
+       held != "" && /^mod [A-Za-z_]+ *\{/ {skip=1; held=""; next}
+       held != "" {print held; held=""}
+       /^#\[cfg\(test\)\]/ {held=FILENAME":"FNR":"$0; next}
+       {print FILENAME":"FNR":"$0}' "$@"
 }
 
 turn_path=(
@@ -88,7 +94,24 @@ if [ -n "$hits" ]; then
   fail=1
 fi
 
+# Library code never prints to stderr directly: a stray line is drawn over
+# the full-screen UI. Use codingbuddy_core::logging::notice (logged, and
+# printed only when no UI owns the terminal) or tracing.
+library_crates=$(find crates -maxdepth 1 -type d -name 'codingbuddy-*' \
+  ! -name codingbuddy-cli ! -name codingbuddy-testkit ! -name codingbuddy-ui)
+for crate in $library_crates; do
+  files=$(find "$crate/src" -name '*.rs' -not -path '*/tests/*' -not -name 'tests.rs' \
+    -not -name serve.rs -not -name conformance.rs)
+  [ -n "$files" ] || continue
+  hits=$(strip_tests $files | grep -E 'eprintln!\(' | grep -v '// guard: allow' || true)
+  if [ -n "$hits" ]; then
+    echo "Library code printing to stderr (use codingbuddy_core::logging::notice):" >&2
+    echo "$hits" >&2
+    fail=1
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
-echo "Turn path is async: no blocking HTTP, processes, threads or block_on"
+echo "Turn path is async: no blocking HTTP, processes, threads or block_on; no stray stderr in libraries"

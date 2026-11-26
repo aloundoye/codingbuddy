@@ -147,7 +147,7 @@ impl ShellLaunch {
 
     #[cfg(test)]
     fn run(self, timeout: Duration) -> Result<ShellRunResult> {
-        codingbuddy_core::runtime::block_on(self.run_with_progress(timeout, None, None))
+        codingbuddy_core::runtime::block_on(self.run_with_progress(timeout, None, None)) // guard: allow (test-only helper)
     }
 
     pub(super) async fn run_with_progress(

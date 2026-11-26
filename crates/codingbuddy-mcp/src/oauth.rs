@@ -208,9 +208,9 @@ pub fn start_oauth_flow(server: &McpServer) -> Result<McpOAuthToken> {
     );
 
     // 3. Open browser
-    eprintln!("Opening browser for OAuth authorization...");
+    eprintln!("Opening browser for OAuth authorization..."); // guard: allow (standalone `mcp oauth` command)
     let _ = open_browser(&auth_url);
-    eprintln!("If browser didn't open, visit: {auth_url}");
+    eprintln!("If browser didn't open, visit: {auth_url}"); // guard: allow (standalone `mcp oauth` command)
 
     // 4. Wait for callback
     let code = wait_for_oauth_callback(&listener, &state, Duration::from_secs(120))?;

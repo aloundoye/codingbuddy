@@ -361,7 +361,7 @@ impl McpManager {
         if self.trusted_workspace {
             append(self.load_project_config()?, Source::Project);
         } else if self.project_config_path().is_file() {
-            eprintln!("[trust] Ignored project MCP configuration");
+            codingbuddy_core::logging::notice("[trust] Ignored project MCP configuration");
         }
         let mut seen = BTreeSet::new();
         let mut servers = Vec::new();
@@ -392,8 +392,8 @@ impl McpManager {
             server.child_env =
                 process_env::variables(&self.workspace, &format!("mcp:{}", server.id), source);
             if expand_server_env_vars(&mut server).is_err() {
-                eprintln!(
-                    "[mcp] Skipped server with invalid configuration or unauthorized environment reference"
+                codingbuddy_core::logging::notice(
+                    "[mcp] Skipped server with invalid configuration or unauthorized environment reference",
                 );
                 continue;
             }
@@ -587,10 +587,10 @@ impl McpManager {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&server.id);
-                    eprintln!(
+                    codingbuddy_core::logging::notice(format_args!(
                         "[mcp] Discovery failed for {}; no tools activated",
                         server.id
-                    );
+                    ));
                     continue;
                 }
             };

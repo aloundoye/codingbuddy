@@ -1109,7 +1109,9 @@ impl LocalToolHost {
                             ttl_seconds: 900, // 15 minutes
                         })
                 {
-                    eprintln!("[codingbuddy] web_search: failed to cache results: {e}");
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[codingbuddy] web_search: failed to cache results: {e}"
+                    ));
                 }
 
                 // Emit event
@@ -1123,7 +1125,9 @@ impl LocalToolHost {
                         cached: false,
                     },
                 }) {
-                    eprintln!("[codingbuddy] web_search: failed to emit event: {e}");
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[codingbuddy] web_search: failed to emit event: {e}"
+                    ));
                 }
 
                 Ok(json!({
@@ -2302,7 +2306,9 @@ impl LocalToolHost {
             },
         };
         if let Err(e) = self.store.append_event(&event) {
-            eprintln!("[codingbuddy] hook: failed to emit event: {e}");
+            codingbuddy_core::logging::notice(format_args!(
+                "[codingbuddy] hook: failed to emit event: {e}"
+            ));
         }
     }
 
@@ -2321,7 +2327,9 @@ impl LocalToolHost {
             },
         };
         if let Err(e) = self.store.append_event(&event) {
-            eprintln!("[codingbuddy] visual_artifact: failed to emit event: {e}");
+            codingbuddy_core::logging::notice(format_args!(
+                "[codingbuddy] visual_artifact: failed to emit event: {e}"
+            ));
         }
     }
 

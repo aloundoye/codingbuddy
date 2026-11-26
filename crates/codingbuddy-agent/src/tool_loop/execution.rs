@@ -774,10 +774,10 @@ impl ToolUseLoop<'_> {
                 .await;
             for run in &post_hook_result.runs {
                 if !run.success {
-                    eprintln!(
+                    codingbuddy_core::logging::notice(format_args!(
                         "[hooks] PostToolUse hook failed: {}",
                         run.handler_description
-                    );
+                    ));
                 }
             }
             if let Some(modified) = post_hook_result.modified_result {

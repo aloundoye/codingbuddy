@@ -228,7 +228,9 @@ impl AppConfig {
 
         let legacy = Self::legacy_toml_path(workspace);
         if !trusted && legacy.is_file() {
-            eprintln!("[trust] Ignored legacy project runtime settings");
+            crate::logging::notice(format_args!(
+                "[trust] Ignored legacy project runtime settings"
+            ));
         }
         if trusted && legacy.exists() {
             let raw = fs::read_to_string(legacy)?;
@@ -266,25 +268,28 @@ impl AppConfig {
             let raw = match fs::read_to_string(&path) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!(
+                    crate::logging::notice(format_args!(
                         "[config] warning: could not read {}: {e}; skipping",
                         path.display()
-                    );
+                    ));
                     continue;
                 }
             };
             let mut value: serde_json::Value = match serde_json::from_str(&raw) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
+                    crate::logging::notice(format_args!(
                         "[config] warning: malformed JSON in {}: {e}; skipping",
                         path.display()
-                    );
+                    ));
                     continue;
                 }
             };
             if !trusted_source && retain_safe_project_settings(&mut value) {
-                eprintln!("[trust] Ignored runtime settings from {}", path.display());
+                crate::logging::notice(format_args!(
+                    "[trust] Ignored runtime settings from {}",
+                    path.display()
+                ));
             }
             record_hook_sources(&mut hook_sources, &value, source);
             record_configured_denials(&mut configured_denials, &value, source);

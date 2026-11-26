@@ -39,10 +39,10 @@ fn text_parse_err(
 /// This prevents silent data corruption by making parse errors observable.
 fn parse_uuid_or_nil(s: &str) -> Uuid {
     Uuid::parse_str(s).unwrap_or_else(|e| {
-        eprintln!(
+        codingbuddy_core::logging::notice(format_args!(
             "codingbuddy-store: warning: corrupt UUID '{}': {e}",
             &s[..s.len().min(36)]
-        );
+        ));
         Uuid::nil()
     })
 }
@@ -298,7 +298,9 @@ impl Store {
         for row in rows {
             match row {
                 Ok(session) => out.push(session),
-                Err(e) => eprintln!("[store] skipping corrupt session row: {e}"),
+                Err(e) => codingbuddy_core::logging::notice(format_args!(
+                    "[store] skipping corrupt session row: {e}"
+                )),
             }
         }
         Ok(out)
@@ -327,7 +329,9 @@ impl Store {
         for row in rows {
             match row {
                 Ok(run) => out.push(run),
-                Err(e) => eprintln!("[store] skipping corrupt run row: {e}"),
+                Err(e) => codingbuddy_core::logging::notice(format_args!(
+                    "[store] skipping corrupt run row: {e}"
+                )),
             }
         }
         Ok(out)

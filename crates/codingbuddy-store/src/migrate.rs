@@ -121,9 +121,9 @@ impl Store {
             let mut event = match parsed {
                 Ok(event) => event,
                 Err(err) if !line.ends_with(b"\n") => {
-                    eprintln!(
+                    codingbuddy_core::logging::notice(format_args!(
                         "codingbuddy-store: skipped incomplete events.jsonl line {number}: {err}"
-                    );
+                    ));
                     break;
                 }
                 Err(err) => {

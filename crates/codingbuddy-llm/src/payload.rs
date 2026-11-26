@@ -17,10 +17,10 @@ impl ApiClient {
         let fast_mode = self.cfg.fast_mode;
         let max_cap = max_output_tokens_for_model(capabilities.provider, &req.model, false);
         if req.max_tokens > max_cap {
-            eprintln!(
+            codingbuddy_core::logging::notice(format_args!(
                 "warning: requested max_tokens ({}) exceeds model limit for {} ({}); capping",
                 req.max_tokens, req.model, max_cap
-            );
+            ));
         }
         let max_tokens = if fast_mode {
             req.max_tokens.min(2048)

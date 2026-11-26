@@ -54,7 +54,7 @@ const NETWORK_RETRY_BASE_MS: u64 = 1000;
 
 /// A model provider. Request methods are async; implementations must not
 /// block the calling task (run blocking work with
-/// `codingbuddy_core::runtime::spawn_blocking`).
+/// `codingbuddy_core::runtime::spawn_blocking`). // guard: allow (doc comment)
 #[async_trait::async_trait]
 pub trait LlmClient {
     /// Preserve the selected transport and cached account while attaching turn cancellation.
@@ -108,37 +108,37 @@ pub trait LlmClient {
 /// turn: standalone commands and tests. Never call these from async code.
 pub trait LlmClientBlockingExt: LlmClient + Sync {
     fn complete_blocking(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        codingbuddy_core::runtime::block_on(self.complete(req))
+        codingbuddy_core::runtime::block_on(self.complete(req)) // guard: allow (LlmClientBlockingExt, standalone callers)
     }
     fn complete_streaming_blocking(
         &self,
         req: &LlmRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        codingbuddy_core::runtime::block_on(self.complete_streaming(req, cb))
+        codingbuddy_core::runtime::block_on(self.complete_streaming(req, cb)) // guard: allow (LlmClientBlockingExt, standalone callers)
     }
     fn complete_chat_blocking(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        codingbuddy_core::runtime::block_on(self.complete_chat(req))
+        codingbuddy_core::runtime::block_on(self.complete_chat(req)) // guard: allow (LlmClientBlockingExt, standalone callers)
     }
     fn complete_chat_streaming_blocking(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        codingbuddy_core::runtime::block_on(self.complete_chat_streaming(req, cb))
+        codingbuddy_core::runtime::block_on(self.complete_chat_streaming(req, cb)) // guard: allow (LlmClientBlockingExt, standalone callers)
     }
     fn complete_fim_blocking(&self, req: &FimRequest) -> Result<LlmResponse> {
-        codingbuddy_core::runtime::block_on(self.complete_fim(req))
+        codingbuddy_core::runtime::block_on(self.complete_fim(req)) // guard: allow (LlmClientBlockingExt, standalone callers)
     }
     fn complete_fim_streaming_blocking(
         &self,
         req: &FimRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        codingbuddy_core::runtime::block_on(self.complete_fim_streaming(req, cb))
+        codingbuddy_core::runtime::block_on(self.complete_fim_streaming(req, cb)) // guard: allow (LlmClientBlockingExt, standalone callers)
     }
     fn list_models_blocking(&self) -> Vec<String> {
-        codingbuddy_core::runtime::block_on(self.list_models())
+        codingbuddy_core::runtime::block_on(self.list_models()) // guard: allow (LlmClientBlockingExt, standalone callers)
     }
 }
 

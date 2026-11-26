@@ -968,10 +968,10 @@ impl<'a> ToolUseLoop<'a> {
             .await;
         for run in &result.runs {
             if !run.success {
-                eprintln!(
+                codingbuddy_core::logging::notice(format_args!(
                     "[hooks] {:?} hook failed: {}",
                     event, run.handler_description
-                );
+                ));
             }
         }
     }

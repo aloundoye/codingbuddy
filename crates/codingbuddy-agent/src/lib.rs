@@ -431,7 +431,9 @@ impl AgentEngine {
     pub fn set_async_approval_handler(&self, handler: tool_loop::ApprovalCallback) {
         match self.approval_handler.lock() {
             Ok(mut guard) => *guard = Some(handler),
-            Err(_) => eprintln!("[agent] approval handler mutex poisoned; handler not installed"),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] approval handler mutex poisoned; handler not installed"
+            )),
         }
     }
 
@@ -440,7 +442,9 @@ impl AgentEngine {
             Ok(mut guard) => {
                 *guard = Some(cb);
             }
-            Err(_) => eprintln!("[agent] stream callback mutex poisoned; callback not installed"),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] stream callback mutex poisoned; callback not installed"
+            )),
         }
     }
 
@@ -451,7 +455,9 @@ impl AgentEngine {
                     cb(chunk);
                 }
             }
-            Err(_) => eprintln!("[agent] stream callback mutex poisoned; chunk not emitted"),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] stream callback mutex poisoned; chunk not emitted"
+            )),
         }
     }
 
@@ -460,9 +466,9 @@ impl AgentEngine {
             Ok(mut guard) => {
                 *guard = Some(handler);
             }
-            Err(_) => {
-                eprintln!("[agent] user question handler mutex poisoned; handler not installed")
-            }
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] user question handler mutex poisoned; handler not installed"
+            )),
         }
     }
 
@@ -471,7 +477,9 @@ impl AgentEngine {
             Ok(mut guard) => {
                 *guard = Some(worker);
             }
-            Err(_) => eprintln!("[agent] subagent worker mutex poisoned; worker not installed"),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] subagent worker mutex poisoned; worker not installed"
+            )),
         }
     }
 
@@ -811,7 +819,9 @@ impl AgentEngine {
             kind,
         };
         if let Err(err) = self.store.append_event(&event) {
-            eprintln!("[agent] failed to persist event: {err}");
+            codingbuddy_core::logging::notice(format_args!(
+                "[agent] failed to persist event: {err}"
+            ));
         }
     }
 

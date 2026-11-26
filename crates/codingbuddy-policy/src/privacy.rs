@@ -119,7 +119,10 @@ impl PrivacyRouter {
                             err
                         ));
                     }
-                    eprintln!("[privacy] invalid regex pattern '{}': {}", pattern, err);
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[privacy] invalid regex pattern '{}': {}",
+                        pattern, err
+                    ));
                 }
             }
         }
