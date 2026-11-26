@@ -141,14 +141,11 @@ impl ToolUseLoop<'_> {
             return None;
         }
         let text = render_session_memory(memory);
-        if changed && let Some(path) = path {
-            let saved = path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(&path, &text));
-            if let Err(error) = saved {
-                tracing::warn!(%error, path = %path.display(), "could not save session memory");
-            }
+        if changed
+            && let Some(path) = path
+            && let Err(error) = write_owner_only(&path, &text)
+        {
+            tracing::warn!(%error, path = %path.display(), "could not save session memory");
         }
         Some(text)
     }
@@ -252,22 +249,22 @@ impl ToolUseLoop<'_> {
 
         // Build the new message list in a local vec, validate, then swap.
         // This avoids cloning the entire (potentially large) messages vec for rollback.
+        // Session memory: decisions recorded by every compaction so far, so
+        // one made long ago survives repeated summarising. The entries are
+        // model-written summaries of a conversation that includes tool output,
+        // so they ride in the summary message with the same (user) standing,
+        // never as a system instruction.
+        let memory_path = self.session_memory_path();
+        let memory = Self::update_session_memory(&mut self.session_memory, memory_path, &summary)
+            .map(|memory| format!("\n\n{memory}"))
+            .unwrap_or_default();
         let summary_msg = ChatMessage::User {
             content: format!(
-                "CONVERSATION_HISTORY (compacted from {middle_count} messages):\n{summary}"
+                "CONVERSATION_HISTORY (compacted from {middle_count} messages):\n{summary}{memory}"
             ),
         };
 
         let mut new_messages = vec![system, summary_msg];
-
-        // Session memory: decisions from every compaction so far, so a
-        // correction made long ago survives repeated summarising.
-        let memory_path = self.session_memory_path();
-        if let Some(memory) =
-            Self::update_session_memory(&mut self.session_memory, memory_path, &summary)
-        {
-            new_messages.push(ChatMessage::System { content: memory });
-        }
 
         if let Some(work_state_message) = self.compaction_work_state_message() {
             new_messages.push(ChatMessage::System {
@@ -323,4 +320,32 @@ impl ToolUseLoop<'_> {
 
         true
     }
+}
+
+/// Write `text` to `path` readable only by the current user (directory 0700,
+/// file 0600 on Unix): session memory records the user's own instructions.
+fn write_owner_only(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    if let Some(dir) = path.parent() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        // An existing file keeps its mode on open, so tighten it explicitly.
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    options.open(path)?.write_all(text.as_bytes())
 }

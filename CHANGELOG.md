@@ -12,7 +12,7 @@ Move it under a version heading when you cut a release.
 ### Added
 - Session memory: decisions, preferences and corrections from each
   compaction summary are kept in `.codingbuddy/session_memory/` and shown to
-  the model again after every compaction, so they are not lost when a long
+  the model again with every compaction summary, so they are not lost when a long
   session is summarised more than once or resumed.
 - After a pause of five minutes or more, large tool outputs from older turns
   are trimmed before the next request, whatever the context size. The

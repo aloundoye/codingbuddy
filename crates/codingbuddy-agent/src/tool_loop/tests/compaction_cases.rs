@@ -525,8 +525,15 @@ fn push_compactable_history(loop_: &mut ToolUseLoop<'_>) {
 }
 
 fn session_memory_message(loop_: &ToolUseLoop<'_>) -> Option<String> {
+    assert!(
+        !loop_.messages.iter().any(|msg| matches!(
+            msg,
+            ChatMessage::System { content } if content.contains("SESSION MEMORY")
+        )),
+        "session memory must not be promoted to a system message"
+    );
     loop_.messages.iter().find_map(|msg| match msg {
-        ChatMessage::System { content } if content.starts_with("SESSION MEMORY") => {
+        ChatMessage::User { content } if content.contains("SESSION MEMORY") => {
             Some(content.clone())
         }
         _ => None,
@@ -573,6 +580,20 @@ fn session_memory_accumulates_across_compactions_and_is_saved() {
     )
     .unwrap();
     assert!(saved.contains("user wants a single PR") && saved.contains("never use mocks"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = workspace.path().join(".codingbuddy/session_memory");
+        let file = dir.join(format!("{session}.md"));
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     // A later run of the same session starts from the saved memory.
     let llm = ScriptedLlm::new(vec![make_text_response(&summary_with_decision(

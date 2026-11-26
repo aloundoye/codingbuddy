@@ -84,9 +84,8 @@ pub(crate) fn merge_session_memory(memory: &mut Vec<String>, entries: Vec<String
 
 /// Render session memory as the markdown saved to disk and shown to the model.
 pub(crate) fn render_session_memory(memory: &[String]) -> String {
-    let mut text = String::from(
-        "SESSION MEMORY (decisions, preferences and corrections from earlier in this session; they still apply):\n",
-    );
+    let mut text =
+        String::from("SESSION MEMORY (decisions recorded in earlier summaries of this session):\n");
     for entry in memory {
         text.push_str("- ");
         text.push_str(entry);
