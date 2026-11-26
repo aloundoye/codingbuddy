@@ -4,7 +4,7 @@ CodingBuddy is an open-source AI coding agent for the terminal, with an optional
 
 Use a hosted provider, a local Ollama model, or an OpenAI-compatible gateway. CodingBuddy supports OpenAI Chat Completions and Responses, Anthropic Messages, Gemini GenerateContent, AWS Bedrock Converse, Vertex AI Gemini, Azure OpenAI, and compatible routes such as DeepSeek and OpenRouter. Coding tasks need a model that supports tool calls.
 
-[Install](#installation) · [Quickstart](#quickstart) · [Provider setup](docs/PROVIDER_SUPPORT.md) · [User guide](docs/USER_GUIDE.md) · [0.5.0 release notes](docs/releases/0.5.0.md)
+[Install](#installation) · [Quickstart](#quickstart) · [Provider setup](docs/PROVIDER_SUPPORT.md) · [User guide](docs/USER_GUIDE.md) · [0.6.0 release notes](docs/releases/0.6.0.md)
 
 ## Installation
 
@@ -111,9 +111,9 @@ Run `codingbuddy serve --transport http --web` and open the printed URL with its
 
 The [VS Code extension](extensions/vscode/) connects over stdio. It supports live prompt events, cancellation, and local checkpoint review.
 
-## Upgrading to 0.5.0
+## Upgrading to 0.6.0
 
-Stop older CodingBuddy processes before reopening a workspace. Existing SQLite sessions remain available, and CodingBuddy imports a legacy JSONL-only journal once while retaining the original archive. Review the [upgrade notes](docs/releases/0.5.0.md#before-upgrading) if you use hooks, background commands, custom sandbox wrappers, or a cloud gateway.
+Saved keys move from the OS keychain to `~/.codingbuddy/credentials.json` (mode 0600) the first time they are used. Corrective prompt heuristics are now off by default for Claude, GPT and Gemini models. Review the [upgrade notes](docs/releases/0.6.0.md#before-upgrading) if you depend on either. Upgrading from 0.4 or earlier? See the [0.5.0 notes](docs/releases/0.5.0.md#before-upgrading) as well.
 
 ## Development
 

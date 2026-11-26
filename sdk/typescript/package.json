@@ -1,6 +1,6 @@
 {
   "name": "codingbuddy-sdk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Drive the CodingBuddy agent from Node.js over its JSON-RPC protocol",
   "license": "MIT",
   "repository": {

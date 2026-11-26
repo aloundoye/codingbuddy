@@ -286,7 +286,9 @@ impl Menus {
                     .ok_or_else(|| anyhow!("Choose a provider first"))?;
                 llm.api_key = Some(value.trim().into());
                 if id == "key-entered-save" {
-                    self.prompt_key_name("save-key-and-connect");
+                    // Saved by default, as the provider's default key.
+                    drop(state);
+                    return self.handle("save-key-and-connect", String::new());
                 } else {
                     let llm = llm.clone();
                     self.connect_with_key(&mut state, llm);
@@ -539,11 +541,11 @@ impl Menus {
         self.menu(
             TerminalMenu::field(
                 "API key",
-                "Paste your key. Input is hidden.",
-                "key-entered",
+                "Paste your key (hidden). Enter saves it in ~/.codingbuddy/credentials.json.",
+                "key-entered-save",
                 true,
             )
-            .with_save_action("key-entered-save"),
+            .with_session_only_action("key-entered"),
         );
     }
 

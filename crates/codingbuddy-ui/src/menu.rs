@@ -47,8 +47,9 @@ impl TerminalMenu {
         }
     }
 
-    /// Add a Ctrl+S action for saving a masked credential.
-    pub fn with_save_action(mut self, action: &str) -> Self {
+    /// Add a Ctrl+O action that uses a masked credential for this session
+    /// only (Enter saves it).
+    pub fn with_session_only_action(mut self, action: &str) -> Self {
         self.alternate_submit = Some(action.into());
         self
     }
@@ -71,7 +72,7 @@ impl TerminalMenu {
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> Option<(String, String)> {
         let code = match key.code {
-            KeyCode::Char('s')
+            KeyCode::Char('o')
                 if key.modifiers == KeyModifiers::CONTROL && self.alternate_submit.is_some() =>
             {
                 KeyCode::Enter
@@ -86,7 +87,7 @@ impl TerminalMenu {
                         self.message = "Paste a non-empty API key, then press Enter.".into();
                         return None;
                     }
-                    let action = if key.code == KeyCode::Char('s') {
+                    let action = if key.code == KeyCode::Char('o') {
                         self.alternate_submit.as_ref().unwrap_or(action)
                     } else {
                         action
@@ -173,7 +174,7 @@ impl TerminalMenu {
                             .add_modifier(Modifier::BOLD),
                     ))
                     .title_bottom(if self.alternate_submit.is_some() {
-                        " Enter connect · Ctrl+S save · Esc cancel "
+                        " Enter save & connect · Ctrl+O this session only · Esc cancel "
                     } else if self.field.is_some() {
                         " Enter continue · Esc cancel "
                     } else {
@@ -214,11 +215,16 @@ mod tests {
             menu.key(KeyCode::Enter.into()),
             Some(("use".into(), String::new()))
         );
-        let mut form =
-            TerminalMenu::field("API key", "Paste", "connect", true).with_save_action("save");
+        let mut form = TerminalMenu::field("API key", "Paste", "save", true)
+            .with_session_only_action("session");
         form.paste("fake-secret");
         assert_eq!(
-            form.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            form.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(("session".into(), "fake-secret".into()))
+        );
+        form.paste("fake-secret");
+        assert_eq!(
+            form.key(KeyCode::Enter.into()),
             Some(("save".into(), "fake-secret".into()))
         );
     }
