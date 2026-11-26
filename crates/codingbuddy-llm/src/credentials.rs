@@ -283,13 +283,9 @@ mod credential_file_tests {
     #[test]
     fn keys_are_saved_to_a_private_file_and_removed() {
         let path = credentials_path().unwrap();
+        // Cargo points the store under target/ (.cargo/config.toml).
         assert!(
-            path.starts_with(
-                env!("CARGO_MANIFEST_DIR")
-                    .rsplit_once("/crates/")
-                    .unwrap()
-                    .0
-            ) || std::env::var_os("CODINGBUDDY_CREDENTIALS_FILE").is_some(),
+            path.components().any(|part| part.as_os_str() == "target"),
             "tests must not use the real credentials file: {}",
             path.display()
         );
