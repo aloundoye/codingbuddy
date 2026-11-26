@@ -66,9 +66,10 @@ use anti_hallucination::{
     has_unverified_file_references_given_outputs,
 };
 use compaction::{
-    COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
-    build_compaction_summary_with_llm, extract_memory_observations, extract_tool_path,
-    truncate_line,
+    COMPACTION_TARGET_PCT, IDLE_PRUNE_AFTER, IDLE_PRUNE_KEEP_CHARS, IDLE_PRUNE_MIN_CHARS,
+    PRUNE_AGE_TURNS, build_compaction_summary, build_compaction_summary_with_llm,
+    extract_memory_observations, extract_tool_path, merge_session_memory, parse_session_memory,
+    render_session_memory, session_memory_entries, truncate_line,
 };
 use helpers::summarize_args;
 use safety::{
@@ -196,6 +197,12 @@ pub struct ToolUseLoop<'a> {
     /// User directives extracted from conversation ("always X", "never Y", etc.).
     /// These survive compaction by being re-injected after the system message.
     pinned_directives: Vec<String>,
+    /// When the model last answered. After a long pause its prompt cache has
+    /// expired, so old tool outputs can be trimmed without losing cache hits.
+    pub(crate) last_model_response_at: Option<std::time::Instant>,
+    /// Decisions and user corrections gathered from every compaction summary
+    /// this session (also saved under `.codingbuddy/session_memory/`).
+    pub(crate) session_memory: Option<Vec<String>>,
     /// Pre-computed workspace path string for hook inputs (avoids repeated allocation).
     workspace_path_str: String,
     /// Whether `cleanup_old_tool_outputs` has run this session (at most once).
@@ -304,6 +311,8 @@ impl<'a> ToolUseLoop<'a> {
             doom_loop_tracker: DoomLoopTracker::default(),
             denial_tracker: safety::DenialTracker::default(),
             pinned_directives: Vec::new(),
+            last_model_response_at: None,
+            session_memory: None,
             workspace_path_str,
             tool_output_cleanup_done: false,
             pending_todo_sync: false,
@@ -1174,6 +1183,7 @@ impl<'a> ToolUseLoop<'a> {
                     (serde_json::to_string(t).unwrap_or_default().len() as f64 / 3.5).ceil() as u64
                 })
                 .sum();
+            self.prune_after_idle();
             let message_tokens = estimate_message_tokens(&self.messages);
             let estimated_tokens = message_tokens + tool_def_tokens;
             let (prune_threshold, compact_threshold, compact_target) =
@@ -1245,6 +1255,7 @@ impl<'a> ToolUseLoop<'a> {
             } else {
                 self.llm.complete_chat(&request).await?
             };
+            self.last_model_response_at = Some(std::time::Instant::now());
 
             self.check_cancellation()?;
 

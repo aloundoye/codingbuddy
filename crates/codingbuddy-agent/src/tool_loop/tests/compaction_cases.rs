@@ -413,3 +413,183 @@ fn context_warning_fires_once_per_crossing() {
     loop_.maybe_warn_context_filling(720, 950);
     assert_eq!(*seen.lock().unwrap(), vec![75, 72]);
 }
+
+// ── Idle pruning and session memory ──
+
+/// Four turn groups, each with one tool output of `len` bytes.
+fn push_turns_with_outputs(loop_: &mut ToolUseLoop<'_>, len: usize) {
+    for i in 0..4 {
+        loop_.messages.push(ChatMessage::User {
+            content: format!("task {i}"),
+        });
+        loop_.messages.push(ChatMessage::Tool {
+            tool_call_id: format!("tc{i}"),
+            content: "y".repeat(len),
+            tool_name: None,
+        });
+    }
+}
+
+fn tool_output_lengths(loop_: &ToolUseLoop<'_>) -> Vec<usize> {
+    loop_
+        .messages
+        .iter()
+        .filter_map(|msg| match msg {
+            ChatMessage::Tool { content, .. } => Some(content.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn idle_pause_trims_large_old_outputs_at_any_context_size() {
+    let llm = ScriptedLlm::new(vec![]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host,
+        ToolLoopConfig::default(),
+        "system".to_string(),
+        default_tools(),
+    );
+    push_turns_with_outputs(&mut loop_, 5_000);
+
+    // A recent response: the prompt cache is warm, nothing changes.
+    loop_.last_model_response_at = Some(std::time::Instant::now());
+    loop_.prune_after_idle();
+    assert_eq!(tool_output_lengths(&loop_), vec![5_000; 4]);
+
+    // After a long pause the old outputs are trimmed; the recent turns stay.
+    loop_.last_model_response_at =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(6 * 60));
+    loop_.prune_after_idle();
+    let lengths = tool_output_lengths(&loop_);
+    assert!(lengths[0] < 600, "oldest output trimmed: {lengths:?}");
+    assert_eq!(&lengths[1..], &[5_000, 5_000, 5_000]);
+    assert!(
+        loop_.last_model_response_at.is_none(),
+        "runs once per pause"
+    );
+}
+
+#[test]
+fn idle_pause_leaves_mid_sized_outputs_alone() {
+    let llm = ScriptedLlm::new(vec![]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let mut loop_ = ToolUseLoop::new(
+        &llm,
+        tool_host,
+        ToolLoopConfig::default(),
+        "system".to_string(),
+        default_tools(),
+    );
+    push_turns_with_outputs(&mut loop_, 1_500);
+    loop_.last_model_response_at =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(6 * 60));
+    loop_.prune_after_idle();
+    assert_eq!(tool_output_lengths(&loop_), vec![1_500; 4]);
+}
+
+#[test]
+fn session_memory_entries_come_from_the_decisions_section() {
+    let summary = "## Goal\n- ship the PR\n\n## Key Decisions Made\n- user wants a single PR\n* never use mocks\n1. stay on dev\n- None\n\n## Work Completed\n- edited lib.rs\n";
+    assert_eq!(
+        compaction::session_memory_entries(summary),
+        vec![
+            "user wants a single PR".to_string(),
+            "never use mocks".to_string(),
+            "stay on dev".to_string(),
+        ]
+    );
+}
+
+fn summary_with_decision(decision: &str) -> String {
+    format!(
+        "## Goal\n- finish the refactor of the parser module\n\n## Key Decisions Made\n- {decision}\n\n## Work Completed\n- edited src/parser.rs"
+    )
+}
+
+/// Turns of history long enough that `compact_messages(200)` summarises them.
+fn push_compactable_history(loop_: &mut ToolUseLoop<'_>) {
+    for i in 0..5 {
+        loop_.messages.push(ChatMessage::User {
+            content: format!("question {i} {}", "z".repeat(300)),
+        });
+        loop_.messages.push(ChatMessage::Assistant {
+            content: Some(format!("answer {i} {}", "w".repeat(300))),
+            native_parts: None,
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+    }
+}
+
+fn session_memory_message(loop_: &ToolUseLoop<'_>) -> Option<String> {
+    loop_.messages.iter().find_map(|msg| match msg {
+        ChatMessage::System { content } if content.starts_with("SESSION MEMORY") => {
+            Some(content.clone())
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn session_memory_accumulates_across_compactions_and_is_saved() {
+    let workspace = tempfile::tempdir().unwrap();
+    let session = Uuid::now_v7();
+    let config = ToolLoopConfig {
+        workspace: Some(workspace.path().to_path_buf()),
+        session_id: Some(session),
+        ..Default::default()
+    };
+    let llm = ScriptedLlm::new(vec![
+        make_text_response(&summary_with_decision("user wants a single PR")),
+        make_text_response(&summary_with_decision("never use mocks in tests")),
+    ]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let mut loop_ = ToolUseLoop::new(&llm, tool_host, config, "system".into(), default_tools());
+
+    push_compactable_history(&mut loop_);
+    assert!(codingbuddy_core::runtime::block_on(
+        loop_.compact_messages(200)
+    ));
+    let first = session_memory_message(&loop_).expect("memory injected");
+    assert!(first.contains("user wants a single PR"));
+
+    // The second summary no longer mentions the first decision; memory keeps it.
+    push_compactable_history(&mut loop_);
+    assert!(codingbuddy_core::runtime::block_on(
+        loop_.compact_messages(200)
+    ));
+    let second = session_memory_message(&loop_).expect("memory injected");
+    assert!(second.contains("user wants a single PR"), "{second}");
+    assert!(second.contains("never use mocks in tests"), "{second}");
+
+    let saved = std::fs::read_to_string(
+        workspace
+            .path()
+            .join(".codingbuddy/session_memory")
+            .join(format!("{session}.md")),
+    )
+    .unwrap();
+    assert!(saved.contains("user wants a single PR") && saved.contains("never use mocks"));
+
+    // A later run of the same session starts from the saved memory.
+    let llm = ScriptedLlm::new(vec![make_text_response(&summary_with_decision(
+        "keep the public API unchanged",
+    ))]);
+    let tool_host = Arc::new(MockToolHost::new(vec![], true));
+    let config = ToolLoopConfig {
+        workspace: Some(workspace.path().to_path_buf()),
+        session_id: Some(session),
+        ..Default::default()
+    };
+    let mut resumed = ToolUseLoop::new(&llm, tool_host, config, "system".into(), default_tools());
+    push_compactable_history(&mut resumed);
+    assert!(codingbuddy_core::runtime::block_on(
+        resumed.compact_messages(200)
+    ));
+    let third = session_memory_message(&resumed).expect("memory injected");
+    assert!(third.contains("user wants a single PR"), "{third}");
+    assert!(third.contains("keep the public API unchanged"), "{third}");
+}

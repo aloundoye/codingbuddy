@@ -10,6 +10,14 @@ Move it under a version heading when you cut a release.
 ## [Unreleased]
 
 ### Added
+- Session memory: decisions, preferences and corrections from each
+  compaction summary are kept in `.codingbuddy/session_memory/` and shown to
+  the model again after every compaction, so they are not lost when a long
+  session is summarised more than once or resumed.
+- After a pause of five minutes or more, large tool outputs from older turns
+  are trimmed before the next request, whatever the context size. The
+  provider's prompt cache has expired by then, so this costs nothing and
+  makes the next request smaller.
 - A warning when the conversation reaches 70% of the context window, before
   older messages are compacted (`context_warning` in JSON output).
 - `codingbuddy session search <words>` finds past prompts and answers across
