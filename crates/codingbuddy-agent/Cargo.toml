@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -52,3 +54,6 @@ tree-sitter-zig.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 codingbuddy-testkit = { path = "../codingbuddy-testkit" }
+
+[lints]
+workspace = true

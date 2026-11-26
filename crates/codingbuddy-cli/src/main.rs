@@ -775,6 +775,9 @@ struct ServeArgs {
     /// Expose one saved session to the authenticated browser for this launch.
     #[arg(long)]
     expose_session: Option<uuid::Uuid>,
+    /// Print the JSON Schema of the JSON-RPC protocol and exit.
+    #[arg(long)]
+    print_schema: bool,
 }
 
 #[derive(Args)]
@@ -1091,6 +1094,21 @@ enum PermissionsCmd {
     Show,
     Set(PermissionsSetArgs),
     DryRun(PermissionsDryRunArgs),
+    /// List the "always allow" approvals saved for this project.
+    Approvals,
+    /// Remove saved approvals: one by tool and pattern, or all with --all.
+    Revoke(PermissionsRevokeArgs),
+}
+
+#[derive(Args, Default)]
+struct PermissionsRevokeArgs {
+    /// Tool the approval is for, e.g. `bash.run`.
+    tool: Option<String>,
+    /// The saved pattern, e.g. `npm *`.
+    pattern: Option<String>,
+    /// Remove every approval saved for this project.
+    #[arg(long, conflicts_with_all = ["tool", "pattern"])]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -1556,7 +1574,9 @@ fn run() -> Result<()> {
                 .as_deref()
                 .map(uuid::Uuid::parse_str)
                 .transpose()?;
-            let output = engine.chat_with_options(&args.prompt, options);
+            let output = codingbuddy_core::runtime::block_on(
+                engine.chat_with_options(&args.prompt, options),
+            );
             let finalize_result = match output.as_ref() {
                 Ok(text) => finalize_background_subagent_run(&cwd, Ok(text.as_str())),
                 Err(err) => {
@@ -1584,7 +1604,9 @@ fn run() -> Result<()> {
                 "Create a detailed implementation plan for: {}\n\nReturn ONLY a structured plan with steps, files, and verification commands. Do NOT implement any changes.",
                 args.prompt
             );
-            let result = engine.chat_with_options(&plan_prompt, options)?;
+            let result = codingbuddy_core::runtime::block_on(
+                engine.chat_with_options(&plan_prompt, options),
+            )?;
             if cli.json {
                 print_json(&json!({"plan": result}))?;
             } else {

@@ -26,7 +26,10 @@ tempfile.workspace = true
 
 [dependencies.tokio]
 version = "1"
-features = ["rt", "time", "net"]
+features = ["rt", "time", "net", "macros", "sync", "process", "io-util"]
 
 [dependencies.jsonschema]
+workspace = true
+
+[lints]
 workspace = true

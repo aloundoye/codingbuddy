@@ -1,6 +1,5 @@
 use crate::{ChatShell, TuiStreamEvent, truncate_inline};
 use std::io;
-use std::sync::mpsc;
 
 /// Colors assigned to subagents for visual distinction in the transcript.
 const SUBAGENT_COLORS: &[&str] = &[
@@ -29,7 +28,7 @@ pub(crate) enum StreamEventResult {
 pub(crate) struct StreamRuntimeState<'a> {
     pub shell: &'a mut ChatShell,
     pub active_phase: &'a mut Option<(u64, String)>,
-    pub pending_approval: &'a mut Option<(String, String, mpsc::Sender<bool>)>,
+    pub pending_approval: &'a mut Option<(String, String, tokio::sync::oneshot::Sender<bool>)>,
     pub info_line: &'a mut String,
     pub is_processing: &'a mut bool,
 }
@@ -386,7 +385,7 @@ mod tests {
 
     #[test]
     fn filter_stream_event_drops_approval_when_cancelled() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
         let mut cancelled = true;
         let event = TuiStreamEvent::ApprovalNeeded {
             tool_name: "fs_edit".to_string(),
@@ -394,7 +393,7 @@ mod tests {
             response_tx: tx,
         };
         assert!(filter_stream_event(event, &mut cancelled).is_none());
-        assert_eq!(rx.recv().ok(), Some(false));
+        assert_eq!(rx.try_recv().ok(), Some(false));
         assert!(cancelled);
     }
 

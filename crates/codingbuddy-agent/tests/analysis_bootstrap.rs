@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
@@ -36,12 +37,13 @@ impl CapturingLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for CapturingLlm {
-    fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+    async fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
         Err(anyhow!("complete() not used in analysis bootstrap tests"))
     }
 
-    fn complete_streaming(
+    async fn complete_streaming(
         &self,
         _req: &LlmRequest,
         _cb: StreamCallback,
@@ -51,7 +53,7 @@ impl LlmClient for CapturingLlm {
         ))
     }
 
-    fn complete_chat(&self, req: &ChatRequest) -> anyhow::Result<LlmResponse> {
+    async fn complete_chat(&self, req: &ChatRequest) -> anyhow::Result<LlmResponse> {
         if let Ok(mut guard) = self.state.lock() {
             guard.chat_requests.push(req.clone());
         }
@@ -66,12 +68,12 @@ impl LlmClient for CapturingLlm {
         })
     }
 
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> anyhow::Result<LlmResponse> {
-        let response = self.complete_chat(req)?;
+        let response = self.complete_chat(req).await?;
         cb(StreamChunk::ContentDelta(response.text.clone()));
         cb(StreamChunk::Done {
             reason: Some(response.finish_reason.clone()),
@@ -79,13 +81,16 @@ impl LlmClient for CapturingLlm {
         Ok(response)
     }
 
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> anyhow::Result<LlmResponse> {
+    async fn complete_fim(
+        &self,
+        _req: &codingbuddy_core::FimRequest,
+    ) -> anyhow::Result<LlmResponse> {
         Err(anyhow!(
             "complete_fim() not used in analysis bootstrap tests"
         ))
     }
 
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         _req: &codingbuddy_core::FimRequest,
         _cb: StreamCallback,
@@ -148,14 +153,14 @@ fn repoish_prompt_injects_auto_context_bootstrap_packet() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(CapturingLlm::new(state.clone()));
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "analyze this project",
         ChatOptions {
             tools: false,
             mode: ChatMode::Ask,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert_eq!(output, "The repo looks healthy.");
 
@@ -188,14 +193,14 @@ fn vague_codebase_prompt_runs_audit_and_streams_answer_once() -> Result<()> {
         move |chunk| chunks.lock().unwrap().push(chunk)
     }));
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "check the codebase",
         ChatOptions {
             tools: false,
             mode: ChatMode::Ask,
             ..Default::default()
         },
-    )?;
+    ))?;
     assert_eq!(output, answer);
 
     assert!(matches!(
@@ -236,16 +241,15 @@ fn repoish_prompt_outside_repo_returns_explicit_error() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(CapturingLlm::new(state.clone()));
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let err = engine
-        .chat_with_options(
-            "analyze this project",
-            ChatOptions {
-                tools: false,
-                mode: ChatMode::Ask,
-                ..Default::default()
-            },
-        )
-        .expect_err("expected explicit no-repo error");
+    let err = codingbuddy_core::runtime::block_on(engine.chat_with_options(
+        "analyze this project",
+        ChatOptions {
+            tools: false,
+            mode: ChatMode::Ask,
+            ..Default::default()
+        },
+    ))
+    .expect_err("expected explicit no-repo error");
     assert_eq!(
         err.to_string(),
         "No repository detected. Run from project root or pass --repo <path>."

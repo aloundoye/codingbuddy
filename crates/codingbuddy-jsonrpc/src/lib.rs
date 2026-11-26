@@ -10,13 +10,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 // Enhanced context management
 use codingbuddy_agent::context::ContextManager;
+mod context_methods;
+mod handoff;
+mod helpers;
+pub mod protocol;
+use helpers::*;
 
 /// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,47 +87,108 @@ impl JsonRpcResponse {
     }
 }
 
+/// A future returned by [`RpcHandler::handle_async`]; it may borrow the
+/// handler and need not be `Send` (the stdio server drives it in place).
+pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
 /// Trait for handling JSON-RPC method dispatching.
 pub trait RpcHandler {
     fn handle(&self, method: &str, params: Value) -> Result<Value>;
+
+    /// Handle a request without blocking the server. Methods that wait
+    /// (running a prompt) override this so other requests, such as a
+    /// cancel, are served meanwhile. Defaults to [`RpcHandler::handle`].
+    fn handle_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> LocalBoxFuture<'a, Result<Value>> {
+        Box::pin(std::future::ready(self.handle(method, params)))
+    }
 }
 
 /// Run a JSON-RPC 2.0 server over stdio (newline-delimited JSON).
+///
+/// Requests are served concurrently: a long `prompt/execute` does not hold
+/// up a `cancel` or `status` sent after it. Each response carries its
+/// request's id and is written when ready, so responses can arrive out of
+/// order. `shutdown` waits for requests in flight, then answers and exits.
 pub fn run_stdio_server(handler: &dyn RpcHandler) -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let reader = stdin.lock();
-    let mut writer = stdout.lock();
+    codingbuddy_core::runtime::runtime().block_on(serve(
+        handler,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    ))
+}
 
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+/// The stdio server loop over any byte streams.
+pub async fn serve(
+    handler: &dyn RpcHandler,
+    input: impl tokio::io::AsyncRead + Unpin,
+    mut output: impl tokio::io::AsyncWrite + Unpin,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            Ok(req) => {
-                if req.method == "shutdown" {
-                    let resp = JsonRpcResponse::success(req.id, serde_json::json!({"ok": true}));
-                    let out = serde_json::to_string(&resp)?;
-                    writeln!(writer, "{out}")?;
-                    writer.flush()?;
-                    return Ok(());
-                }
-                match handler.handle(&req.method, req.params) {
-                    Ok(result) => JsonRpcResponse::success(req.id, result),
-                    Err(e) => JsonRpcResponse::error(req.id, ERR_INTERNAL, e.to_string()),
-                }
-            }
-            Err(_) => JsonRpcResponse::error(Value::Null, ERR_PARSE, "Parse error"),
-        };
-
-        let out = serde_json::to_string(&response)?;
-        writeln!(writer, "{out}")?;
-        writer.flush()?;
+    async fn send(
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+        response: &JsonRpcResponse,
+    ) -> Result<()> {
+        let mut line = serde_json::to_vec(response)?;
+        line.push(b'\n');
+        output.write_all(&line).await?;
+        output.flush().await?;
+        Ok(())
     }
 
+    let mut lines = tokio::io::BufReader::new(input).lines();
+    let mut in_flight = futures_util::stream::FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            Some(response) = in_flight.next(), if !in_flight.is_empty() => {
+                send(&mut output, &response).await?;
+            }
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let request = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        send(
+                            &mut output,
+                            &JsonRpcResponse::error(Value::Null, ERR_PARSE, "Parse error"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                if request.method == "shutdown" {
+                    while let Some(response) = in_flight.next().await {
+                        send(&mut output, &response).await?;
+                    }
+                    let response =
+                        JsonRpcResponse::success(request.id, serde_json::json!({"ok": true}));
+                    send(&mut output, &response).await?;
+                    return Ok(());
+                }
+                in_flight.push(async move {
+                    match handler.handle_async(&request.method, request.params).await {
+                        Ok(result) => JsonRpcResponse::success(request.id, result),
+                        Err(e) => JsonRpcResponse::error(request.id, ERR_INTERNAL, e.to_string()),
+                    }
+                });
+            }
+        }
+    }
+    // Input closed: finish what was asked.
+    while let Some(response) = in_flight.next().await {
+        send(&mut output, &response).await?;
+    }
     Ok(())
 }
 
@@ -237,12 +302,18 @@ impl IdeRpcHandler {
         self.exposed_session = Some(id);
         self.http_sessions
             .lock()
-            .expect("HTTP sessions lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id);
         Ok(())
     }
 
     fn run_durable_prompt(&self, params: Value, background: bool) -> Result<Value> {
+        codingbuddy_core::runtime::block_on(self.run_durable_prompt_async(params, background))
+    }
+
+    /// Start a prompt. In the foreground the returned future runs it to
+    /// completion; in the background it is spawned and this returns at once.
+    async fn run_durable_prompt_async(&self, params: Value, background: bool) -> Result<Value> {
         let session_id = require_uuid(&params, "session_id")?;
         let request = if background {
             require_uuid(&params, "request_id")?
@@ -281,10 +352,12 @@ impl IdeRpcHandler {
         let token = codingbuddy_core::CancellationToken::new();
         self.running
             .lock()
-            .expect("prompt cancellation lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, token.clone());
-        let run = move |handler: &Self| {
-            let result = handler.execute_prompt(params, id, Arc::clone(&lease), token.clone());
+        let run = async move |handler: &Self| {
+            let result = handler
+                .execute_prompt(params, id, Arc::clone(&lease), token.clone())
+                .await;
             let (status, output, error) = match &result {
                 Ok(row) => (
                     row["status"].as_str().unwrap_or("failed"),
@@ -303,7 +376,7 @@ impl IdeRpcHandler {
             handler
                 .running
                 .lock()
-                .expect("prompt cancellation lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
             finished?;
             result
@@ -311,14 +384,14 @@ impl IdeRpcHandler {
         if background {
             let mut worker = Self::from_store(Arc::clone(&self.store));
             worker.running = Arc::clone(&self.running);
-            std::thread::spawn(move || {
-                let _ = run(&worker);
+            codingbuddy_core::runtime::runtime().spawn(async move {
+                let _ = run(&worker).await;
             });
             return Ok(
                 serde_json::json!({"prompt_id":id,"session_id":session_id,"status":"running"}),
             );
         }
-        run(self)
+        run(self).await
     }
 
     fn handle_prompt_events(&self, params: Value) -> Result<Value> {
@@ -329,7 +402,7 @@ impl IdeRpcHandler {
         let writer_active = self
             .running
             .lock()
-            .expect("prompt cancellation lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(&id);
         let mut rows = self.store.prompt_events(id, cursor, limit + 1)?;
         let more = rows.len() > limit as usize;
@@ -352,7 +425,7 @@ impl IdeRpcHandler {
         if let Some(token) = self
             .running
             .lock()
-            .expect("prompt cancellation lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&id)
         {
             token.cancel();
@@ -412,7 +485,7 @@ impl IdeRpcHandler {
                     requested.filter(|id| {
                         self.http_sessions
                             .lock()
-                            .expect("HTTP sessions lock")
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .contains(id)
                     })
                 });
@@ -429,7 +502,7 @@ impl IdeRpcHandler {
                     self.handle_session_open(serde_json::json!({"workspace_root": workspace}))?;
                 self.http_sessions
                     .lock()
-                    .expect("HTTP sessions lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(require_uuid(&response, "session_id")?);
                 Ok(response)
             }
@@ -438,7 +511,7 @@ impl IdeRpcHandler {
                 anyhow::ensure!(
                     self.http_sessions
                         .lock()
-                        .expect("HTTP sessions lock")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .contains(&session_id),
                     "session was not opened by this HTTP server"
                 );
@@ -465,7 +538,7 @@ impl IdeRpcHandler {
                     };
                 self.http_prompts
                     .lock()
-                    .expect("HTTP prompts lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(require_uuid(&result, "prompt_id")?);
                 Ok(result)
             }
@@ -475,7 +548,7 @@ impl IdeRpcHandler {
                 anyhow::ensure!(
                     self.http_sessions
                         .lock()
-                        .expect("HTTP sessions lock")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .contains(&session),
                     "prompt is unavailable"
                 );
@@ -487,7 +560,10 @@ impl IdeRpcHandler {
             }
             _ => {
                 let prompt_id = require_uuid(&params, "prompt_id")?;
-                let mut prompts = self.http_prompts.lock().expect("HTTP prompts lock");
+                let mut prompts = self
+                    .http_prompts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 anyhow::ensure!(prompts.contains(&prompt_id), "prompt is unavailable");
                 let response = self.handle_prompt_stream_next(params)?;
                 if response["done"] == true {
@@ -585,7 +661,7 @@ impl IdeRpcHandler {
 
     // -- Prompt methods --
 
-    fn execute_prompt(
+    async fn execute_prompt(
         &self,
         params: Value,
         prompt_id: Uuid,
@@ -685,7 +761,7 @@ impl IdeRpcHandler {
                 ..Default::default()
             };
 
-            match engine.chat_with_options(&prompt, chat_options) {
+            match engine.chat_with_options(&prompt, chat_options).await {
                 Ok(output) => ("completed".to_string(), output, None),
                 Err(err) => {
                     provider_error =
@@ -772,320 +848,6 @@ impl IdeRpcHandler {
             "chunks": out_chunks,
             "next_cursor": next,
             "done": state.status != "running" && !more,
-        }))
-    }
-
-    fn handle_session_handoff_export(&self, params: Value) -> Result<Value> {
-        let session_id = if let Some(session_id) = optional_uuid(&params, "session_id")? {
-            session_id
-        } else {
-            self.store
-                .load_latest_session()?
-                .map(|s| s.session_id)
-                .ok_or_else(|| anyhow!("no sessions available to export"))?
-        };
-        let session = self
-            .store
-            .load_session(session_id)?
-            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        let projection = self.store.rebuild_from_events(session_id)?;
-        let bundle_id = Uuid::now_v7();
-        let output_path = params
-            .get("output_path")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                self.store
-                    .root
-                    .join("teleport")
-                    .join(format!("{bundle_id}.json"))
-            });
-        if let Some(parent) = output_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let payload = serde_json::json!({
-            "schema": "deepseek.handoff.v1",
-            "bundle_id": bundle_id.to_string(),
-            "exported_at": chrono::Utc::now().to_rfc3339(),
-            "session": {
-                "session_id": session_id.to_string(),
-                "workspace_root": session.workspace_root,
-                "status": format!("{:?}", session.status),
-            },
-            "chat_messages": projection.chat_messages,
-            "transcript": projection.transcript,
-            "step_status": projection.step_status,
-        });
-        fs::write(&output_path, serde_json::to_vec_pretty(&payload)?)?;
-        self.store.append_event(&codingbuddy_store::NewEvent {
-            event_id: uuid::Uuid::now_v7(),
-            at: chrono::Utc::now(),
-            session_id,
-            kind: EventKind::TeleportBundleCreated {
-                bundle_id,
-                path: output_path.to_string_lossy().to_string(),
-            },
-        })?;
-
-        Ok(serde_json::json!({
-            "bundle_id": bundle_id.to_string(),
-            "session_id": session_id.to_string(),
-            "path": output_path.to_string_lossy().to_string(),
-            "turn_count": payload["chat_messages"].as_array().map_or(0, std::vec::Vec::len),
-        }))
-    }
-
-    fn handle_session_handoff_import(&self, params: Value) -> Result<Value> {
-        let bundle_path = params
-            .get("bundle_path")
-            .or_else(|| params.get("handoff_path"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing 'bundle_path' parameter"))?;
-        let raw = fs::read_to_string(bundle_path)?;
-        let payload: Value = serde_json::from_str(&raw)?;
-        if payload
-            .get("schema")
-            .and_then(|v| v.as_str())
-            .map(|value| value != "deepseek.handoff.v1")
-            .unwrap_or(false)
-        {
-            return Err(anyhow!("unsupported handoff schema"));
-        }
-
-        let workspace_root = params
-            .get("workspace_root")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string)
-            .or_else(|| {
-                payload
-                    .get("session")
-                    .and_then(|s| s.get("workspace_root"))
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| ".".to_string());
-        let session_id = Uuid::now_v7();
-        let session = Session {
-            session_id,
-            workspace_root,
-            baseline_commit: None,
-            status: SessionState::Idle,
-            budgets: SessionBudgets {
-                per_turn_seconds: 300,
-                max_think_tokens: 8192,
-            },
-            active_plan_id: None,
-        };
-        self.store.save_session(&session)?;
-
-        let chat_messages = payload
-            .get("chat_messages")
-            .cloned()
-            .and_then(|v| serde_json::from_value::<Vec<ChatMessage>>(v).ok())
-            .unwrap_or_default();
-        for message in &chat_messages {
-            self.store.append_event(&codingbuddy_store::NewEvent {
-                event_id: uuid::Uuid::now_v7(),
-                at: chrono::Utc::now(),
-                session_id,
-                kind: EventKind::ChatTurn {
-                    message: message.clone(),
-                },
-            })?;
-        }
-        let resume_import = params
-            .get("resume")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        if resume_import {
-            self.store.append_event(&codingbuddy_store::NewEvent {
-                event_id: uuid::Uuid::now_v7(),
-                at: chrono::Utc::now(),
-                session_id,
-                kind: EventKind::SessionResumed {
-                    session_id,
-                    events_replayed: chat_messages.len() as u64,
-                },
-            })?;
-        }
-
-        Ok(serde_json::json!({
-            "session_id": session_id.to_string(),
-            "imported": true,
-            "bundle_path": bundle_path,
-            "turn_count": chat_messages.len(),
-            "status": "idle",
-            "resumed": resume_import,
-        }))
-    }
-
-    fn handle_session_handoff_link_create(&self, params: Value) -> Result<Value> {
-        let exported = self.handle_session_handoff_export(params.clone())?;
-        let bundle_path = exported
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("handoff export did not return bundle path"))?;
-        let session_id = exported
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("handoff export did not return session id"))?;
-        let session_id = Uuid::parse_str(session_id)?;
-
-        let handoff_id = Uuid::now_v7();
-        let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
-        let token_hash = sha256_hex(&token);
-        let created_at = chrono::Utc::now();
-        let ttl_minutes = params
-            .get("ttl_minutes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(30)
-            .clamp(1, 24 * 60);
-        let expires_at = (created_at + chrono::Duration::minutes(ttl_minutes as i64)).to_rfc3339();
-
-        let descriptor = HandoffDescriptor {
-            schema: "deepseek.handoff_link.v1".to_string(),
-            handoff_id,
-            bundle_path: bundle_path.to_string(),
-            token_hash,
-            created_at: created_at.to_rfc3339(),
-            expires_at: expires_at.clone(),
-            used_at: None,
-            session_id,
-        };
-        write_handoff_descriptor(self.store.root.as_path(), &descriptor)?;
-
-        self.store.append_event(&codingbuddy_store::NewEvent {
-            event_id: uuid::Uuid::now_v7(),
-            at: chrono::Utc::now(),
-            session_id,
-            kind: EventKind::TeleportHandoffLinkCreated {
-                handoff_id,
-                session_id,
-                expires_at: expires_at.clone(),
-            },
-        })?;
-
-        let base_url = params
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("https://app.deepseek.com/handoff");
-        let sep = if base_url.contains('?') { '&' } else { '?' };
-        let link_url = format!("{base_url}{sep}handoff_id={handoff_id}&token={token}");
-
-        Ok(serde_json::json!({
-            "schema": "deepseek.handoff_link.v1",
-            "handoff_id": handoff_id.to_string(),
-            "bundle_path": bundle_path,
-            "session_id": session_id.to_string(),
-            "expires_at": expires_at,
-            "token": token,
-            "url": link_url,
-        }))
-    }
-
-    fn handle_session_handoff_link_consume(&self, params: Value) -> Result<Value> {
-        let handoff_id = require_uuid(&params, "handoff_id")?;
-        let token = params
-            .get("token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing 'token' parameter"))?;
-        let mut descriptor = read_handoff_descriptor(self.store.root.as_path(), handoff_id)?;
-        let now = chrono::Utc::now();
-
-        let invalid_reason = if descriptor.used_at.is_some() {
-            Some("already_used")
-        } else if sha256_hex(token) != descriptor.token_hash {
-            Some("token_mismatch")
-        } else {
-            let expires = chrono::DateTime::parse_from_rfc3339(&descriptor.expires_at)
-                .map(|value| value.with_timezone(&chrono::Utc))
-                .map_err(|_| anyhow!("invalid descriptor expiry timestamp"))?;
-            if now > expires { Some("expired") } else { None }
-        };
-
-        if let Some(reason) = invalid_reason {
-            self.store.append_event(&codingbuddy_store::NewEvent {
-                event_id: uuid::Uuid::now_v7(),
-                at: chrono::Utc::now(),
-                session_id: descriptor.session_id,
-                kind: EventKind::TeleportHandoffLinkConsumed {
-                    handoff_id,
-                    session_id: descriptor.session_id,
-                    success: false,
-                    reason: reason.to_string(),
-                },
-            })?;
-            return Err(anyhow!("handoff token rejected: {reason}"));
-        }
-
-        let imported = self.handle_session_handoff_import(serde_json::json!({
-            "bundle_path": descriptor.bundle_path,
-            "resume": true,
-        }))?;
-        descriptor.used_at = Some(now.to_rfc3339());
-        write_handoff_descriptor(self.store.root.as_path(), &descriptor)?;
-
-        self.store.append_event(&codingbuddy_store::NewEvent {
-            event_id: uuid::Uuid::now_v7(),
-            at: chrono::Utc::now(),
-            session_id: descriptor.session_id,
-            kind: EventKind::TeleportHandoffLinkConsumed {
-                handoff_id,
-                session_id: descriptor.session_id,
-                success: true,
-                reason: "consumed".to_string(),
-            },
-        })?;
-
-        Ok(serde_json::json!({
-            "schema": "deepseek.handoff_link.v1",
-            "handoff_id": handoff_id.to_string(),
-            "consumed": true,
-            "imported_session_id": imported["session_id"],
-            "turn_count": imported["turn_count"],
-        }))
-    }
-
-    fn handle_session_remote_resume(&self, params: Value) -> Result<Value> {
-        if params.get("bundle_path").is_some() || params.get("handoff_path").is_some() {
-            let imported = self.handle_session_handoff_import(params)?;
-            return Ok(serde_json::json!({
-                "remote": true,
-                "mode": "handoff_import",
-                "session_id": imported["session_id"],
-                "status": imported["status"],
-                "turn_count": imported["turn_count"],
-            }));
-        }
-        let resumed = self.handle_session_resume(params.clone())?;
-        let session_id = resumed
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing resumed session id"))?;
-        let parsed = Uuid::parse_str(session_id)?;
-        let events_replayed = resumed
-            .get("turn_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        self.store.append_event(&codingbuddy_store::NewEvent {
-            event_id: uuid::Uuid::now_v7(),
-            at: chrono::Utc::now(),
-            session_id: parsed,
-            kind: EventKind::SessionResumed {
-                session_id: parsed,
-                events_replayed,
-            },
-        })?;
-
-        Ok(serde_json::json!({
-            "remote": true,
-            "mode": "session_resume",
-            "session_id": session_id,
-            "status": resumed["status"],
-            "turn_count": resumed["turn_count"],
-            "workspace_root": resumed["workspace_root"],
         }))
     }
 
@@ -1197,7 +959,10 @@ impl IdeRpcHandler {
         let invocation_id = Uuid::parse_str(invocation_id_str)?;
 
         // Remove from pending approvals.
-        let mut approvals = self.approvals.lock().expect("approvals lock");
+        let mut approvals = self
+            .approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tool_name = approvals
             .get_mut(&session_id)
             .and_then(|pa| pa.pending.remove(invocation_id_str))
@@ -1226,7 +991,10 @@ impl IdeRpcHandler {
             .ok_or_else(|| anyhow!("missing 'invocation_id' parameter"))?;
 
         // Remove from pending approvals.
-        let mut approvals = self.approvals.lock().expect("approvals lock");
+        let mut approvals = self
+            .approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tool_name = approvals
             .get_mut(&session_id)
             .and_then(|pa| pa.pending.remove(invocation_id_str))
@@ -1362,200 +1130,6 @@ impl IdeRpcHandler {
     }
 
     // -- Context management methods --
-
-    fn handle_context_suggest(&self, params: Value) -> Result<Value> {
-        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-
-        let context_manager = self.context_manager.lock().expect("context_manager lock");
-
-        if let Some(manager) = context_manager.as_ref() {
-            let suggestions = manager.suggest_relevant_files(query, limit);
-            let suggestions_json: Vec<Value> = suggestions
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "path": s.path.to_string_lossy(),
-                        "score": s.score,
-                        "reasons": s.reasons,
-                    })
-                })
-                .collect();
-
-            Ok(serde_json::json!({
-                "suggestions": suggestions_json,
-                "count": suggestions.len(),
-                "query": query,
-            }))
-        } else {
-            Ok(serde_json::json!({
-                "suggestions": [],
-                "count": 0,
-                "query": query,
-                "note": "Context analysis unavailable",
-            }))
-        }
-    }
-
-    fn handle_context_analyze(&self, _params: Value) -> Result<Value> {
-        let mut context_manager = self.context_manager.lock().expect("context_manager lock");
-
-        if let Some(manager) = context_manager.as_mut() {
-            match manager.analyze_workspace() {
-                Ok(()) => Ok(serde_json::json!({
-                    "status": "analyzed",
-                    "file_count": manager.file_count(),
-                })),
-                Err(e) => Ok(serde_json::json!({
-                    "status": "error",
-                    "error": e.to_string(),
-                })),
-            }
-        } else {
-            Ok(serde_json::json!({
-                "status": "unavailable",
-                "note": "Context manager not initialized",
-            }))
-        }
-    }
-
-    fn handle_context_compress(&self, params: Value) -> Result<Value> {
-        let context = params.get("context").and_then(|v| v.as_str()).unwrap_or("");
-        let max_tokens = params
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(4000) as usize;
-
-        let context_manager = self.context_manager.lock().expect("context_manager lock");
-
-        if let Some(manager) = context_manager.as_ref() {
-            let compressed = manager.compress_context(context, max_tokens);
-            let original_lines = context.lines().count();
-            let compressed_lines = compressed.lines().count();
-
-            Ok(serde_json::json!({
-                "compressed": compressed,
-                "original_lines": original_lines,
-                "compressed_lines": compressed_lines,
-                "compression_ratio": if original_lines > 0 {
-                    (compressed_lines as f64) / (original_lines as f64)
-                } else {
-                    1.0
-                },
-            }))
-        } else {
-            // Fallback simple compression
-            let lines: Vec<&str> = context.lines().collect();
-            let total_lines = lines.len();
-            let keep_lines = (max_tokens / 10).min(total_lines);
-
-            let compressed = if total_lines > keep_lines {
-                let start = keep_lines / 2;
-                let end = keep_lines - start;
-                let mut result: Vec<&str> = lines.iter().take(start).copied().collect();
-                result.push("// ... context truncated ...");
-                result.extend(lines.iter().rev().take(end).rev());
-                result.join("\n")
-            } else {
-                context.to_string()
-            };
-
-            Ok(serde_json::json!({
-                "compressed": compressed,
-                "original_lines": total_lines,
-                "compressed_lines": compressed.lines().count(),
-                "compression_ratio": if total_lines > 0 {
-                    (compressed.lines().count() as f64) / (total_lines as f64)
-                } else {
-                    1.0
-                },
-                "note": "Using fallback compression",
-            }))
-        }
-    }
-
-    fn handle_context_related(&self, params: Value) -> Result<Value> {
-        let file_path = params
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing 'file_path' parameter"))?;
-        let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-
-        let path = Path::new(file_path);
-        let context_manager = self.context_manager.lock().expect("context_manager lock");
-
-        if let Some(manager) = context_manager.as_ref() {
-            let related = manager.get_related_files(path, depth);
-            let related_json: Vec<Value> = related
-                .iter()
-                .map(|p| serde_json::json!(p.to_string_lossy()))
-                .collect();
-
-            Ok(serde_json::json!({
-                "file_path": file_path,
-                "depth": depth,
-                "related_files": related_json,
-                "count": related.len(),
-            }))
-        } else {
-            Ok(serde_json::json!({
-                "file_path": file_path,
-                "depth": depth,
-                "related_files": [],
-                "count": 0,
-                "note": "Context analysis unavailable",
-            }))
-        }
-    }
-
-    fn handle_context_debug(&self, params: Value) -> Result<Value> {
-        let session_id = require_uuid(&params, "session_id")?;
-        let prompt = params
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing 'prompt' parameter"))?
-            .to_string();
-
-        let session = self
-            .store
-            .load_session(session_id)?
-            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        let workspace_root = PathBuf::from(session.workspace_root);
-
-        let mode = params
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .map(parse_chat_mode)
-            .unwrap_or(ChatMode::Code);
-        let tools = params
-            .get("tools")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let repo_root_override = params
-            .get("repo_root")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-
-        let engine = AgentEngine::new(&workspace_root)?;
-        let digest = engine.context_debug_preview(
-            &prompt,
-            &ChatOptions {
-                tools,
-                mode,
-                repo_root_override,
-                debug_context: true,
-                ..Default::default()
-            },
-        );
-
-        Ok(serde_json::json!({
-            "schema": "deepseek.context.debug.v1",
-            "session_id": session_id.to_string(),
-            "digest": digest,
-        }))
-    }
-
-    // -- Task methods --
 
     fn handle_task_list(&self, params: Value) -> Result<Value> {
         let session_id = params
@@ -1723,7 +1297,7 @@ impl IdeRpcHandler {
     pub fn add_pending_approval(&self, session_id: Uuid, invocation_id: &str, tool_name: &str) {
         self.approvals
             .lock()
-            .expect("approvals lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(session_id)
             .or_default()
             .pending
@@ -1732,7 +1306,28 @@ impl IdeRpcHandler {
 }
 
 impl RpcHandler for IdeRpcHandler {
+    fn handle_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> LocalBoxFuture<'a, Result<Value>> {
+        if method == "prompt/execute" {
+            #[cfg(test)]
+            if let Err(problem) = protocol::check_params(method, &params) {
+                panic!("{problem}: {params}");
+            }
+            return Box::pin(self.run_durable_prompt_async(params, false));
+        }
+        Box::pin(std::future::ready(self.handle(method, params)))
+    }
+
     fn handle(&self, method: &str, params: Value) -> Result<Value> {
+        // Every call made by the test suite must match the published
+        // protocol, so `docs/protocol/jsonrpc.schema.json` cannot drift.
+        #[cfg(test)]
+        if let Err(problem) = protocol::check_params(method, &params) {
+            panic!("{problem}: {params}");
+        }
         match method {
             // Basic lifecycle
             "initialize" => Ok(serde_json::json!({
@@ -1762,15 +1357,20 @@ impl RpcHandler for IdeRpcHandler {
                 let id = if let Some(id) = params.get("prompt_id").and_then(Value::as_str) {
                     Uuid::parse_str(id)?
                 } else {
-                    let running = self.running.lock().unwrap();
+                    let running = self
+                        .running
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     anyhow::ensure!(
                         running.len() <= 1,
                         "Multiple active prompts; supply prompt_id"
                     );
-                    if running.is_empty() {
-                        return Ok(serde_json::json!({"cancelled":false,"status":"idle"}));
+                    match running.keys().next() {
+                        Some(prompt_id) => *prompt_id,
+                        None => {
+                            return Ok(serde_json::json!({"cancelled":false,"status":"idle"}));
+                        }
                     }
-                    *running.keys().next().unwrap()
                 };
                 let result = self.handle_prompt_cancel(serde_json::json!({"prompt_id":id}))?;
                 Ok(
@@ -1873,803 +1473,5 @@ impl RpcHandler for IdeRpcHandler {
     }
 }
 
-fn timeline_category(kind: &str) -> &'static str {
-    if kind.contains("Patch") || kind.contains("Snapshot") {
-        "patch"
-    } else if kind.contains("Tool") {
-        "tool"
-    } else if kind.contains("Background") || kind.contains("Subagent") || kind.contains("Run") {
-        "background"
-    } else if kind.contains("Task") || kind.contains("Step") || kind.contains("Plan") {
-        "plan"
-    } else if kind.contains("Model") || kind.contains("Provider") {
-        "model"
-    } else if kind.contains("Session") || kind.contains("Phase") {
-        "session"
-    } else if kind.contains("Error") || kind.contains("Warning") {
-        "diagnostic"
-    } else {
-        "message"
-    }
-}
-
-fn timeline_summary(kind: &str, payload: &Value) -> String {
-    let kind = kind.split('@').next().unwrap_or(kind);
-    let body = payload.get("payload").unwrap_or(payload);
-    match kind {
-        "ChatTurn" => body
-            .get("message")
-            .map(chat_turn_summary)
-            .unwrap_or_else(|| "chat turn".to_string()),
-        "ToolProposed" => body
-            .pointer("/proposal/call/name")
-            .and_then(Value::as_str)
-            .map(|name| format!("tool proposed: {name}"))
-            .unwrap_or_else(|| "tool proposed".to_string()),
-        "ToolApproved" => body
-            .get("invocation_id")
-            .and_then(Value::as_str)
-            .map(|id| format!("tool approved: {id}"))
-            .unwrap_or_else(|| "tool approved".to_string()),
-        "ToolResult" => body
-            .pointer("/result/name")
-            .and_then(Value::as_str)
-            .map(|name| format!("tool result: {name}"))
-            .unwrap_or_else(|| "tool result".to_string()),
-        "PatchStaged" => body
-            .get("patch_id")
-            .and_then(Value::as_str)
-            .map(|id| format!("patch staged: {id}"))
-            .unwrap_or_else(|| "patch staged".to_string()),
-        "PatchApplied" => {
-            let applied = body
-                .get("applied")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            body.get("patch_id")
-                .and_then(Value::as_str)
-                .map(|id| format!("patch applied={applied}: {id}"))
-                .unwrap_or_else(|| format!("patch applied={applied}"))
-        }
-        "ModelChanged" => body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(|model| format!("model changed: {model}"))
-            .unwrap_or_else(|| "model changed".to_string()),
-        "ProviderSelected" => {
-            let provider = body.get("provider").and_then(Value::as_str).unwrap_or("");
-            let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-            format!("model selected: {provider}/{model}")
-        }
-        "PhaseTransition" => {
-            let from = body.get("from").and_then(Value::as_str).unwrap_or("");
-            let to = body.get("to").and_then(Value::as_str).unwrap_or("");
-            format!("phase: {from} -> {to}")
-        }
-        "SessionStateChanged" => {
-            let from = body.get("from").and_then(Value::as_str).unwrap_or("");
-            let to = body.get("to").and_then(Value::as_str).unwrap_or("");
-            format!("session state: {from} -> {to}")
-        }
-        _ => kind.to_string(),
-    }
-}
-
-fn chat_turn_summary(message: &Value) -> String {
-    if let Some(content) = message.get("content").and_then(Value::as_str) {
-        return format!("message: {}", truncate_timeline(content));
-    }
-    if message.get("tool_calls").is_some() {
-        return "assistant tool call turn".to_string();
-    }
-    "chat turn".to_string()
-}
-
-fn truncate_timeline(value: &str) -> String {
-    const MAX_CHARS: usize = 120;
-    if value.chars().count() <= MAX_CHARS {
-        return value.replace('\n', " ");
-    }
-    let mut out: String = value.chars().take(MAX_CHARS - 1).collect();
-    out.push('…');
-    out.replace('\n', " ")
-}
-
-fn handoff_dir(store_root: &Path) -> PathBuf {
-    store_root.join("teleport").join("handoffs")
-}
-
-fn handoff_descriptor_path(store_root: &Path, handoff_id: Uuid) -> PathBuf {
-    handoff_dir(store_root).join(format!("{handoff_id}.json"))
-}
-
-fn write_handoff_descriptor(store_root: &Path, descriptor: &HandoffDescriptor) -> Result<()> {
-    let path = handoff_descriptor_path(store_root, descriptor.handoff_id);
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(descriptor)?)?;
-    Ok(())
-}
-
-fn read_handoff_descriptor(store_root: &Path, handoff_id: Uuid) -> Result<HandoffDescriptor> {
-    let path = handoff_descriptor_path(store_root, handoff_id);
-    let raw = fs::read_to_string(&path)?;
-    let descriptor = serde_json::from_str::<HandoffDescriptor>(&raw)?;
-    Ok(descriptor)
-}
-
-fn sha256_hex(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// Extract a UUID from a JSON params object.
-fn public_chat_history(messages: Vec<ChatMessage>) -> Vec<Value> {
-    messages
-        .into_iter()
-        .filter_map(|message| match message {
-            ChatMessage::User { content } => {
-                Some(serde_json::json!({"role":"user","content":content}))
-            }
-            ChatMessage::Assistant {
-                content: Some(content),
-                ..
-            } => Some(serde_json::json!({"role":"assistant","content":content})),
-            _ => None,
-        })
-        .collect()
-}
-
-fn require_uuid(params: &Value, field: &str) -> Result<Uuid> {
-    let s = params
-        .get(field)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing '{field}' parameter"))?;
-    Uuid::parse_str(s).map_err(|e| anyhow!("invalid UUID for '{field}': {e}"))
-}
-
-fn optional_uuid(params: &Value, field: &str) -> Result<Option<Uuid>> {
-    let Some(raw) = params.get(field).and_then(|v| v.as_str()) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        Uuid::parse_str(raw).map_err(|e| anyhow!("invalid UUID for '{field}': {e}"))?,
-    ))
-}
-
-fn env_flag_enabled(key: &str) -> bool {
-    match std::env::var(key) {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty() && !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
-        }
-        Err(_) => false,
-    }
-}
-
-fn parse_chat_mode(value: &str) -> ChatMode {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "ask" => ChatMode::Ask,
-        "context" => ChatMode::Context,
-        _ => ChatMode::Code,
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn delivery_one_prompt_replay_is_deduplicated_and_launch_scoped() -> Result<()> {
-        let workspace = tempfile::tempdir()?;
-        let local = IdeRpcHandler::new(workspace.path())?;
-        let session = local.handle_http("session/open", json!({}))?;
-        let id = require_uuid(&session, "session_id")?;
-        let request = json!({"session_id":id,"request_id":Uuid::now_v7(),"prompt":"test","mock_output":"fixture"});
-        let first = local.handle("prompt/start", request.clone())?;
-        let prompt_id = require_uuid(&first, "prompt_id")?;
-        let repeat = local.handle("prompt/start", request)?;
-        assert_eq!(repeat["prompt_id"], first["prompt_id"]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while local.store.prompt_state(prompt_id)?.status == "running" {
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "prompt did not settle"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let page = local.handle_http("prompt/events", json!({"prompt_id":prompt_id,"limit":1}))?;
-        assert_eq!(page["events"][0]["event"]["text"], "fixture");
-        assert_eq!(page["done"], false);
-        let next = local.handle_http(
-            "prompt/events",
-            json!({"prompt_id":prompt_id,"cursor":page["next_cursor"]}),
-        )?;
-        assert_eq!(next["events"][0]["event"]["type"], "done");
-        assert_eq!(next["done"], true);
-        let mut restarted = IdeRpcHandler::new(workspace.path())?;
-        assert!(
-            restarted
-                .handle_http("prompt/events", json!({"prompt_id":prompt_id}))
-                .is_err()
-        );
-        let unrelated = restarted.handle_http("session/open", json!({"session_id":id}))?;
-        assert_ne!(unrelated["session_id"], session["session_id"]);
-        restarted.expose_session(id)?;
-        let resumed = restarted.handle_http("session/open", json!({}))?;
-        assert_eq!(resumed["session_id"], session["session_id"]);
-        assert_eq!(resumed["latest_prompt"]["prompt_id"], first["prompt_id"]);
-        assert_eq!(resumed["history"][1]["content"], "fixture");
-        assert!(restarted.handle_http("config/set", json!({})).is_err());
-        assert!(restarted.handle_http("prompt/start", json!({"session_id":id,"prompt":"test","request_id":Uuid::now_v7(),"additional_dirs":["/"]})).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn jsonrpc_request_round_trip() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: json!(1),
-            method: "initialize".to_string(),
-            params: json!({}),
-        };
-        let serialized = serde_json::to_string(&req).expect("serialize");
-        let deserialized: JsonRpcRequest = serde_json::from_str(&serialized).expect("deserialize");
-        assert_eq!(deserialized.method, "initialize");
-        assert_eq!(deserialized.id, json!(1));
-    }
-
-    #[test]
-    fn parse_error_returns_code_32700() {
-        let bad_json = "not json";
-        let result = serde_json::from_str::<JsonRpcRequest>(bad_json);
-        assert!(result.is_err());
-        let resp = JsonRpcResponse::error(Value::Null, ERR_PARSE, "Parse error");
-        assert_eq!(resp.error.as_ref().unwrap().code, -32700);
-    }
-
-    #[test]
-    fn success_response_has_no_error() {
-        let resp = JsonRpcResponse::success(json!(42), json!({"ok": true}));
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap()["ok"], true);
-    }
-
-    #[test]
-    fn error_response_has_no_result() {
-        let resp = JsonRpcResponse::error(json!(1), ERR_METHOD_NOT_FOUND, "method not found");
-        assert!(resp.result.is_none());
-        assert_eq!(resp.error.as_ref().unwrap().code, -32601);
-    }
-
-    #[test]
-    fn default_handler_initialize() {
-        let handler = DefaultRpcHandler;
-        let result = handler.handle("initialize", json!({})).expect("initialize");
-        assert_eq!(result["name"], "codingbuddy-cli");
-    }
-
-    #[test]
-    fn default_handler_unknown_method() {
-        let handler = DefaultRpcHandler;
-        let err = handler
-            .handle("nonexistent", json!({}))
-            .expect_err("should fail");
-        assert!(err.to_string().contains("method not found"));
-    }
-
-    #[test]
-    fn ide_handler_initialize() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-        let result = handler.handle("initialize", json!({})).expect("initialize");
-        assert_eq!(result["name"], "codingbuddy-cli");
-        let caps = result["capabilities"].as_array().unwrap();
-        assert!(caps.iter().any(|c| c == "session/open"));
-        assert!(caps.iter().any(|c| c == "prompt/execute"));
-        assert!(caps.iter().any(|c| c == "prompt/stream_next"));
-        assert!(caps.iter().any(|c| c == "session/handoff_export"));
-        assert!(caps.iter().any(|c| c == "session/handoff_import"));
-        assert!(caps.iter().any(|c| c == "session/handoff_link_create"));
-        assert!(caps.iter().any(|c| c == "session/handoff_link_consume"));
-        assert!(caps.iter().any(|c| c == "session/remote_resume"));
-        assert!(caps.iter().any(|c| c == "events/poll"));
-        assert!(caps.iter().any(|c| c == "tool/approve"));
-        assert!(caps.iter().any(|c| c == "patch/preview"));
-        assert!(caps.iter().any(|c| c == "context/debug"));
-    }
-
-    #[test]
-    fn ide_handler_session_open_and_list() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        // Open a session.
-        let result = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/project"}))
-            .expect("session/open");
-        let sid = result["session_id"].as_str().unwrap();
-        assert!(!sid.is_empty());
-        assert_eq!(result["status"], "idle");
-
-        // List sessions.
-        let list = handler
-            .handle("session/list", json!({}))
-            .expect("session/list");
-        let sessions = list["sessions"].as_array().unwrap();
-        assert!(!sessions.is_empty());
-        assert!(sessions.iter().any(|s| s["session_id"] == sid));
-    }
-
-    #[test]
-    fn ide_handler_session_fork() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        // Open a session.
-        let result = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/test"}))
-            .unwrap();
-        let sid = result["session_id"].as_str().unwrap();
-
-        // Fork it.
-        let forked = handler
-            .handle("session/fork", json!({"session_id": sid}))
-            .expect("session/fork");
-        assert_eq!(forked["forked_from"], sid);
-        assert_ne!(forked["session_id"], sid);
-        assert_eq!(forked["status"], "idle");
-    }
-
-    #[test]
-    fn ide_handler_session_resume() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        let result = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/r"}))
-            .unwrap();
-        let sid = result["session_id"].as_str().unwrap();
-
-        let resumed = handler
-            .handle("session/resume", json!({"session_id": sid}))
-            .expect("session/resume");
-        assert_eq!(resumed["session_id"], sid);
-        assert_eq!(resumed["turn_count"], 0);
-    }
-
-    #[test]
-    fn ide_handler_prompt_execute() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        let result = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/p"}))
-            .unwrap();
-        let sid = result["session_id"].as_str().unwrap();
-
-        let exec = handler
-            .handle(
-                "prompt/execute",
-                json!({
-                    "session_id": sid,
-                    "prompt": "explain this code",
-                    "mock_output": "Initial Analysis\n- sample"
-                }),
-            )
-            .expect("prompt/execute");
-        assert_eq!(exec["status"], "completed");
-        assert_eq!(exec["prompt"], "explain this code");
-        assert!(exec["prompt_id"].as_str().is_some());
-        assert!(exec["output"].as_str().is_some());
-    }
-
-    #[test]
-    fn ide_handler_context_debug_returns_digest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-        let opened = handler
-            .handle("session/open", json!({"workspace_root": tmp.path()}))
-            .unwrap();
-        let sid = opened["session_id"].as_str().unwrap();
-
-        let debug = handler
-            .handle(
-                "context/debug",
-                json!({
-                    "session_id": sid,
-                    "prompt": "analyze this project",
-                    "mode": "ask",
-                    "tools": false
-                }),
-            )
-            .expect("context/debug");
-        assert_eq!(debug["schema"], "deepseek.context.debug.v1");
-        assert!(debug["digest"].as_str().is_some());
-    }
-
-    #[test]
-    fn ide_handler_prompt_partial_stream() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        let opened = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/stream"}))
-            .unwrap();
-        let sid = opened["session_id"].as_str().unwrap();
-        let exec = handler
-            .handle(
-                "prompt/execute",
-                json!({
-                    "session_id": sid,
-                    "prompt": "stream this response please",
-                    "include_partial_messages": true,
-                    "mock_output": "stream this response please"
-                }),
-            )
-            .expect("prompt/execute");
-        assert_eq!(exec["partial_messages_enabled"], true);
-        let prompt_id = exec["prompt_id"].as_str().unwrap();
-
-        let chunk_1 = handler
-            .handle(
-                "prompt/stream_next",
-                json!({"prompt_id": prompt_id, "cursor": 0, "max_chunks": 1}),
-            )
-            .expect("prompt/stream_next first");
-        assert_eq!(chunk_1["chunks"].as_array().unwrap().len(), 1);
-        let next_cursor = chunk_1["next_cursor"].as_u64().unwrap();
-        assert!(next_cursor >= 1);
-        if !chunk_1["done"].as_bool().unwrap_or(false) {
-            let chunk_2 = handler
-                .handle(
-                    "prompt/stream_next",
-                    json!({"prompt_id": prompt_id, "cursor": next_cursor, "max_chunks": 100}),
-                )
-                .expect("prompt/stream_next second");
-            assert_eq!(chunk_2["done"], true);
-        }
-    }
-
-    #[test]
-    fn prompt_stream_resume_replays_a_draft_reset_and_replacement() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let handler = IdeRpcHandler::new(temp.path())?;
-        let opened = handler.handle("session/open", json!({}))?;
-        let session = require_uuid(&opened, "session_id")?;
-        let lease = handler.store.session_lease(session)?;
-        let prompt = handler
-            .store
-            .start_prompt(&lease, session, Uuid::now_v7(), &json!({}))?;
-        handler.store.append_prompt_event(
-            prompt,
-            &stream_chunk_to_event_json(&StreamChunk::ContentDelta("Discarded".into())),
-        )?;
-        let first = handler.handle(
-            "prompt/stream_next",
-            json!({"prompt_id": prompt, "cursor": 0}),
-        )?;
-        assert_eq!(first["done"], false);
-        assert_eq!(first["chunks"][0]["delta"], "Discarded");
-        for chunk in [
-            StreamChunk::ClearStreamingText,
-            StreamChunk::ContentDelta("Replacement".into()),
-        ] {
-            handler
-                .store
-                .append_prompt_event(prompt, &stream_chunk_to_event_json(&chunk))?;
-        }
-        handler
-            .store
-            .finish_prompt(prompt, "completed", Some("Replacement"), None)?;
-        drop(lease);
-
-        let reconnected = IdeRpcHandler::new(temp.path())?;
-        let remainder = reconnected.handle(
-            "prompt/stream_next",
-            json!({
-                "prompt_id": prompt, "cursor": first["next_cursor"]
-            }),
-        )?;
-        assert_eq!(remainder["chunks"][0]["type"], "clear_streaming_text");
-        assert_eq!(remainder["chunks"][1]["delta"], "Replacement");
-        assert_eq!(
-            remainder["chunks"][2]["event"],
-            json!({"type": "done", "status": "completed"})
-        );
-        assert_eq!(remainder["next_cursor"], 4);
-        assert_eq!(remainder["done"], true);
-        Ok(())
-    }
-
-    #[test]
-    fn ide_handler_handoff_export_import_remote_resume() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        let opened = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/handoff"}))
-            .unwrap();
-        let sid = opened["session_id"].as_str().unwrap();
-        let _ = handler
-            .handle(
-                "prompt/execute",
-                json!({
-                    "session_id": sid,
-                    "prompt": "save this conversation",
-                    "mock_output": "saved"
-                }),
-            )
-            .expect("prompt/execute");
-
-        let export = handler
-            .handle("session/handoff_export", json!({"session_id": sid}))
-            .expect("handoff_export");
-        let bundle_path = export["path"].as_str().unwrap();
-        assert!(std::path::Path::new(bundle_path).exists());
-
-        let imported = handler
-            .handle(
-                "session/handoff_import",
-                json!({"bundle_path": bundle_path, "resume": true}),
-            )
-            .expect("handoff_import");
-        assert_eq!(imported["imported"], true);
-        let imported_id = imported["session_id"].as_str().unwrap();
-        assert!(!imported_id.is_empty());
-
-        let remote = handler
-            .handle(
-                "session/remote_resume",
-                json!({"session_id": imported_id, "transport": "stdio"}),
-            )
-            .expect("remote_resume");
-        assert_eq!(remote["remote"], true);
-        assert_eq!(remote["session_id"], imported_id);
-    }
-
-    #[test]
-    fn ide_handler_handoff_link_create_and_consume() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        let opened = handler
-            .handle(
-                "session/open",
-                json!({"workspace_root": "/tmp/handoff-link"}),
-            )
-            .unwrap();
-        let sid = opened["session_id"].as_str().unwrap();
-        let _ = handler
-            .handle(
-                "prompt/execute",
-                json!({
-                    "session_id": sid,
-                    "prompt": "handoff link seed",
-                    "mock_output": "seeded"
-                }),
-            )
-            .expect("prompt/execute");
-
-        let created = handler
-            .handle(
-                "session/handoff_link_create",
-                json!({"session_id": sid, "ttl_minutes": 10}),
-            )
-            .expect("handoff_link_create");
-        assert_eq!(created["schema"], "deepseek.handoff_link.v1");
-        let handoff_id = created["handoff_id"].as_str().unwrap();
-        let token = created["token"].as_str().unwrap();
-        assert!(!handoff_id.is_empty());
-        assert!(!token.is_empty());
-
-        let consumed = handler
-            .handle(
-                "session/handoff_link_consume",
-                json!({"handoff_id": handoff_id, "token": token}),
-            )
-            .expect("handoff_link_consume");
-        assert_eq!(consumed["consumed"], true);
-        assert!(consumed["imported_session_id"].as_str().is_some());
-    }
-
-    #[test]
-    fn ide_handler_events_poll_returns_rows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-        let opened = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/events"}))
-            .unwrap();
-        let sid = opened["session_id"].as_str().unwrap();
-        let _ = handler
-            .handle(
-                "prompt/execute",
-                json!({
-                    "session_id": sid,
-                    "prompt": "hello",
-                    "mock_output": "hello there"
-                }),
-            )
-            .expect("prompt/execute");
-
-        let poll = handler
-            .handle(
-                "events/poll",
-                json!({"session_id": sid, "after_seq": 0, "limit": 10}),
-            )
-            .expect("events/poll");
-        let events = poll["events"].as_array().unwrap();
-        assert!(!events.is_empty());
-        assert!(events[0]["seq_no"].as_u64().is_some());
-    }
-
-    #[test]
-    fn ide_handler_tool_approve_deny() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        let result = handler
-            .handle("session/open", json!({"workspace_root": "/tmp/t"}))
-            .unwrap();
-        let sid_str = result["session_id"].as_str().unwrap();
-        let sid = Uuid::parse_str(sid_str).unwrap();
-
-        let inv_id = Uuid::now_v7();
-        handler.add_pending_approval(sid, &inv_id.to_string(), "bash.run");
-
-        // Approve the tool.
-        let approved = handler
-            .handle(
-                "tool/approve",
-                json!({
-                    "session_id": sid_str,
-                    "invocation_id": inv_id.to_string(),
-                }),
-            )
-            .expect("tool/approve");
-        assert_eq!(approved["approved"], true);
-        assert_eq!(approved["tool_name"], "bash.run");
-
-        // Deny a different one.
-        let inv2 = Uuid::now_v7();
-        handler.add_pending_approval(sid, &inv2.to_string(), "fs.write");
-        let denied = handler
-            .handle(
-                "tool/deny",
-                json!({
-                    "session_id": sid_str,
-                    "invocation_id": inv2.to_string(),
-                }),
-            )
-            .expect("tool/deny");
-        assert_eq!(denied["denied"], true);
-        assert_eq!(denied["tool_name"], "fs.write");
-    }
-
-    #[test]
-    fn ide_handler_task_list_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-
-        let result = handler.handle("task/list", json!({})).expect("task/list");
-        let tasks = result["tasks"].as_array().unwrap();
-        assert!(tasks.is_empty());
-    }
-
-    #[test]
-    fn ide_handler_unknown_method() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-        let err = handler
-            .handle("nonexistent", json!({}))
-            .expect_err("should fail");
-        assert!(err.to_string().contains("method not found"));
-    }
-
-    #[test]
-    fn ide_handler_session_not_found() {
-        let tmp = tempfile::tempdir().unwrap();
-        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
-        let fake = Uuid::now_v7();
-        let err = handler
-            .handle("session/resume", json!({"session_id": fake.to_string()}))
-            .expect_err("should fail");
-        assert!(err.to_string().contains("session not found"));
-    }
-
-    #[test]
-    fn require_uuid_helper() {
-        let params = json!({"id": "not-a-uuid"});
-        assert!(require_uuid(&params, "id").is_err());
-
-        let valid = Uuid::now_v7();
-        let params = json!({"id": valid.to_string()});
-        assert_eq!(require_uuid(&params, "id").unwrap(), valid);
-
-        let empty = json!({});
-        assert!(require_uuid(&empty, "id").is_err());
-    }
-}
-
-#[cfg(test)]
-mod delivery_three {
-    use super::*;
-    #[test]
-    fn local_restore_requires_preview_approval_and_is_never_an_http_capability() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        std::fs::write(temp.path().join("file"), "before")?;
-        let memory = codingbuddy_memory::MemoryManager::new(temp.path())?;
-        let checkpoint = memory.create_checkpoint("fixture")?;
-        std::fs::write(temp.path().join("file"), "after")?;
-        let before = memory.capture_before(&["file"]);
-        memory.record_step_snapshot("fs.write", "fixture", before, &["file"])?;
-        let handler = IdeRpcHandler::new(temp.path())?;
-        let plan = handler.handle(
-            "checkpoint/preview",
-            serde_json::json!({"checkpoint_id":checkpoint.checkpoint_id}),
-        )?;
-        let id = plan["id"].clone();
-        assert_eq!(plan["entries"].as_array().unwrap().len(), 1);
-        assert!(
-            handler
-                .handle(
-                    "checkpoint/apply",
-                    serde_json::json!({"plan_id":id,"approved":false})
-                )
-                .is_err()
-        );
-        assert!(
-            handler
-                .handle_http(
-                    "checkpoint/apply",
-                    serde_json::json!({"plan_id":id,"approved":true})
-                )
-                .is_err()
-        );
-        assert_eq!(std::fs::read_to_string(temp.path().join("file"))?, "after");
-        let applied = handler.handle(
-            "checkpoint/apply",
-            serde_json::json!({"plan_id":id,"approved":true}),
-        )?;
-        assert_eq!(applied["recovery_status"], "verified");
-        assert_eq!(std::fs::read_to_string(temp.path().join("file"))?, "before");
-        assert_eq!(
-            handler.handle("checkpoint/reconcile", serde_json::json!({"plan_id":id}))?["recovery_status"],
-            "applied"
-        );
-        Ok(())
-    }
-    #[test]
-    fn cancellation_from_a_later_local_client_reaches_the_owned_prompt() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let handler = IdeRpcHandler::new(temp.path())?;
-        let session = handler.handle(
-            "session/open",
-            serde_json::json!({"workspace_root":temp.path()}),
-        )?;
-        let session = Uuid::parse_str(session["session_id"].as_str().unwrap())?;
-        let store = Store::new(temp.path())?;
-        let lease = store.session_lease(session)?;
-        let prompt = store.start_prompt(
-            &lease,
-            session,
-            Uuid::now_v7(),
-            &serde_json::json!({"prompt":"fixture"}),
-        )?;
-        let token = codingbuddy_core::CancellationToken::new();
-        let _monitor = store.monitor_operation(prompt, token.clone())?;
-        let response = handler.handle("cancel", serde_json::json!({"prompt_id":prompt}))?;
-        assert_eq!(response["cancelled"], true);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !token.is_cancelled() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(token.is_cancelled());
-        Ok(())
-    }
-}
+mod tests;

@@ -50,7 +50,8 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
                 },
             )?;
 
-            let (discovered, refreshes) = manager.refresh_tools()?;
+            let (discovered, refreshes) =
+                codingbuddy_core::runtime::block_on(manager.refresh_tools())?;
             let discovered_for_server = discovered
                 .iter()
                 .filter(|tool| tool.server_id == server.id)
@@ -68,8 +69,9 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
             }
         }
         McpCmd::List => {
-            let (_, refreshes, notice) =
-                manager.discover_tools_with_notice(read_mcp_fingerprint(cwd)?.as_deref())?;
+            let (_, refreshes, notice) = codingbuddy_core::runtime::block_on(
+                manager.discover_tools_with_notice(read_mcp_fingerprint(cwd)?.as_deref()),
+            )?;
             write_mcp_fingerprint(cwd, &notice.fingerprint)?;
             emit_mcp_discovery_events(cwd, &refreshes)?;
             let servers = manager.list_servers()?;

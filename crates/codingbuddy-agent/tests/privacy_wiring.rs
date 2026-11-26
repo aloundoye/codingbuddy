@@ -1,4 +1,5 @@
 //! Tests for tool-output privacy and keyword search registration.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use codingbuddy_agent::tool_loop::{ToolLoopConfig, ToolUseLoop};
 use codingbuddy_core::{LlmResponse, LlmToolCall, StreamChunk, TokenUsage};
@@ -52,6 +53,7 @@ fn privacy_router_redacts_in_tool_loop() {
 
     // Tool host that returns content with a custom secret pattern
     struct SensitiveToolHost;
+    #[async_trait::async_trait]
     impl codingbuddy_core::ToolHost for SensitiveToolHost {
         fn propose(&self, call: codingbuddy_core::ToolCall) -> codingbuddy_core::ToolProposal {
             codingbuddy_core::ToolProposal {
@@ -60,7 +62,7 @@ fn privacy_router_redacts_in_tool_loop() {
                 approved: true,
             }
         }
-        fn execute(
+        async fn execute(
             &self,
             _approved: codingbuddy_core::ApprovedToolCall,
         ) -> codingbuddy_core::ToolResult {
@@ -95,7 +97,7 @@ fn privacy_router_redacts_in_tool_loop() {
         }
     }));
 
-    let result = loop_.run("Read secret.txt");
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Read secret.txt"));
     assert!(result.is_ok());
 
     // Check that privacy warning was emitted

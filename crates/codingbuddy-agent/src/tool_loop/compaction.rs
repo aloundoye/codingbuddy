@@ -8,6 +8,101 @@ use codingbuddy_llm::LlmClient;
 /// are eligible for truncation during the prune phase).
 pub(crate) const PRUNE_AGE_TURNS: usize = 3;
 
+/// After this long without a model response the provider's prompt cache has
+/// expired (Anthropic's default TTL is 5 minutes), so rewriting old messages
+/// costs no cache hits. Large old tool outputs are trimmed then, at any
+/// context size.
+pub(crate) const IDLE_PRUNE_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Only tool outputs longer than this are trimmed after an idle pause.
+pub(crate) const IDLE_PRUNE_MIN_CHARS: usize = 2_000;
+/// How much of a trimmed output is kept after an idle pause.
+pub(crate) const IDLE_PRUNE_KEEP_CHARS: usize = 500;
+
+/// Most entries kept in session memory; the oldest are dropped first.
+pub(crate) const SESSION_MEMORY_MAX_ENTRIES: usize = 30;
+const SESSION_MEMORY_MAX_ENTRY_CHARS: usize = 300;
+
+/// The bullet points under "## Key Decisions Made" in a compaction summary
+/// (see [`COMPACTION_TEMPLATE`]).
+pub(crate) fn session_memory_entries(summary: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut in_section = false;
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+            in_section = trimmed
+                .trim_start_matches('#')
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("key decisions");
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| {
+                let digits = trimmed.find(|c: char| !c.is_ascii_digit())?;
+                (digits > 0)
+                    .then(|| trimmed[digits..].strip_prefix(". "))
+                    .flatten()
+            })
+        else {
+            continue;
+        };
+        let entry = rest.trim();
+        let lower = entry.to_ascii_lowercase();
+        if entry.is_empty() || lower == "none" || lower.starts_with("none ") || lower == "n/a" {
+            continue;
+        }
+        let end = entry.floor_char_boundary(SESSION_MEMORY_MAX_ENTRY_CHARS.min(entry.len()));
+        entries.push(entry[..end].to_string());
+    }
+    entries
+}
+
+/// Add new entries to session memory, skipping duplicates and keeping the
+/// newest `SESSION_MEMORY_MAX_ENTRIES`. Returns whether anything changed.
+pub(crate) fn merge_session_memory(memory: &mut Vec<String>, entries: Vec<String>) -> bool {
+    let mut changed = false;
+    for entry in entries {
+        if !memory
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&entry))
+        {
+            memory.push(entry);
+            changed = true;
+        }
+    }
+    if memory.len() > SESSION_MEMORY_MAX_ENTRIES {
+        memory.drain(..memory.len() - SESSION_MEMORY_MAX_ENTRIES);
+    }
+    changed
+}
+
+/// Render session memory as the markdown saved to disk and shown to the model.
+pub(crate) fn render_session_memory(memory: &[String]) -> String {
+    let mut text =
+        String::from("SESSION MEMORY (decisions recorded in earlier summaries of this session):\n");
+    for entry in memory {
+        text.push_str("- ");
+        text.push_str(entry);
+        text.push('\n');
+    }
+    text
+}
+
+/// Read entries back from a saved session memory file.
+pub(crate) fn parse_session_memory(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
 /// Target token usage after compaction — we try to fit the compacted
 /// conversation into this fraction of the context window.
 pub const COMPACTION_TARGET_PCT: f64 = 0.80;
@@ -139,7 +234,7 @@ pub(crate) fn build_compaction_summary(messages: &[ChatMessage]) -> String {
 ///
 /// Sends the conversation to `deepseek-chat` with a structured template.
 /// Falls back to code-based extraction on any error.
-pub(crate) fn build_compaction_summary_with_llm(
+pub(crate) async fn build_compaction_summary_with_llm(
     llm: &(dyn LlmClient + Send + Sync),
     messages: &[ChatMessage],
 ) -> Result<String> {
@@ -213,7 +308,7 @@ pub(crate) fn build_compaction_summary_with_llm(
         response_format: None,
     };
 
-    let response = llm.complete_chat(&request)?;
+    let response = llm.complete_chat(&request).await?;
     let text = response.text.trim().to_string();
 
     // Validate the response has at least some structure

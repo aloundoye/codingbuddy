@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 anyhow.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -21,3 +23,6 @@ aws-smithy-eventstream = "0.61"
 aws-smithy-types = "1"
 codingbuddy-store = { path = "../codingbuddy-store" }
 reqwest = { workspace = true }
+
+[lints]
+workspace = true

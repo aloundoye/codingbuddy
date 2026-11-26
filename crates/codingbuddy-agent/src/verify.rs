@@ -9,7 +9,7 @@ pub struct VerifyResult {
 }
 
 /// Callback type for verify-step approval gating.
-type ApprovalCallback<'a> = Option<&'a mut dyn FnMut(&ToolCall) -> anyhow::Result<bool>>;
+type ApprovalCallback<'a> = Option<&'a mut (dyn FnMut(&ToolCall) -> anyhow::Result<bool> + Send)>;
 
 pub fn derive_verify_commands(workspace: &Path) -> Vec<String> {
     if workspace.join("Cargo.toml").exists() {
@@ -27,7 +27,7 @@ pub fn derive_verify_commands(workspace: &Path) -> Vec<String> {
     vec!["git status --short".to_string()]
 }
 
-pub fn run_verify(
+pub async fn run_verify(
     workspace: &Path,
     tool_host: &LocalToolHost,
     commands: &[String],
@@ -38,19 +38,27 @@ pub fn run_verify(
 
     for command in commands {
         let result = match approval.as_mut() {
-            Some(callback) => tool_host.run_verification_with_approval(
-                command,
-                workspace,
-                timeout_seconds,
-                Default::default(),
-                Some(&mut **callback),
-            ),
-            None => tool_host.run_verification_command(
-                command,
-                workspace,
-                timeout_seconds,
-                Default::default(),
-            ),
+            Some(callback) => {
+                tool_host
+                    .run_verification_with_approval(
+                        command,
+                        workspace,
+                        timeout_seconds,
+                        Default::default(),
+                        Some(&mut **callback),
+                    )
+                    .await
+            }
+            None => {
+                tool_host
+                    .run_verification_command(
+                        command,
+                        workspace,
+                        timeout_seconds,
+                        Default::default(),
+                    )
+                    .await
+            }
         };
         let output = extract_output(&result);
         if command_passed(&result, result["success"] == true) {

@@ -13,7 +13,7 @@ fn simple_text_response_no_tools() {
         default_tools(),
     );
 
-    let result = loop_.run("Hi").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Hi")).unwrap();
     assert_eq!(result.response, "Hello, world!");
     assert_eq!(result.turns, 1);
     assert!(result.tool_calls_made.is_empty());
@@ -50,7 +50,7 @@ fn single_tool_call_and_response() {
         default_tools(),
     );
 
-    let result = loop_.run("What's in src/lib.rs?").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("What's in src/lib.rs?")).unwrap();
     assert_eq!(result.response, "The file contains a module definition.");
     assert_eq!(result.turns, 2);
     assert_eq!(result.tool_calls_made.len(), 1);
@@ -103,7 +103,7 @@ fn todo_tools_persist_session_checklist() {
         "system".to_string(),
         default_tools(),
     );
-    let result = loop_.run("start complex work").expect("run");
+    let result = codingbuddy_core::runtime::block_on(loop_.run("start complex work")).expect("run");
     assert_eq!(result.response, "Checklist initialized.");
     assert_eq!(result.tool_calls_made.len(), 2);
     assert_eq!(result.tool_calls_made[0].tool_name, "todo_write");
@@ -156,7 +156,8 @@ fn todo_write_rejects_multiple_in_progress_items() {
         default_tools(),
     );
 
-    let err = loop_.run("set checklist").expect_err("run should fail");
+    let err = codingbuddy_core::runtime::block_on(loop_.run("set checklist"))
+        .expect_err("run should fail");
     assert!(
         err.to_string()
             .contains("todo_write allows at most one 'in_progress'")
@@ -207,7 +208,7 @@ fn multi_tool_calls_parallel() {
         default_tools(),
     );
 
-    let result = loop_.run("Read both files").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Read both files")).unwrap();
     assert_eq!(result.turns, 2);
     assert_eq!(result.tool_calls_made.len(), 2);
 }
@@ -240,7 +241,7 @@ fn parallel_candidates_that_need_approval_fall_back_without_execution() {
         default_tools(),
     );
 
-    let result = loop_.run("Read both files").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Read both files")).unwrap();
     assert_eq!(result.turns, 2);
     assert_eq!(result.tool_calls_made.len(), 2);
     assert!(result.tool_calls_made.iter().all(|r| !r.success));
@@ -448,7 +449,7 @@ fn tool_chain_multiple_turns() {
         default_tools(),
     );
 
-    let result = loop_.run("Find auth code").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Find auth code")).unwrap();
     assert_eq!(result.turns, 3);
     assert_eq!(result.tool_calls_made.len(), 2);
     assert_eq!(result.response, "Found the implementation in y.rs.");
@@ -493,7 +494,7 @@ fn max_turns_limit_stops_loop() {
         default_tools(),
     );
 
-    let result = loop_.run("loop forever").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("loop forever")).unwrap();
     assert_eq!(result.turns, 3);
     assert_eq!(result.finish_reason, "max_turns");
 }
@@ -523,7 +524,7 @@ fn tool_call_denied_by_policy() {
     );
 
     // No approval callback → denied by default
-    let result = loop_.run("Read secret file").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Read secret file")).unwrap();
     assert_eq!(result.turns, 2);
     assert_eq!(result.tool_calls_made.len(), 1);
     assert!(!result.tool_calls_made[0].success);
@@ -552,7 +553,7 @@ fn content_filter_returns_error() {
         default_tools(),
     );
 
-    let err = loop_.run("bad prompt").unwrap_err();
+    let err = codingbuddy_core::runtime::block_on(loop_.run("bad prompt")).unwrap_err();
     assert!(err.to_string().contains("content filter"));
 }
 
@@ -584,7 +585,7 @@ fn usage_accumulated_across_turns() {
         default_tools(),
     );
 
-    let result = loop_.run("test").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("test")).unwrap();
     // Each response has 100 prompt + 50 completion, 2 turns
     assert_eq!(result.usage.prompt_tokens, 200);
     assert_eq!(result.usage.completion_tokens, 100);
@@ -614,10 +615,10 @@ fn continue_with_appends_to_history() {
         default_tools(),
     );
 
-    let r1 = loop_.run("first question").unwrap();
+    let r1 = codingbuddy_core::runtime::block_on(loop_.run("first question")).unwrap();
     assert_eq!(r1.response, "First answer");
 
-    let r2 = loop_.continue_with("follow up").unwrap();
+    let r2 = codingbuddy_core::runtime::block_on(loop_.continue_with("follow up")).unwrap();
     assert_eq!(r2.response, "Second answer");
     // Messages should contain: system, user1, assistant1, user2, assistant2
     assert_eq!(r2.messages.len(), 5);
@@ -657,8 +658,9 @@ fn complex_continuation_injects_anchor_context() {
     };
     let mut loop_ = ToolUseLoop::new(&llm, tool_host, config, "system".to_string(), vec![]);
 
-    let _ = loop_.run("first question").expect("first run");
-    let second = loop_.continue_with("follow up").expect("second run");
+    let _ = codingbuddy_core::runtime::block_on(loop_.run("first question")).expect("first run");
+    let second =
+        codingbuddy_core::runtime::block_on(loop_.continue_with("follow up")).expect("second run");
 
     let has_anchor = second.messages.iter().any(|msg| {
         matches!(
@@ -759,7 +761,7 @@ fn complex_write_without_todo_refresh_injects_checklist_nudge() {
     };
     let mut loop_ = ToolUseLoop::new(&llm, tool_host, config, "system".to_string(), tools);
 
-    let result = loop_.run("apply the patch").expect("run");
+    let result = codingbuddy_core::runtime::block_on(loop_.run("apply the patch")).expect("run");
     let has_nudge = result.messages.iter().any(|msg| {
         matches!(
             msg,

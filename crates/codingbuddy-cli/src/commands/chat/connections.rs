@@ -1,7 +1,7 @@
 use super::*;
 use codingbuddy_core::{LlmConfig, Session, SessionBudgets, SessionState};
 use codingbuddy_ui::{TerminalMenu, TuiStreamEvent};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 
 const PROVIDERS: &[(&str, &str)] = &[
     ("openai-compatible", "OpenAI"),
@@ -73,7 +73,7 @@ pub(super) struct Menus {
     pub chat_mode: Arc<Mutex<ChatMode>>,
     pub read_only: Arc<std::sync::atomic::AtomicBool>,
     pub allow_tools: bool,
-    pub tx: mpsc::Sender<TuiStreamEvent>,
+    pub tx: codingbuddy_ui::StreamSender,
 }
 
 impl Menus {
@@ -129,7 +129,10 @@ impl Menus {
                 if id == "code" {
                     self.check_model(&state.llm, true)?;
                 }
-                *self.chat_mode.lock().unwrap() = mode;
+                *self
+                    .chat_mode
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
                 let _ = self.tx.send(TuiStreamEvent::Menu(None));
                 self.notify(format!("Mode set to {id}"), false);
             }
@@ -232,7 +235,10 @@ impl Menus {
                     .pending
                     .as_mut()
                     .ok_or_else(|| anyhow!("Choose a provider first"))?;
-                llm.providers.get_mut(&llm.provider).unwrap().base_url = url;
+                llm.providers
+                    .get_mut(&llm.provider)
+                    .ok_or_else(|| anyhow!("Provider `{}` is not configured", llm.provider))?
+                    .base_url = url;
                 self.menu(TerminalMenu::choices(
                     "Authentication",
                     "Choose how the endpoint authenticates",
@@ -248,7 +254,11 @@ impl Menus {
                     .take()
                     .ok_or_else(|| anyhow!("Choose a provider first"))?;
                 if id == "custom-none" {
-                    let profile = llm.providers.get_mut(&llm.provider).unwrap();
+                    let provider_id = llm.provider.clone();
+                    let profile = llm
+                        .providers
+                        .get_mut(&provider_id)
+                        .ok_or_else(|| anyhow!("Provider `{provider_id}` is not configured"))?;
                     profile.api_key_env.clear();
                     profile.auth_strategy = Some("none".into());
                 }
@@ -422,8 +432,11 @@ impl Menus {
                 self.notify("Default provider and model saved.".into(), false);
             }
             "history-preview" => {
-                let source =
-                    (*self.session.lock().unwrap()).ok_or_else(|| anyhow!("No source session"))?;
+                let source = (*self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner))
+                .ok_or_else(|| anyhow!("No source session"))?;
                 let store = Store::new(&self.cwd)?;
                 let _lease = store.session_lease(source)?;
                 let history =
@@ -474,7 +487,10 @@ impl Menus {
                         .fork_session_with_messages(source, &history)?
                         .session_id
                 };
-                *self.session.lock().unwrap() = Some(selected);
+                *self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selected);
                 state.history_choice = None;
                 self.activate(&mut state, llm)?;
             }
@@ -587,14 +603,19 @@ impl Menus {
         let cwd = self.cwd.clone();
         let code = self.allow_tools
             && !self.read_only.load(std::sync::atomic::Ordering::Relaxed)
-            && *self.chat_mode.lock().unwrap() == ChatMode::Code;
+            && *self
+                .chat_mode
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == ChatMode::Code;
         state.pending = Some(llm.clone());
         let menu = models_menu(&cwd, &llm, &[], code, "Discovering available models…");
         let _ = self.tx.send(TuiStreamEvent::Menu(Some(menu)));
-        thread::spawn(move || {
-            let ids = codingbuddy_llm::ApiClient::new(llm.clone())
-                .map(|client| codingbuddy_llm::LlmClient::list_models(&client))
-                .unwrap_or_default();
+        codingbuddy_core::runtime::runtime().spawn(async move {
+            let ids = match codingbuddy_llm::ApiClient::new(llm.clone()) {
+                Ok(client) => codingbuddy_llm::LlmClient::list_models(&client).await,
+                Err(_) => Vec::new(),
+            };
             let menu = models_menu(
                 &cwd,
                 &llm,
@@ -617,7 +638,11 @@ impl Menus {
     fn verify(&self, state: &mut Connection, llm: LlmConfig) -> Result<()> {
         let code = self.allow_tools
             && !self.read_only.load(std::sync::atomic::Ordering::Relaxed)
-            && *self.chat_mode.lock().unwrap() == ChatMode::Code;
+            && *self
+                .chat_mode
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == ChatMode::Code;
         if let Err(error) = self.check_model(&llm, code) {
             self.show_connection_failure(state, llm, &error);
             return Ok(());
@@ -644,8 +669,8 @@ impl Menus {
             &format!("Verifying {}/{}…", llm.provider, llm.active_base_model()),
             Vec::new(),
         ));
-        thread::spawn(move || {
-            let result = codingbuddy_llm::probe_provider(&llm);
+        codingbuddy_core::runtime::runtime().spawn(async move {
+            let result = codingbuddy_llm::probe_provider(&llm).await;
             if result.is_ok() {
                 let _ = codingbuddy_store::Store::new(&controller.cwd)
                     .and_then(|store| store.route_key())
@@ -686,7 +711,10 @@ impl Menus {
     }
 
     fn select(&self, state: &mut Connection, llm: LlmConfig) -> Result<()> {
-        let session = *self.session.lock().unwrap();
+        let session = *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let needs_choice = if let Some(session) = session {
             let history = Store::new(&self.cwd)?.rebuild_from_events(session)?;
             !history.chat_messages.is_empty()
@@ -725,7 +753,10 @@ impl Menus {
     }
 
     pub fn ensure_session(&self) -> Result<Uuid> {
-        let mut session = self.session.lock().unwrap();
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(id) = *session {
             return Ok(id);
         }
@@ -752,8 +783,15 @@ impl Menus {
     }
 
     pub fn review_resume(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if let Some(session) = *self.session.lock().unwrap() {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session) = *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             let projection = Store::new(&self.cwd)?.rebuild_from_events(session)?;
             if !projection.chat_messages.is_empty()
                 && projection.provider_selection.as_ref().is_some_and(
@@ -866,7 +904,10 @@ fn candidate(active: &LlmConfig, provider: &str) -> Result<LlmConfig> {
             format!("http://{host}")
         };
         let url = codingbuddy_llm::validate_base_url(&url)?;
-        let profile = llm.providers.get_mut(provider).unwrap();
+        let profile = llm
+            .providers
+            .get_mut(provider)
+            .ok_or_else(|| anyhow!("Provider `{provider}` is not configured"))?;
         if profile.base_url != url {
             profile.base_url = url;
             llm.endpoint.clear();

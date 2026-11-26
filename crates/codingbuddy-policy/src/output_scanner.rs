@@ -98,6 +98,12 @@ impl OutputScanner {
                 placeholder: "[REDACTED:aws_key]",
             },
             SecretPattern {
+                // Google API keys: classic `AIza…` and the newer `AQ.…` format.
+                regex: Regex::new(r"\b(AIza[0-9A-Za-z_\-]{35}|AQ\.[0-9A-Za-z_\-]{40,})")
+                    .expect("valid regex"),
+                placeholder: "[REDACTED:google_api_key]",
+            },
+            SecretPattern {
                 regex: Regex::new(r"ghp_[a-zA-Z0-9]{36,}").expect("valid regex"),
                 placeholder: "[REDACTED:github_token]",
             },
@@ -336,6 +342,20 @@ fn main() {
         assert!(result.had_secrets);
         assert!(result.redacted_output.contains("[REDACTED:api_key]"));
         assert!(!result.redacted_output.contains("sk-abcdefghij"));
+    }
+
+    #[test]
+    fn redact_google_api_keys_in_both_formats() {
+        // Shapes only: neither value is a real key.
+        let aq = format!("AQ.{}", "Ab8RN6LyMCxx-gwW_lVZoVczNrLQkYkLCTrq_lvsNJ6bGSr7w");
+        let aiza = format!("AIza{}", "SyD-abcdefghijklmnopqrstuvwxyz01234");
+        for key in [aq, aiza] {
+            let text = format!("GET /v1beta/models?key={key} failed");
+            let result = scanner().scan(&text);
+            assert!(result.had_secrets, "{key}");
+            assert!(result.redacted_output.contains("[REDACTED:google_api_key]"));
+            assert!(!result.redacted_output.contains(&key[..10]));
+        }
     }
 
     #[test]

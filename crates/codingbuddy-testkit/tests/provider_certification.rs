@@ -1,7 +1,9 @@
 //! Real transport, agent, and SQLite conformance for each certified route.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use anyhow::{Context, Result, ensure};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{AppConfig, ChatMessage, EventKind};
+use codingbuddy_llm::LlmClientBlockingExt;
 use codingbuddy_llm::{certification, certification::FixtureRoute};
 use codingbuddy_store::Store;
 use serde_json::{Value, json};
@@ -466,14 +468,14 @@ fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
                 cfg.clone(),
                 Box::new(fixture_client(cfg.llm.clone(), &server)?),
             )?;
-            let output = engine.chat_with_options(
+            let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
                 "Read first.txt then second.txt.",
                 ChatOptions {
                     tools: true,
                     disable_team_orchestration: true,
                     ..Default::default()
                 },
-            )?;
+            ))?;
             ensure!(
                 output == "Certification complete.",
                 "unexpected output for {}",
@@ -554,7 +556,7 @@ fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
             let client = fixture_client(cfg.llm.clone(), &server)?;
             let resumed =
                 AgentEngine::new_with_config_and_llm(workspace.path(), cfg, Box::new(client))?;
-            resumed.chat_with_options(
+            codingbuddy_core::runtime::block_on(resumed.chat_with_options(
                 "Continue.",
                 ChatOptions {
                     tools: true,
@@ -562,7 +564,7 @@ fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
                     disable_team_orchestration: true,
                     ..Default::default()
                 },
-            )?;
+            ))?;
             ensure!(
                 server.requests.lock().unwrap().len() == 4,
                 "duplicate model request"
@@ -583,7 +585,6 @@ fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
 #[test]
 fn route_usage_and_private_parts_are_normalized() -> Result<()> {
     use codingbuddy_core::{ChatRequest, ToolChoice};
-    use codingbuddy_llm::LlmClient;
     for route in certification::routes() {
         for streaming in [false, true] {
             let server = mock(route.clone())?;
@@ -620,9 +621,9 @@ fn route_usage_and_private_parts_are_normalized() -> Result<()> {
             };
             let client = fixture_client(cfg, &server)?;
             let response = if streaming {
-                client.complete_chat_streaming(&req, Arc::new(|_| {}))?
+                client.complete_chat_streaming_blocking(&req, Arc::new(|_| {}))?
             } else {
-                client.complete_chat(&req)?
+                client.complete_chat_blocking(&req)?
             };
             let usage = response.usage.context("missing fixture usage")?;
             ensure!(
@@ -691,16 +692,15 @@ fn unfinished_responses_never_dispatch_tools() -> Result<()> {
         cfg.agent_loop.phase_loop_enabled = false;
         let engine = AgentEngine::new_with_config(workspace.path(), cfg)?;
         ensure!(
-            engine
-                .chat_with_options(
-                    "Read first.txt.",
-                    ChatOptions {
-                        tools: true,
-                        disable_team_orchestration: true,
-                        ..Default::default()
-                    }
-                )
-                .is_err(),
+            codingbuddy_core::runtime::block_on(engine.chat_with_options(
+                "Read first.txt.",
+                ChatOptions {
+                    tools: true,
+                    disable_team_orchestration: true,
+                    ..Default::default()
+                }
+            ))
+            .is_err(),
             "unfinished response accepted"
         );
         let store = Store::new(workspace.path())?;
@@ -760,13 +760,13 @@ fn incomplete_cloud_streams_never_dispatch_tools() -> Result<()> {
         cfg.agent_loop.phase_loop_enabled = false;
         let client = fixture_client(cfg.llm.clone(), &server)?;
         let engine = AgentEngine::new_with_config_and_llm(workspace.path(), cfg, Box::new(client))?;
-        let result = engine.chat_with_options(
+        let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "Read first.txt.",
             ChatOptions {
                 tools: true,
                 ..Default::default()
             },
-        );
+        ));
         ensure!(result.is_err(), "{} accepted incomplete output", route.id);
         let store = Store::new(workspace.path())?;
         let session = store.load_latest_session()?.context("missing session")?;
@@ -806,7 +806,6 @@ fn explicit_probe_contract_is_bounded_and_uses_only_read_tools() -> Result<()> {
 #[test]
 fn private_continuation_survives_restart_between_every_model_step() -> Result<()> {
     use codingbuddy_core::{ChatRequest, FunctionDefinition, ToolChoice, ToolDefinition};
-    use codingbuddy_llm::LlmClient;
     use codingbuddy_store::NewEvent;
     for route in certification::routes() {
         for streaming in [false, true] {
@@ -863,9 +862,9 @@ fn private_continuation_survives_restart_between_every_model_step() -> Result<()
                 };
                 let client = fixture_client(cfg.clone(), &server)?;
                 let response = if streaming {
-                    client.complete_chat_streaming(&request, Arc::new(|_| {}))?
+                    client.complete_chat_streaming_blocking(&request, Arc::new(|_| {}))?
                 } else {
-                    client.complete_chat(&request)?
+                    client.complete_chat_blocking(&request)?
                 };
                 let invocations = store.model_step(
                     session,

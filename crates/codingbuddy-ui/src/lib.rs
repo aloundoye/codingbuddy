@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -11,8 +11,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 mod image;
@@ -54,11 +54,52 @@ use stream_runtime::{
 mod menu;
 pub use menu::TerminalMenu;
 pub use theme::TuiTheme;
+/// Sends agent events to the TUI. Sending never blocks or awaits.
+pub type StreamSender = tokio::sync::mpsc::UnboundedSender<TuiStreamEvent>;
+/// The TUI's end of [`StreamSender`].
+pub type StreamReceiver = tokio::sync::mpsc::UnboundedReceiver<TuiStreamEvent>;
+
+/// A channel for agent events to the TUI.
+pub fn stream_channel() -> (StreamSender, StreamReceiver) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
+/// What woke the TUI up.
+enum Wake {
+    Terminal(Event),
+    Stream(TuiStreamEvent),
+    /// Animation frame, or a source closed.
+    Tick,
+}
+
+/// How often the TUI redraws while nothing happens (spinners, timers).
+const FRAME: Duration = Duration::from_millis(33);
+
+/// Wait for a key, an agent event or the next frame, whichever comes first.
+/// The main thread sleeps in the async runtime meanwhile, instead of
+/// polling.
+fn next_wake(
+    terminal_events: &mut crossterm::event::EventStream,
+    stream_rx: &mut StreamReceiver,
+) -> Result<Wake> {
+    use futures_util::StreamExt;
+    codingbuddy_core::runtime::runtime().block_on(async {
+        tokio::select! {
+            event = terminal_events.next() => match event {
+                Some(event) => Ok(Wake::Terminal(event?)),
+                None => Ok(Wake::Tick),
+            },
+            message = stream_rx.recv() => Ok(message.map_or(Wake::Tick, Wake::Stream)),
+            () = tokio::time::sleep(FRAME) => Ok(Wake::Tick),
+        }
+    })
+}
+
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<String>,
 {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = stream_channel();
     run_tui_shell_with_bindings(
         status,
         KeyBindings::default(),
@@ -97,7 +138,7 @@ pub fn run_tui_shell_with_bindings<F, S>(
     bindings: KeyBindings,
     tui_theme: TuiTheme,
     reduced_motion: bool,
-    stream_rx: mpsc::Receiver<TuiStreamEvent>,
+    mut stream_rx: StreamReceiver,
     mut on_submit: F,
     mut refresh_status: S,
     mut controls: TerminalControls<'_>,
@@ -148,12 +189,7 @@ where
     let mut terminal = Terminal::new(backend)?;
 
     let workspace_path = PathBuf::from(status.working_directory.clone());
-    let project_hash_cached = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        workspace_path.to_string_lossy().as_bytes().hash(&mut h);
-        format!("{:x}", h.finish())
-    };
+    let project_hash_cached = codingbuddy_store::project_hash(&workspace_path);
     let app_cfg = codingbuddy_core::AppConfig::load(&workspace_path).unwrap_or_default();
     let ui_cfg = app_cfg.ui.clone();
     let detailed_status = ui_cfg.statusline_mode == "detailed";
@@ -190,7 +226,10 @@ where
     let mut vim_pending_text_object: Option<(char, char)> = None;
     let mut vim_pending_g = false;
     let mut is_processing = false;
-    let mut pending_approval: Option<(String, String, mpsc::Sender<bool>)> = None;
+    let mut pending_approval: Option<(String, String, tokio::sync::oneshot::Sender<bool>)> = None;
+    // Agent events that arrived while waiting for input, handled next pass.
+    let mut early_events: VecDeque<TuiStreamEvent> = VecDeque::new();
+    let mut terminal_events = crossterm::event::EventStream::new();
     let mut cancelled = false;
     let mut transcript_scroll = 0usize;
     let mut transcript_page = 1usize;
@@ -221,7 +260,10 @@ where
 
     loop {
         // Drain streaming events from background agent thread.
-        while let Ok(ev) = stream_rx.try_recv() {
+        while let Some(ev) = early_events
+            .pop_front()
+            .or_else(|| stream_rx.try_recv().ok())
+        {
             let ev = match ev {
                 TuiStreamEvent::Menu(next) => {
                     menu = next;
@@ -662,7 +704,10 @@ where
         if sigint_flag.swap(false, Ordering::Relaxed) {
             if is_processing {
                 if let Some(token) = &controls.cancellation {
-                    token.lock().unwrap().cancel();
+                    token
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cancel();
                 }
                 cancelled = true;
                 shell.active_tool = None;
@@ -678,10 +723,15 @@ where
             }
         }
 
-        if !event::poll(Duration::from_millis(33))? {
-            continue;
-        }
-        let mut key = match event::read()? {
+        let event = match next_wake(&mut terminal_events, &mut stream_rx)? {
+            Wake::Terminal(event) => event,
+            Wake::Stream(event) => {
+                early_events.push_back(event);
+                continue;
+            }
+            Wake::Tick => continue,
+        };
+        let mut key = match event {
             Event::Resize(_, _) => {
                 // Let the next draw pass recompute viewport partitions immediately.
                 continue;
@@ -906,7 +956,10 @@ where
         if key == bindings.exit {
             if is_processing {
                 if let Some(token) = &controls.cancellation {
-                    token.lock().unwrap().cancel();
+                    token
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cancel();
                 }
                 cancelled = true;
                 shell.active_tool = None;
@@ -929,7 +982,8 @@ where
             );
             let always = matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'));
             if let Some((tool_name, args_summary, response_tx)) = pending_approval.take() {
-                let _ = response_tx.send(approved);
+                // Persist before answering: the agent reloads saved
+                // approvals as soon as it gets the answer.
                 if always && approved && !fresh_approval(&args_summary) {
                     let pattern = derive_approval_pattern(&tool_name, &args_summary);
                     let persisted = codingbuddy_store::Store::new(&workspace_path)
@@ -951,6 +1005,7 @@ where
                 } else {
                     info_line = format!("denied `{tool_name}`");
                 }
+                let _ = response_tx.send(approved);
             }
             continue;
         }
@@ -1515,7 +1570,10 @@ where
             is_processing = true;
             cancelled = false;
             if let Some(token) = &controls.cancellation {
-                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+                *token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    codingbuddy_core::CancellationToken::new();
             }
             active_phase = None;
             last_phase_event_at = Instant::now();
@@ -1563,7 +1621,10 @@ where
             is_processing = true;
             cancelled = false;
             if let Some(token) = &controls.cancellation {
-                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+                *token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    codingbuddy_core::CancellationToken::new();
             }
             active_phase = None;
             last_phase_event_at = Instant::now();
@@ -1867,7 +1928,10 @@ where
             is_processing = true;
             cancelled = false;
             if let Some(token) = &controls.cancellation {
-                *token.lock().unwrap() = codingbuddy_core::CancellationToken::new();
+                *token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    codingbuddy_core::CancellationToken::new();
             }
             active_phase = None;
             last_phase_event_at = Instant::now();
@@ -1963,13 +2027,8 @@ fn derive_approval_pattern(tool_name: &str, args_summary: &str) -> String {
         serde_json::from_str(args_summary).unwrap_or(serde_json::Value::Null);
 
     if tool_name.starts_with("bash") {
-        let cmd = parsed
-            .get("cmd")
-            .or_else(|| parsed.get("command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let first_word = cmd.split_whitespace().next().unwrap_or("*");
-        format!("{first_word} *")
+        let cmd = codingbuddy_policy::approvals::bash_command_arg(&parsed).unwrap_or("");
+        codingbuddy_policy::approvals::approval_pattern_for(cmd)
     } else {
         let path = parsed
             .get("path")

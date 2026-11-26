@@ -28,6 +28,7 @@ mod compaction;
 mod event_emission;
 mod execution;
 mod helpers;
+mod loop_compaction;
 mod model_routing;
 mod permission_execution;
 pub mod phases;
@@ -57,15 +58,18 @@ use uuid::Uuid;
 
 use crate::tool_bridge;
 
+#[cfg(test)]
+use anti_hallucination::has_unverified_file_references;
 use anti_hallucination::{
     HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS, SHELL_COMMAND_NUDGE,
     check_response_consistency, extract_shell_commands, extract_user_directives,
-    has_unverified_file_references,
+    has_unverified_file_references_given_outputs,
 };
 use compaction::{
-    COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
-    build_compaction_summary_with_llm, extract_memory_observations, extract_tool_path,
-    truncate_line,
+    COMPACTION_TARGET_PCT, IDLE_PRUNE_AFTER, IDLE_PRUNE_KEEP_CHARS, IDLE_PRUNE_MIN_CHARS,
+    PRUNE_AGE_TURNS, build_compaction_summary, build_compaction_summary_with_llm,
+    extract_memory_observations, extract_tool_path, merge_session_memory, parse_session_memory,
+    render_session_memory, session_memory_entries, truncate_line,
 };
 use helpers::summarize_args;
 use safety::{
@@ -91,6 +95,10 @@ pub const PRUNE_THRESHOLD_PCT: f64 = 0.80;
 
 /// Context window usage percentage that triggers full compaction (Phase 2).
 pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
+
+/// Context window usage percentage at which the user is told compaction is
+/// coming, so they can `/compact` or start fresh on their own terms.
+pub const CONTEXT_WARNING_PCT: f64 = 0.70;
 
 /// Minimum usable input budget during compaction to avoid zero-token edge cases.
 const MIN_COMPACTION_INPUT_BUDGET_TOKENS: u64 = 1024;
@@ -169,6 +177,9 @@ pub struct ToolUseLoop<'a> {
     recent_errors: VecDeque<String>,
     /// Whether error recovery guidance has been injected this escalation cycle.
     recovery_injected: bool,
+    /// Whether the user was warned that compaction is near. Cleared when
+    /// usage drops back under the warning threshold (after compaction).
+    context_warned: bool,
     /// Pre-compiled output scanner for injection/secret detection.
     output_scanner: codingbuddy_policy::output_scanner::OutputScanner,
     /// Cache for read-only tool results (see [`cache::ToolCache`]).
@@ -186,6 +197,12 @@ pub struct ToolUseLoop<'a> {
     /// User directives extracted from conversation ("always X", "never Y", etc.).
     /// These survive compaction by being re-injected after the system message.
     pinned_directives: Vec<String>,
+    /// When the model last answered. After a long pause its prompt cache has
+    /// expired, so old tool outputs can be trimmed without losing cache hits.
+    pub(crate) last_model_response_at: Option<std::time::Instant>,
+    /// Decisions and user corrections gathered from every compaction summary
+    /// this session (also saved under `.codingbuddy/session_memory/`).
+    pub(crate) session_memory: Option<Vec<String>>,
     /// Pre-computed workspace path string for hook inputs (avoids repeated allocation).
     workspace_path_str: String,
     /// Whether `cleanup_old_tool_outputs` has run this session (at most once).
@@ -282,6 +299,7 @@ impl<'a> ToolUseLoop<'a> {
             escalation: codingbuddy_core::complexity::EscalationSignals::default(),
             recent_errors: VecDeque::new(),
             recovery_injected: false,
+            context_warned: false,
             output_scanner: codingbuddy_policy::output_scanner::OutputScanner::new(),
             tool_cache: cache::ToolCache::new(),
             circuit_breaker: HashMap::new(),
@@ -293,6 +311,8 @@ impl<'a> ToolUseLoop<'a> {
             doom_loop_tracker: DoomLoopTracker::default(),
             denial_tracker: safety::DenialTracker::default(),
             pinned_directives: Vec::new(),
+            last_model_response_at: None,
+            session_memory: None,
             workspace_path_str,
             tool_output_cleanup_done: false,
             pending_todo_sync: false,
@@ -559,6 +579,26 @@ impl<'a> ToolUseLoop<'a> {
             compact_threshold.max(1),
             compact_target.max(1),
         )
+    }
+
+    /// Emit [`StreamChunk::ContextWarning`] once when usage crosses
+    /// [`CONTEXT_WARNING_PCT`] of the usable budget. `compact_threshold` is
+    /// [`COMPACTION_THRESHOLD_PCT`] of that budget.
+    fn maybe_warn_context_filling(&mut self, estimated_tokens: u64, compact_threshold: u64) {
+        let usable = (compact_threshold as f64 / COMPACTION_THRESHOLD_PCT).max(1.0);
+        let used = estimated_tokens as f64 / usable;
+        if used < CONTEXT_WARNING_PCT {
+            self.context_warned = false;
+            return;
+        }
+        if self.context_warned {
+            return;
+        }
+        self.context_warned = true;
+        self.emit(StreamChunk::ContextWarning {
+            used_pct: (used * 100.0).round().min(100.0) as u8,
+            compact_at_pct: (COMPACTION_THRESHOLD_PCT * 100.0).round() as u8,
+        });
     }
 
     fn is_active_task_status(status: &str) -> bool {
@@ -905,7 +945,8 @@ impl<'a> ToolUseLoop<'a> {
         self.stream_cb = Some(cb);
     }
 
-    /// Set the approval callback for tool permission prompts.
+    /// Set the approval callback for tool permission prompts. The turn
+    /// awaits the answer.
     pub fn set_approval_callback(&mut self, cb: ApprovalCallback) {
         self.approval_cb = Some(cb);
     }
@@ -921,14 +962,16 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Fire a hook event and log any failures.
-    fn fire_hook_logged(&self, hooks: &HookRuntime, event: HookEvent, input: &HookInput) {
-        let result = hooks.fire_with_context(event, input, &self.execution_context());
+    async fn fire_hook_logged(&self, hooks: &HookRuntime, event: HookEvent, input: &HookInput) {
+        let result = hooks
+            .fire_with_context(event, input, &self.execution_context())
+            .await;
         for run in &result.runs {
             if !run.success {
-                eprintln!(
+                codingbuddy_core::logging::notice(format_args!(
                     "[hooks] {:?} hook failed: {}",
                     event, run.handler_description
-                );
+                ));
             }
         }
     }
@@ -940,7 +983,9 @@ impl<'a> ToolUseLoop<'a> {
 
     /// Set the checkpoint callback invoked before destructive tool calls.
     pub fn set_checkpoint_callback(&mut self, cb: CheckpointCallback) {
-        self.checkpoint_cb = Some(cb);
+        self.checkpoint_cb = Some(Arc::new(move |reason, paths| {
+            codingbuddy_core::runtime::blocking_section(|| cb(reason, paths))
+        }));
     }
 
     /// Set the config watcher for hot-reload polling between tool-use turns.
@@ -961,17 +1006,17 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Run the loop with a user message.
-    pub fn run(&mut self, user_message: &str) -> Result<ToolLoopResult> {
-        self.add_user_turn(user_message, false)
+    pub async fn run(&mut self, user_message: &str) -> Result<ToolLoopResult> {
+        self.add_user_turn(user_message, false).await
     }
 
     /// Continue the conversation with additional user input (multi-turn).
-    pub fn continue_with(&mut self, user_message: &str) -> Result<ToolLoopResult> {
-        self.add_user_turn(user_message, true)
+    pub async fn continue_with(&mut self, user_message: &str) -> Result<ToolLoopResult> {
+        self.add_user_turn(user_message, true).await
     }
 
     /// Shared logic for adding a user turn and executing the loop.
-    fn add_user_turn(
+    async fn add_user_turn(
         &mut self,
         user_message: &str,
         is_continuation: bool,
@@ -993,9 +1038,9 @@ impl<'a> ToolUseLoop<'a> {
 
         self.collect_directives(user_message);
 
-        let _span = tracing::info_span!("turn", continuation = is_continuation).entered();
+        let span = tracing::info_span!("turn", continuation = is_continuation);
         let started = std::time::Instant::now();
-        let result = self.execute_loop();
+        let result = tracing::Instrument::instrument(self.execute_loop(), span).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok(outcome) => tracing::info!(
@@ -1029,7 +1074,7 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// The main loop: call LLM, execute tools, feed results back, repeat.
-    fn execute_loop(&mut self) -> Result<ToolLoopResult> {
+    async fn execute_loop(&mut self) -> Result<ToolLoopResult> {
         let mut tool_calls_made = Vec::new();
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
@@ -1075,7 +1120,7 @@ impl<'a> ToolUseLoop<'a> {
                     provider_options: Default::default(),
                     response_format: None,
                 };
-                let summary_text = match self.llm.complete_chat(&summary_request) {
+                let summary_text = match self.llm.complete_chat(&summary_request).await {
                     Ok(resp) => {
                         if let Some(u) = &resp.usage {
                             total_usage.prompt_tokens += u.prompt_tokens;
@@ -1138,10 +1183,13 @@ impl<'a> ToolUseLoop<'a> {
                     (serde_json::to_string(t).unwrap_or_default().len() as f64 / 3.5).ceil() as u64
                 })
                 .sum();
+            self.prune_after_idle();
             let message_tokens = estimate_message_tokens(&self.messages);
             let estimated_tokens = message_tokens + tool_def_tokens;
             let (prune_threshold, compact_threshold, compact_target) =
                 self.compaction_budget_for_next_turn(tool_def_tokens);
+
+            self.maybe_warn_context_filling(estimated_tokens, compact_threshold);
 
             if estimated_tokens > prune_threshold {
                 // Phase 1: Lightweight pruning — trim old tool outputs
@@ -1153,7 +1201,7 @@ impl<'a> ToolUseLoop<'a> {
                 if post_prune_tokens > compact_threshold {
                     // Phase 2: Full compaction with structured summary
                     let pre_msg_count = self.messages.len() as u64;
-                    let compacted = self.compact_messages(compact_target);
+                    let compacted = self.compact_messages(compact_target).await;
                     if compacted {
                         let post_tokens = estimate_message_tokens(&self.messages) + tool_def_tokens;
                         if let Some(ref cb) = self.event_cb {
@@ -1194,17 +1242,20 @@ impl<'a> ToolUseLoop<'a> {
 
             let response = if let Some(ref cb) = self.stream_cb {
                 let cb = cb.clone();
-                self.llm.complete_chat_streaming(
-                    &request,
-                    Arc::new(move |chunk| {
-                        if !matches!(chunk, StreamChunk::Done { .. }) {
-                            cb(chunk);
-                        }
-                    }),
-                )?
+                self.llm
+                    .complete_chat_streaming(
+                        &request,
+                        Arc::new(move |chunk| {
+                            if !matches!(chunk, StreamChunk::Done { .. }) {
+                                cb(chunk);
+                            }
+                        }),
+                    )
+                    .await?
             } else {
-                self.llm.complete_chat(&request)?
+                self.llm.complete_chat(&request).await?
             };
+            self.last_model_response_at = Some(std::time::Instant::now());
 
             self.check_cancellation()?;
 
@@ -1262,7 +1313,8 @@ impl<'a> ToolUseLoop<'a> {
             // Shell command nudge: if the model outputs bash code blocks as
             // text instead of using the bash_run tool, nudge it to retry with
             // tools. This runs once before the general hallucination nudge.
-            if response.tool_calls.is_empty()
+            if self.config.heuristics.shell_command_nudge
+                && response.tool_calls.is_empty()
                 && shell_nudge_count == 0
                 && !extract_shell_commands(&response.text).is_empty()
             {
@@ -1336,13 +1388,28 @@ impl<'a> ToolUseLoop<'a> {
                 // Earlier turns' tool use does not count — the model can revert to
                 // hallucination on a new question. Unverified file references are
                 // always checked against this turn's tool calls.
-                let has_unverified_refs = if nudge_count < MAX_NUDGE_ATTEMPTS {
-                    has_unverified_file_references(&text, &tool_calls_made)
+                let has_unverified_refs = if self.config.heuristics.unverified_file_refs
+                    && nudge_count < MAX_NUDGE_ATTEMPTS
+                {
+                    let tool_outputs: Vec<&str> = self
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    has_unverified_file_references_given_outputs(
+                        &text,
+                        &tool_calls_made,
+                        &tool_outputs,
+                    )
                 } else {
                     false
                 };
-                let ungrounded_long_answer =
-                    tool_calls_made.is_empty() && text.len() > HALLUCINATION_NUDGE_THRESHOLD;
+                let ungrounded_long_answer = self.config.heuristics.grounding_nudge
+                    && tool_calls_made.is_empty()
+                    && text.len() > HALLUCINATION_NUDGE_THRESHOLD;
                 let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
                     && (ungrounded_long_answer || has_unverified_refs);
 
@@ -1385,7 +1452,10 @@ impl<'a> ToolUseLoop<'a> {
                 // Nudge up to 2 times per turn, then let it through.
                 // Fast path: skip the strip_code_blocks allocation if total word count
                 // (including code) is under the threshold — most responses are short.
-                if verbosity_nudge_count < 2 && text.split_whitespace().count() > 400 {
+                if self.config.heuristics.verbosity_nudge
+                    && verbosity_nudge_count < 2
+                    && text.split_whitespace().count() > 400
+                {
                     let prose = helpers::strip_code_blocks(&text);
                     let word_count = prose.split_whitespace().count();
                     if word_count > 400 {
@@ -1498,7 +1568,7 @@ impl<'a> ToolUseLoop<'a> {
                     self.check_cancellation()?;
                     self.durable_invocation = Some((id, false));
                     let from = self.messages.len();
-                    let outcome = self.execute_tool_calls(std::slice::from_ref(call));
+                    let outcome = self.execute_tool_calls(std::slice::from_ref(call)).await;
                     let (_, dispatched) = self
                         .durable_invocation
                         .take()
@@ -1533,12 +1603,14 @@ impl<'a> ToolUseLoop<'a> {
                 }
                 records
             } else {
-                self.execute_tool_calls(&response.tool_calls)?
+                self.execute_tool_calls(&response.tool_calls).await?
             };
             let batch_had_success = records.iter().any(|record| record.success);
             let batch_had_failure = records.iter().any(|record| !record.success);
             tool_calls_made.extend(records);
-            self.maybe_inject_complex_checklist_nudge(&response.tool_calls);
+            if self.config.heuristics.complex_checklist_nudge {
+                self.maybe_inject_complex_checklist_nudge(&response.tool_calls);
+            }
 
             // Update escalation signals based on batch outcome
             if batch_had_success {
@@ -1549,7 +1621,9 @@ impl<'a> ToolUseLoop<'a> {
                 self.escalation.record_failure();
 
                 // Error recovery: inject guidance on first escalation transition
-                if self.escalation.should_escalate()
+                let guidance = self.config.heuristics.error_recovery_guidance;
+                if guidance
+                    && self.escalation.should_escalate()
                     && !was_escalated_before_batch
                     && !self.recovery_injected
                 {
@@ -1567,7 +1641,7 @@ impl<'a> ToolUseLoop<'a> {
 
                 // Stuck detection: same error 3+ times → stronger nudge
                 let repeated_count = self.repeated_error_count();
-                if repeated_count >= 3 {
+                if guidance && repeated_count >= 3 {
                     if let Some(ref cb) = self.event_cb {
                         cb(EventKind::ErrorRecoveryTriggered {
                             level: "stuck".to_string(),
@@ -1624,7 +1698,7 @@ impl<'a> ToolUseLoop<'a> {
                         }),
                         requires_approval: true,
                     };
-                    cb(&dummy_call).unwrap_or(false)
+                    cb(dummy_call).await.unwrap_or(false)
                 } else {
                     false
                 };
@@ -1711,8 +1785,11 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Handle agent-level tools (user_question, spawn_task, extended_thinking, etc.)
-    fn handle_agent_level_tool(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
-        agent_tools::handle_agent_level_tool(self, llm_call)
+    async fn handle_agent_level_tool(
+        &mut self,
+        llm_call: &LlmToolCall,
+    ) -> Result<Vec<ToolCallRecord>> {
+        agent_tools::handle_agent_level_tool(self, llm_call).await
     }
 
     fn apply_phase_transition(&mut self, new_phase: codingbuddy_core::TaskPhase) {
@@ -1808,222 +1885,6 @@ impl<'a> ToolUseLoop<'a> {
         } else {
             0
         }
-    }
-
-    /// Phase 1: Lightweight pruning of old tool outputs.
-    ///
-    /// Truncates verbose tool results that are older than `PRUNE_AGE_TURNS` turn groups
-    /// from the end. Keeps the last write result per file path and all recent results.
-    /// This preserves conversation structure while reducing token usage.
-    fn prune_old_tool_outputs(&mut self) {
-        // Count turn groups from the end (a turn group starts at each User message)
-        let mut turn_count = 0;
-        let mut recent_boundary = self.messages.len();
-        for (i, msg) in self.messages.iter().enumerate().rev() {
-            if matches!(msg, ChatMessage::User { .. }) {
-                turn_count += 1;
-                if turn_count >= PRUNE_AGE_TURNS {
-                    recent_boundary = i;
-                    break;
-                }
-            }
-        }
-
-        if recent_boundary <= 1 {
-            return; // Not enough history to prune
-        }
-
-        // Track file paths from recent tool results — keep those untouched
-        let mut recent_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for msg in self.messages[recent_boundary..].iter().rev() {
-            if let ChatMessage::Tool { content, .. } = msg
-                && let Some(path) = extract_tool_path(content)
-            {
-                recent_paths.insert(path);
-            }
-        }
-
-        // Truncate old tool results in the "old" zone (messages[1..recent_boundary])
-        const TRUNCATED_MARKER: &str = "[output pruned — re-read file if needed]";
-        let max_kept_chars = 200;
-
-        for msg in &mut self.messages[1..recent_boundary] {
-            if let ChatMessage::Tool { content, .. } = msg {
-                // Skip if already truncated or short
-                if content.len() <= max_kept_chars || content.contains(TRUNCATED_MARKER) {
-                    continue;
-                }
-                // Keep results referencing files still active in recent turns
-                if let Some(path) = extract_tool_path(content)
-                    && recent_paths.contains(&path)
-                {
-                    continue;
-                }
-                // Truncate: keep first 200 chars + marker (safe on multi-byte UTF-8)
-                let safe_end = content.floor_char_boundary(max_kept_chars.min(content.len()));
-                let truncated = format!("{}\n{}", &content[..safe_end], TRUNCATED_MARKER,);
-                *content = truncated;
-            }
-        }
-    }
-
-    /// Compact messages by removing middle exchanges while preserving tool-call/result pairing.
-    ///
-    /// Walks backward from the end, keeping complete exchange groups (User + Assistant + Tool
-    /// messages form a group). Never orphans a Tool message from its corresponding Assistant
-    /// tool_calls. Respects `target_tokens` budget for kept messages.
-    fn compact_messages(&mut self, target_tokens: u64) -> bool {
-        if self.messages.len() <= 7 {
-            return false;
-        }
-
-        let system = self.messages[0].clone();
-
-        // Walk backward to find group boundaries.
-        // A group starts at a User message and includes everything until the next User message.
-        let mut keep_from = self.messages.len();
-        let mut kept_tokens: u64 = 0;
-        let target = target_tokens;
-
-        while keep_from > 1 {
-            // Find the start of this group (previous User message)
-            let group_start = self.messages[1..keep_from]
-                .iter()
-                .rposition(|m| matches!(m, ChatMessage::User { .. }))
-                .map(|i| i + 1) // +1 for the offset from [1..]
-                .unwrap_or(1);
-
-            let group_tokens: u64 = self.messages[group_start..keep_from]
-                .iter()
-                .map(|m| estimate_message_tokens(std::slice::from_ref(m)))
-                .sum();
-
-            if kept_tokens + group_tokens > target && keep_from < self.messages.len() {
-                break; // This group would exceed budget
-            }
-            kept_tokens += group_tokens;
-            keep_from = group_start;
-        }
-
-        if keep_from <= 1 {
-            return false; // Nothing to compact
-        }
-
-        let middle_count = keep_from - 1;
-        let compacted_msgs = &self.messages[1..keep_from];
-        // Try LLM-based compaction first, fall back to code-based extraction on any error.
-        let summary = match build_compaction_summary_with_llm(self.llm, compacted_msgs) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "[compact] LLM compaction failed: {e:#}; falling back to code-based extraction"
-                );
-                build_compaction_summary(compacted_msgs)
-            }
-        };
-
-        // P2.7: Validate summary before applying compaction.
-        // Reject empty or trivially short summaries that would lose context.
-        if summary.trim().is_empty() || summary.trim().len() < 50 {
-            eprintln!(
-                "[compact] rejecting compaction: summary too short ({} chars)",
-                summary.trim().len()
-            );
-            return false;
-        }
-
-        // Fire PreCompact hook if configured
-        if let Some(ref hooks) = self.hooks {
-            let mut input = HookInput::new(HookEvent::PreCompact, self.workspace_str());
-            input.tool_result = Some(serde_json::Value::String(summary.clone()));
-            self.fire_hook_logged(hooks, HookEvent::PreCompact, &input);
-        }
-
-        // Scan compacted messages for any directives we haven't captured yet
-        for msg in compacted_msgs {
-            if let ChatMessage::User { content } = msg {
-                for directive in extract_user_directives(content) {
-                    if !self.pinned_directives.contains(&directive) {
-                        self.pinned_directives.push(directive);
-                    }
-                }
-            }
-        }
-        self.pinned_directives.truncate(20);
-
-        // Auto-extract memory observations from compacted messages.
-        // These capture user corrections and decisions that should persist.
-        let auto_memories = extract_memory_observations(compacted_msgs);
-        if !auto_memories.is_empty()
-            && let Some(ref cb) = self.event_cb
-        {
-            cb(EventKind::MemoryObservations {
-                observations: auto_memories,
-            });
-        }
-
-        // Build the new message list in a local vec, validate, then swap.
-        // This avoids cloning the entire (potentially large) messages vec for rollback.
-        let summary_msg = ChatMessage::User {
-            content: format!(
-                "CONVERSATION_HISTORY (compacted from {middle_count} messages):\n{summary}"
-            ),
-        };
-
-        let mut new_messages = vec![system, summary_msg];
-
-        if let Some(work_state_message) = self.compaction_work_state_message() {
-            new_messages.push(ChatMessage::System {
-                content: work_state_message,
-            });
-        }
-
-        // Re-inject pinned user directives so they survive compaction.
-        // Placed as a System message right after the summary so the model
-        // always sees them regardless of how many compaction rounds occur.
-        if !self.pinned_directives.is_empty() {
-            let directives_text = self
-                .pinned_directives
-                .iter()
-                .map(|d| format!("- {d}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            new_messages.push(ChatMessage::System {
-                content: format!(
-                    "USER DIRECTIVES (must follow throughout this conversation):\n{directives_text}"
-                ),
-            });
-        }
-
-        new_messages.extend(self.messages[keep_from..].to_vec());
-        self.append_compaction_followup(&mut new_messages, compacted_msgs, middle_count);
-
-        // P2.7: Post-compaction validation — ensure the result is structurally sound.
-        // Must have at least 2 messages and start with a System message.
-        if new_messages.len() < 2 || !matches!(&new_messages[0], ChatMessage::System { .. }) {
-            eprintln!(
-                "[compact] post-compaction validation failed: {} messages, discarding",
-                new_messages.len()
-            );
-            return false;
-        }
-
-        self.messages = new_messages;
-
-        // Re-inject recently active files so the model retains awareness
-        if let Some(file_context) = self.build_post_compact_file_context(5) {
-            self.messages.push(ChatMessage::System {
-                content: file_context,
-            });
-        }
-
-        // Fire PostCompact hook if configured
-        if let Some(ref hooks) = self.hooks {
-            let input = HookInput::new(HookEvent::PostCompact, self.workspace_str());
-            self.fire_hook_logged(hooks, HookEvent::PostCompact, &input);
-        }
-
-        true
     }
 
     /// Apply privacy router to tool output, redacting sensitive content if configured.

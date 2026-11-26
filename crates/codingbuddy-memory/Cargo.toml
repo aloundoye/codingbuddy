@@ -12,13 +12,19 @@ glob.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
-walkdir.workspace = true
+ignore.workspace = true
 sha2.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-store = { path = "../codingbuddy-store" }
 
 codingbuddy-policy = { path = "../codingbuddy-policy" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 rusqlite = { workspace = true }
 tempfile = "3"
+
+[lints]
+workspace = true

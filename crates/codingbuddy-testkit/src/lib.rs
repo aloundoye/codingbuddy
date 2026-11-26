@@ -1,3 +1,9 @@
+//! Test support: mocks, fixtures and cassettes. Panicking on bad fixtures is
+//! the right behaviour here, so `unwrap` is allowed.
+#![allow(clippy::unwrap_used)]
+
+pub mod cassette;
+
 use anyhow::Result;
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{
@@ -40,16 +46,21 @@ impl ScriptedLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for ScriptedLlm {
-    fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
+    async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
         Err(anyhow::anyhow!("complete() not used in scripted tests"))
     }
-    fn complete_streaming(&self, _req: &LlmRequest, _cb: StreamCallback) -> Result<LlmResponse> {
+    async fn complete_streaming(
+        &self,
+        _req: &LlmRequest,
+        _cb: StreamCallback,
+    ) -> Result<LlmResponse> {
         Err(anyhow::anyhow!(
             "complete_streaming() not used in scripted tests"
         ))
     }
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
         self.captured
             .lock()
             .expect("captured lock")
@@ -60,17 +71,17 @@ impl LlmClient for ScriptedLlm {
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("scripted llm exhausted"))
     }
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         _cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.complete_chat(req)
+        self.complete_chat(req).await
     }
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+    async fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
         Err(anyhow::anyhow!("complete_fim() not used in scripted tests"))
     }
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         _req: &codingbuddy_core::FimRequest,
         _cb: StreamCallback,
@@ -278,13 +289,13 @@ pub fn fake_session() -> codingbuddy_core::Session {
 
 pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
     let engine = AgentEngine::new(workspace)?;
-    engine.chat_with_options(
+    codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "replay test",
         ChatOptions {
             tools: false,
             ..Default::default()
         },
-    )
+    ))
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1247,13 +1258,13 @@ mod tests {
         let mock = start_mock_llm_server();
         configure_runtime_for_mock_llm(&workspace, &mock.endpoint);
         let result = mock_engine(&workspace, &mock.endpoint).and_then(|engine| {
-            engine.chat_with_options(
+            codingbuddy_core::runtime::block_on(engine.chat_with_options(
                 "replay test",
                 ChatOptions {
                     tools: false,
                     ..Default::default()
                 },
-            )
+            ))
         });
         assert!(result.is_ok(), "replay smoke failed: {:?}", result.err());
     }
@@ -1339,21 +1350,21 @@ mod tests {
     fn replay_deterministic_output() {
         let (dir, mock) = temp_workspace_with_mock();
         let engine = mock_engine(dir.path(), &mock.endpoint).expect("engine");
-        let r1 = engine.chat_with_options(
+        let r1 = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "determinism test",
             ChatOptions {
                 tools: false,
                 ..Default::default()
             },
-        );
+        ));
         assert!(r1.is_ok(), "first chat failed: {:?}", r1.err());
-        let r2 = engine.chat_with_options(
+        let r2 = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "determinism test",
             ChatOptions {
                 tools: false,
                 ..Default::default()
             },
-        );
+        ));
         assert!(r2.is_ok(), "second chat failed: {:?}", r2.err());
         assert_eq!(r1.unwrap_or_default(), r2.unwrap_or_default());
     }
@@ -1362,13 +1373,13 @@ mod tests {
     fn replay_with_tool_calls_journals_events() {
         let (dir, mock) = temp_workspace_with_mock();
         let engine = mock_engine(dir.path(), &mock.endpoint).expect("engine");
-        let r = engine.chat_with_options(
+        let r = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "journal test",
             ChatOptions {
                 tools: false,
                 ..Default::default()
             },
-        );
+        ));
         assert!(r.is_ok(), "chat failed: {:?}", r.err());
         assert!(r.unwrap_or_default().contains("Mock response"));
         let store = codingbuddy_store::Store::new(dir.path()).expect("store");

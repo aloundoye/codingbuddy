@@ -22,7 +22,7 @@ fn images_forwarded_to_llm_request() {
         default_tools(),
     );
 
-    let result = loop_.run("what's in this image?").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("what's in this image?")).unwrap();
     assert_eq!(result.response, "I see the image.");
     // Images are cleared after the first turn to avoid re-sending them every turn
     assert!(
@@ -62,7 +62,7 @@ fn post_tool_use_hook_gets_actual_args() {
         default_tools(),
     );
 
-    let result = loop_.run("read main.rs").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("read main.rs")).unwrap();
     assert_eq!(result.response, "Done.");
     assert_eq!(result.tool_calls_made.len(), 1);
     assert_eq!(result.tool_calls_made[0].tool_name, "fs_read");
@@ -90,7 +90,7 @@ fn bootstrap_context_injected_on_first_turn() {
         default_tools(),
     );
 
-    let result = loop_.run("What is this project?").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("What is this project?")).unwrap();
     assert_eq!(result.response, "ok");
 
     // Verify the message order: System (prompt), System (bootstrap), User
@@ -128,7 +128,7 @@ fn bootstrap_respects_token_budget() {
         default_tools(),
     );
 
-    let result = loop_.run("hi").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("hi")).unwrap();
     // The large context is in messages[1] — it should be present (truncation
     // happens in lib.rs via truncate_to_token_budget before it reaches here)
     assert!(result.messages.len() >= 3);
@@ -155,7 +155,7 @@ fn bootstrap_disabled_when_no_initial_context() {
         default_tools(),
     );
 
-    let result = loop_.run("hi").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("hi")).unwrap();
     // Messages: System, User, Assistant — no bootstrap System message
     assert!(matches!(&result.messages[0], ChatMessage::System { content } if content == "system"));
     assert!(matches!(&result.messages[1], ChatMessage::User { .. }));
@@ -205,7 +205,7 @@ fn privacy_router_filters_tool_output() {
         default_tools(),
     );
 
-    let result = loop_.run("read .env").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("read .env")).unwrap();
     // The tool output should have been filtered
     let tool_msg = result
         .messages
@@ -367,7 +367,7 @@ fn complex_escalated_routes_to_reasoner() {
         default_tools(),
     );
 
-    let result = loop_.run("refactor auth").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("refactor auth")).unwrap();
     // After the compile error, escalation should be active
     assert!(
         loop_.escalation.compile_error,
@@ -418,7 +418,7 @@ fn reasoner_strips_sampling_params() {
     );
 
     // If not using reasoner, temperature should be preserved
-    let result = loop_.run("hi").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("hi")).unwrap();
     assert_eq!(result.response, "ok");
     // The test passes — the key assertion is in the build_request logic itself
     // which strips temperature when model contains "reasoner".
@@ -484,7 +484,7 @@ fn bootstrap_includes_repo_map_content() {
         default_tools(),
     );
 
-    let result = loop_.run("analyze project").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("analyze project")).unwrap();
     assert!(
         matches!(&result.messages[1], ChatMessage::System { content }
             if content.contains("Key source files:") && content.contains("src/lib.rs"))

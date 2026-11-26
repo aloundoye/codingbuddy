@@ -20,7 +20,7 @@ use crate::output::*;
 use crate::util::*;
 use crate::{
     CleanArgs, ConfigCmd, DoctorArgs, IndexCmd, PermissionModeArg, PermissionsCmd,
-    PermissionsSetArgs, PluginCmd,
+    PermissionsRevokeArgs, PermissionsSetArgs, PluginCmd,
 };
 
 pub(crate) fn parse_permissions_cmd(args: Vec<String>) -> Result<PermissionsCmd> {
@@ -91,9 +91,32 @@ pub(crate) fn parse_permissions_cmd(args: Vec<String>) -> Result<PermissionsCmd>
         }));
     }
 
+    if first == "approvals" {
+        return Ok(PermissionsCmd::Approvals);
+    }
+    if first == "revoke" {
+        if args.get(1).is_some_and(|arg| arg == "--all") {
+            return Ok(PermissionsCmd::Revoke(PermissionsRevokeArgs {
+                all: true,
+                ..PermissionsRevokeArgs::default()
+            }));
+        }
+        let tool = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: /permissions revoke <tool> <pattern> | --all"))?;
+        let pattern = args
+            .get(2..)
+            .filter(|rest| !rest.is_empty())
+            .ok_or_else(|| anyhow!("usage: /permissions revoke <tool> <pattern> | --all"))?;
+        return Ok(PermissionsCmd::Revoke(PermissionsRevokeArgs {
+            tool: Some(tool.clone()),
+            pattern: Some(pattern.join(" ")),
+            all: false,
+        }));
+    }
     if first != "set" {
         return Err(anyhow!(
-            "use /permissions show|set|bash|edits|sandbox|allow|clear-allowlist|dry-run"
+            "use /permissions show|set|bash|edits|sandbox|allow|clear-allowlist|dry-run|approvals|revoke"
         ));
     }
 
@@ -716,6 +739,10 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         "checks": checks,
         "warnings": warnings,
         "logs": logs_payload(),
+        "heuristics": cfg
+            .agent_loop
+            .heuristics
+            .resolve(&cfg.llm.provider, &cfg.llm.active_base_model()),
     });
 
     Ok(payload)
@@ -936,6 +963,22 @@ pub(crate) fn run_permissions(cwd: &Path, cmd: PermissionsCmd, json_mode: bool) 
     let payload = permissions_payload(cwd, cmd)?;
     if json_mode {
         print_json(&payload)?;
+    } else if let Some(approvals) = payload.get("approvals").and_then(|v| v.as_array()) {
+        if let Some(removed) = payload.get("removed").and_then(|v| v.as_u64()) {
+            println!("removed {removed} saved approval(s)");
+        } else if approvals.is_empty() {
+            println!("no saved approvals for this project");
+        } else {
+            println!("saved \"always allow\" approvals:");
+            for approval in approvals {
+                println!(
+                    "  {}  {}",
+                    approval["tool"].as_str().unwrap_or_default(),
+                    approval["pattern"].as_str().unwrap_or_default()
+                );
+            }
+            println!("remove one with: codingbuddy permissions revoke <tool> '<pattern>'");
+        }
     } else if payload.get("dry_run").is_some() {
         println!(
             "dry-run: tool={} mode={} result={}",
@@ -975,12 +1018,69 @@ pub(crate) fn run_permissions(cwd: &Path, cmd: PermissionsCmd, json_mode: bool) 
     Ok(())
 }
 
+fn approvals_json(approvals: &[codingbuddy_store::PersistentApproval]) -> serde_json::Value {
+    approvals
+        .iter()
+        .map(|a| json!({"tool": a.tool_name, "pattern": a.command_pattern}))
+        .collect()
+}
+
 pub(crate) fn permissions_payload(cwd: &Path, cmd: PermissionsCmd) -> Result<serde_json::Value> {
     let mut cfg = AppConfig::ensure(cwd)?;
     let mut updated = false;
     let team_locks = team_policy_locks();
     match cmd {
         PermissionsCmd::Show => {}
+        PermissionsCmd::Approvals => {
+            let store = Store::new(cwd)?;
+            let approvals =
+                store.list_persistent_approvals(&codingbuddy_store::project_hash(cwd))?;
+            return Ok(json!({ "approvals": approvals_json(&approvals) }));
+        }
+        PermissionsCmd::Revoke(args) => {
+            let store = Store::new(cwd)?;
+            let project = codingbuddy_store::project_hash(cwd);
+            let saved = store.list_persistent_approvals(&project)?;
+            let targets: Vec<_> = if args.all {
+                saved
+            } else {
+                let tool = args
+                    .tool
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("tool is required"))?;
+                let pattern = args
+                    .pattern
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("pattern is required"))?;
+                let matching: Vec<_> = saved
+                    .into_iter()
+                    .filter(|a| {
+                        (a.tool_name == tool
+                            || ToolName::from_api_name(tool)
+                                .is_some_and(|t| t.as_internal() == a.tool_name))
+                            && a.command_pattern == pattern
+                    })
+                    .collect();
+                anyhow::ensure!(
+                    !matching.is_empty(),
+                    "no saved approval for `{tool}` with pattern `{pattern}`; \
+                     see `codingbuddy permissions approvals`"
+                );
+                matching
+            };
+            for approval in &targets {
+                store.remove_persistent_approval(
+                    &approval.tool_name,
+                    &approval.command_pattern,
+                    &project,
+                )?;
+            }
+            let remaining = store.list_persistent_approvals(&project)?;
+            return Ok(json!({
+                "removed": targets.len(),
+                "approvals": approvals_json(&remaining),
+            }));
+        }
         PermissionsCmd::Set(args) => {
             if let Some(locks) = team_locks.as_ref() {
                 let locked_fields = locked_permission_fields_for_set(&args, locks);
@@ -1312,13 +1412,13 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
                 args.input.as_deref(),
             )?;
             let engine = AgentEngine::new(cwd)?;
-            let output = engine.chat_with_options(
+            let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
                 &rendered.prompt,
                 ChatOptions {
                     tools: args.tools,
                     ..Default::default()
                 },
-            )?;
+            ))?;
             if json_mode {
                 print_json(&json!({
                     "plugin_id": rendered.plugin_id,
@@ -1377,6 +1477,58 @@ pub(crate) fn run_clean(cwd: &Path, args: CleanArgs, json_mode: bool) -> Result<
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn saved_approvals_can_be_listed_and_revoked() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        fs::create_dir_all(cwd.join(".codingbuddy")).unwrap();
+        fs::write(cwd.join(".codingbuddy/settings.json"), "{}").unwrap();
+        let project = codingbuddy_store::project_hash(cwd);
+        let store = Store::new(cwd).unwrap();
+        store
+            .insert_persistent_approval("bash.run", "npm *", &project)
+            .unwrap();
+        store
+            .insert_persistent_approval("bash.run", "cargo *", &project)
+            .unwrap();
+
+        let listed = permissions_payload(cwd, PermissionsCmd::Approvals).unwrap();
+        assert_eq!(listed["approvals"].as_array().unwrap().len(), 2);
+
+        // The API spelling of the tool name works too.
+        let revoked = permissions_payload(
+            cwd,
+            parse_permissions_cmd(vec![
+                "revoke".into(),
+                "bash_run".into(),
+                "npm".into(),
+                "*".into(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(revoked["removed"], 1);
+        assert_eq!(revoked["approvals"][0]["pattern"], "cargo *");
+
+        assert!(
+            permissions_payload(
+                cwd,
+                parse_permissions_cmd(vec!["revoke".into(), "bash.run".into(), "nope".into()])
+                    .unwrap()
+            )
+            .is_err(),
+            "revoking an unknown approval is an error"
+        );
+
+        let all = permissions_payload(
+            cwd,
+            parse_permissions_cmd(vec!["revoke".into(), "--all".into()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(all["removed"], 1);
+        assert!(all["approvals"].as_array().unwrap().is_empty());
+    }
 
     #[test]
     fn doctor_includes_capability_profiles_with_rules() {

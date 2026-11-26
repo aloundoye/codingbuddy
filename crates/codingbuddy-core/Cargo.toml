@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 sha2.workspace = true
 anyhow.workspace = true
 cap-std.workspace = true
@@ -17,6 +18,7 @@ serde_json.workspace = true
 strsim.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
@@ -31,3 +33,6 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+[lints]
+workspace = true

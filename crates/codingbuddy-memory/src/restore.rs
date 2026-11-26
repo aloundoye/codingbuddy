@@ -57,7 +57,25 @@ impl MemoryManager {
             }
             Err(error) => return Err(error.into()),
         };
+        let metadata = input.metadata()?;
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(metadata.permissions().mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let mode = None;
         let blobs = self.blob_fs()?;
+        let cache_key = (files.root().to_owned(), path.to_owned());
+        let stamp = stat_cache::Stamp::of(&metadata);
+        if let Some(hash) = stat_cache::lookup(&cache_key, stamp)
+            && blobs.resolve(Path::new(&hash), false).is_ok()
+        {
+            return Ok(FileState {
+                hash: Some(hash),
+                mode,
+            });
+        }
         let temporary = PathBuf::from(Uuid::now_v7().to_string());
         let mut output = blobs.open_lock_file(&temporary)?.into_std();
         let mut digest = Sha256::new();
@@ -70,22 +88,44 @@ impl MemoryManager {
             digest.update(&buffer[..size]);
             output.write_all(&buffer[..size])?;
         }
-        output.sync_all()?;
-        drop(output);
         let hash = format!("{:x}", digest.finalize());
-        blobs.rename_file(&temporary, Path::new(&hash))?;
-        #[cfg(unix)]
-        let mode = {
-            use std::os::unix::fs::PermissionsExt;
-            Some(input.metadata()?.permissions().mode() & 0o777)
-        };
-        #[cfg(not(unix))]
-        let mode = None;
+        if blobs.resolve(Path::new(&hash), false).is_ok() {
+            // Blobs are content-addressed: an existing one already holds
+            // these bytes, durably. Skip the fsync and the rename.
+            drop(output);
+            blobs.remove_file(&temporary)?;
+        } else {
+            flush_to_device(&output)?;
+            drop(output);
+            blobs.rename_file(&temporary, Path::new(&hash))?;
+        }
+        stat_cache::remember(cache_key, stamp, &hash);
         Ok(FileState {
             hash: Some(hash),
             mode,
         })
     }
+
+    /// The content hash of `path` without storing a blob, or `None` when it
+    /// does not exist. Uses the same stat cache as [`Self::capture_state`].
+    fn current_hash(&self, files: &WorkspaceFs, path: &Path) -> Result<Option<String>> {
+        let mut input = match files.open_file(path) {
+            Ok(file) => file.into_std(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let cache_key = (files.root().to_owned(), path.to_owned());
+        let stamp = stat_cache::Stamp::of(&input.metadata()?);
+        if let Some(hash) = stat_cache::lookup(&cache_key, stamp) {
+            return Ok(Some(hash));
+        }
+        let mut digest = Sha256::new();
+        std::io::copy(&mut input, &mut digest)?;
+        let hash = format!("{:x}", digest.finalize());
+        stat_cache::remember(cache_key, stamp, &hash);
+        Ok(Some(hash))
+    }
+
     pub fn create_checkpoint_linked(
         &self,
         reason: &str,
@@ -93,32 +133,15 @@ impl MemoryManager {
         session: Option<Uuid>,
     ) -> Result<CheckpointRecord> {
         let files = WorkspaceFs::open(&self.workspace)?;
+        let checkpoint_id = Uuid::now_v7();
         let root = runtime_dir(files.root())
             .join("checkpoints")
-            .join(Uuid::now_v7().to_string());
+            .join(checkpoint_id.to_string());
         files.subdir(&files.relative(&root.join("fs"))?, true)?;
-        let checkpoint_id = Uuid::parse_str(root.file_name().unwrap().to_str().unwrap())?;
         let mut skipped = Vec::new();
         let selected: Vec<PathBuf> = if paths.is_empty() {
-            let mut selected = Vec::new();
-            for entry in WalkDir::new(files.root())
-                .into_iter()
-                .filter_entry(|entry| {
-                    entry
-                        .path()
-                        .strip_prefix(files.root())
-                        .is_ok_and(|path| !has_ignored_component(path))
-                })
-            {
-                let entry = entry?;
-                if entry.file_type().is_symlink() {
-                    skipped.push(entry.path().strip_prefix(files.root())?.to_owned());
-                    continue;
-                }
-                if entry.file_type().is_file() {
-                    selected.push(entry.path().strip_prefix(files.root())?.to_owned());
-                }
-            }
+            let (selected, symlinks) = checkpoint_files(&files)?;
+            skipped.extend(symlinks);
             selected
         } else {
             paths
@@ -126,11 +149,37 @@ impl MemoryManager {
                 .map(|path| files.relative(path))
                 .collect::<std::io::Result<_>>()?
         };
-        let mut captured = BTreeMap::new();
-        for path in selected {
-            anyhow::ensure!(!has_ignored_component(&path), "Protected checkpoint path");
-            captured.insert(path.clone(), self.capture_state(&files, &path)?);
+        for path in &selected {
+            anyhow::ensure!(!has_ignored_component(path), "Protected checkpoint path");
         }
+        // Capturing is dominated by per-blob fsyncs on first sight of a
+        // file; a few workers overlap them.
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .clamp(1, 8);
+        let chunk = selected.len().div_ceil(workers).max(1);
+        let captured: BTreeMap<PathBuf, FileState> = std::thread::scope(|scope| {
+            let handles: Vec<_> = selected
+                .chunks(chunk)
+                .map(|paths| {
+                    let files = &files;
+                    scope.spawn(move || {
+                        paths
+                            .iter()
+                            .map(|path| Ok((path.clone(), self.capture_state(files, path)?)))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+            let mut captured = BTreeMap::new();
+            for handle in handles {
+                let part = handle
+                    .join()
+                    .map_err(|_| anyhow!("checkpoint worker panicked"))??;
+                captured.extend(part);
+            }
+            Ok::<_, anyhow::Error>(captured)
+        })?;
         let cursor = session
             .map(|id| self.store.checkpoint_cursor(id))
             .transpose()?;
@@ -157,6 +206,47 @@ impl MemoryManager {
         self.store.insert_checkpoint(&record)?;
         Ok(record)
     }
+    /// Workspace files whose content or presence differs from checkpoint
+    /// `checkpoint_id`: modified, deleted, and newly created files. Used to
+    /// attribute a shell command's changes to the agent so `/rewind` can
+    /// undo them (restore only reverts changes it can attribute).
+    pub fn changed_since_checkpoint(&self, checkpoint_id: Uuid) -> Result<Vec<PathBuf>> {
+        let files = WorkspaceFs::open(&self.workspace)?;
+        let private = files.subdir(Path::new(".codingbuddy"), false)?;
+        let manifest: CheckpointManifest = serde_json::from_slice(
+            &private.read(
+                Path::new("checkpoints")
+                    .join(checkpoint_id.to_string())
+                    .join("manifest.json")
+                    .as_path(),
+            )?,
+        )?;
+        anyhow::ensure!(manifest.version == 2, "Unsupported checkpoint manifest");
+
+        let mut current = BTreeMap::new();
+        for path in checkpoint_files(&files)?.0 {
+            if let Some(hash) = self.current_hash(&files, &path)? {
+                current.insert(path, hash);
+            }
+        }
+
+        let mut changed: Vec<PathBuf> = manifest
+            .files
+            .iter()
+            .filter(|(path, before)| current.get(*path) != before.hash.as_ref())
+            .map(|(path, _)| path.clone())
+            .collect();
+        changed.extend(
+            current
+                .keys()
+                .filter(|path| !manifest.files.contains_key(*path))
+                .cloned(),
+        );
+        changed.sort();
+        changed.dedup();
+        Ok(changed)
+    }
+
     pub fn preview_restore(
         &self,
         checkpoint_id: Uuid,
@@ -417,7 +507,13 @@ impl MemoryManager {
         let fork = if mode != "files" {
             Some(
                 self.store
-                    .fork_for_restore(id, plan.session_id.unwrap(), plan.cursor.unwrap())?
+                    .fork_for_restore(
+                        id,
+                        plan.session_id
+                            .ok_or_else(|| anyhow!("restore plan has no session to fork"))?,
+                        plan.cursor
+                            .ok_or_else(|| anyhow!("restore plan has no conversation cursor"))?,
+                    )?
                     .session_id,
             )
         } else {
@@ -785,5 +881,150 @@ mod delivery_three {
         assert!(manager.create_checkpoint("reject").is_err());
         assert_eq!(fs::read_dir(outside.path())?.count(), 0);
         Ok(())
+    }
+}
+
+/// Files a whole-workspace checkpoint covers, and the symlinks it skips.
+///
+/// Honours `.gitignore` (and `.git/info/exclude`, even outside a git
+/// repository) so dependency and build folders such as `node_modules` are
+/// not copied before every shell command. Hidden files are included; `.git`,
+/// `.codingbuddy` and `target` never are.
+fn checkpoint_files(files: &WorkspaceFs) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let root = files.root().to_owned();
+    let filter_root = root.clone();
+    let mut selected = Vec::new();
+    let mut symlinks = Vec::new();
+    let walker = ignore::WalkBuilder::new(&root)
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .ignore(false)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            entry
+                .path()
+                .strip_prefix(&filter_root)
+                .is_ok_and(|path| !has_ignored_component(path))
+        })
+        .build();
+    for entry in walker {
+        let entry = entry?;
+        let Some(kind) = entry.file_type() else {
+            continue;
+        };
+        let relative = entry.path().strip_prefix(&root)?.to_owned();
+        if kind.is_symlink() {
+            symlinks.push(relative);
+        } else if kind.is_file() {
+            selected.push(relative);
+        }
+    }
+    selected.sort();
+    Ok((selected, symlinks))
+}
+
+/// A process-wide cache of content hashes keyed by file metadata, so a
+/// checkpoint only reads files that changed since the last one (the same
+/// trick as git's index).
+mod stat_cache {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    use std::time::{Duration, SystemTime};
+
+    /// A file is only cached once its timestamps are this old: a write in
+    /// the same timestamp tick as the hash would otherwise go unnoticed.
+    const SETTLE: Duration = Duration::from_secs(2);
+    const MAX_ENTRIES: usize = 200_000;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        len: u64,
+        modified: Option<SystemTime>,
+        changed: Option<SystemTime>,
+        inode: u64,
+    }
+
+    impl Stamp {
+        pub(super) fn of(metadata: &std::fs::Metadata) -> Self {
+            #[cfg(unix)]
+            let (changed, inode) = {
+                use std::os::unix::fs::MetadataExt;
+                let ctime = u64::try_from(metadata.ctime()).ok().map(|secs| {
+                    SystemTime::UNIX_EPOCH
+                        + Duration::new(secs, u32::try_from(metadata.ctime_nsec()).unwrap_or(0))
+                });
+                (ctime, metadata.ino())
+            };
+            #[cfg(not(unix))]
+            let (changed, inode) = (None, 0);
+            Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                changed,
+                inode,
+            }
+        }
+
+        fn settled(&self) -> bool {
+            let Some(cutoff) = SystemTime::now().checked_sub(SETTLE) else {
+                return false;
+            };
+            self.modified.is_some_and(|at| at < cutoff) && self.changed.is_none_or(|at| at < cutoff)
+        }
+    }
+
+    type Key = (PathBuf, PathBuf);
+
+    fn cache() -> &'static Mutex<HashMap<Key, (Stamp, String)>> {
+        static CACHE: OnceLock<Mutex<HashMap<Key, (Stamp, String)>>> = OnceLock::new();
+        CACHE.get_or_init(Default::default)
+    }
+
+    pub(super) fn lookup(key: &Key, stamp: Stamp) -> Option<String> {
+        let cache = cache().lock().unwrap_or_else(PoisonError::into_inner);
+        cache
+            .get(key)
+            .filter(|(cached, _)| *cached == stamp)
+            .map(|(_, hash)| hash.clone())
+    }
+
+    pub(super) fn remember(key: Key, stamp: Stamp, hash: &str) {
+        if !stamp.settled() {
+            return;
+        }
+        let mut cache = cache().lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, (stamp, hash.to_string()));
+    }
+}
+
+/// Push a blob's bytes to the storage device.
+///
+/// On macOS `File::sync_all` issues `F_FULLFSYNC`, which also empties the
+/// drive's cache and serialises every caller, costing milliseconds per
+/// file. Blobs use a plain `fsync` instead, and the checkpoint manifest,
+/// written last with `sync_all`, flushes the drive cache once for the whole
+/// batch (git's `core.fsyncMethod=batch`).
+fn flush_to_device(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` owns a valid open descriptor for this call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
     }
 }

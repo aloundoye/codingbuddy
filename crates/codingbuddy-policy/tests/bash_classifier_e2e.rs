@@ -1,4 +1,5 @@
 //! E2E tests for bash command safety classification.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use codingbuddy_policy::bash_classifier::{BashSafety, classify_bash_command};
 

@@ -1,0 +1,11 @@
+# Binaries built and run by cargo here (tests, `cargo run`) must not touch
+# the developer's real credentials:
+# - macOS treats every rebuilt binary as a new app and asks for the login
+#   password before it may read the keychain, so legacy keychain reads are off;
+# - saved provider keys come from a throwaway file under target/, so tests
+#   never pick up the developer's own key.
+# Binaries you run directly (target/debug/codingbuddy, installed releases)
+# are unaffected. Export the variables yourself to override them.
+[env]
+CODINGBUDDY_NO_KEYCHAIN = "1"
+CODINGBUDDY_CREDENTIALS_FILE = { value = "target/test-credentials/credentials.json", relative = true }

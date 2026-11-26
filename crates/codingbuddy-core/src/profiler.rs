@@ -43,15 +43,15 @@ impl StartupProfiler {
         if !self.enabled || self.checkpoints.is_empty() {
             return;
         }
-        eprintln!("[startup-trace] Startup timing:");
+        eprintln!("[startup-trace] Startup timing:"); // guard: allow (startup trace, only with CODINGBUDDY_STARTUP_TRACE)
         let mut prev = self.start;
         for (label, ts) in &self.checkpoints {
             let delta = ts.duration_since(prev);
             let total = ts.duration_since(self.start);
-            eprintln!("  {label:<30} +{delta:>8.1?}  (total {total:>8.1?})");
+            eprintln!("  {label:<30} +{delta:>8.1?}  (total {total:>8.1?})"); // guard: allow (startup trace, only with CODINGBUDDY_STARTUP_TRACE)
             prev = *ts;
         }
-        eprintln!("  {:<30} {:>10.1?}", "TOTAL", self.start.elapsed());
+        eprintln!("  {:<30} {:>10.1?}", "TOTAL", self.start.elapsed()); // guard: allow (startup trace, only with CODINGBUDDY_STARTUP_TRACE)
     }
 }
 

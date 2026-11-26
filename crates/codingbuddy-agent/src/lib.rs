@@ -27,6 +27,8 @@ use codingbuddy_hooks::HookRuntime;
 use codingbuddy_llm::{ApiClient, LlmClient};
 use codingbuddy_mcp::McpManager;
 mod observe;
+mod session_prompt;
+mod turn;
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
 use codingbuddy_subagent::SubagentTask;
@@ -42,14 +44,21 @@ use std::time::Duration;
 use tool_surface::shape_tool_surface;
 use uuid::Uuid;
 
-/// Handler for spawn_task subagent workers. Retained for API compatibility,
-/// but the core loop does not dispatch subagents in this architecture.
-pub type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send + Sync>;
+/// Runs a spawn_task subagent: a whole child agent, awaited by the parent.
+pub type SubagentWorkerFn = Arc<
+    dyn Fn(SubagentTask) -> codingbuddy_core::runtime::BoxFuture<'static, Result<String>>
+        + Send
+        + Sync,
+>;
+/// An approval decision made on the spot (tests, policies, headless runs).
+/// It runs on the async runtime, so it must not wait for a person; use
+/// [`AgentEngine::set_async_approval_handler`] for that.
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
 fn install_mcp_executor(host: &mut LocalToolHost, manager: Arc<McpManager>) {
     host.set_context_mcp_executor(Arc::new(move |alias, args, context| {
-        manager.call_tool(alias, args, context)
+        let manager = manager.clone();
+        Box::pin(async move { manager.call_tool(alias, args, context).await })
     }));
 }
 
@@ -128,7 +137,7 @@ pub struct AgentEngine {
     stream_callback: Mutex<Option<codingbuddy_core::StreamCallback>>,
     max_turns: Option<u64>,
     max_budget_usd: Option<f64>,
-    approval_handler: Mutex<Option<Arc<Mutex<ApprovalHandler>>>>,
+    approval_handler: Mutex<Option<tool_loop::ApprovalCallback>>,
     user_question_handler: Mutex<Option<UserQuestionHandler>>,
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
     pub(crate) hooks: HookRuntime,
@@ -210,21 +219,8 @@ impl AgentEngine {
         let observer = Observer::new(workspace, &cfg.telemetry)?;
         let mut policy = PolicyEngine::from_app_config(&cfg.policy);
 
-        let project_hash = format!("{:x}", {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            workspace.to_string_lossy().as_bytes().hash(&mut h);
-            h.finish()
-        });
-        if let Ok(approvals) = store.list_persistent_approvals(&project_hash) {
-            let bash_approvals: Vec<String> = approvals
-                .iter()
-                .filter(|a| a.tool_name == "bash.run")
-                .map(|a| a.command_pattern.clone())
-                .collect();
-            if !bash_approvals.is_empty() {
-                policy.set_persistent_bash_approvals(bash_approvals);
-            }
+        if let Some(bash_approvals) = saved_bash_approvals(&store, workspace) {
+            policy.set_persistent_bash_approvals(bash_approvals);
         }
 
         let mut tool_host = LocalToolHost::with_config(
@@ -331,7 +327,7 @@ impl AgentEngine {
         }
     }
 
-    pub fn validate_api_key(&self) -> Result<()> {
+    pub async fn validate_api_key(&self) -> Result<()> {
         let provider = self.cfg.llm.active_provider();
         let model = self.cfg.llm.active_base_model();
         let test_request = ChatRequest {
@@ -354,7 +350,7 @@ impl AgentEngine {
             response_format: None,
         };
 
-        match self.llm.complete_chat(&test_request) {
+        match self.llm.complete_chat(&test_request).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 let err_str = e.to_string().to_ascii_lowercase();
@@ -405,12 +401,39 @@ impl AgentEngine {
         self.observer.set_verbose(verbose);
     }
 
-    pub fn set_approval_handler(&self, handler: ApprovalHandler) {
-        match self.approval_handler.lock() {
-            Ok(mut guard) => {
-                *guard = Some(Arc::new(Mutex::new(handler)));
+    /// A callback that re-reads this project's saved "always allow"
+    /// approvals into the live policy. Front-ends call it after the user
+    /// saves one, so it applies to the next call in the same session.
+    pub fn approval_reloader(&self) -> impl Fn() + Send + Sync + 'static {
+        let store = self.store.clone();
+        let policy = self.policy.clone();
+        let workspace = self.workspace.clone();
+        move || {
+            if let Some(approvals) = saved_bash_approvals(&store, &workspace) {
+                policy.replace_bash_approvals(approvals);
             }
-            Err(_) => eprintln!("[agent] approval handler mutex poisoned; handler not installed"),
+        }
+    }
+
+    pub fn set_approval_handler(&self, handler: ApprovalHandler) {
+        let handler = Arc::new(Mutex::new(handler));
+        self.set_async_approval_handler(Arc::new(move |call| {
+            let decision = handler
+                .lock()
+                .map_err(|_| anyhow!("approval handler mutex poisoned"))
+                .and_then(|mut decide| decide(&call));
+            Box::pin(std::future::ready(decision))
+        }));
+    }
+
+    /// Install an approval handler that waits for a person (a UI prompt):
+    /// the turn awaits its answer without holding a thread.
+    pub fn set_async_approval_handler(&self, handler: tool_loop::ApprovalCallback) {
+        match self.approval_handler.lock() {
+            Ok(mut guard) => *guard = Some(handler),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] approval handler mutex poisoned; handler not installed"
+            )),
         }
     }
 
@@ -419,7 +442,9 @@ impl AgentEngine {
             Ok(mut guard) => {
                 *guard = Some(cb);
             }
-            Err(_) => eprintln!("[agent] stream callback mutex poisoned; callback not installed"),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] stream callback mutex poisoned; callback not installed"
+            )),
         }
     }
 
@@ -430,7 +455,9 @@ impl AgentEngine {
                     cb(chunk);
                 }
             }
-            Err(_) => eprintln!("[agent] stream callback mutex poisoned; chunk not emitted"),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] stream callback mutex poisoned; chunk not emitted"
+            )),
         }
     }
 
@@ -439,9 +466,9 @@ impl AgentEngine {
             Ok(mut guard) => {
                 *guard = Some(handler);
             }
-            Err(_) => {
-                eprintln!("[agent] user question handler mutex poisoned; handler not installed")
-            }
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] user question handler mutex poisoned; handler not installed"
+            )),
         }
     }
 
@@ -450,7 +477,9 @@ impl AgentEngine {
             Ok(mut guard) => {
                 *guard = Some(worker);
             }
-            Err(_) => eprintln!("[agent] subagent worker mutex poisoned; worker not installed"),
+            Err(_) => codingbuddy_core::logging::notice(format_args!(
+                "[agent] subagent worker mutex poisoned; worker not installed"
+            )),
         }
     }
 
@@ -459,8 +488,8 @@ impl AgentEngine {
     }
 
     /// Discover available models from the active provider's API.
-    pub fn discover_models(&self) -> Vec<String> {
-        self.llm.list_models()
+    pub async fn discover_models(&self) -> Vec<String> {
+        self.llm.list_models().await
     }
 
     fn active_plan_prompt_addendum(&self, session: &Session) -> Result<Option<String>> {
@@ -549,7 +578,7 @@ impl AgentEngine {
                     read_only_fallback: false,
                     custom_agent: None,
                 };
-                worker(&task)
+                worker(task)
             }));
         }
         None
@@ -640,7 +669,7 @@ impl AgentEngine {
 
     /// Fire PreToolUse hooks. Returns the aggregate result.
     /// Callers should check `result.blocked` to decide whether to skip tool execution.
-    pub fn fire_pre_tool_use(
+    pub async fn fire_pre_tool_use(
         &self,
         tool_name: &str,
         tool_input: &serde_json::Value,
@@ -650,14 +679,26 @@ impl AgentEngine {
             codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::PreToolUse, &ws)
                 .with_tool(tool_name, tool_input.clone());
         self.hooks
-            .fire(codingbuddy_hooks::HookEvent::PreToolUse, &input)
+            .fire_with_context(
+                codingbuddy_hooks::HookEvent::PreToolUse,
+                &input,
+                &Default::default(),
+            )
+            .await
     }
 
     /// Fire Stop hooks at end of agent execution.
-    pub fn fire_stop(&self) {
+    pub async fn fire_stop(&self) {
         let ws = self.workspace.display().to_string();
         let input = codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Stop, &ws);
-        let _ = self.hooks.fire(codingbuddy_hooks::HookEvent::Stop, &input);
+        let _ = self
+            .hooks
+            .fire_with_context(
+                codingbuddy_hooks::HookEvent::Stop,
+                &input,
+                &Default::default(),
+            )
+            .await;
     }
 
     pub(crate) fn stream(&self, chunk: StreamChunk) {
@@ -670,7 +711,7 @@ impl AgentEngine {
         }
     }
 
-    pub fn chat(&self, prompt: &str) -> Result<String> {
+    pub async fn chat(&self, prompt: &str) -> Result<String> {
         self.chat_with_options(
             prompt,
             ChatOptions {
@@ -678,15 +719,16 @@ impl AgentEngine {
                 ..Default::default()
             },
         )
+        .await
     }
 
-    pub fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
-        let result = self.analyze_prompt(prompt, options)?;
+    pub async fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        let result = self.analyze_prompt(prompt, options).await?;
         self.stream(StreamChunk::Done { reason: None });
         Ok(result)
     }
 
-    fn analyze_prompt(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+    async fn analyze_prompt(&self, prompt: &str, options: ChatOptions) -> Result<String> {
         let cfg = self.effective_config(&options);
         let routed_llm = self.routed_llm_for_options(&cfg, &options)?;
         let llm = match routed_llm.as_ref() {
@@ -704,7 +746,8 @@ impl AgentEngine {
             prompt,
             &options,
             stream_cb.clone(),
-        )?;
+        )
+        .await?;
 
         if let Some(compatibility) = response.compatibility.as_ref()
             && (!compatibility.transforms.is_empty() || !compatibility.degraded_inputs.is_empty())
@@ -757,896 +800,6 @@ impl AgentEngine {
         bootstrap.debug_digest(intent_label, options.mode)
     }
 
-    /// Run the tool-use conversation loop.
-    ///
-    /// The model freely decides which tools to call at each step, enabling
-    /// fluid think→act→observe behavior. Bootstrap context (project structure,
-    /// repo map, manifests) is injected on the first turn so the model starts
-    /// with project awareness instead of blind.
-    fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
-        let cfg = self.effective_config(options);
-        let routed_llm = self.routed_llm_for_options(&cfg, options)?;
-        let llm = match routed_llm.as_ref() {
-            Some(client) => client.as_ref(),
-            None => self.llm.as_ref(),
-        };
-        let project_memory = codingbuddy_memory::MemoryManager::new(&self.workspace)
-            .ok()
-            .and_then(|mm| mm.read_combined_memory().ok());
-
-        // Build workspace context for environment section in system prompt
-        let git_branch = codingbuddy_core::process_env::git_inspection(&self.workspace)
-            .args(["branch", "--show-current"])
-            .current_dir(&self.workspace)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
-        let ws_context = codingbuddy_core::prompts::WorkspaceContext {
-            cwd: self.workspace.display().to_string(),
-            git_branch,
-            os: std::env::consts::OS.to_string(),
-        };
-
-        // Classify complexity before building system prompt (planning injection depends on it).
-        let complexity = codingbuddy_core::complexity::classify_complexity(prompt);
-
-        // Build repo map for Complex tasks so the model knows the project structure
-        let repo_map_summary =
-            if complexity == codingbuddy_core::complexity::PromptComplexity::Complex {
-                Some(shared::build_repo_map(
-                    &self.workspace,
-                    prompt,
-                    40, // top 40 files
-                    &options.additional_dirs,
-                ))
-            } else {
-                None
-            };
-
-        // Select agent profile: manual override takes precedence over auto-selection.
-        let profile = options
-            .profile_override
-            .as_deref()
-            .and_then(agent_profiles::profile_by_name)
-            .or_else(|| agent_profiles::select_profile(options.mode, prompt, complexity));
-
-        let active_base_model = cfg.llm.active_base_model();
-        let active_reasoner_model = cfg.llm.active_reasoner_model();
-        let mut session = self.ensure_session_record_for(options.session_id)?;
-        if session.status == SessionState::AwaitingApproval && prompt_grants_plan_approval(prompt) {
-            session.status = SessionState::ExecutingStep;
-            self.store.save_session(&session)?;
-            self.append_event_best_effort_for_session(
-                Some(session.session_id),
-                EventKind::SessionStateChanged {
-                    from: SessionState::AwaitingApproval,
-                    to: SessionState::ExecutingStep,
-                },
-            );
-            self.emit_stream_chunk_best_effort(StreamChunk::PhaseTransition {
-                from: TaskPhase::Plan.as_str().to_string(),
-                to: TaskPhase::Execute.as_str().to_string(),
-            });
-        }
-
-        let mut system_prompt = codingbuddy_core::prompts::build_model_aware_system_prompt(
-            project_memory.as_deref(),
-            options.system_prompt_override.as_deref(),
-            options.system_prompt_append.as_deref(),
-            Some(&ws_context),
-            complexity,
-            repo_map_summary.as_deref(),
-            &active_base_model,
-        );
-
-        // Inject output style preference
-        match cfg.output_style.as_str() {
-            "concise" => {
-                system_prompt.push_str("\n\nIMPORTANT: Be extremely concise. One-sentence answers preferred. No preamble or trailing summaries.");
-            }
-            "verbose" => {
-                system_prompt.push_str("\n\nExplain your reasoning in detail. Include context, alternatives considered, and trade-offs.");
-            }
-            _ => {} // "normal" or unrecognized — no injection
-        }
-
-        if let Some(plan_addendum) = self.active_plan_prompt_addendum(&session)? {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&plan_addendum);
-        }
-
-        if let Some(p) = profile {
-            system_prompt.push_str(p.system_prompt_addendum);
-        }
-
-        // Append skill catalog with when_to_use hints so the LLM knows available skills
-        if let Ok(skill_mgr) = crate::skills::SkillManager::new(&self.workspace)
-            && let Ok(skills) = skill_mgr.list(&cfg.skills.paths)
-        {
-            let prompt_lower = prompt.to_lowercase();
-            let mut recommended: Vec<String> = Vec::new();
-            let mut available: Vec<String> = Vec::new();
-
-            for s in &skills {
-                let Some(hint) = s.when_to_use.as_ref() else {
-                    continue;
-                };
-                let effort_tag = s.effort.as_deref().unwrap_or("medium");
-                let line = format!("- `{}` [{}]: {}", s.id, effort_tag, hint);
-
-                // Check if prompt matches the when_to_use keywords
-                let hint_words: Vec<&str> = hint.split_whitespace().collect();
-                let matches = hint_words
-                    .iter()
-                    .filter(|w| w.len() > 3)
-                    .any(|w| prompt_lower.contains(&w.to_lowercase()));
-                if matches {
-                    recommended.push(line);
-                } else {
-                    available.push(line);
-                }
-            }
-
-            if !recommended.is_empty() {
-                system_prompt.push_str("\n\n## Recommended Skills (match this task)\n");
-                system_prompt.push_str("Consider invoking these with the `skill` tool:\n");
-                system_prompt.push_str(&recommended.join("\n"));
-            }
-            if !available.is_empty() {
-                system_prompt.push_str("\n\n## Other Available Skills\n");
-                system_prompt.push_str(&available.join("\n"));
-            }
-        }
-
-        let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
-
-        // Complexity-driven initial budget, with evidence-driven escalation in the loop.
-        // force_max_think is an explicit user override to maximum.
-        let think_budget = if options.force_max_think {
-            codingbuddy_core::complexity::MAX_THINK_BUDGET // 64K
-        } else {
-            codingbuddy_core::complexity::thinking_budget_for(complexity) // Simple 8K / Medium 16K / Complex 32K
-        };
-
-        // Gather lightweight bootstrap context so the model starts with project awareness.
-        // Budget: ~15% of context window to leave room for conversation.
-        let initial_context =
-            self.build_bootstrap_context(prompt, options, cfg.llm.context_window_tokens);
-        let initial_phase = match session.status {
-            SessionState::Planning | SessionState::AwaitingApproval => Some(TaskPhase::Plan),
-            SessionState::ExecutingStep => Some(TaskPhase::Execute),
-            SessionState::Verifying => Some(TaskPhase::Verify),
-            _ => None,
-        };
-
-        let provider_kind = cfg
-            .llm
-            .active_provider_kind()
-            .unwrap_or(codingbuddy_core::ProviderKind::Deepseek);
-        let config = tool_loop::ToolLoopConfig {
-            model: active_base_model.clone(),
-            max_tokens: codingbuddy_core::max_output_tokens_for_model(
-                provider_kind,
-                &active_base_model,
-                true,
-            ),
-            provider_kind,
-            temperature: None, // Incompatible with thinking mode
-            context_window_tokens: cfg.llm.context_window_tokens,
-            reserved_overhead_tokens: cfg.context.reserved_overhead_tokens,
-            response_budget_tokens: cfg.context.response_budget_tokens,
-            max_turns: self
-                .max_turns
-                .or(cfg.budgets.max_turns)
-                .unwrap_or(cfg.agent_loop.tool_loop_max_turns)
-                .min(cfg.agent_loop.tool_loop_max_turns) as usize,
-            read_only,
-            thinking: Some(codingbuddy_core::ThinkingConfig::enabled(think_budget)),
-            extended_thinking_model: active_reasoner_model,
-            complexity,
-            subagent_worker: self.build_subagent_worker(),
-            skill_runner: self.build_skill_runner(),
-            workspace: Some(self.workspace.clone()),
-            trusted_workspace: self.cfg.workspace_trust == Some(true),
-            privacy_router: build_privacy_router(&cfg),
-            images: options.images.clone(),
-            initial_context,
-            profile_name: profile.map(|p| p.name.to_string()),
-            phase_loop_enabled: cfg.agent_loop.phase_loop_enabled,
-            initial_phase,
-            session_id: Some(session.session_id),
-            edit_validator: if self.cfg.workspace_trust == Some(true) && cfg.lsp.enabled {
-                Some(std::sync::Arc::new(codingbuddy_lsp::EditValidator::new(
-                    self.workspace.clone(),
-                    codingbuddy_lsp::LspConfig {
-                        enabled: cfg.lsp.enabled,
-                        languages: cfg.lsp.languages.clone(),
-                        timeout_seconds: cfg.lsp.timeout_seconds,
-                    },
-                )))
-            } else {
-                None
-            },
-        };
-
-        // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.
-        let builtin_tools =
-            runtime_tool_definitions(&self.workspace, self.cfg.workspace_trust == Some(true));
-        let signals = detect_signals(prompt, &self.workspace);
-        let (tiered_tools, mut discoverable_tools) =
-            tiered_tool_definitions(builtin_tools, &signals);
-        let mut runtime_tool_metadata = HashMap::new();
-
-        // Move deferred tools to discoverable (discovered via tool_search, not sent by default)
-        let mut tools = Vec::with_capacity(tiered_tools.len());
-        for tool in tiered_tools {
-            let is_deferred = codingbuddy_core::ToolName::from_api_name(&tool.function.name)
-                .map(|tn| tn.metadata().deferred)
-                .unwrap_or(false);
-            if is_deferred {
-                discoverable_tools.push(tool);
-            } else {
-                tools.push(tool);
-            }
-        }
-        register_tool_definitions_metadata(&mut runtime_tool_metadata, &tools);
-        register_tool_definitions_metadata(&mut runtime_tool_metadata, &discoverable_tools);
-        if let Some(ref mcp) = self.mcp
-            && let Ok(mcp_tools) = mcp.discover_tools()
-        {
-            for mt in mcp_tools {
-                let tool_name = format!("mcp__{}__{}", mt.server_id, mt.name);
-                runtime_tool_metadata.insert(tool_name.clone(), mcp_tool_metadata(&tool_name, &mt));
-                tools.push(codingbuddy_core::ToolDefinition {
-                    tool_type: "function".to_string(),
-                    function: codingbuddy_core::FunctionDefinition {
-                        name: tool_name,
-                        description: truncate_mcp_description(&mt.description),
-                        parameters: mcp_tool_parameters(&mt.input_schema),
-                        strict: None,
-                    },
-                });
-            }
-        }
-
-        let visible = |tool: &codingbuddy_core::ToolDefinition| {
-            let name = &tool.function.name;
-            let internal = codingbuddy_tools::map_tool_name(name);
-            // Resource-specific rules are checked against each actual tool call.
-            self.policy
-                .denial(&codingbuddy_core::ToolCall {
-                    name: internal.to_owned(),
-                    args: serde_json::Value::Null,
-                    requires_approval: false,
-                })
-                .is_none()
-        };
-        tools.retain(visible);
-        discoverable_tools.retain(visible);
-
-        // Apply agent profile tool filtering
-        if let Some(p) = profile {
-            tools =
-                agent_profiles::filter_by_profile_with_metadata(tools, p, &runtime_tool_metadata);
-            discoverable_tools = agent_profiles::filter_by_profile_with_metadata(
-                discoverable_tools,
-                p,
-                &runtime_tool_metadata,
-            );
-        }
-        if let Some(capabilities) = cfg.llm.capabilities_for_model(&active_base_model) {
-            (tools, discoverable_tools) =
-                shape_tool_surface(tools, discoverable_tools, capabilities);
-        }
-
-        if !discoverable_tools.is_empty() {
-            let tool_search = tool_search_definition();
-            runtime_tool_metadata.insert(
-                tool_search.function.name.clone(),
-                RuntimeToolMetadata::for_api_name(&tool_search.function.name),
-            );
-            tools.push(tool_search);
-        }
-
-        let mut loop_ =
-            tool_loop::ToolUseLoop::new(llm, self.tool_host.clone(), config, system_prompt, tools);
-        loop_.set_budget_limit(self.max_budget_usd.or(cfg.budgets.max_budget_usd));
-        loop_.set_discoverable_tools(discoverable_tools);
-        loop_.extend_tool_metadata(runtime_tool_metadata);
-
-        if let Some(cb) = self.prompt_stream_callback(options.prompt_id) {
-            loop_.set_stream_callback(cb.clone());
-            self.tool_host
-                .set_progress_callback(Arc::new(move |data: &str| {
-                    cb(StreamChunk::ToolProgress {
-                        tool_name: "bash_run".to_string(),
-                        data: data.to_string(),
-                    });
-                }));
-        }
-
-        // Wire approval handler (clone Arc — engine stays reusable across run() calls)
-        {
-            let guard = self
-                .approval_handler
-                .lock()
-                .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
-            if let Some(ref handler) = *guard {
-                let handler = handler.clone();
-                loop_.set_approval_callback(Arc::new(move |call| {
-                    let mut h = handler
-                        .lock()
-                        .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
-                    h(call)
-                }));
-            }
-        }
-
-        // Wire user question handler (clone Arc — already Arc<dyn Fn>)
-        {
-            let guard = self
-                .user_question_handler
-                .lock()
-                .map_err(|_| anyhow!("user question handler mutex poisoned"))?;
-            if let Some(ref handler) = *guard {
-                loop_.set_user_question_callback(handler.clone());
-            }
-        }
-
-        loop_.durable_session = Some((self.store.clone(), session.session_id));
-        loop_.durable_prompt = options.prompt_id;
-        loop_.set_event_callback(Arc::new({
-            let store = self.store.clone();
-            let session_id = session.session_id;
-            move |kind| {
-                if let Err(error) =
-                    store.append_event(&codingbuddy_store::NewEvent::new(session_id, kind))
-                {
-                    eprintln!("[agent] failed to persist tool event: {error}");
-                }
-            }
-        }));
-
-        loop_.set_hooks(HookRuntime::from_app_config(&self.workspace, &self.cfg));
-
-        loop_.cancellation = options.cancellation.clone();
-        loop_.deadline = options.deadline;
-        loop_.parent_run_id = options.parent_run_id;
-
-        // Wire config watcher for hot-reload polling between tool-use turns
-        if let Some(ref watcher) = self.config_watcher {
-            loop_.set_config_watcher(watcher);
-        }
-
-        let ws = self.workspace.clone();
-        let checkpoint_session = session.session_id;
-        loop_.set_checkpoint_callback(Arc::new(move |reason, paths| {
-            codingbuddy_memory::MemoryManager::new(&ws)?.create_checkpoint_linked(
-                reason,
-                paths,
-                Some(checkpoint_session),
-            )?;
-            Ok(())
-        }));
-
-        if !options.chat_history.is_empty() {
-            loop_ = loop_.with_history(options.chat_history.clone());
-        }
-
-        let result = loop_.run(prompt)?;
-
-        if !result.tool_calls_made.is_empty() {
-            self.observer.verbose_log(&format!(
-                "tool-use loop: {} turns, {} tool calls, {} prompt tokens",
-                result.turns,
-                result.tool_calls_made.len(),
-                result.usage.prompt_tokens,
-            ));
-        }
-
-        Ok(result.response)
-    }
-
-    /// Build bootstrap context messages from gather_context.
-    ///
-    /// Returns a vec of System messages containing project structure, repo map, etc.
-    /// Budgeted to ~15% of context window to leave room for conversation.
-    fn build_bootstrap_context(
-        &self,
-        prompt: &str,
-        options: &ChatOptions,
-        context_window_tokens: u64,
-    ) -> Vec<ChatMessage> {
-        let bootstrap = gather_context::gather_for_prompt(
-            &self.workspace,
-            &self.cfg,
-            prompt,
-            options.mode,
-            &options.additional_dirs,
-            options.repo_root_override.as_deref(),
-        );
-
-        if !bootstrap.enabled || bootstrap.packet.is_empty() {
-            return vec![];
-        }
-
-        // Enrich with dependency-analysis hub files
-        let mut packet = bootstrap.packet;
-        if let Ok(mut ctx_mgr) = crate::context::ContextManager::new(&self.workspace)
-            && ctx_mgr.analyze_workspace().is_ok()
-        {
-            let suggestions = ctx_mgr.suggest_relevant_files(prompt, 10);
-            if !suggestions.is_empty() {
-                packet.push_str("\nKey files (by dependency centrality):\n");
-                for s in &suggestions {
-                    let reasons = s.reasons.join(", ");
-                    packet.push_str(&format!(
-                        "  - {} (score: {:.1}, {})\n",
-                        s.path.display(),
-                        s.score,
-                        reasons
-                    ));
-                }
-            }
-        }
-
-        // Budget: ~10% of context window (128K × 0.10 ≈ 12.8K tokens)
-        // Reduced from /7 to leave more room for conversation context retention.
-        let budget_tokens = context_window_tokens / 10;
-        let truncated = truncate_to_token_budget(&packet, budget_tokens);
-
-        vec![ChatMessage::System {
-            content: format!(
-                "The following is background context about the project. Use it to inform your tool calls and analysis. NEVER reference this context directly in your response — the user already knows their project. Do not mention section headers like \"directory structure\" or \"build manifests\". Just act on the information.\n\n{truncated}"
-            ),
-        }]
-    }
-
-    fn prompt_stream_callback(
-        &self,
-        prompt_id: Option<Uuid>,
-    ) -> Option<codingbuddy_core::StreamCallback> {
-        let callback = self
-            .stream_callback
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
-        if callback.is_none() && prompt_id.is_none() {
-            return None;
-        }
-        let store = self.store.clone();
-        Some(Arc::new(move |chunk: StreamChunk| {
-            if matches!(
-                chunk,
-                StreamChunk::ReasoningDelta(_) | StreamChunk::Done { .. }
-            ) {
-                return;
-            }
-            if let Some(id) = prompt_id
-                && matches!(
-                    chunk,
-                    StreamChunk::ContentDelta(_) | StreamChunk::ClearStreamingText
-                )
-                && let Err(error) = store
-                    .append_prompt_event(id, &codingbuddy_core::stream_chunk_to_event_json(&chunk))
-            {
-                eprintln!("[agent] failed to persist prompt event: {error}");
-            }
-            if let Some(callback) = &callback {
-                callback(chunk);
-            }
-        }))
-    }
-
-    pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
-        let session = self.ensure_session_record_for(options.session_id)?;
-        options.session_id = Some(session.session_id);
-        if options.deadline.is_none() && self.cfg.budgets.max_turn_duration_secs > 0 {
-            options.deadline = Some(
-                std::time::Instant::now()
-                    + std::time::Duration::from_secs(self.cfg.budgets.max_turn_duration_secs),
-            );
-        }
-        options
-            .cancellation
-            .get_or_insert_with(codingbuddy_core::CancellationToken::new);
-        let owned_prompt = options.session_lease.is_none();
-        let lease = match options.session_lease.take() {
-            Some(lease) => {
-                anyhow::ensure!(
-                    lease.matches(&self.store, session.session_id)?,
-                    "invalid session lease"
-                );
-                lease
-            }
-            None => Arc::new(self.store.session_lease(session.session_id)?),
-        };
-        if !owned_prompt {
-            let output = self.execute_session_prompt(prompt, options, session, &lease)?;
-            self.stream(StreamChunk::Done { reason: None });
-            return Ok(output);
-        }
-        let id = self.store.start_prompt(
-            &lease,
-            session.session_id,
-            Uuid::now_v7(),
-            &serde_json::json!({"prompt": prompt}),
-        )?;
-        options.prompt_id = Some(id);
-        if let Some(parent) = options.parent_run_id {
-            self.store.attach_operation_parent(id, parent)?;
-        }
-        let cancellation = options.cancellation.clone();
-        let result = self.execute_session_prompt(prompt, options, session, &lease);
-        let output = result.as_ref().ok().map(String::as_str);
-        if let Some(provider_error) = result
-            .as_ref()
-            .err()
-            .and_then(codingbuddy_llm::error::diagnostic)
-        {
-            self.store.append_prompt_event(
-                id,
-                &serde_json::json!({"type":"provider_error","provider_error":provider_error}),
-            )?;
-        }
-        let error = result.as_ref().err().map(|error| format!("{error:#}"));
-        let status = if result.is_ok() {
-            "completed"
-        } else if cancellation.is_some_and(|token| token.is_cancelled()) {
-            "cancelled"
-        } else {
-            "failed"
-        };
-        self.store
-            .finish_prompt(id, status, output, error.as_deref())?;
-        if result.is_ok() {
-            self.stream(StreamChunk::Done { reason: None });
-        }
-        result
-    }
-
-    pub fn retry_interrupted_tool(
-        &self,
-        session: Uuid,
-        previous: Uuid,
-    ) -> Result<(Uuid, codingbuddy_core::ToolResult)> {
-        use codingbuddy_core::{ApprovedToolCall, ToolExecutionContext, ToolHost, ToolPermission};
-        self.ensure_session_record_for(Some(session))?;
-        let lease = self.store.session_lease(session)?;
-        let call = self.store.interrupted_tool_request(session, previous)?;
-        anyhow::ensure!(
-            call.name != "batch",
-            "Retry the individual tool operations from a new prompt"
-        );
-        let (proposal, permission) = self.tool_host.propose_with_permission(call);
-        if let ToolPermission::Deny { reason, .. } = permission {
-            self.tool_host.discard_proposal(proposal.invocation_id);
-            self.store.append_event(&codingbuddy_store::NewEvent::new(
-                session,
-                EventKind::ToolDenied {
-                    invocation_id: proposal.invocation_id,
-                    tool_name: proposal.call.name,
-                    reason: reason.clone(),
-                },
-            ))?;
-            anyhow::bail!("{reason}");
-        }
-        let invocation = self
-            .store
-            .retry_invocation(&lease, session, previous, &proposal.call)?;
-        let result = self.tool_host.execute_with_context(
-            ApprovedToolCall {
-                invocation_id: proposal.invocation_id,
-                call: proposal.call,
-            },
-            ToolExecutionContext {
-                session_id: Some(session),
-                invocation_id: Some(invocation.id),
-                cancellation: None,
-                ..Default::default()
-            },
-        );
-        anyhow::ensure!(
-            result.output["recovery_status"] != "ambiguous",
-            "Retry invocation {} may have changed the workspace. Resolve it locally before continuing.",
-            invocation.id
-        );
-        let (message, _) = tool_bridge::tool_result_to_message(
-            &invocation.provider_call_id,
-            &invocation.name,
-            &result,
-            Some(&codingbuddy_policy::output_scanner::OutputScanner::new()),
-        );
-        self.store
-            .settle_invocation(session, invocation.id, message, "running")?;
-        Ok((invocation.id, result))
-    }
-
-    fn reconcile_session_invocations(
-        &self,
-        lease: &codingbuddy_store::SessionLease,
-        session: Uuid,
-    ) -> Result<()> {
-        use codingbuddy_store::InvocationReceipt;
-        use sha2::{Digest, Sha256};
-        let files = codingbuddy_core::workspace_fs::WorkspaceFs::open(&self.workspace)?;
-        for invocation in self.store.interrupted_invocations(lease, session)? {
-            let result = match self.store.invocation_receipt(invocation.id)? {
-                Some(InvocationReceipt::File {
-                    path,
-                    postimage_sha256,
-                    execution_root,
-                }) if execution_root.as_ref().is_none_or(|root|root.canonicalize().is_ok_and(|root|root==files.root())) => files
-                    .resolve(&path, false)
-                    .ok()
-                    .and_then(|path| files.read(&path).ok())
-                    .filter(|bytes| format!("{:x}", Sha256::digest(bytes)) == postimage_sha256)
-                    .map(
-                        |_| serde_json::json!({"path":path,"recovery_status":"verified_postimage"}),
-                    ),
-                Some(InvocationReceipt::File {..})=>None,
-                Some(InvocationReceipt::Patch { patch_id }) => {
-                    let patches = codingbuddy_diff::PatchStore::new(&self.workspace)?;
-                    if patches.verify_postimage(patch_id).unwrap_or(false) {
-                        self.store
-                            .record_patch_application(session, patch_id, true, Vec::new())?;
-                        Some(
-                            serde_json::json!({"patch_id":patch_id,"applied":true,"recovery_status":"verified_postimage"}),
-                        )
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            };
-            if let Some(content) = result {
-                self.store.settle_invocation(
-                    session,
-                    invocation.id,
-                    ChatMessage::Tool {
-                        tool_call_id: invocation.provider_call_id,
-                        tool_name: Some(invocation.name),
-                        content: content.to_string(),
-                    },
-                    "running",
-                )?;
-            } else {
-                anyhow::bail!(
-                    "Session paused. Invocation {} ({}) may have had side effects. Resolve it locally before continuing.",
-                    invocation.id,
-                    invocation.name
-                );
-            }
-        }
-        // Earlier ambiguous invocations can delay settlement of later, never-dispatched calls.
-        self.store.interrupted_invocations(lease, session)?;
-        Ok(())
-    }
-
-    fn execute_session_prompt(
-        &self,
-        prompt: &str,
-        mut options: ChatOptions,
-        session: Session,
-        lease: &codingbuddy_store::SessionLease,
-    ) -> Result<String> {
-        let execution = codingbuddy_core::execution::ExecutionContext {
-            cancellation: options.cancellation.clone().unwrap_or_default(),
-            deadline: options.deadline,
-            ..Default::default()
-        };
-        let _deadline_guard = execution.watch_deadline()?;
-        let _cancellation_monitor = options
-            .prompt_id
-            .map(|id| {
-                self.store
-                    .monitor_operation(id, options.cancellation.clone().unwrap_or_default())
-            })
-            .transpose()?;
-        self.reconcile_session_invocations(lease, session.session_id)?;
-        let mut effective = self.effective_config(&options);
-        let uses_routed_client = options.llm_config.is_some() || options.model_spec.is_some();
-        if uses_routed_client {
-            effective.llm.api_key = codingbuddy_llm::resolve_key_from_config(&effective.llm);
-            options.llm_config = Some(effective.llm.clone());
-        }
-        let model = if !options.tools && options.force_max_think {
-            effective.llm.active_reasoner_model()
-        } else {
-            effective.llm.active_base_model()
-        };
-        let destination = effective.llm.connection_id();
-        let projection = self.store.rebuild_from_events(session.session_id)?;
-        if !projection.chat_messages.is_empty()
-            && self.store.pinned_route(session.session_id)?.is_none()
-        {
-            let changed =
-                projection
-                    .provider_selection
-                    .as_ref()
-                    .is_some_and(|(provider, _, previous)| {
-                        provider != &effective.llm.provider
-                            || previous
-                                .as_ref()
-                                .is_some_and(|previous| previous != &destination)
-                    });
-            if changed {
-                return Err(anyhow!(
-                    "Conversation belongs to a different provider or endpoint. Use session portable-fork to preview and transfer history."
-                ));
-            }
-        }
-        let local_key = self.store.route_key()?;
-        let route = if uses_routed_client {
-            codingbuddy_llm::session_route(&effective.llm, &model, &local_key)?
-        } else {
-            self.llm
-                .pinned_session_route(&model, &local_key)
-                .unwrap_or_else(|| {
-                    codingbuddy_llm::session_route(&effective.llm, &model, &local_key)
-                })?
-        };
-        if projection.legacy_tool_history
-            && effective.llm.active_provider_kind().is_some_and(|kind| {
-                matches!(
-                    codingbuddy_llm::protocol::select_chat_protocol(
-                        &effective.llm.active_provider(),
-                        kind
-                    ),
-                    codingbuddy_llm::protocol::ChatProtocol::AnthropicMessages
-                        | codingbuddy_llm::protocol::ChatProtocol::GeminiGenerateContent
-                )
-            })
-        {
-            anyhow::bail!(
-                "Legacy session lacks provider continuation data. Use session portable-fork to preview and continue with its redacted text history."
-            );
-        }
-        let projection = self.store.provider_history(session.session_id, &route)?;
-        // Fire SessionStart hook
-        let ws = self.workspace.display().to_string();
-        let session_start_input =
-            codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::SessionStart, &ws)
-                .with_prompt(prompt)
-                .with_session_type("startup");
-        let _ = self.hooks.fire_with_context(
-            codingbuddy_hooks::HookEvent::SessionStart,
-            &session_start_input,
-            &execution,
-        );
-
-        // Fire Setup hook once per session (not per turn)
-        if !self
-            .setup_fired
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            let setup_input =
-                codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Setup, &ws);
-            let _ = self.hooks.fire_with_context(
-                codingbuddy_hooks::HookEvent::Setup,
-                &setup_input,
-                &execution,
-            );
-        }
-
-        // Fire UserPromptSubmit hook (blocking — can modify prompt)
-        let user_submit_input =
-            codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::UserPromptSubmit, &ws)
-                .with_prompt(prompt);
-        let submit_result = self.hooks.fire_with_context(
-            codingbuddy_hooks::HookEvent::UserPromptSubmit,
-            &user_submit_input,
-            &execution,
-        );
-        if submit_result.blocked {
-            return Err(anyhow!("prompt blocked by UserPromptSubmit hook"));
-        }
-
-        let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
-        let mut history = projection.chat_messages;
-        // A prompt that failed, was cancelled, or whose process died leaves its
-        // user turn (and possibly tool results) without a final answer. Close it
-        // so the model keeps the context but does not answer the stale request
-        // alongside the new one.
-        if previous_turn_unfinished(&history) {
-            let marker = ChatMessage::Assistant {
-                content: Some(INTERRUPTED_TURN_MARKER.to_string()),
-                native_parts: None,
-                reasoning_content: None,
-                tool_calls: vec![],
-            };
-            self.store
-                .append_event(&codingbuddy_store::NewEvent::new(
-                    session.session_id,
-                    EventKind::ChatTurn {
-                        message: marker.clone(),
-                    },
-                ))
-                .context("persist interrupted turn marker")?;
-            history.push(marker);
-        }
-        options.chat_history = history;
-        self.store.append_event(&codingbuddy_store::NewEvent {
-            event_id: uuid::Uuid::now_v7(),
-            at: Utc::now(),
-            session_id: session.session_id,
-            kind: EventKind::ProviderSelected {
-                provider: effective.llm.provider.clone(),
-                model,
-                destination: Some(destination),
-            },
-        })?;
-
-        self.store
-            .append_event(&codingbuddy_store::NewEvent::new(
-                session.session_id,
-                EventKind::ChatTurn {
-                    message: ChatMessage::User {
-                        content: prompt_enriched.clone(),
-                    },
-                },
-            ))
-            .context("persist user turn")?;
-
-        let analyze = !options.tools;
-        let tool_loop = options.tools
-            && (options.cancellation.is_some()
-                || !should_run_team_orchestration(self, &prompt_enriched, &options));
-        let result = if !options.tools {
-            self.analyze_prompt(&prompt_enriched, options)
-        } else if !tool_loop {
-            team::run(self, &prompt_enriched, &options)
-        } else {
-            self.run_tool_use_loop(&prompt_enriched, &options)
-        };
-
-        let result = result.and_then(|text| {
-            if analyze || tool_loop {
-                return Ok(text);
-            }
-            if self.store.rebuild_from_events(session.session_id)?.chat_messages.last().is_some_and(
-                |message| matches!(message, ChatMessage::Assistant { content: Some(content), tool_calls, .. } if content == &text && tool_calls.is_empty())
-            ) {
-                return Ok(text);
-            }
-            self.store
-                .append_event(&codingbuddy_store::NewEvent::new(
-                    session.session_id,
-                    EventKind::ChatTurn {
-                        message: ChatMessage::Assistant {
-                            content: Some(text.clone()),
-                            native_parts: None,
-                            reasoning_content: None,
-                            tool_calls: vec![],
-                        },
-                    },
-                ))
-                .context("persist assistant turn")?;
-            Ok(text)
-        });
-
-        // Fire SessionEnd hook
-        let ws = self.workspace.display().to_string();
-        let mut session_end_input =
-            codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::SessionEnd, &ws);
-        session_end_input.tool_result = result
-            .as_ref()
-            .ok()
-            .map(|s| serde_json::Value::String(s.clone()));
-        let _ = self.hooks.fire_with_context(
-            codingbuddy_hooks::HookEvent::SessionEnd,
-            &session_end_input,
-            &execution,
-        );
-
-        let stop_input = codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Stop, &ws);
-        self.hooks
-            .fire_with_context(codingbuddy_hooks::HookEvent::Stop, &stop_input, &execution);
-
-        result
-    }
-
     pub(crate) fn append_event_best_effort(&self, kind: EventKind) {
         self.append_event_best_effort_for_session(None, kind);
     }
@@ -1666,7 +819,9 @@ impl AgentEngine {
             kind,
         };
         if let Err(err) = self.store.append_event(&event) {
-            eprintln!("[agent] failed to persist event: {err}");
+            codingbuddy_core::logging::notice(format_args!(
+                "[agent] failed to persist event: {err}"
+            ));
         }
     }
 
@@ -1682,16 +837,16 @@ impl AgentEngine {
         });
     }
 
-    pub(crate) fn request_approval(&self, call: &ToolCall) -> Result<bool> {
-        if let Ok(guard) = self.approval_handler.lock()
-            && let Some(ref handler) = *guard
-        {
-            let mut h = handler
-                .lock()
-                .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
-            return h(call);
+    pub(crate) async fn request_approval(&self, call: &ToolCall) -> Result<bool> {
+        let handler = self
+            .approval_handler
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        match handler {
+            Some(handler) => handler(call.clone()).await,
+            None => Ok(false),
         }
-        Ok(false)
     }
 
     #[deprecated(note = "resume returns a session summary only")]
@@ -1881,7 +1036,14 @@ fn should_run_team_orchestration(
     }
 }
 
-fn enrich_prompt_with_urls(prompt: &str, enabled: bool) -> String {
+/// Fetch up to three URLs named in the prompt, concurrently, and append
+/// their text. Gives up (returning the prompt unchanged) as soon as the turn
+/// is cancelled; failed fetches are skipped.
+async fn enrich_prompt_with_urls(
+    prompt: &str,
+    enabled: bool,
+    cancellation: Option<&codingbuddy_core::CancellationToken>,
+) -> String {
     if !enabled {
         return prompt.to_string();
     }
@@ -1889,30 +1051,47 @@ fn enrich_prompt_with_urls(prompt: &str, enabled: bool) -> String {
     if urls.is_empty() {
         return prompt.to_string();
     }
-    let client = match reqwest::blocking::Client::builder()
+    let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("codingbuddy-cli/0.2")
+        .user_agent(concat!("codingbuddy-cli/", env!("CARGO_PKG_VERSION")))
         .build()
-    {
-        Ok(client) => client,
-        Err(_) => return prompt.to_string(),
+    else {
+        return prompt.to_string();
+    };
+    let fetched = codingbuddy_core::runtime::with_cancellation(cancellation, async move {
+        let tasks: Vec<_> = urls
+            .into_iter()
+            .map(|url| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let response = client.get(&url).send().await.ok()?;
+                    let status = response.status().as_u16();
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let body = response.text().await.ok()?;
+                    Some((url, status, content_type, body))
+                })
+            })
+            .collect();
+        let mut pages = Vec::new();
+        for task in tasks {
+            if let Ok(Some(page)) = task.await {
+                pages.push(page);
+            }
+        }
+        pages
+    })
+    .await;
+    let Ok(pages) = fetched else {
+        return prompt.to_string();
     };
 
     let mut rows = Vec::new();
-    for url in urls {
-        let Ok(resp) = client.get(&url).send() else {
-            continue;
-        };
-        let status = resp.status().as_u16();
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-        let Ok(body) = resp.text() else {
-            continue;
-        };
+    for (url, status, content_type, body) in pages {
         let max_bytes = 24_000usize;
         let truncated = body.len() > max_bytes;
         let clipped = if truncated {
@@ -2000,275 +1179,18 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn delivery_one_reconciles_local_writes_and_pauses_external_effects() -> Result<()> {
-        use sha2::{Digest, Sha256};
-        let workspace = tempfile::tempdir()?;
-        let root = workspace.path();
-        let engine = AgentEngine::new_with_config(root, AppConfig::default())?;
-        let session = engine.ensure_session_record_for(None)?.session_id;
-        let store = Store::new(root)?;
-        let lease = store.session_lease(session)?;
-        let calls = [
-            codingbuddy_core::LlmToolCall {
-                id: "write".into(),
-                name: "fs_write".into(),
-                arguments: "{}".into(),
-            },
-            codingbuddy_core::LlmToolCall {
-                id: "external".into(),
-                name: "external".into(),
-                arguments: "{}".into(),
-            },
-        ];
-        let ids = store.model_step(session, None, None, &calls, &[])?;
-        store.dispatch_invocation(session, ids[0])?;
-        store.record_invocation_receipt(
-            session,
-            ids[0],
-            &codingbuddy_store::InvocationReceipt::File {
-                execution_root: None,
-                path: "marker".into(),
-                postimage_sha256: format!("{:x}", Sha256::digest(b"expected")),
-            },
-        )?;
-        std::fs::write(root.join("marker"), b"expected")?;
-        store.dispatch_invocation(session, ids[1])?;
-        drop(lease);
-        drop(engine);
-        let resumed = AgentEngine::new_with_config(root, AppConfig::default())?;
-        let lease = store.session_lease(session)?;
-        let error = resumed
-            .reconcile_session_invocations(&lease, session)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(&ids[1].to_string()));
-        let unresolved = store.interrupted_invocations(&lease, session)?;
-        assert_eq!(unresolved.len(), 1);
-        assert_eq!(unresolved[0].id, ids[1]);
-        let transcript = store.rebuild_from_events(session)?;
-        assert!(
-            matches!(&transcript.chat_messages[1], ChatMessage::Tool { tool_call_id, content, .. }
-            if tool_call_id == "write" && content.contains("verified_postimage"))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn extract_urls_handles_punctuation_and_dedup() {
-        let prompt = "check https://example.com, then (https://example.com) and https://a.dev.";
-        let urls = extract_urls(prompt, 5);
-        assert_eq!(urls, vec!["https://example.com", "https://a.dev"]);
-    }
-
-    #[test]
-    fn html_strip_removes_tags() {
-        let html = "<html><body><h1>Title</h1><p>Hello world</p></body></html>";
-        let stripped = naive_strip_html(html);
-        assert!(stripped.contains("Title"));
-        assert!(stripped.contains("Hello world"));
-        assert!(!stripped.contains("<h1>"));
-    }
-
-    #[test]
-    fn truncate_to_token_budget_short_text_unchanged() {
-        let text = "hello world\nsecond line";
-        let result = truncate_to_token_budget(text, 1000);
-        assert_eq!(result, text);
-    }
-
-    #[test]
-    fn truncate_to_token_budget_long_text_truncated() {
-        let text = "line1\nline2\nline3\nline4\nline5\nline6";
-        // 4 tokens = 16 chars, which should cut mid-text
-        let result = truncate_to_token_budget(text, 4);
-        assert!(result.contains("truncated"));
-        assert!(result.len() < text.len() + 40); // truncated + marker
-    }
-
-    #[test]
-    fn mcp_metadata_trusts_declared_read_only_tools() {
-        let tool = codingbuddy_mcp::McpTool {
-            server_id: "github".to_string(),
-            name: "search".to_string(),
-            description: "Search issues".to_string(),
-            input_schema: serde_json::json!({"type":"object"}),
-            annotations: serde_json::json!({"readOnlyHint": true}),
-        };
-        let metadata = mcp_tool_metadata("mcp__github__search", &tool);
-        assert!(metadata.read_only);
-        assert!(!metadata.approval_required);
-        assert_eq!(metadata.trust_level, DynamicToolTrust::TrustedReadOnly);
-        assert_eq!(metadata.permission_matcher, ToolPermissionMatcher::Mcp);
-        assert!(metadata.is_allowed_in_phase(TaskPhase::Explore));
-    }
-
-    #[test]
-    fn mcp_metadata_restricts_unknown_or_destructive_tools() {
-        let tool = codingbuddy_mcp::McpTool {
-            server_id: "slack".to_string(),
-            name: "post".to_string(),
-            description: "Post a message".to_string(),
-            input_schema: serde_json::json!({"type":"object"}),
-            annotations: serde_json::json!({"readOnlyHint": true, "destructiveHint": true}),
-        };
-        let metadata = mcp_tool_metadata("mcp__slack__post", &tool);
-        assert!(!metadata.read_only);
-        assert!(metadata.approval_required);
-        assert_eq!(metadata.trust_level, DynamicToolTrust::Untrusted);
-        assert!(!metadata.is_allowed_in_phase(TaskPhase::Explore));
-        assert!(metadata.is_allowed_in_phase(TaskPhase::Execute));
-    }
-
-    #[test]
-    fn runtime_tool_definitions_include_plugin_commands() {
-        let workspace =
-            std::env::temp_dir().join(format!("codingbuddy-agent-plugin-tools-{}", Uuid::now_v7()));
-        std::fs::create_dir_all(&workspace).expect("workspace");
-
-        let plugin_src = workspace.join("plugin-src");
-        std::fs::create_dir_all(plugin_src.join(".codingbuddy-plugin")).expect("plugin dir");
-        std::fs::create_dir_all(plugin_src.join("commands")).expect("commands dir");
-        std::fs::write(
-            plugin_src.join(".codingbuddy-plugin/plugin.json"),
-            r#"{"id":"phase-c-plugin","name":"Phase C Plugin","version":"0.1.0"}"#,
-        )
-        .expect("manifest");
-        std::fs::write(plugin_src.join("commands/review.md"), "# review").expect("command");
-
-        let manager = codingbuddy_tools::PluginManager::new(&workspace).expect("plugin manager");
-        manager.install(&plugin_src).expect("install plugin");
-
-        let defs = runtime_tool_definitions(&workspace, true);
-        assert!(
-            defs.iter()
-                .any(|def| def.function.name == "plugin__phase_c_plugin__review"),
-            "plugin command should be exposed as runtime tool definition"
-        );
-    }
-
-    #[test]
-    fn shadow_commit_used_in_checkpoint() {
-        // Verify that MemoryManager::create_shadow_commit exists and returns
-        // the expected ShadowCommit struct. On non-git directories, it should
-        // still return a result (with git_backed=false), allowing fallback.
-        let workspace = std::env::temp_dir().join(format!("shadow-test-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        std::fs::write(workspace.join("test.txt"), "hello").expect("write file");
-
-        let mm = codingbuddy_memory::MemoryManager::new(&workspace).expect("memory manager");
-        let result = mm.create_shadow_commit("test checkpoint");
-        // In a non-git directory, shadow commit should not be git-backed
-        // (it falls back to file-based internally, or returns an error)
-        match result {
-            Ok(sc) => {
-                assert!(
-                    !sc.git_backed,
-                    "non-git dir should not produce git-backed shadow commit"
-                );
-            }
-            Err(_) => {
-                // Also acceptable: shadow commit fails in non-git dir
-                // and the checkpoint callback falls back to file-based
-            }
-        }
-
-        let _ = std::fs::remove_dir_all(&workspace);
-    }
-
-    // ── Batch 7: Context Manager Wiring ──
-
-    #[test]
-    fn context_manager_handles_missing_repo() {
-        // ContextManager should gracefully handle a non-existent or empty workspace
-        let result = crate::context::ContextManager::new("/tmp/nonexistent_codingbuddy_test_dir");
-        // Should succeed (creates empty graph) — not panic
-        assert!(
-            result.is_ok(),
-            "ContextManager::new should not fail on missing dir"
-        );
-    }
-
-    #[test]
-    fn context_manager_suggest_files_on_real_workspace() {
-        // Create a temp workspace with a few files that have import relationships
-        let workspace = std::env::temp_dir().join("codingbuddy_test_ctx_mgr");
-        let _ = std::fs::remove_dir_all(&workspace);
-        std::fs::create_dir_all(workspace.join("src")).expect("create src dir");
-        std::fs::write(
-            workspace.join("src/lib.rs"),
-            "pub mod utils;\npub mod handler;\n",
-        )
-        .expect("write lib.rs");
-        std::fs::write(workspace.join("src/utils.rs"), "pub fn helper() {}\n")
-            .expect("write utils.rs");
-        std::fs::write(
-            workspace.join("src/handler.rs"),
-            "use crate::utils;\npub fn handle() { utils::helper(); }\n",
-        )
-        .expect("write handler.rs");
-
-        let mut ctx_mgr = crate::context::ContextManager::new(&workspace).expect("context manager");
-        ctx_mgr.analyze_workspace().expect("analyze");
-
-        let suggestions = ctx_mgr.suggest_relevant_files("handler", 5);
-        // handler.rs should score high because its name matches the query
-        let has_handler = suggestions
-            .iter()
-            .any(|s| s.path.to_string_lossy().contains("handler"));
-        assert!(
-            has_handler,
-            "handler.rs should appear in suggestions for query 'handler'"
-        );
-
-        let _ = std::fs::remove_dir_all(&workspace);
-    }
-
-    #[test]
-    fn test_stream_callback_clone_pattern() {
-        // Verify the clone-then-call pattern: the callback is cloned out of
-        // the mutex before invocation, so the lock is not held during the call.
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_inner = call_count.clone();
-
-        // Simulate the Mutex<Option<StreamCallback>> pattern from AgentEngine
-        let stream_callback: Mutex<Option<codingbuddy_core::StreamCallback>> =
-            Mutex::new(Some(Arc::new(move |_chunk: StreamChunk| {
-                call_count_inner.fetch_add(1, Ordering::SeqCst);
-            })));
-
-        // Clone-then-call pattern (same as AgentEngine::stream)
-        let cb = stream_callback.lock().ok().and_then(|g| g.clone());
-        if let Some(cb) = cb {
-            cb(StreamChunk::ContentDelta("hello".to_string()));
-        }
-
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            1,
-            "callback should have been called once"
-        );
-
-        // Verify the mutex is NOT held during the callback (we can lock again)
-        assert!(
-            stream_callback.lock().is_ok(),
-            "mutex should not be poisoned or held"
-        );
-
-        // Call again to verify repeatability
-        let cb = stream_callback.lock().ok().and_then(|g| g.clone());
-        if let Some(cb) = cb {
-            cb(StreamChunk::ContentDelta("world".to_string()));
-        }
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            2,
-            "callback should have been called twice"
-        );
-    }
+/// This project's saved `bash.run` approval patterns, or `None` when the
+/// store cannot be read (the current list is then left as it is).
+fn saved_bash_approvals(store: &Store, workspace: &Path) -> Option<Vec<String>> {
+    let project_hash = codingbuddy_store::project_hash(workspace);
+    let approvals = store.list_persistent_approvals(&project_hash).ok()?;
+    Some(
+        approvals
+            .into_iter()
+            .filter(|a| a.tool_name == "bash.run")
+            .map(|a| a.command_pattern)
+            .collect(),
+    )
 }

@@ -307,8 +307,7 @@ impl Store {
 
 /// Bridges cancellation across clients/processes without sharing credentials or listeners.
 pub struct OperationMonitor {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    task: tokio::task::JoinHandle<()>,
     store: Store,
     id: Uuid,
     token: codingbuddy_core::CancellationToken,
@@ -318,13 +317,14 @@ impl Drop for OperationMonitor {
         if self.token.is_cancelled() {
             let _ = self.store.cancel_operation(self.id);
         }
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.task.abort();
     }
 }
 impl Store {
+    /// Link `token` to the operation's durable cancel flag, in both
+    /// directions: cancelling the token records the request at once, and a
+    /// cancel requested by another client (checked every 30 ms) fires the
+    /// token. Runs as a task, so a running tool holds no extra thread.
     pub fn monitor_operation(
         &self,
         id: Uuid,
@@ -332,30 +332,29 @@ impl Store {
     ) -> Result<OperationMonitor> {
         self.operation(id)?;
         let store = self.clone();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopped = stop.clone();
         let monitored = token.clone();
-        let thread = std::thread::Builder::new()
-            .name("operation-cancellation".into())
-            .spawn(move || {
-                while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
-                    if token.is_cancelled() {
+        let task = codingbuddy_core::runtime::runtime().spawn(async move {
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(30));
+            loop {
+                tokio::select! {
+                    () = token.cancelled() => {
                         let _ = store.cancel_operation(id);
-                        break;
+                        return;
                     }
-                    match store.operation(id) {
-                        Ok(operation) if !operation.cancel_requested => {}
-                        _ => {
-                            token.cancel();
-                            break;
+                    _ = poll.tick() => {
+                        match store.operation(id) {
+                            Ok(operation) if !operation.cancel_requested => {}
+                            _ => {
+                                token.cancel();
+                                return;
+                            }
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(30));
                 }
-            })?;
+            }
+        });
         Ok(OperationMonitor {
-            stop,
-            thread: Some(thread),
+            task,
             store: self.clone(),
             id,
             token: monitored,

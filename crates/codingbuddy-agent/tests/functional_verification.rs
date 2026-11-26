@@ -1,6 +1,7 @@
 //! Functional verification tests for v6 Phase 1.
 //!
 //! These tests verify that features actually WORK end-to-end, not just exist.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use anyhow::Result;
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
@@ -56,14 +57,14 @@ fn verify_fs_read_executes_and_returns_content() -> Result<()> {
         text_response("The file says hello."),
     ]);
     let engine = AgentEngine::new_with_llm(ws, Box::new(llm))?;
-    let result = engine.chat_with_options(
+    let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "read hello.txt",
         ChatOptions {
             tools: true,
             mode: ChatMode::Code,
             ..Default::default()
         },
-    )?;
+    ))?;
     assert!(!result.is_empty(), "Should return a response");
     Ok(())
 }
@@ -89,14 +90,14 @@ fn verify_fs_edit_modifies_file_on_disk() -> Result<()> {
         text_response("Changed the file."),
     ]);
     let engine = AgentEngine::new_with_llm(ws, Box::new(llm))?;
-    let _result = engine.chat_with_options(
+    let _result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "change old to new",
         ChatOptions {
             tools: true,
             mode: ChatMode::Code,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let content = fs::read_to_string(ws.join("target.txt"))?;
     assert!(

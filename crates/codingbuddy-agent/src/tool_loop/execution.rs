@@ -17,7 +17,7 @@ enum ToolPreparation {
 }
 
 impl ToolUseLoop<'_> {
-    pub(super) fn execute_tool_calls(
+    pub(super) async fn execute_tool_calls(
         &mut self,
         mut calls: &[LlmToolCall],
     ) -> Result<Vec<ToolCallRecord>> {
@@ -40,61 +40,59 @@ impl ToolUseLoop<'_> {
                 })
                 .count();
             if group < 2 {
-                records.extend(self.execute_tool_call(first)?);
+                records.extend(self.execute_tool_call(first).await?);
                 calls = rest;
                 continue;
             }
             let (reads, remaining) = calls.split_at(group);
             for chunk in reads.chunks(16) {
-                let ready = chunk
-                    .iter()
-                    .map(|call| {
-                        let start = self.messages.len();
-                        let preparation = self.prepare_tool_call(call, false)?;
-                        Ok((preparation, self.messages.split_off(start)))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut ready = Vec::with_capacity(chunk.len());
+                for call in chunk {
+                    let start = self.messages.len();
+                    let preparation = self.prepare_tool_call(call, false).await?;
+                    ready.push((preparation, self.messages.split_off(start)));
+                }
                 self.check_cancellation()?;
 
-                let results = std::thread::scope(|scope| {
-                    let workers = ready
-                        .into_iter()
-                        .map(|(preparation, messages)| {
-                            let worker = match &preparation {
-                                ToolPreparation::Ready(call) => {
-                                    let approved = call.approved.clone();
-                                    let host = host.clone();
-                                    let cancellation = self.cancellation.clone();
-                                    let session = self.durable_session.as_ref().map(|(_, id)| *id);
-                                    let prompt_id = self.durable_prompt;
-                                    let deadline = self.deadline;
-                                    let parent_run_id = self.parent_run_id;
-                                    Some(scope.spawn(move || {
-                                        host.execute_with_context(
-                                            approved,
-                                            codingbuddy_core::ToolExecutionContext {
-                                                session_id: session,
-                                                invocation_id: None,
-                                                cancellation: cancellation.as_ref(),
-                                                prompt_id,
-                                                deadline,
-                                                parent_run_id,
-                                            },
-                                        )
-                                    }))
-                                }
-                                ToolPreparation::Complete(_) => None,
-                            };
-                            (preparation, worker, messages)
-                        })
-                        .collect::<Vec<_>>();
-                    workers
-                        .into_iter()
-                        .map(|(preparation, worker, messages)| {
-                            (preparation, worker.map(|worker| worker.join()), messages)
-                        })
-                        .collect::<Vec<_>>()
-                });
+                // Each read runs as its own task, so the reads overlap.
+                let mut pending = Vec::with_capacity(ready.len());
+                for (preparation, messages) in ready {
+                    let worker = match &preparation {
+                        ToolPreparation::Ready(call) => {
+                            let approved = call.approved.clone();
+                            let host = host.clone();
+                            let cancellation = self.cancellation.clone();
+                            let session = self.durable_session.as_ref().map(|(_, id)| *id);
+                            let prompt_id = self.durable_prompt;
+                            let deadline = self.deadline;
+                            let parent_run_id = self.parent_run_id;
+                            Some(codingbuddy_core::runtime::runtime().spawn(async move {
+                                host.execute_with_context(
+                                    approved,
+                                    codingbuddy_core::ToolExecutionContext {
+                                        session_id: session,
+                                        invocation_id: None,
+                                        cancellation: cancellation.as_ref(),
+                                        prompt_id,
+                                        deadline,
+                                        parent_run_id,
+                                    },
+                                )
+                                .await
+                            }))
+                        }
+                        ToolPreparation::Complete(_) => None,
+                    };
+                    pending.push((preparation, worker, messages));
+                }
+                let mut results = Vec::with_capacity(pending.len());
+                for (preparation, worker, messages) in pending {
+                    let result = match worker {
+                        Some(worker) => Some(worker.await),
+                        None => None,
+                    };
+                    results.push((preparation, result, messages));
+                }
                 for (preparation, result, messages) in results {
                     self.messages.extend(messages);
                     match preparation {
@@ -106,7 +104,7 @@ impl ToolUseLoop<'_> {
                                     output: serde_json::json!({"error": "tool worker panicked"}),
                                 },
                             );
-                            records.extend(self.finish_tool_call(*call, result, false)?);
+                            records.extend(self.finish_tool_call(*call, result, false).await?);
                         }
                         ToolPreparation::Complete(completed) => records.extend(completed),
                     }
@@ -118,24 +116,27 @@ impl ToolUseLoop<'_> {
     }
 
     /// Execute a single call through the same preparation and result pipeline as parallel reads.
-    fn execute_tool_call(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
-        self.execute_tool_call_inner(llm_call, false)
+    async fn execute_tool_call(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
+        self.execute_tool_call_inner(llm_call, false).await
     }
 
-    fn execute_tool_call_inner(
+    async fn execute_tool_call_inner(
         &mut self,
         llm_call: &LlmToolCall,
         batch_child: bool,
     ) -> Result<Vec<ToolCallRecord>> {
         // Arguments are not logged: they can hold file contents or secrets.
-        let _span = tracing::info_span!(
+        let span = tracing::info_span!(
             "tool",
             name = %llm_call.name,
             call_id = %llm_call.id,
-        )
-        .entered();
+        );
         let started = Instant::now();
-        let result = self.execute_tool_call_untraced(llm_call, batch_child);
+        let result = tracing::Instrument::instrument(
+            self.execute_tool_call_untraced(llm_call, batch_child),
+            span,
+        )
+        .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok(records) => {
@@ -158,7 +159,7 @@ impl ToolUseLoop<'_> {
         result
     }
 
-    fn execute_tool_call_untraced(
+    async fn execute_tool_call_untraced(
         &mut self,
         llm_call: &LlmToolCall,
         batch_child: bool,
@@ -187,9 +188,9 @@ impl ToolUseLoop<'_> {
                 return Ok(records);
             }
             self.dispatch_durable_invocation(None)?;
-            return self.handle_agent_level_tool(llm_call);
+            return self.handle_agent_level_tool(llm_call).await;
         }
-        let prepared = match self.prepare_tool_call(llm_call, batch_child)? {
+        let prepared = match self.prepare_tool_call(llm_call, batch_child).await? {
             ToolPreparation::Ready(prepared) => prepared,
             ToolPreparation::Complete(records) => return Ok(records),
         };
@@ -212,7 +213,7 @@ impl ToolUseLoop<'_> {
             self.dispatch_durable_invocation(Some(&prepared.approved.call))?;
         }
         let result = if prepared.approved.call.name == "batch" {
-            self.execute_batch(&prepared.approved)?
+            self.execute_batch(&prepared.approved).await?
         } else {
             host.execute_with_context(
                 prepared.approved.clone(),
@@ -229,6 +230,7 @@ impl ToolUseLoop<'_> {
                     parent_run_id: self.parent_run_id,
                 },
             )
+            .await
         };
         self.check_cancellation()?;
         if let (Some((store, _)), Some((id, _))) = (&self.durable_session, self.durable_invocation)
@@ -243,7 +245,7 @@ impl ToolUseLoop<'_> {
                 "Invocation {id} may have changed the workspace. Resolve it locally before continuing."
             );
         }
-        self.finish_tool_call(*prepared, result, batch_child)
+        self.finish_tool_call(*prepared, result, batch_child).await
     }
 
     fn dispatch_durable_invocation(
@@ -263,7 +265,7 @@ impl ToolUseLoop<'_> {
         Ok(())
     }
 
-    fn prepare_tool_call(
+    async fn prepare_tool_call(
         &mut self,
         llm_call: &LlmToolCall,
         batch_child: bool,
@@ -360,8 +362,9 @@ impl ToolUseLoop<'_> {
                 session_type: None,
                 workspace: self.workspace_str().to_string(),
             };
-            let hook_result =
-                hooks.fire_with_context(HookEvent::PreToolUse, &input, &self.execution_context());
+            let hook_result = hooks
+                .fire_with_context(HookEvent::PreToolUse, &input, &self.execution_context())
+                .await;
             if hook_result.blocked
                 || hook_result.permission_decision
                     == Some(codingbuddy_hooks::PermissionDecision::Deny)
@@ -451,11 +454,13 @@ impl ToolUseLoop<'_> {
                     session_type: None,
                     workspace: self.workspace_str().to_string(),
                 };
-                let result = hooks.fire_with_context(
-                    HookEvent::PermissionRequest,
-                    &perm_input,
-                    &self.execution_context(),
-                );
+                let result = hooks
+                    .fire_with_context(
+                        HookEvent::PermissionRequest,
+                        &perm_input,
+                        &self.execution_context(),
+                    )
+                    .await;
                 hook_decision = if result.blocked {
                     Some(codingbuddy_hooks::PermissionDecision::Deny)
                 } else {
@@ -477,7 +482,7 @@ impl ToolUseLoop<'_> {
                 if let Some(details) = host.approval_details(proposal.invocation_id) {
                     approval_call.args["effective_isolation"] = serde_json::Value::String(details);
                 }
-                match cb(&approval_call) {
+                match cb(approval_call).await {
                     Ok(v) => v,
                     Err(e) => {
                         host.discard_proposal(proposal.invocation_id);
@@ -637,7 +642,7 @@ impl ToolUseLoop<'_> {
         })))
     }
 
-    fn finish_tool_call(
+    async fn finish_tool_call(
         &mut self,
         prepared: PreparedToolCall,
         mut result: codingbuddy_core::ToolResult,
@@ -729,6 +734,7 @@ impl ToolUseLoop<'_> {
                         ..Default::default()
                     },
                 )
+                .await
             } else {
                 String::new()
             };
@@ -763,14 +769,15 @@ impl ToolUseLoop<'_> {
                 session_type: None,
                 workspace: self.workspace_str().to_string(),
             };
-            let post_hook_result =
-                hooks.fire_with_context(HookEvent::PostToolUse, &input, &self.execution_context());
+            let post_hook_result = hooks
+                .fire_with_context(HookEvent::PostToolUse, &input, &self.execution_context())
+                .await;
             for run in &post_hook_result.runs {
                 if !run.success {
-                    eprintln!(
+                    codingbuddy_core::logging::notice(format_args!(
                         "[hooks] PostToolUse hook failed: {}",
                         run.handler_description
-                    );
+                    ));
                 }
             }
             if let Some(modified) = post_hook_result.modified_result {
@@ -781,7 +788,8 @@ impl ToolUseLoop<'_> {
                     event: HookEvent::PostToolUseFailure.as_str().to_string(),
                     ..input
                 };
-                self.fire_hook_logged(hooks, HookEvent::PostToolUseFailure, &fail_input);
+                self.fire_hook_logged(hooks, HookEvent::PostToolUseFailure, &fail_input)
+                    .await;
             }
         }
 
@@ -959,7 +967,7 @@ impl ToolUseLoop<'_> {
         }])
     }
 
-    fn execute_batch(
+    async fn execute_batch(
         &mut self,
         approved: &codingbuddy_core::ApprovedToolCall,
     ) -> Result<codingbuddy_core::ToolResult> {
@@ -974,7 +982,8 @@ impl ToolUseLoop<'_> {
                     .to_owned(),
                 arguments: args.to_string(),
             };
-            let records = self.execute_tool_call_inner(&child, true)?;
+            // Boxed: a batch child runs through the same path as its parent.
+            let records = Box::pin(self.execute_tool_call_inner(&child, true)).await?;
             let message = self.messages.pop();
             let content = match message {
                 Some(ChatMessage::Tool { content, .. }) => content,

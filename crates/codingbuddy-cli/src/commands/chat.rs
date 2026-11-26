@@ -20,9 +20,8 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -65,7 +64,9 @@ mod args;
 #[path = "chat_lifecycle.rs"]
 mod chat_lifecycle;
 mod connections;
+mod model_display;
 mod payloads;
+mod resume_print;
 mod slash;
 mod tui;
 mod web;
@@ -74,7 +75,9 @@ use args::{
     chat_mode_name, format_provider_info, parse_chat_mode_name, parse_commit_message,
     parse_diff_args, parse_stage_args, truncate_inline,
 };
+use model_display::*;
 use payloads::*;
+pub(crate) use resume_print::*;
 use slash::*;
 use tui::{ChatTuiArgs, run_chat_tui};
 use web::fetch_preview_text;
@@ -99,6 +102,22 @@ pub(crate) fn run_setup_menu(cwd: &Path) -> Result<()> {
         watch_files_enabled: false,
         initial_session_id: None,
     })
+}
+
+/// Save a name for `session` (or the latest session) so pickers and
+/// `codingbuddy session list` show it.
+pub(crate) fn rename_session(cwd: &Path, session: Option<Uuid>, name: &str) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let session = match session {
+        Some(id) => id,
+        None => {
+            store
+                .load_latest_session()?
+                .ok_or_else(|| anyhow!("no session to rename yet; send a prompt first"))?
+                .session_id
+        }
+    };
+    store.set_session_title(session, name)
 }
 
 pub(crate) fn run_chat(
@@ -593,14 +612,17 @@ pub(crate) fn run_chat(
                             } else {
                                 json!({})
                             };
-                            let result = codingbuddy_mcp::execute_mcp_stdio_request(
-                                &mcp.get_server(server_id)?.ok_or_else(|| {
-                                    anyhow::anyhow!("MCP server not found: {server_id}")
-                                })?,
-                                "prompts/get",
-                                json!({"name": prompt_name, "arguments": prompt_args}),
-                                3,
-                                std::time::Duration::from_secs(10),
+                            let server = mcp.get_server(server_id)?.ok_or_else(|| {
+                                anyhow::anyhow!("MCP server not found: {server_id}")
+                            })?;
+                            let result = codingbuddy_core::runtime::block_on(
+                                codingbuddy_mcp::execute_mcp_stdio_request(
+                                    &server,
+                                    "prompts/get",
+                                    json!({"name": prompt_name, "arguments": prompt_args}),
+                                    3,
+                                    std::time::Duration::from_secs(10),
+                                ),
                             )?;
                             if json_mode {
                                 print_json(&result)?;
@@ -1244,7 +1266,7 @@ pub(crate) fn run_chat(
                 }
                 SlashCommand::Rename(name) => {
                     if let Some(name) = name {
-                        // Store session rename in metadata
+                        rename_session(cwd, selected_session_id, &name)?;
                         if json_mode {
                             print_json(&json!({"renamed": name}))?;
                         } else {
@@ -1532,24 +1554,25 @@ pub(crate) fn run_chat(
                             println!("{rendered}");
                         } else {
                             // Feed rendered prompt into the agent
-                            let output = engine.chat_with_options(
-                                &rendered,
-                                ChatOptions {
-                                    tools: allow_tools && !read_only_mode,
-                                    force_max_think,
-                                    additional_dirs: additional_dirs.clone(),
-                                    repo_root_override: repo_root_override.clone(),
-                                    debug_context,
-                                    mode: active_chat_mode,
-                                    teammate_mode: teammate_mode.clone(),
-                                    detect_urls,
-                                    watch_files: watch_files_enabled,
-                                    session_id: selected_session_id,
-                                    profile_override: active_profile_override.clone(),
-                                    model_spec: active_model_spec.clone(),
-                                    ..Default::default()
-                                },
-                            )?;
+                            let output =
+                                codingbuddy_core::runtime::block_on(engine.chat_with_options(
+                                    &rendered,
+                                    ChatOptions {
+                                        tools: allow_tools && !read_only_mode,
+                                        force_max_think,
+                                        additional_dirs: additional_dirs.clone(),
+                                        repo_root_override: repo_root_override.clone(),
+                                        debug_context,
+                                        mode: active_chat_mode,
+                                        teammate_mode: teammate_mode.clone(),
+                                        detect_urls,
+                                        watch_files: watch_files_enabled,
+                                        session_id: selected_session_id,
+                                        profile_override: active_profile_override.clone(),
+                                        model_spec: active_model_spec.clone(),
+                                        ..Default::default()
+                                    },
+                                ))?;
                             last_assistant_response = Some(output);
                         }
                     } else if json_mode {
@@ -1591,6 +1614,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::ImageData { .. } => "ImageData",
                         codingbuddy_core::StreamChunk::WatchTriggered { .. } => "WatchTriggered",
                         codingbuddy_core::StreamChunk::SecurityWarning { .. } => "SecurityWarning",
+                        codingbuddy_core::StreamChunk::ContextWarning { .. } => "ContextWarning",
                         codingbuddy_core::StreamChunk::UsageUpdate { .. } => "UsageUpdate",
                         codingbuddy_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
                         codingbuddy_core::StreamChunk::SnapshotRecorded { .. } => "SnapshotRecorded",
@@ -1713,6 +1737,13 @@ pub(crate) fn run_chat(
                         let _ = writeln!(handle, "  \x1b[33m⚠ Security:\x1b[0m {message}");
                         let _ = handle.flush();
                     }
+                    codingbuddy_core::StreamChunk::ContextWarning { used_pct, compact_at_pct } => {
+                        use std::io::Write as _;
+                        let err = std::io::stderr();
+                        let mut handle = err.lock();
+                        let _ = writeln!(handle, "  \x1b[33m◔\x1b[0m Context {used_pct}% full; older messages will be compacted at {compact_at_pct}%. Use /compact to do it now.");
+                        let _ = handle.flush();
+                    }
                     codingbuddy_core::StreamChunk::Error { message, .. } => {
                         use std::io::Write as _;
                         let err = std::io::stderr();
@@ -1770,7 +1801,7 @@ pub(crate) fn run_chat(
                 &active_model_for_display(&cfg, active_model_spec.as_deref(), force_max_think),
             );
         }
-        let output = engine.chat_with_options(
+        let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             prompt,
             ChatOptions {
                 tools: allow_tools && !read_only_mode,
@@ -1788,7 +1819,7 @@ pub(crate) fn run_chat(
                 model_spec: active_model_spec.clone(),
                 ..Default::default()
             },
-        );
+        ));
         if let Some(renderer) = md_renderer
             && let Ok(mut renderer) = renderer.lock()
         {
@@ -1854,24 +1885,25 @@ pub(crate) fn run_chat(
                     auto_prompt.push_str(&hints);
                     auto_prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
 
-                    let auto_output = engine.chat_with_options(
-                        &auto_prompt,
-                        ChatOptions {
-                            tools: allow_tools && !read_only_mode,
-                            force_max_think,
-                            additional_dirs: additional_dirs.clone(),
-                            repo_root_override: repo_root_override.clone(),
-                            debug_context,
-                            mode: active_chat_mode,
-                            teammate_mode: teammate_mode.clone(),
-                            detect_urls,
-                            watch_files: true,
-                            session_id: selected_session_id,
-                            profile_override: active_profile_override.clone(),
-                            model_spec: active_model_spec.clone(),
-                            ..Default::default()
-                        },
-                    )?;
+                    let auto_output =
+                        codingbuddy_core::runtime::block_on(engine.chat_with_options(
+                            &auto_prompt,
+                            ChatOptions {
+                                tools: allow_tools && !read_only_mode,
+                                force_max_think,
+                                additional_dirs: additional_dirs.clone(),
+                                repo_root_override: repo_root_override.clone(),
+                                debug_context,
+                                mode: active_chat_mode,
+                                teammate_mode: teammate_mode.clone(),
+                                detect_urls,
+                                watch_files: true,
+                                session_id: selected_session_id,
+                                profile_override: active_profile_override.clone(),
+                                model_spec: active_model_spec.clone(),
+                                ..Default::default()
+                            },
+                        ))?;
                     last_assistant_response = Some(auto_output);
                 } else {
                     break;
@@ -1913,591 +1945,6 @@ pub(crate) fn load_tui_keybindings(cwd: &Path, cfg: &AppConfig) -> KeyBindings {
         }
     }
     KeyBindings::default()
-}
-
-pub(crate) fn run_resume(cwd: &Path, args: RunArgs, json_mode: bool) -> Result<String> {
-    if let Some(session_id) = args.session_id {
-        let session_id = Uuid::parse_str(&session_id)?;
-        let store = Store::new(cwd)?;
-        let projection = store.rebuild_from_events(session_id)?;
-        return Ok(format!(
-            "resumed session={} turns={} steps={}",
-            session_id,
-            projection.transcript.len(),
-            projection.step_status.len()
-        ));
-    }
-    ensure_llm_ready(cwd, json_mode)?;
-    #[allow(deprecated)]
-    {
-        AgentEngine::new(cwd)?.resume()
-    }
-}
-
-pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
-    use codingbuddy_core::StreamChunk;
-    use std::io::{Read, stdin};
-
-    let prompt = if !cli.prompt_args.is_empty() {
-        cli.prompt_args.join(" ")
-    } else if !stdin().is_terminal() {
-        let mut buf = String::new();
-        stdin().read_to_string(&mut buf)?;
-        buf.trim().to_string()
-    } else {
-        return Err(anyhow!(
-            "-p/--print requires a prompt argument or stdin input"
-        ));
-    };
-
-    if prompt.is_empty() {
-        return Err(anyhow!("empty prompt"));
-    }
-
-    let json_mode = cli.json || cli.output_format == "json" || cli.output_format == "stream-json";
-    let is_stream_json = cli.output_format == "stream-json";
-    let is_text = !json_mode;
-    let cfg = selected_config(cwd, cli.model.as_deref())?;
-    codingbuddy_llm::check_provider(&cfg.llm)?;
-    let mut engine = AgentEngine::new_with_config(cwd, cfg)?;
-    apply_cli_flags(&mut engine, cli);
-    wire_subagent_worker(&engine, cwd);
-
-    // Handle --no-input: auto-deny all approval prompts
-    if cli.no_input {
-        engine.set_approval_handler(Box::new(|_call| Ok(false)));
-    }
-
-    // Handle --from-pr: fetch PR diff and prepend to prompt
-    let prompt = if let Some(pr_number) = cli.from_pr {
-        let diff = std::process::Command::new("gh")
-            .args(["pr", "diff", &pr_number.to_string()])
-            .output()?;
-        let pr_context = String::from_utf8_lossy(&diff.stdout);
-        format!("PR #{pr_number} diff:\n```\n{pr_context}\n```\n\n{prompt}")
-    } else {
-        prompt
-    };
-
-    let plain_stream = PlainStream::default();
-    if is_stream_json {
-        engine.set_stream_callback(Arc::new(|chunk| {
-            let mut handle = std::io::stdout().lock();
-            let _ = serde_json::to_writer(&mut handle, &stream_chunk_to_event_json(&chunk));
-            let _ = writeln!(handle);
-            let _ = handle.flush();
-        }));
-    } else if is_text {
-        let stream = plain_stream.clone();
-        engine.set_stream_callback(Arc::new(move |chunk| stream.event(chunk)));
-    }
-
-    let options = chat_options_from_cli(cli, true, ChatMode::Code);
-    let output = engine.chat_with_options(&prompt, options);
-    plain_stream.event(StreamChunk::Done { reason: None });
-    let output = output?;
-
-    match cli.output_format.as_str() {
-        "json" => {
-            let session_id = Store::new(cwd)?
-                .load_latest_session()?
-                .map(|s| s.session_id.to_string())
-                .unwrap_or_default();
-            print_json(&json!({
-                "output": output,
-                "session_id": session_id,
-                "model": AppConfig::load(cwd)
-                    .unwrap_or_default()
-                    .llm
-                    .active_base_model(),
-            }))?;
-        }
-        "stream-json" => {
-            // Streaming was already output via callback; emit final summary
-            let session_id = Store::new(cwd)?
-                .load_latest_session()?
-                .map(|s| s.session_id.to_string())
-                .unwrap_or_default();
-            println!(
-                "{}",
-                serde_json::to_string(&json!({
-                    "type": "result",
-                    "output": output,
-                    "session_id": session_id,
-                    "model": AppConfig::load(cwd)
-                        .unwrap_or_default()
-                        .llm
-                        .active_base_model(),
-                }))?
-            );
-        }
-        _ => {
-            // Text was already streamed to stdout via callback; output is the session summary
-            // (only print if there was no streaming, e.g., from cache hit)
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Default)]
-struct PlainStream(Arc<std::sync::Mutex<bool>>);
-
-impl PlainStream {
-    fn event(&self, chunk: StreamChunk) {
-        if let Ok(mut line_open) = self.0.lock() {
-            let mut writer = std::io::stdout().lock();
-            Self::write_event(&mut writer, &mut line_open, chunk);
-            let _ = writer.flush();
-        }
-    }
-
-    fn write_event(writer: &mut impl Write, line_open: &mut bool, chunk: StreamChunk) {
-        let status = match chunk {
-            StreamChunk::ContentDelta(text) => {
-                if !text.is_empty() {
-                    let _ = write!(writer, "{text}");
-                    *line_open = !text.ends_with('\n');
-                }
-                return;
-            }
-            StreamChunk::ToolCallStart {
-                tool_name,
-                args_summary,
-            } => format!("[tool: {tool_name}] {args_summary}"),
-            StreamChunk::ToolCallEnd {
-                tool_name,
-                duration_ms,
-                success,
-                summary,
-            } => {
-                let status = if success { "ok" } else { "error" };
-                format!("[tool: {tool_name}] {status} ({duration_ms}ms) {summary}")
-            }
-            StreamChunk::ModeTransition { from, to, reason } => {
-                format!("[mode: {from} -> {to}: {reason}]")
-            }
-            StreamChunk::SubagentSpawned { run_id, name, goal } => {
-                format!("[subagent:spawned] {name} ({run_id}) {goal}")
-            }
-            StreamChunk::SubagentCompleted {
-                run_id,
-                name,
-                summary,
-            } => format!(
-                "[subagent:completed] {name} ({run_id}) {}",
-                summary.replace('\n', " ")
-            ),
-            StreamChunk::SubagentFailed {
-                run_id,
-                name,
-                error,
-            } => format!(
-                "[subagent:failed] {name} ({run_id}) {}",
-                error.replace('\n', " ")
-            ),
-            StreamChunk::ImageData { label, .. } => format!("[image: {label}]"),
-            StreamChunk::WatchTriggered { comment_count, .. } => {
-                format!("[watch: {comment_count} comment(s) detected]")
-            }
-            StreamChunk::SecurityWarning { message } => format!("[security warning: {message}]"),
-            StreamChunk::Error { message, .. } => format!("[error: {message}]"),
-            StreamChunk::PhaseTransition { from, to } => format!("[phase: {from} -> {to}]"),
-            StreamChunk::ModelChanged { model } => format!("[model changed: {model}]"),
-            StreamChunk::ConfigReloaded { path } => {
-                eprintln!("Config reloaded: {path}");
-                return;
-            }
-            StreamChunk::RateLimited {
-                wait_seconds,
-                provider,
-                attempt,
-                max_attempts,
-            } => format!(
-                "[rate limited by {provider}: retrying in {wait_seconds}s ({attempt}/{max_attempts})]"
-            ),
-            StreamChunk::ToolProgress { tool_name, data } => {
-                if !*line_open {
-                    let _ = write!(writer, "[{tool_name}] ");
-                }
-                let _ = write!(writer, "{data}");
-                *line_open = !data.ends_with('\n');
-                return;
-            }
-            StreamChunk::ClearStreamingText | StreamChunk::Done { .. } => {
-                if std::mem::take(line_open) {
-                    let _ = writeln!(writer);
-                }
-                return;
-            }
-            StreamChunk::ReasoningDelta(_)
-            | StreamChunk::UsageUpdate { .. }
-            | StreamChunk::SnapshotRecorded { .. }
-            | StreamChunk::ToolCallReady { .. } => return,
-        };
-        if std::mem::take(line_open) {
-            let _ = writeln!(writer);
-        }
-        let _ = writeln!(writer, "{status}");
-    }
-}
-
-fn print_resume_banner(session: &codingbuddy_core::Session, turn_count: usize) {
-    let id_prefix = &session.session_id.to_string()[..8];
-    eprintln!(
-        "Resuming session {id_prefix} ({turn_count} messages, state={:?})",
-        session.status
-    );
-    if session.status == codingbuddy_core::SessionState::ExecutingStep {
-        eprintln!(
-            "Warning: Previous session was interrupted during tool execution. Results may be incomplete."
-        );
-    }
-}
-
-pub(crate) fn run_continue_session(cwd: &Path, json_mode: bool, cli: &crate::Cli) -> Result<()> {
-    let store = Store::new(cwd)?;
-    let session = store
-        .load_latest_session()?
-        .ok_or_else(|| anyhow!("no previous session to continue"))?;
-    let projection = store.rebuild_from_events(session.session_id)?;
-    if !json_mode && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        print_resume_banner(&session, projection.transcript.len());
-    }
-    run_chat(
-        cwd,
-        json_mode,
-        false,
-        true,
-        false,
-        Some(cli),
-        Some(session.session_id),
-    )
-}
-
-pub(crate) fn run_resume_specific(
-    cwd: &Path,
-    session_id: &str,
-    json_mode: bool,
-    cli: &crate::Cli,
-) -> Result<()> {
-    let store = Store::new(cwd)?;
-    let uuid =
-        Uuid::parse_str(session_id).map_err(|_| anyhow!("invalid session ID: {session_id}"))?;
-    let session = store
-        .load_session(uuid)?
-        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-    let projection = store.rebuild_from_events(session.session_id)?;
-    if !json_mode && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        print_resume_banner(&session, projection.transcript.len());
-    }
-    run_chat(
-        cwd,
-        json_mode,
-        false,
-        true,
-        false,
-        Some(cli),
-        Some(session.session_id),
-    )
-}
-
-#[derive(Debug)]
-struct CatalogDisplayResolution {
-    catalog: codingbuddy_core::ModelCatalog,
-    source: String,
-    cache_path: PathBuf,
-    cache_fresh: bool,
-    refresh_error: Option<String>,
-}
-
-fn refresh_model_catalog_background(cwd: &Path, cfg: &AppConfig) {
-    if !cfg.llm.model_catalog.enabled || cfg.llm.model_catalog.offline {
-        return;
-    }
-    let llm = cfg.llm.clone();
-    let runtime = runtime_dir(cwd);
-    thread::spawn(move || {
-        let _ = codingbuddy_llm::model_catalog::resolve_model_catalog(&llm, &runtime);
-    });
-}
-
-fn resolve_catalog_for_display(cwd: &Path, cfg: &AppConfig) -> CatalogDisplayResolution {
-    let runtime = runtime_dir(cwd);
-    match codingbuddy_llm::model_catalog::resolve_model_catalog(&cfg.llm, &runtime) {
-        Ok(resolution) => CatalogDisplayResolution {
-            catalog: resolution.catalog,
-            source: format!("{:?}", resolution.source),
-            cache_path: resolution.cache_path,
-            cache_fresh: resolution.cache_fresh,
-            refresh_error: resolution.refresh_error,
-        },
-        Err(error) => CatalogDisplayResolution {
-            catalog: cfg.llm.model_catalog_for_runtime(&runtime),
-            source: "RuntimeCacheFallback".to_string(),
-            cache_path: cfg.llm.model_catalog.cache_path_for(&runtime),
-            cache_fresh: false,
-            refresh_error: Some(error.to_string()),
-        },
-    }
-}
-
-/// Format a catalog-backed list of models with pricing, limits, and provider capabilities.
-fn format_models_list(cwd: &Path, cfg: &AppConfig) -> String {
-    let resolution = resolve_catalog_for_display(cwd, cfg);
-    let catalog = resolution.catalog;
-    let items = catalog.selector_items(&cfg.llm);
-
-    let mut out = format!(
-        "Models (catalog: {}, {} total, cache: {}, fresh: {}). Use `/model provider/model` to switch:\n",
-        resolution.source,
-        catalog.models.len(),
-        resolution.cache_path.display(),
-        resolution.cache_fresh
-    );
-    if let Some(error) = resolution.refresh_error {
-        out.push_str(&format!("Catalog refresh warning: {error}\n"));
-    }
-    out.push_str(&format!(
-        "  {:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14} {:<20} {:<18}  {}\n",
-        "Provider",
-        "Model",
-        "Context",
-        "Output",
-        "$/M in/out",
-        "Where",
-        "Auth",
-        "Protocol",
-        "Status",
-        "Capabilities"
-    ));
-    out.push_str(&format!("  {}\n", "-".repeat(176)));
-
-    for item in items {
-        let marker = if item.active { "* " } else { "  " };
-        let place = if item.local { "local" } else { "cloud" };
-        let auth = format_model_auth(&item);
-        out.push_str(&format!(
-            "{marker}{:<18} {:<36} {:>8} {:>8} {:>15} {:<7} {:<14} {:<20} {:<18}  {}\n",
-            item.provider,
-            truncate_inline(&item.id, 36),
-            format_token_limit(item.context_tokens),
-            format_output_limit(item.output_tokens),
-            format_model_cost(item.cost),
-            place,
-            auth,
-            truncate_inline(&item.chat_protocol, 20),
-            format_model_status(&item),
-            format_selector_capabilities(&item)
-        ));
-    }
-
-    out
-}
-
-fn format_model_auth(item: &codingbuddy_core::ModelSelectorItem) -> String {
-    if !item.requires_api_key {
-        "none".to_string()
-    } else if item.api_key_available {
-        "ready".to_string()
-    } else {
-        truncate_inline(&format!("missing:{}", item.api_key_env), 14)
-    }
-}
-
-fn format_model_status(item: &codingbuddy_core::ModelSelectorItem) -> String {
-    let mut parts = Vec::new();
-    match item.status {
-        codingbuddy_core::ModelStatus::Stable => {}
-        codingbuddy_core::ModelStatus::Preview => parts.push("preview"),
-        codingbuddy_core::ModelStatus::Deprecated => parts.push("deprecated"),
-        codingbuddy_core::ModelStatus::Unknown => parts.push("unknown"),
-    }
-    match item.provider_status {
-        codingbuddy_core::ProviderStatus::Available => {}
-        codingbuddy_core::ProviderStatus::Degraded => parts.push("provider-degraded"),
-        codingbuddy_core::ProviderStatus::Unavailable => parts.push("provider-down"),
-        codingbuddy_core::ProviderStatus::Unknown => parts.push("provider-unknown"),
-    }
-    if parts.is_empty() {
-        "ok".to_string()
-    } else {
-        truncate_inline(&parts.join(","), 18)
-    }
-}
-
-fn format_token_limit(tokens: u64) -> String {
-    if tokens == 0 {
-        "?".to_string()
-    } else if tokens >= 1_000_000 {
-        format!("{}M", tokens / 1_000_000)
-    } else {
-        format!("{}K", tokens / 1_000)
-    }
-}
-
-fn format_output_limit(tokens: u32) -> String {
-    if tokens == 0 {
-        "?".to_string()
-    } else {
-        format_token_limit(u64::from(tokens))
-    }
-}
-
-fn format_model_cost(cost: codingbuddy_core::ModelCost) -> String {
-    if cost.input_per_mtok_usd == 0.0 && cost.output_per_mtok_usd == 0.0 {
-        "local/free".to_string()
-    } else {
-        format!(
-            "{:.2}/{:.2}",
-            cost.input_per_mtok_usd, cost.output_per_mtok_usd
-        )
-    }
-}
-
-fn format_selector_capabilities(item: &codingbuddy_core::ModelSelectorItem) -> String {
-    let mut caps = Vec::new();
-    if item.capability.tool_call {
-        caps.push("tools");
-    }
-    if item.capability.parallel_tool_call {
-        caps.push("parallel");
-    }
-    if item.capability.reasoning {
-        caps.push("reasoning");
-    }
-    if item.capability.thinking_config {
-        caps.push("thinking");
-    }
-    if item.capability.image_input
-        || item
-            .modalities
-            .contains(&codingbuddy_core::ModelModality::Image)
-    {
-        caps.push("vision");
-    }
-    if item.capability.fim {
-        caps.push("fim");
-    }
-    if item
-        .modalities
-        .contains(&codingbuddy_core::ModelModality::Audio)
-    {
-        caps.push("audio");
-    }
-    if item
-        .modalities
-        .contains(&codingbuddy_core::ModelModality::Video)
-    {
-        caps.push("video");
-    }
-    match item.status {
-        codingbuddy_core::ModelStatus::Preview => caps.push("preview"),
-        codingbuddy_core::ModelStatus::Deprecated => caps.push("deprecated"),
-        codingbuddy_core::ModelStatus::Unknown => caps.push("unknown"),
-        codingbuddy_core::ModelStatus::Stable => {}
-    }
-    match item.provider_status {
-        codingbuddy_core::ProviderStatus::Degraded => caps.push("provider-degraded"),
-        codingbuddy_core::ProviderStatus::Unavailable => caps.push("provider-down"),
-        codingbuddy_core::ProviderStatus::Unknown => caps.push("provider-unknown"),
-        codingbuddy_core::ProviderStatus::Available => {}
-    }
-    if caps.is_empty() {
-        if item.capability.tool_call {
-            "text".to_string()
-        } else {
-            "text,no-tools".to_string()
-        }
-    } else {
-        if !item.capability.tool_call {
-            caps.push("no-tools");
-        }
-        caps.join(",")
-    }
-}
-
-fn model_selector_items_json(cwd: &Path, cfg: &AppConfig) -> serde_json::Value {
-    let resolution = resolve_catalog_for_display(cwd, cfg);
-    let catalog = resolution.catalog;
-    serde_json::json!({
-        "catalog_source": resolution.source,
-        "catalog_cache_path": resolution.cache_path,
-        "catalog_cache_fresh": resolution.cache_fresh,
-        "catalog_refresh_error": resolution.refresh_error,
-        "active_provider": cfg.llm.provider,
-        "active_model": cfg.llm.active_base_model(),
-        "models": catalog.selector_items(&cfg.llm),
-    })
-}
-
-fn active_model_for_display(
-    cfg: &AppConfig,
-    model_spec: Option<&str>,
-    force_max_think: bool,
-) -> String {
-    let mut effective = cfg.clone();
-    if let Some(spec) = model_spec {
-        effective.llm.apply_model_spec(spec);
-    }
-    if force_max_think {
-        effective.llm.active_reasoner_model()
-    } else {
-        effective.llm.active_base_model()
-    }
-}
-
-fn model_switch_safety_message(
-    cwd: &Path,
-    cfg: &AppConfig,
-    model_spec: &str,
-    allow_tools: bool,
-    read_only_mode: bool,
-    active_chat_mode: ChatMode,
-) -> Option<String> {
-    if !allow_tools || read_only_mode || active_chat_mode != ChatMode::Code {
-        return None;
-    }
-    let mut effective = cfg.clone();
-    effective.llm.apply_model_spec(model_spec);
-    let provider = effective.llm.provider.clone();
-    let model = effective.llm.active_base_model();
-    let catalog = effective.llm.model_catalog_for_runtime(&runtime_dir(cwd));
-    let item = catalog
-        .selector_items(&effective.llm)
-        .into_iter()
-        .find(|item| item.provider == provider && item.id == model);
-    let supports_tools = item
-        .as_ref()
-        .map(|item| item.capability.tool_call)
-        .or_else(|| {
-            effective
-                .llm
-                .capabilities_for_model(&model)
-                .map(|capabilities| capabilities.supports_tool_calling)
-        })
-        .unwrap_or(true);
-    if supports_tools {
-        return None;
-    }
-    let spec = item
-        .as_ref()
-        .map(|item| item.selection_spec.clone())
-        .unwrap_or_else(|| format!("{provider}/{model}"));
-    Some(format!(
-        "model switch blocked: {spec} is marked no-tools. Use /ask, /context, or /read-only on before switching, or choose a tool-capable model from /models."
-    ))
-}
-
-/// Open a file path in the system browser (cross-platform).
-fn open_in_browser(path: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(path).spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", path])
-        .spawn();
 }
 
 #[cfg(test)]

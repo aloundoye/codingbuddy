@@ -90,13 +90,13 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
 
     let prompt = build_strict_review_prompt(focus, &diff_content);
     let engine = AgentEngine::new(cwd)?;
-    let output = engine.analyze_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.analyze_with_options(
         &prompt,
         ChatOptions {
             tools: false,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let mut publish_summary = None;
     let payload = if args.strict {

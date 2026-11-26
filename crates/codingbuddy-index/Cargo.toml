@@ -15,3 +15,6 @@ notify.workspace = true
 uuid.workspace = true
 ignore.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
+
+[lints]
+workspace = true

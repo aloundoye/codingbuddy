@@ -1,5 +1,5 @@
 //! Versioned fixture scope and local, route-bound live verification evidence.
-use crate::{ApiClient, LlmClient};
+use crate::ApiClient;
 use anyhow::{Context, Result, ensure};
 use codingbuddy_core::{
     ChatMessage, ChatRequest, FunctionDefinition, LlmConfig, NativeParts, ToolChoice,
@@ -218,11 +218,16 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
         bounded.timeout_seconds = bounded.timeout_seconds.clamp(1, 30);
         bounded.stream = streaming;
         let client = ApiClient::new(bounded)?;
-        let response = if streaming {
-            client.complete_chat_streaming(&request, std::sync::Arc::new(|_| {}))?
-        } else {
-            client.complete_chat(&request)?
-        };
+        // A standalone command: block this thread on the request.
+        let response = codingbuddy_core::runtime::block_on(async {
+            if streaming {
+                client
+                    .complete_chat_streaming_body(&request, std::sync::Arc::new(|_| {}))
+                    .await
+            } else {
+                client.complete_chat_body(&request).await
+            }
+        })?;
         usage.push(json!(response.usage));
         if step == 2 {
             ensure!(
@@ -269,16 +274,18 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
             .base_url
             .trim_end_matches('/')
             .trim_end_matches("/v1");
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let models: Value = client
+        let client = crate::chat_transport::build_http_client(std::time::Duration::from_secs(10))?;
+        let request = client
             .get(format!("{root}/api/tags"))
-            .headers(route.headers(cfg.api_key.as_deref())?)
-            .send()?
-            .error_for_status()?
-            .json()?;
+            .headers(route.headers(cfg.api_key.as_deref())?);
+        let models: Value = codingbuddy_core::runtime::block_on(async move {
+            request
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await
+        })?;
         Some(
             models["models"]
                 .as_array()

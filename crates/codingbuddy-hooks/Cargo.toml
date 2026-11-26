@@ -13,8 +13,11 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-wait-timeout = "0.2"
+tokio = { workspace = true, features = ["rt", "process"] }
 codingbuddy-policy = { path = "../codingbuddy-policy" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

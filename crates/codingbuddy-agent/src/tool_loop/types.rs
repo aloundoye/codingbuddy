@@ -1,7 +1,7 @@
 //! Public types, configuration, and callback signatures for the tool-use loop.
 
 use anyhow::Result;
-use codingbuddy_core::{ChatMessage, EventKind, ProviderKind, TokenUsage, UserQuestion};
+use codingbuddy_core::{ChatMessage, EventKind, ProviderKind, TokenUsage};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -40,12 +40,18 @@ pub struct ToolLoopResult {
     pub messages: Vec<ChatMessage>,
 }
 
-/// Callback for requesting tool approval from the user.
-/// Returns `true` if approved, `false` if denied.
-pub type ApprovalCallback = Arc<dyn Fn(&codingbuddy_core::ToolCall) -> Result<bool> + Send + Sync>;
+/// Callback for requesting tool approval from the user. Resolves to `true`
+/// if approved. Async: waiting for the user holds no thread.
+pub type ApprovalCallback = Arc<
+    dyn Fn(
+            codingbuddy_core::ToolCall,
+        ) -> codingbuddy_core::runtime::BoxFuture<'static, Result<bool>>
+        + Send
+        + Sync,
+>;
 
 /// Callback for asking the user a question during tool execution.
-pub type UserQuestionCallback = Arc<dyn Fn(UserQuestion) -> Option<String> + Send + Sync>;
+pub type UserQuestionCallback = codingbuddy_core::UserQuestionHandler;
 
 /// Callback for event logging (tool proposed/result events).
 pub type EventCallback = Arc<dyn Fn(EventKind) + Send + Sync>;
@@ -55,7 +61,12 @@ pub type EventCallback = Arc<dyn Fn(EventKind) + Send + Sync>;
 pub type CheckpointCallback = Arc<dyn Fn(&str, &[PathBuf]) -> Result<()> + Send + Sync>;
 
 /// Callback for executing a subagent task (spawn_task tool).
-pub type SubagentWorker = Arc<dyn Fn(SubagentRequest) -> Result<String> + Send + Sync>;
+/// Async: a worker runs a whole child agent, which the parent awaits.
+pub type SubagentWorker = Arc<
+    dyn Fn(SubagentRequest) -> codingbuddy_core::runtime::BoxFuture<'static, Result<String>>
+        + Send
+        + Sync,
+>;
 
 /// Result of invoking a skill (returned by SkillRunner callback).
 #[derive(Debug, Clone)]
@@ -143,6 +154,8 @@ pub struct ToolLoopConfig {
     pub session_id: Option<Uuid>,
     /// Optional post-edit validator for LSP-like diagnostics (Phase 4).
     pub edit_validator: Option<Arc<codingbuddy_lsp::EditValidator>>,
+    /// Which corrective prompt heuristics run for this model and provider.
+    pub heuristics: codingbuddy_core::heuristics::ResolvedHeuristics,
 }
 
 impl Default for ToolLoopConfig {
@@ -178,6 +191,7 @@ impl Default for ToolLoopConfig {
             initial_phase: None,
             session_id: None,
             edit_validator: None,
+            heuristics: codingbuddy_core::heuristics::ResolvedHeuristics::default(),
         }
     }
 }

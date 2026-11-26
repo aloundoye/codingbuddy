@@ -34,7 +34,7 @@ fn error_recovery_guidance_injected_on_first_escalation() {
         default_tools(),
     );
 
-    let result = loop_.run("fix the build").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("fix the build")).unwrap();
 
     let has_recovery = result.messages.iter().any(
         |m| matches!(m, ChatMessage::System { content } if content.contains("ERROR RECOVERY")),
@@ -97,7 +97,7 @@ fn stuck_detection_fires_after_3_same_errors() {
         default_tools(),
     );
 
-    let result = loop_.run("fix the build").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("fix the build")).unwrap();
 
     let has_stuck = result.messages.iter().any(
         |m| matches!(m, ChatMessage::System { content } if content.contains("STUCK DETECTION")),
@@ -159,7 +159,7 @@ fn recovery_guidance_not_repeated_after_success() {
         default_tools(),
     );
 
-    let result = loop_.run("fix the build").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("fix the build")).unwrap();
 
     let recovery_count = result
         .messages

@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 sha2.workspace = true
+schemars = { version = "1", features = ["uuid1"] }
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-diff = { path = "../codingbuddy-diff" }
 codingbuddy-memory = { path = "../codingbuddy-memory" }
@@ -19,6 +20,11 @@ codingbuddy-policy = { path = "../codingbuddy-policy" }
 codingbuddy-store = { path = "../codingbuddy-store" }
 codingbuddy-llm = { path = "../codingbuddy-llm" }
 codingbuddy-agent = { path = "../codingbuddy-agent" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { workspace = true, features = ["rt", "io-std", "io-util", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

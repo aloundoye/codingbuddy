@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "source": "synthetic",
+  "provider": "google",
+  "model": "gemini-2.5-flash",
+  "scenario": "text_then_tool",
+  "recorded_at": "synthetic: written by hand in Gemini's streaming format; replace with a recording",
+  "prompt": "Before you use any tool, explain in three or four sentences what you are going to check and why. Then read notes.txt and summarize it in one sentence.",
+  "workspace": {
+    "notes.txt": "Release checklist\n- Bump the version in Cargo.toml\n- Update CHANGELOG.md\n- Tag the release and push the tag\n"
+  },
+  "stream": true,
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "chunks": [
+          {
+            "delay_ms": 40,
+            "text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"I'll start by reading notes.txt, because the summary has to reflect what the file actually says rather than what a release checklist usually contains. \"}],\"role\":\"model\"},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":812,\"candidatesTokenCount\":64,\"totalTokenCount\":876},\"modelVersion\":\"gemini-2.5-flash\"}\r\n\r\n"
+          },
+          {
+            "delay_ms": 40,
+            "text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Once I have its contents I'll condense them into a single sentence that keeps every step in order.\"}],\"role\":\"model\"},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":812,\"candidatesTokenCount\":64,\"totalTokenCount\":876},\"modelVersion\":\"gemini-2.5-flash\"}\r\n\r\n"
+          },
+          {
+            "delay_ms": 40,
+            "text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"fs_read\",\"args\":{\"path\":\"notes.txt\"}},\"thoughtSignature\":\"CiQBVKhc7synthetic\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":812,\"candidatesTokenCount\":83,\"totalTokenCount\":895},\"modelVersion\":\"gemini-2.5-flash\"}\r\n\r\n"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "chunks": [
+          {
+            "delay_ms": 40,
+            "text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"The release checklist says to bump the version in Cargo.toml, \"}],\"role\":\"model\"},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":940,\"candidatesTokenCount\":14,\"totalTokenCount\":954},\"modelVersion\":\"gemini-2.5-flash\"}\r\n\r\n"
+          },
+          {
+            "delay_ms": 40,
+            "text": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"update CHANGELOG.md, and then tag the release and push the tag.\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":940,\"candidatesTokenCount\":27,\"totalTokenCount\":967},\"modelVersion\":\"gemini-2.5-flash\"}\r\n\r\n"
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "tool_calls": [
+      "fs_read"
+    ],
+    "output": "The release checklist says to bump the version in Cargo.toml, update CHANGELOG.md, and then tag the release and push the tag."
+  }
+}

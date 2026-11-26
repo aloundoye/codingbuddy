@@ -59,210 +59,228 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
 pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
     let workspace = cwd.to_path_buf();
     let parent_config = engine.delegation_config();
-    let worker = std::sync::Arc::new(
-        move |task: &codingbuddy_subagent::SubagentTask| -> anyhow::Result<String> {
-            task.execution.check()?;
-            let run_store = Store::new(&workspace)?;
-            let operation_id = Uuid::now_v7();
-            if !task.run_in_background {
-                run_store.begin_operation(
-                    operation_id,
-                    task.child_session_id,
-                    task.execution.prompt_id,
-                    "subagent",
-                    &json!({"name":task.name}),
-                )?;
-            }
-            let _settlement = if task.run_in_background {
-                None
-            } else {
-                Some(DelegationGuard {
-                    store: Store::new(&workspace)?,
-                    id: operation_id,
-                })
-            };
-            let _run_monitor = if task.run_in_background {
-                None
-            } else {
-                Some(
-                    run_store
-                        .monitor_operation(operation_id, task.execution.cancellation.clone())?,
-                )
-            };
-            let (mode, force_max_think, role_prompt, _mode_name) = match &task.role {
-                codingbuddy_subagent::SubagentRole::Explore => (
-                    codingbuddy_agent::ChatMode::Ask,
-                    false,
-                    "You are an exploration subagent. Read, search, and summarize. Do not edit files.",
-                    "ask",
-                ),
-                codingbuddy_subagent::SubagentRole::Plan => (
-                    codingbuddy_agent::ChatMode::Ask,
-                    true,
-                    "You are a planning subagent. Explore the codebase, identify risks, and produce a concrete implementation plan. Do not edit files.",
-                    "ask",
-                ),
-                codingbuddy_subagent::SubagentRole::Bash => (
-                    codingbuddy_agent::ChatMode::Code,
-                    false,
-                    "You are a bash-focused subagent. Prefer commands and verification steps, keep file edits minimal, and report command outcomes precisely.",
-                    "code",
-                ),
-                codingbuddy_subagent::SubagentRole::Task => (
-                    codingbuddy_agent::ChatMode::Code,
-                    false,
-                    "You are an execution subagent. Use the available tools to complete the delegated task and report what changed and what remains.",
-                    "code",
-                ),
-                codingbuddy_subagent::SubagentRole::Custom(_) => (
-                    codingbuddy_agent::ChatMode::Code,
-                    false,
-                    "You are a custom subagent. Follow the delegated objective and use tools deliberately.",
-                    "code",
-                ),
-            };
-
-            let system_prompt = match task.name.as_str() {
-                "debugger" => {
-                    "You are the Debugger subagent. Triage failing tests or build output, identify suspect files, and recommend the smallest credible fix."
+    let worker: codingbuddy_agent::SubagentWorkerFn = std::sync::Arc::new(
+        move |task: codingbuddy_subagent::SubagentTask| {
+            let workspace = workspace.clone();
+            let parent_config = parent_config.clone();
+            Box::pin(async move {
+                let task = &task;
+                task.execution.check()?;
+                let run_store = Store::new(&workspace)?;
+                let operation_id = Uuid::now_v7();
+                if !task.run_in_background {
+                    run_store.begin_operation(
+                        operation_id,
+                        task.child_session_id,
+                        task.execution.prompt_id,
+                        "subagent",
+                        &json!({"name":task.name}),
+                    )?;
                 }
-                "refactor-sheriff" => {
-                    "You are the Refactor Sheriff subagent. Identify behavior-preserving refactors, call out risks, and propose the cleanest change sequence."
-                }
-                "security-sentinel" => {
-                    "You are the Security Sentinel subagent. Review the requested goal for vulnerabilities, risky commands, and unsafe assumptions."
-                }
-                _ => role_prompt,
-            };
-
-            let delegated_prompt = format!(
-                "{system_prompt}\n\nParent Session: {}\nChild Session: {}\nDelegated Goal:\n{}\n\nReturn a concise, structured result with findings, actions taken, and any remaining risks or follow-ups.",
-                task.parent_session_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                task.child_session_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                task.goal
-            );
-
-            if task.run_in_background {
-                let child_session_id = task
-                    .child_session_id
-                    .ok_or_else(|| anyhow!("background subagent missing child_session_id"))?;
-                let _task_id = task
-                    .task_id
-                    .ok_or_else(|| anyhow!("background subagent missing task_id"))?;
-                let parent_session_id = task
-                    .parent_session_id
-                    .ok_or_else(|| anyhow!("background subagent missing parent_session_id"))?;
-
-                let payload = crate::worker::spawn(
-                    &workspace,
-                    parent_session_id,
-                    crate::worker::WorkerJob::Agent {
-                        prompt: delegated_prompt.clone(),
-                        tools: true,
-                        session: child_session_id,
-                        task: Some(Box::new(task.clone())),
-                        max_turns: task.max_turns.map(|n| n as u64),
-                    },
-                    parent_config.clone(),
-                    task.execution.prompt_id,
-                )?;
-                let store = Store::new(&workspace)?;
-                let background_job_id = payload
-                    .get("job_id")
-                    .and_then(|value| value.as_str())
-                    .and_then(|value| Uuid::parse_str(value).ok());
-                if let Some(mut run) = store.load_subagent_run(task.run_id)? {
-                    run.background_job_id = background_job_id;
-                    run.status = "running".to_string();
-                    run.updated_at = chrono::Utc::now().to_rfc3339();
-                    store.upsert_subagent_run(&run)?;
-                }
-                return Ok(payload.to_string());
-            }
-
-            let worktree = codingbuddy_subagent::WorktreeIsolation::create_with_trust(
-                &workspace,
-                &task.name,
-                &[],
-                parent_config.workspace_trust == Some(true),
-            )?;
-            let mut engine = codingbuddy_agent::AgentEngine::new_isolated(
-                worktree.path(),
-                &workspace,
-                parent_config.clone(),
-            )?;
-            let mut options = codingbuddy_agent::ChatOptions {
-                tools: true,
-                force_max_think,
-                mode: if task.read_only_fallback {
-                    codingbuddy_agent::ChatMode::Ask
+                let _settlement = if task.run_in_background {
+                    None
                 } else {
-                    mode
-                },
-                session_id: task.child_session_id,
-                cancellation: Some(task.execution.cancellation.clone()),
-                deadline: task.execution.deadline,
-                parent_run_id: Some(operation_id),
-                ..Default::default()
-            };
-
-            if let Some(max_turns) = task.max_turns {
-                engine.set_max_turns(Some(
-                    (max_turns as u64).min(
-                        parent_config
-                            .budgets
-                            .max_turns
-                            .unwrap_or(parent_config.agent_loop.tool_loop_max_turns),
+                    Some(DelegationGuard {
+                        store: Store::new(&workspace)?,
+                        id: operation_id,
+                    })
+                };
+                let _run_monitor = if task.run_in_background {
+                    None
+                } else {
+                    Some(
+                        run_store
+                            .monitor_operation(operation_id, task.execution.cancellation.clone())?,
+                    )
+                };
+                let (mode, force_max_think, role_prompt, _mode_name) = match &task.role {
+                    codingbuddy_subagent::SubagentRole::Explore => (
+                        codingbuddy_agent::ChatMode::Ask,
+                        false,
+                        "You are an exploration subagent. Read, search, and summarize. Do not edit files.",
+                        "ask",
                     ),
-                ));
-            }
-            if let Some(model) = &task.model_override {
-                engine.cfg_mut().llm.base_model = model.clone();
-                engine.cfg_mut().llm.max_think_model = model.clone();
-                let provider_name = engine.cfg_mut().llm.provider.clone();
-                if let Some(provider) = engine.cfg_mut().llm.providers.get_mut(&provider_name) {
-                    provider.models.chat = model.clone();
-                    provider.models.reasoner = Some(model.clone());
-                }
-            }
+                    codingbuddy_subagent::SubagentRole::Plan => (
+                        codingbuddy_agent::ChatMode::Ask,
+                        true,
+                        "You are a planning subagent. Explore the codebase, identify risks, and produce a concrete implementation plan. Do not edit files.",
+                        "ask",
+                    ),
+                    codingbuddy_subagent::SubagentRole::Bash => (
+                        codingbuddy_agent::ChatMode::Code,
+                        false,
+                        "You are a bash-focused subagent. Prefer commands and verification steps, keep file edits minimal, and report command outcomes precisely.",
+                        "code",
+                    ),
+                    codingbuddy_subagent::SubagentRole::Task => (
+                        codingbuddy_agent::ChatMode::Code,
+                        false,
+                        "You are an execution subagent. Use the available tools to complete the delegated task and report what changed and what remains.",
+                        "code",
+                    ),
+                    codingbuddy_subagent::SubagentRole::Custom(_) => (
+                        codingbuddy_agent::ChatMode::Code,
+                        false,
+                        "You are a custom subagent. Follow the delegated objective and use tools deliberately.",
+                        "code",
+                    ),
+                };
 
-            options.system_prompt_append = Some(delegated_prompt);
-            let result = engine.chat_with_options(&task.goal, options);
-            let diff = worktree.collect_for_parent()?;
-            let artifact = if diff.is_empty() {
-                None
-            } else {
-                Some(
-                    codingbuddy_diff::PatchStore::new(&workspace)?
-                        .stage(&diff, &[])?
-                        .patch_id,
-                )
-            };
-            let status = if task.execution.cancellation.is_cancelled() {
-                "cancelled"
-            } else if result.is_ok() {
-                "completed"
-            } else {
-                "failed"
-            };
-            run_store.transition_operation(
-                operation_id,
-                "running",
-                status,
-                &json!({"artifact":artifact,"workspace":worktree.path()}),
-            )?;
-            let output = result?;
-            Ok(format!(
-                "{output}\n\nWorktree retained: {}. Staged patch: {}. Local review is required to apply it.",
-                worktree.path().display(),
-                artifact
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "none".into())
-            ))
+                let system_prompt = match task.name.as_str() {
+                    "debugger" => {
+                        "You are the Debugger subagent. Triage failing tests or build output, identify suspect files, and recommend the smallest credible fix."
+                    }
+                    "refactor-sheriff" => {
+                        "You are the Refactor Sheriff subagent. Identify behavior-preserving refactors, call out risks, and propose the cleanest change sequence."
+                    }
+                    "security-sentinel" => {
+                        "You are the Security Sentinel subagent. Review the requested goal for vulnerabilities, risky commands, and unsafe assumptions."
+                    }
+                    _ => role_prompt,
+                };
+
+                let delegated_prompt = format!(
+                    "{system_prompt}\n\nParent Session: {}\nChild Session: {}\nDelegated Goal:\n{}\n\nReturn a concise, structured result with findings, actions taken, and any remaining risks or follow-ups.",
+                    task.parent_session_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    task.child_session_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    task.goal
+                );
+
+                if task.run_in_background {
+                    let child_session_id = task
+                        .child_session_id
+                        .ok_or_else(|| anyhow!("background subagent missing child_session_id"))?;
+                    let _task_id = task
+                        .task_id
+                        .ok_or_else(|| anyhow!("background subagent missing task_id"))?;
+                    let parent_session_id = task
+                        .parent_session_id
+                        .ok_or_else(|| anyhow!("background subagent missing parent_session_id"))?;
+
+                    let payload = crate::worker::spawn(
+                        &workspace,
+                        parent_session_id,
+                        crate::worker::WorkerJob::Agent {
+                            prompt: delegated_prompt.clone(),
+                            tools: true,
+                            session: child_session_id,
+                            task: Some(Box::new(task.clone())),
+                            max_turns: task.max_turns.map(|n| n as u64),
+                        },
+                        parent_config.clone(),
+                        task.execution.prompt_id,
+                    )?;
+                    let store = Store::new(&workspace)?;
+                    let background_job_id = payload
+                        .get("job_id")
+                        .and_then(|value| value.as_str())
+                        .and_then(|value| Uuid::parse_str(value).ok());
+                    if let Some(mut run) = store.load_subagent_run(task.run_id)? {
+                        run.background_job_id = background_job_id;
+                        run.status = "running".to_string();
+                        run.updated_at = chrono::Utc::now().to_rfc3339();
+                        store.upsert_subagent_run(&run)?;
+                    }
+                    return Ok(payload.to_string());
+                }
+
+                // Snapshotting the workspace into a worktree is bulk git and
+                // file work: run it on the blocking pool.
+                let worktree = {
+                    let (workspace, name) = (workspace.clone(), task.name.clone());
+                    let trusted = parent_config.workspace_trust == Some(true);
+                    codingbuddy_core::runtime::spawn_blocking(move || {
+                        codingbuddy_subagent::WorktreeIsolation::create_with_trust(
+                            &workspace,
+                            &name,
+                            &[],
+                            trusted,
+                        )
+                    })
+                    .await?
+                };
+                let mut engine = codingbuddy_agent::AgentEngine::new_isolated(
+                    worktree.path(),
+                    &workspace,
+                    parent_config.clone(),
+                )?;
+                let mut options = codingbuddy_agent::ChatOptions {
+                    tools: true,
+                    force_max_think,
+                    mode: if task.read_only_fallback {
+                        codingbuddy_agent::ChatMode::Ask
+                    } else {
+                        mode
+                    },
+                    session_id: task.child_session_id,
+                    cancellation: Some(task.execution.cancellation.clone()),
+                    deadline: task.execution.deadline,
+                    parent_run_id: Some(operation_id),
+                    ..Default::default()
+                };
+
+                if let Some(max_turns) = task.max_turns {
+                    engine.set_max_turns(Some(
+                        (max_turns as u64).min(
+                            parent_config
+                                .budgets
+                                .max_turns
+                                .unwrap_or(parent_config.agent_loop.tool_loop_max_turns),
+                        ),
+                    ));
+                }
+                if let Some(model) = &task.model_override {
+                    engine.cfg_mut().llm.base_model = model.clone();
+                    engine.cfg_mut().llm.max_think_model = model.clone();
+                    let provider_name = engine.cfg_mut().llm.provider.clone();
+                    if let Some(provider) = engine.cfg_mut().llm.providers.get_mut(&provider_name) {
+                        provider.models.chat = model.clone();
+                        provider.models.reasoner = Some(model.clone());
+                    }
+                }
+
+                options.system_prompt_append = Some(delegated_prompt);
+                let result = engine.chat_with_options(&task.goal, options).await;
+                let (diff, worktree) = codingbuddy_core::runtime::spawn_blocking(move || {
+                    (worktree.collect_for_parent(), worktree)
+                })
+                .await;
+                let diff = diff?;
+                let artifact = if diff.is_empty() {
+                    None
+                } else {
+                    Some(
+                        codingbuddy_diff::PatchStore::new(&workspace)?
+                            .stage(&diff, &[])?
+                            .patch_id,
+                    )
+                };
+                let status = if task.execution.cancellation.is_cancelled() {
+                    "cancelled"
+                } else if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                run_store.transition_operation(
+                    operation_id,
+                    "running",
+                    status,
+                    &json!({"artifact":artifact,"workspace":worktree.path()}),
+                )?;
+                let output = result?;
+                Ok(format!(
+                    "{output}\n\nWorktree retained: {}. Staged patch: {}. Local review is required to apply it.",
+                    worktree.path().display(),
+                    artifact
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".into())
+                ))
+            })
         },
     );
     engine.set_subagent_worker(worker);

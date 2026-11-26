@@ -33,15 +33,15 @@ impl Observer {
 
     pub fn verbose_log(&self, msg: &str) {
         tracing::debug!(target: "codingbuddy_agent::observe", "{msg}");
-        if self.verbose {
-            eprintln!("[codingbuddy] {msg}");
+        if self.verbose && !codingbuddy_core::logging::terminal_claimed() {
+            eprintln!("[codingbuddy] {msg}"); // guard: allow (--verbose, skipped while a UI owns the terminal)
         }
     }
 
     pub fn warn_log(&self, msg: &str) {
         tracing::warn!(target: "codingbuddy_agent::observe", "{msg}");
-        if self.verbose {
-            eprintln!("[codingbuddy WARN] {msg}");
+        if self.verbose && !codingbuddy_core::logging::terminal_claimed() {
+            eprintln!("[codingbuddy WARN] {msg}"); // guard: allow (--verbose, skipped while a UI owns the terminal)
         }
         let _ = self.append_log_line(&format!("{} WARN {msg}", Utc::now().to_rfc3339()));
     }

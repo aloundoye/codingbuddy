@@ -3,7 +3,6 @@ use crate::{protocol::ChatProtocol, providers::bedrock};
 use anyhow::Result;
 use codingbuddy_core::{ChatRequest, LlmResponse, StreamCallback};
 use serde_json::Value;
-use std::io::Read;
 
 pub struct ProviderRequest<'a> {
     pub(crate) route: &'a crate::route::ChatRoute,
@@ -19,9 +18,10 @@ impl ProviderRequest<'_> {
     pub fn profile(&self) -> &codingbuddy_core::ProviderConfig {
         &self.route.provider
     }
-    pub fn wait<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T> {
+    pub async fn wait<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T> {
         self.transport
-            .wait_with_timeout(self.timeout, future)?
+            .wait_with_timeout(self.timeout, future)
+            .await?
             .map_err(|_| {
                 crate::error::ProviderError::new(
                     self.route.protocol,
@@ -33,6 +33,7 @@ impl ProviderRequest<'_> {
 }
 
 /// A registered native wire codec. Breaking changes require a new interface version.
+#[async_trait::async_trait]
 pub trait ProviderAdapterV1: Send + Sync {
     fn protocol(&self) -> ChatProtocol;
     fn endpoint(
@@ -42,17 +43,22 @@ pub trait ProviderAdapterV1: Send + Sync {
         model: &str,
         streaming: bool,
     ) -> Result<String>;
-    fn authenticate(
+    async fn authenticate(
         &self,
         request: &ProviderRequest<'_>,
         body: &[u8],
     ) -> Result<reqwest::header::HeaderMap>;
     fn encode(&self, request: &ChatRequest) -> Result<Value>;
     fn decode_response(&self, body: &Value) -> Result<LlmResponse>;
-    fn decode_stream(&self, input: &mut dyn Read, callback: StreamCallback) -> Result<LlmResponse>;
+    async fn decode_stream(
+        &self,
+        input: &mut crate::chat_transport::ByteStream<'_>,
+        callback: StreamCallback,
+    ) -> Result<LlmResponse>;
 }
 
 struct Bedrock;
+#[async_trait::async_trait]
 impl ProviderAdapterV1 for Bedrock {
     fn protocol(&self) -> ChatProtocol {
         ChatProtocol::BedrockConverse
@@ -66,7 +72,7 @@ impl ProviderAdapterV1 for Bedrock {
     ) -> Result<String> {
         bedrock::endpoint(kind, deployment, model, streaming)
     }
-    fn authenticate(
+    async fn authenticate(
         &self,
         request: &ProviderRequest<'_>,
         body: &[u8],
@@ -98,6 +104,7 @@ impl ProviderAdapterV1 for Bedrock {
             request.timeout,
             body,
         )
+        .await
     }
     fn encode(&self, request: &ChatRequest) -> Result<Value> {
         bedrock::encode(request)
@@ -105,8 +112,12 @@ impl ProviderAdapterV1 for Bedrock {
     fn decode_response(&self, body: &Value) -> Result<LlmResponse> {
         bedrock::decode(body)
     }
-    fn decode_stream(&self, input: &mut dyn Read, callback: StreamCallback) -> Result<LlmResponse> {
-        bedrock::stream(input, callback)
+    async fn decode_stream(
+        &self,
+        input: &mut crate::chat_transport::ByteStream<'_>,
+        callback: StreamCallback,
+    ) -> Result<LlmResponse> {
+        bedrock::stream(input, callback).await
     }
 }
 

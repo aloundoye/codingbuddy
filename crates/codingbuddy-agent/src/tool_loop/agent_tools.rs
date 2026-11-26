@@ -3,16 +3,16 @@ use codingbuddy_core::{RuntimeToolMetadata, ToolDefinition, ToolName, ToolTier};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-pub(super) fn handle_agent_level_tool(
+pub(super) async fn handle_agent_level_tool(
     tool_loop: &mut ToolUseLoop<'_>,
     llm_call: &LlmToolCall,
 ) -> Result<Vec<ToolCallRecord>> {
     let start = Instant::now();
     let args: serde_json::Value = serde_json::from_str(&llm_call.arguments).unwrap_or_else(|e| {
-        eprintln!(
+        codingbuddy_core::logging::notice(format_args!(
             "[tool_loop] failed to parse agent tool arguments for '{}': {e}",
             llm_call.name
-        );
+        ));
         serde_json::json!({})
     });
 
@@ -27,7 +27,7 @@ pub(super) fn handle_agent_level_tool(
         "extended_thinking" | "think_deeply" => {
             let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
             let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
-            handle_extended_thinking(tool_loop, question, context)?
+            handle_extended_thinking(tool_loop, question, context).await?
         }
         "tool_search" => handle_tool_search(tool_loop, &args),
         "user_question" => {
@@ -49,7 +49,7 @@ pub(super) fn handle_agent_level_tool(
                     question: question.to_string(),
                     options,
                 };
-                match cb(uq) {
+                match cb(uq).await {
                     Some(answer) => format!("User response: {answer}"),
                     None => format!(
                         "Question for user: {question}\n[User cancelled. Proceed with your best judgment.]"
@@ -61,8 +61,8 @@ pub(super) fn handle_agent_level_tool(
                 )
             }
         }
-        "task_create" => handle_task_create(tool_loop, &args)?,
-        "task_update" => handle_task_update(tool_loop, &args)?,
+        "task_create" => handle_task_create(tool_loop, &args).await?,
+        "task_update" => handle_task_update(tool_loop, &args).await?,
         "todo_read" => handle_todo_read(tool_loop)?,
         "todo_write" => handle_todo_write(tool_loop, &args)?,
         "task_get" => handle_task_get(tool_loop, &args)?,
@@ -74,13 +74,18 @@ pub(super) fn handle_agent_level_tool(
         {
             "This tool requires a trusted workspace.".to_string()
         }
-        "spawn_task" => handle_spawn_task(tool_loop, &args)?,
-        "send_message" => handle_send_message(tool_loop, &args)?,
+        "spawn_task" => handle_spawn_task(tool_loop, &args).await?,
+        "send_message" => handle_send_message(tool_loop, &args).await?,
         "enter_plan_mode" => handle_enter_plan_mode(tool_loop)?,
         "exit_plan_mode" => handle_exit_plan_mode(tool_loop, &args)?,
-        "enter_worktree" => handle_enter_worktree(tool_loop, &args)?,
-        "exit_worktree" => handle_exit_worktree(tool_loop, &args)?,
-        "skill" => handle_skill(tool_loop, &args)?,
+        // Worktree snapshots are bulk git and file work.
+        "enter_worktree" => {
+            codingbuddy_core::runtime::blocking_section(|| handle_enter_worktree(tool_loop, &args))?
+        }
+        "exit_worktree" => {
+            codingbuddy_core::runtime::blocking_section(|| handle_exit_worktree(tool_loop, &args))?
+        }
+        "skill" => handle_skill(tool_loop, &args).await?,
         _ => {
             format!(
                 "Agent-level tool '{}' is not yet available in tool-use mode. Try a different approach.",
@@ -286,7 +291,7 @@ fn tool_search_priority(name: &str) -> (u8, u8, String) {
     (primary, tier, name.to_string())
 }
 
-pub(super) fn handle_extended_thinking(
+pub(super) async fn handle_extended_thinking(
     tool_loop: &ToolUseLoop<'_>,
     question: &str,
     context: &str,
@@ -320,11 +325,11 @@ pub(super) fn handle_extended_thinking(
         provider_options: Default::default(),
         response_format: None,
     };
-    let response = tool_loop.llm.complete_chat(&request)?;
+    let response = tool_loop.llm.complete_chat(&request).await?;
     Ok(response.text)
 }
 
-pub(super) fn handle_task_create(
+pub(super) async fn handle_task_create(
     tool_loop: &ToolUseLoop<'_>,
     args: &serde_json::Value,
 ) -> Result<String> {
@@ -367,7 +372,9 @@ pub(super) fn handle_task_create(
         )
         .with_tool("task_create", args.clone())
         .with_prompt(subject);
-        tool_loop.fire_hook_logged(hooks, codingbuddy_hooks::HookEvent::TaskCreated, &input);
+        tool_loop
+            .fire_hook_logged(hooks, codingbuddy_hooks::HookEvent::TaskCreated, &input)
+            .await;
     }
 
     Ok(serde_json::json!({
@@ -380,7 +387,7 @@ pub(super) fn handle_task_create(
     .to_string())
 }
 
-pub(super) fn handle_task_update(
+pub(super) async fn handle_task_update(
     tool_loop: &ToolUseLoop<'_>,
     args: &serde_json::Value,
 ) -> Result<String> {
@@ -415,7 +422,9 @@ pub(super) fn handle_task_update(
             session_type: None,
             workspace: tool_loop.workspace_str().to_string(),
         };
-        tool_loop.fire_hook_logged(hooks, HookEvent::TaskCompleted, &input);
+        tool_loop
+            .fire_hook_logged(hooks, HookEvent::TaskCompleted, &input)
+            .await;
     }
 
     Ok(serde_json::json!({
@@ -701,7 +710,7 @@ pub(super) fn handle_task_output(
 
 /// Send a follow-up message to a completed or running subagent.
 /// Looks up the agent's session by run_id and re-invokes with the message.
-pub(super) fn handle_send_message(
+pub(super) async fn handle_send_message(
     tool_loop: &ToolUseLoop<'_>,
     args: &serde_json::Value,
 ) -> Result<String> {
@@ -752,7 +761,7 @@ pub(super) fn handle_send_message(
         run_in_background: false,
     };
 
-    match worker(request) {
+    match worker(request).await {
         Ok(result) => Ok(result),
         Err(e) => Ok(format!(
             "Failed to send message to agent '{}': {e}",
@@ -817,7 +826,7 @@ pub(super) fn handle_task_stop(
     Ok(serde_json::json!({"task_id":task_id,"run_id":run.run_id,"background_job_id":background_job.job_id,"status":"cancelling"}).to_string())
 }
 
-pub(super) fn handle_spawn_task(
+pub(super) async fn handle_spawn_task(
     tool_loop: &ToolUseLoop<'_>,
     args: &serde_json::Value,
 ) -> Result<String> {
@@ -928,18 +937,19 @@ pub(super) fn handle_spawn_task(
                 session_type: None,
                 workspace: tool_loop.workspace_str().to_string(),
             };
-            tool_loop.fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
+            tool_loop
+                .fire_hook_logged(hooks, HookEvent::SubagentStart, &input)
+                .await;
         }
         // Auto-promote: if foreground agent takes >60s, report as backgrounded
         let result = if !run_in_background {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let worker_clone = worker.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(worker_clone(request));
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
-                Ok(result) => result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // The child agent runs as its own task. On timeout it keeps
+            // running detached and reports through the store.
+            let child = codingbuddy_core::runtime::runtime().spawn(worker(request));
+            match tokio::time::timeout(std::time::Duration::from_secs(60), child).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(anyhow!("subagent worker panicked")),
+                Err(_) => {
                     // Auto-promoted to background — record as running
                     let _ = store.update_task_status(task_id, "running", None);
                     let _ = store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
@@ -967,12 +977,9 @@ pub(super) fn handle_spawn_task(
                         "message": "Agent exceeded 60s timeout, running in background. Results will arrive as a notification."
                     }).to_string());
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    Err(anyhow!("subagent worker disconnected"))
-                }
             }
         } else {
-            worker(request)
+            worker(request).await
         };
         let result = match result {
             Ok(result) => {
@@ -1133,7 +1140,9 @@ pub(super) fn handle_spawn_task(
                 session_type: None,
                 workspace: tool_loop.workspace_str().to_string(),
             };
-            tool_loop.fire_hook_logged(hooks, HookEvent::SubagentStop, &input);
+            tool_loop
+                .fire_hook_logged(hooks, HookEvent::SubagentStop, &input)
+                .await;
         }
         result
     } else {
@@ -1236,7 +1245,7 @@ pub(super) fn handle_exit_plan_mode(
     Ok("Plan saved. Await user approval before executing code changes.".to_string())
 }
 
-pub(super) fn handle_skill(
+pub(super) async fn handle_skill(
     tool_loop: &ToolUseLoop<'_>,
     args: &serde_json::Value,
 ) -> Result<String> {
@@ -1295,7 +1304,7 @@ pub(super) fn handle_skill(
                 max_turns: None,
                 run_in_background: false,
             };
-            return match worker(request) {
+            return match worker(request).await {
                 Ok(output) => Ok(format!(
                     "Skill '{skill_name}' (forked) completed:\n{output}"
                 )),

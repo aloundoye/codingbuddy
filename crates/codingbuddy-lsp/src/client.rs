@@ -1,32 +1,39 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_core::execution::{ExecutionContext, OwnedChild};
+use codingbuddy_core::execution::{AsyncChild, ExecutionContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+type Pending = Arc<Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>>;
 
 /// A single LSP client connected to one server process over stdio.
+///
+/// A reader task routes each response to the request that is waiting for
+/// it (by JSON-RPC id), so several requests can be in flight at once and
+/// none of them holds a thread while the server works.
 pub struct LspClient {
-    process: Mutex<OwnedChild>,
+    process: Mutex<AsyncChild>,
     context: Mutex<ExecutionContext>,
-    responses: Mutex<mpsc::Receiver<Value>>,
-    reader: Option<std::thread::JoinHandle<()>>,
-    writer: Option<std::thread::JoinHandle<()>>,
-    writes: Option<mpsc::SyncSender<QueuedWrite>>,
+    pending: Pending,
+    writes: tokio::sync::mpsc::Sender<Vec<u8>>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
     next_id: AtomicI64,
     server_command: String,
     workspace_root: PathBuf,
-    initialized: Mutex<bool>,
+    initialized: tokio::sync::Mutex<bool>,
 }
 
-struct QueuedWrite {
-    message: Value,
-    done: mpsc::SyncSender<std::io::Result<()>>,
-}
+/// Largest JSON-RPC body sent or accepted.
+const FRAME_LIMIT: usize = 16 * 1024 * 1024;
+/// Longest a single request may take.
+const REQUEST_LIMIT: Duration = Duration::from_secs(30);
+
 /// An LSP location (file + line + column).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspLocation {
@@ -63,8 +70,11 @@ impl LspClient {
         let _ = (server_command, server_args, workspace_root);
         anyhow::bail!("Language-server startup requires a policy-prepared owned process")
     }
+
+    /// Connect to a server the caller started (with piped stdin/stdout).
+    /// Must be called inside the async runtime.
     pub fn from_owned(
-        mut child: OwnedChild,
+        mut child: AsyncChild,
         server_command: &str,
         workspace_root: &Path,
         context: ExecutionContext,
@@ -73,51 +83,59 @@ impl LspClient {
             .stdin
             .take()
             .ok_or_else(|| anyhow!("Missing language-server stdin"))?;
-        let (writes, requests) = mpsc::sync_channel::<QueuedWrite>(8);
-        let writer = std::thread::spawn(move || {
-            while let Ok(request) = requests.recv() {
-                let result = (|| -> std::io::Result<()> {
-                    let body = serde_json::to_vec(&request.message)?;
-                    if body.len() > 16 * 1024 * 1024 {
-                        return Err(std::io::Error::other("Language request limit exceeded"));
-                    }
-                    write!(input, "Content-Length: {}\r\n\r\n", body.len())?;
-                    input.write_all(&body)?;
-                    input.flush()
-                })();
-                let failed = result.is_err();
-                let _ = request.done.try_send(result);
-                if failed {
-                    break;
-                }
-            }
-        });
         let output = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Missing language-server stdout"))?;
-        let (tx, rx) = mpsc::sync_channel(64);
-        let reader = std::thread::spawn(move || {
-            let mut reader = BufReader::new(output);
-            while let Ok(Some(frame)) = read_frame(&mut reader) {
-                if tx.try_send(frame).is_err() {
+        let (writes, mut queued) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let writer = tokio::spawn(async move {
+            while let Some(frame) = queued.recv().await {
+                if input.write_all(&frame).await.is_err() || input.flush().await.is_err() {
                     break;
                 }
             }
         });
+        let pending: Pending = Arc::default();
+        let routes = pending.clone();
+        let reader = tokio::spawn(async move {
+            let mut output = tokio::io::BufReader::new(output);
+            while let Ok(Some(frame)) = read_frame_async(&mut output).await {
+                // Responses carry an id and no method; requests and
+                // notifications from the server are not answered.
+                if frame.get("method").is_some() {
+                    continue;
+                }
+                let Some(id) = frame.get("id").and_then(Value::as_i64) else {
+                    continue;
+                };
+                let waiter = routes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(frame);
+                }
+            }
+            // Wake every waiting request: the server is gone.
+            routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        });
         Ok(Self {
             process: Mutex::new(child),
             context: Mutex::new(context),
-            responses: Mutex::new(rx),
-            reader: Some(reader),
-            writes: Some(writes),
-            writer: Some(writer),
+            pending,
+            writes,
+            reader,
+            writer,
             next_id: AtomicI64::new(1),
             server_command: server_command.into(),
             workspace_root: workspace_root.into(),
-            initialized: Mutex::new(false),
+            initialized: tokio::sync::Mutex::new(false),
         })
     }
+
     pub fn set_context(&self, context: &ExecutionContext) -> Result<()> {
         *self
             .context
@@ -127,11 +145,8 @@ impl LspClient {
     }
 
     /// Send the initialize request and initialized notification.
-    pub fn initialize(&self) -> Result<Value> {
-        let mut guard = self
-            .initialized
-            .lock()
-            .map_err(|_| anyhow!("lock poisoned"))?;
+    pub async fn initialize(&self) -> Result<Value> {
+        let mut guard = self.initialized.lock().await;
         if *guard {
             return Ok(json!({"already_initialized": true}));
         }
@@ -166,17 +181,17 @@ impl LspClient {
             },
         });
 
-        let result = self.send_request("initialize", params)?;
+        let result = self.send_request("initialize", params).await?;
 
         // Send initialized notification (no id, no response expected)
-        self.send_notification("initialized", json!({}))?;
+        self.send_notification("initialized", json!({})).await?;
 
         *guard = true;
         Ok(result)
     }
 
     /// Notify the server that a file was opened.
-    pub fn did_open(&self, file_path: &Path, language_id: &str, text: &str) -> Result<()> {
+    pub async fn did_open(&self, file_path: &Path, language_id: &str, text: &str) -> Result<()> {
         let uri = path_to_uri(file_path);
         self.send_notification(
             "textDocument/didOpen",
@@ -189,10 +204,11 @@ impl LspClient {
                 }
             }),
         )
+        .await
     }
 
     /// Notify the server that a file was changed.
-    pub fn did_change(&self, file_path: &Path, version: i32, text: &str) -> Result<()> {
+    pub async fn did_change(&self, file_path: &Path, version: i32, text: &str) -> Result<()> {
         let uri = path_to_uri(file_path);
         self.send_notification(
             "textDocument/didChange",
@@ -201,12 +217,19 @@ impl LspClient {
                 "contentChanges": [{ "text": text }],
             }),
         )
+        .await
     }
 
     /// Request hover information at a position.
-    pub fn hover(&self, file_path: &Path, line: u32, col: u32) -> Result<Option<HoverResult>> {
-        let result =
-            self.send_request("textDocument/hover", position_params(file_path, line, col))?;
+    pub async fn hover(
+        &self,
+        file_path: &Path,
+        line: u32,
+        col: u32,
+    ) -> Result<Option<HoverResult>> {
+        let result = self
+            .send_request("textDocument/hover", position_params(file_path, line, col))
+            .await?;
 
         if result.is_null() {
             return Ok(None);
@@ -220,45 +243,65 @@ impl LspClient {
     }
 
     /// Request goto-definition at a position.
-    pub fn definition(&self, file_path: &Path, line: u32, col: u32) -> Result<Vec<LspLocation>> {
-        let result = self.send_request(
-            "textDocument/definition",
-            position_params(file_path, line, col),
-        )?;
+    pub async fn definition(
+        &self,
+        file_path: &Path,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<LspLocation>> {
+        let result = self
+            .send_request(
+                "textDocument/definition",
+                position_params(file_path, line, col),
+            )
+            .await?;
         Ok(parse_locations(&result))
     }
 
     /// Request all references at a position.
-    pub fn references(&self, file_path: &Path, line: u32, col: u32) -> Result<Vec<LspLocation>> {
+    pub async fn references(
+        &self,
+        file_path: &Path,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<LspLocation>> {
         let uri = path_to_uri(file_path);
-        let result = self.send_request(
-            "textDocument/references",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line.saturating_sub(1), "character": col.saturating_sub(1) },
-                "context": { "includeDeclaration": true },
-            }),
-        )?;
+        let result = self
+            .send_request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line.saturating_sub(1), "character": col.saturating_sub(1) },
+                    "context": { "includeDeclaration": true },
+                }),
+            )
+            .await?;
         Ok(parse_locations(&result))
     }
 
     /// Request document symbols.
-    pub fn document_symbols(&self, file_path: &Path) -> Result<Vec<DocumentSymbol>> {
+    pub async fn document_symbols(&self, file_path: &Path) -> Result<Vec<DocumentSymbol>> {
         let uri = path_to_uri(file_path);
-        let result = self.send_request(
-            "textDocument/documentSymbol",
-            json!({ "textDocument": { "uri": uri } }),
-        )?;
+        let result = self
+            .send_request(
+                "textDocument/documentSymbol",
+                json!({ "textDocument": { "uri": uri } }),
+            )
+            .await?;
         Ok(parse_symbols(&result))
     }
 
-    /// Send a shutdown request then exit notification.
+    /// Stop the server process (and everything it started).
     pub fn shutdown(&self) -> Result<()> {
-        if let Ok(mut proc) = self.process.lock() {
-            proc.terminate();
-            let _ = proc.wait();
-        }
+        self.terminate();
         Ok(())
+    }
+
+    fn terminate(&self) {
+        self.process
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .terminate();
     }
 
     /// Check if the server process is still alive.
@@ -276,140 +319,165 @@ impl LspClient {
 
     // ── Internal JSON-RPC ──
 
-    /// Send a request and read the response while holding the process lock,
-    /// preventing interleaved writes from concurrent callers.
-    fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+    /// The context for one request: the caller's, capped at
+    /// [`REQUEST_LIMIT`].
+    fn request_context(&self) -> Result<ExecutionContext> {
+        let mut context = self
+            .context
+            .lock()
+            .map_err(|_| anyhow!("Language context unavailable"))?
+            .clone();
+        let limit = Instant::now() + REQUEST_LIMIT;
+        context.deadline = Some(
+            context
+                .deadline
+                .map_or(limit, |deadline| deadline.min(limit)),
+        );
+        Ok(context)
+    }
+
+    /// Wait for `work` unless the request is cancelled or runs past its
+    /// deadline, in which case the server is stopped: a server that ignores
+    /// a request must not keep holding the language slot.
+    async fn bounded<T>(
+        &self,
+        context: &ExecutionContext,
+        work: impl std::future::Future<Output = Result<T>>,
+        on_abandon: impl FnOnce(),
+    ) -> Result<T> {
+        context.check()?;
+        let deadline = codingbuddy_core::execution::deadline_for(context, REQUEST_LIMIT);
+        let outcome = tokio::select! {
+            biased;
+            () = context.cancellation.cancelled() => Err(anyhow!("Execution cancelled")),
+            () = tokio::time::sleep_until(deadline) => Err(anyhow!("Execution deadline exceeded")),
+            result = work => return result,
+        };
+        on_abandon();
+        self.terminate();
+        outcome
+    }
+
+    async fn write(&self, message: &Value) -> Result<()> {
+        let body = serde_json::to_vec(message)?;
+        anyhow::ensure!(body.len() <= FRAME_LIMIT, "Language request limit exceeded");
+        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        frame.extend_from_slice(&body);
+        self.writes
+            .send(frame)
+            .await
+            .map_err(|_| anyhow!("Language input closed"))
+    }
+
+    async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let req = json!({
+        let request = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params,
         });
-
-        let mut proc = self.process.lock().map_err(|_| anyhow!("lock poisoned"))?;
-
-        let mut context = self
-            .context
+        let context = self.request_context()?;
+        let (respond, response) = tokio::sync::oneshot::channel();
+        self.pending
             .lock()
-            .map_err(|_| anyhow!("Language context unavailable"))?
-            .clone();
-        let limit = Instant::now() + Duration::from_secs(30);
-        context.deadline = Some(
-            context
-                .deadline
-                .map_or(limit, |deadline| deadline.min(limit)),
-        );
-        self.write_queued(&mut proc, req, &context)?;
-        let responses = self
-            .responses
-            .lock()
-            .map_err(|_| anyhow!("Language response queue unavailable"))?;
-        loop {
-            if let Err(error) = context.check() {
-                let cleanup = ExecutionContext {
-                    deadline: Some(Instant::now() + Duration::from_millis(100)),
-                    ..Default::default()
-                };
-                let _ = self.write_queued(
-                    &mut proc,
-                    json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}}),
-                    &cleanup,
-                );
-                proc.terminate();
-                let _ = proc.wait();
-                return Err(error);
-            }
-            match responses.recv_timeout(Duration::from_millis(20)) {
-                Ok(frame) if frame["id"].as_i64() == Some(id) => {
-                    anyhow::ensure!(
-                        frame.get("error").is_none(),
-                        "Language server returned an error"
-                    );
-                    return frame
-                        .get("result")
-                        .cloned()
-                        .ok_or_else(|| anyhow!("Language result missing"));
+            .map_err(|_| anyhow!("Language response routes unavailable"))?
+            .insert(id, respond);
+        let exchange = async {
+            self.write(&request).await?;
+            let frame = response
+                .await
+                .map_err(|_| anyhow!("Language server closed before response"))?;
+            anyhow::ensure!(
+                frame.get("error").is_none(),
+                "Language server returned an error"
+            );
+            frame
+                .get("result")
+                .cloned()
+                .ok_or_else(|| anyhow!("Language result missing"))
+        };
+        let result = self
+            .bounded(&context, exchange, || {
+                // Best effort: tell the server before stopping it.
+                let cancel = json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}});
+                if let Ok(body) = serde_json::to_vec(&cancel) {
+                    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+                    frame.extend_from_slice(&body);
+                    let _ = self.writes.try_send(frame);
                 }
-                Ok(_) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => {
-                    proc.terminate();
-                    anyhow::bail!("Language server closed before response");
-                }
-            }
+            })
+            .await;
+        if let Ok(mut routes) = self.pending.lock() {
+            routes.remove(&id);
         }
+        result
     }
 
-    fn send_notification(&self, method: &str, params: Value) -> Result<()> {
-        let msg = json!({
+    async fn send_notification(&self, method: &str, params: Value) -> Result<()> {
+        let message = json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
         });
-        let mut proc = self.process.lock().map_err(|_| anyhow!("lock poisoned"))?;
-        let mut context = self
-            .context
-            .lock()
-            .map_err(|_| anyhow!("Language context unavailable"))?
-            .clone();
-        let limit = Instant::now() + Duration::from_secs(30);
-        context.deadline = Some(
-            context
-                .deadline
-                .map_or(limit, |deadline| deadline.min(limit)),
-        );
-        self.write_queued(&mut proc, msg, &context)
-    }
-    fn write_queued(
-        &self,
-        proc: &mut OwnedChild,
-        message: Value,
-        context: &ExecutionContext,
-    ) -> Result<()> {
-        context.check()?;
-        let (done, ack) = mpsc::sync_channel(1);
-        self.writes
-            .as_ref()
-            .ok_or_else(|| anyhow!("Language input closed"))?
-            .try_send(QueuedWrite { message, done })
-            .map_err(|_| anyhow!("Language input queue unavailable"))?;
-        loop {
-            if let Err(error) = context.check() {
-                proc.terminate();
-                let _ = proc.wait();
-                return Err(error);
-            }
-            match ack.recv_timeout(Duration::from_millis(20)) {
-                Ok(result) => return result.map_err(Into::into),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => anyhow::bail!("Language input closed"),
-            }
-        }
+        let context = self.request_context()?;
+        self.bounded(&context, self.write(&message), || {}).await
     }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.shutdown();
-        self.writes.take();
-        if let Some(writer) = self.writer.take() {
-            let _ = writer.join();
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        self.terminate();
+        self.reader.abort();
+        self.writer.abort();
     }
 }
 
-// ── JSON-RPC I/O (free functions operating on locked Child) ──
-
-fn read_frame(reader: &mut impl BufRead) -> Result<Option<Value>> {
+/// Read one `Content-Length` framed JSON-RPC message. `Ok(None)` at EOF.
+async fn read_frame_async(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> Result<Option<Value>> {
     let mut content_length = None;
     let mut headers = 0usize;
     loop {
         let mut line = String::new();
-        let size = std::io::Read::take(&mut *reader, 65537).read_line(&mut line)?;
+        let size = (&mut *reader).take(65537).read_line(&mut line).await?;
+        if size == 0 {
+            return Ok(None);
+        }
+        headers += size;
+        anyhow::ensure!(headers <= 65536, "Language frame headers exceeded limit");
+        #[cfg(test)]
+        if line.trim() == "running 1 test" || (line.trim().is_empty() && content_length.is_none()) {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("Content-Length")
+        {
+            anyhow::ensure!(content_length.is_none(), "Duplicate language frame length");
+            content_length = Some(value.trim().parse::<usize>()?);
+        }
+    }
+    let size = content_length.ok_or_else(|| anyhow!("Missing language frame length"))?;
+    anyhow::ensure!(size <= FRAME_LIMIT, "Language frame limit exceeded");
+    let mut bytes = vec![0; size];
+    reader.read_exact(&mut bytes).await?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+// ── Test fixture I/O ──
+
+#[cfg(test)]
+fn read_frame(reader: &mut impl std::io::BufRead) -> Result<Option<Value>> {
+    let mut content_length = None;
+    let mut headers = 0usize;
+    loop {
+        let mut line = String::new();
+        let size =
+            std::io::BufRead::read_line(&mut std::io::Read::take(&mut *reader, 65537), &mut line)?;
         if size == 0 {
             return Ok(None);
         }
@@ -739,12 +807,13 @@ mod tests {
 #[cfg(test)]
 mod delivery_three {
     use super::*;
+    use std::io::Write;
     #[test]
     fn server_fixture() {
         if std::env::var_os("CODINGBUDDY_LSP_FIXTURE").is_none() {
             return;
         }
-        let mut input = BufReader::new(std::io::stdin());
+        let mut input = std::io::BufReader::new(std::io::stdin());
         while let Ok(Some(request)) = read_frame(&mut input) {
             if request.get("id").is_none() {
                 continue;
@@ -761,6 +830,9 @@ mod delivery_three {
     }
     #[test]
     fn stalled_language_read_is_cancelled_and_owned_process_is_reaped() -> Result<()> {
+        codingbuddy_core::runtime::block_on(stalled_read())
+    }
+    async fn stalled_read() -> Result<()> {
         let workspace = tempfile::tempdir()?;
         let token = codingbuddy_core::CancellationToken::new();
         let context = ExecutionContext {
@@ -768,7 +840,7 @@ mod delivery_three {
             deadline: Some(Instant::now() + Duration::from_secs(3)),
             ..Default::default()
         };
-        let mut command = std::process::Command::new(std::env::current_exe()?);
+        let mut command = tokio::process::Command::new(std::env::current_exe()?);
         command
             .args([
                 "--exact",
@@ -780,9 +852,9 @@ mod delivery_three {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        let child = OwnedChild::spawn(&mut command)?;
+        let child = AsyncChild::spawn(&mut command)?;
         let client = LspClient::from_owned(child, "fixture", workspace.path(), context)?;
-        client.initialize()?;
+        client.initialize().await?;
         let cancel = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             token.cancel();
@@ -791,10 +863,16 @@ mod delivery_three {
         assert!(
             client
                 .hover(&workspace.path().join("file.rs"), 1, 1)
+                .await
                 .is_err()
         );
         cancel.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
+        // SIGKILL delivery and reaping are asynchronous.
+        let reaped = Instant::now() + Duration::from_secs(2);
+        while client.is_alive() && Instant::now() < reaped {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!client.is_alive());
         Ok(())
     }

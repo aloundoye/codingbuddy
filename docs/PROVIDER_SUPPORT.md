@@ -35,7 +35,7 @@ Set the protocol on the existing OpenAI-compatible profile in user settings:
 }
 ```
 
-Keep credentials in the configured environment variable or keyring. Explicit `llm.endpoint` overrides take precedence. The default Responses endpoint appends `/v1/responses` once. Gemini sends its API key in `x-goog-api-key`, including for SSE streaming.
+Keep credentials in the configured environment variable or in `~/.codingbuddy/credentials.json` (where `/connect` saves them; `GEMINI_API_KEY` also works for Google). Explicit `llm.endpoint` overrides take precedence. The default Responses endpoint appends `/v1/responses` once. Gemini sends its API key in `x-goog-api-key`, including for SSE streaming.
 
 Responses sends `store: false`, the complete eligible history, and requests encrypted reasoning content. It keeps output item IDs, provider call IDs, and durable internal invocation IDs distinct. Private continuation is stored in Order 1's private SQLite tables and replays only on the same route. Portable forks and ordinary exports exclude it. Only a completed response with finished, validated calls can reach tool dispatch; item completion and `[DONE]` are insufficient.
 
@@ -121,7 +121,7 @@ Put deployment settings in user settings under `llm.providers`. Keep model profi
 }
 ```
 
-- **Azure** accepts `api-key` through the profile's usual environment or keyring credential source, which defaults to `AZURE_OPENAI_API_KEY`. For `entra`, use Azure managed identity or the service principal environment variables `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`. Set `api_version` to `2024-10-21` for the dated deployment path.
+- **Azure** accepts `api-key` through the profile's usual environment or saved-credential source, which defaults to `AZURE_OPENAI_API_KEY`. For `entra`, use Azure managed identity or the service principal environment variables `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`. Set `api_version` to `2024-10-21` for the dated deployment path.
 - **Vertex** uses standard Google ADC with the Cloud Platform scope. Set the location to your region or `global`. The route supports Gemini publisher models. ADC sources that launch executables are disabled.
 - **Bedrock** uses the AWS SDK credential chain with explicit region and optional profile. It supports session credentials and AWS SSO. Use a model ID, inference profile ID, or ARN accepted by Converse. AWS credential processes are disabled.
 - Use a distinct, stable `account_id` for each rotating cloud principal. Update it when the underlying identity changes, including when reauthenticating through an unchanged SDK profile. Cloud route fingerprints include deployment, credential strategy, and locally available source identifiers. A portable fork is required to transfer history to a different route. Existing non-cloud profiles retain their existing route format.

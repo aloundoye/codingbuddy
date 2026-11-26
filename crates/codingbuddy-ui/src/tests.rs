@@ -1796,7 +1796,7 @@ fn streamed_preamble_appears_before_approval_and_tool_and_survives_a_reset() {
     let mut pending_approval = None;
     let mut info_line = String::new();
     let mut is_processing = true;
-    let (response_tx, _) = mpsc::channel();
+    let (response_tx, _) = tokio::sync::oneshot::channel();
     {
         let mut state = StreamRuntimeState {
             shell: &mut shell,

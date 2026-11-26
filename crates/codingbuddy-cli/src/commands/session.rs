@@ -24,6 +24,18 @@ pub enum SessionCmd {
     },
     /// List all sessions
     List,
+    /// Search past prompts and answers across sessions
+    Search {
+        /// Words that must all appear in a message (case-insensitive)
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Maximum number of matches to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// How many recent sessions to search
+        #[arg(long, default_value_t = 200)]
+        sessions: usize,
+    },
     /// Show details of a specific session
     Show {
         /// Session ID to show (defaults to latest)
@@ -83,8 +95,10 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
             retry,
         } => {
             if retry {
-                let (id, result) = codingbuddy_agent::AgentEngine::new(workspace)?
-                    .retry_interrupted_tool(session_id, invocation_id)?;
+                let engine = codingbuddy_agent::AgentEngine::new(workspace)?;
+                let (id, result) = codingbuddy_core::runtime::block_on(
+                    engine.retry_interrupted_tool(session_id, invocation_id),
+                )?;
                 println!("Retry invocation {id}. Success: {}", result.success);
                 return Ok(());
             }
@@ -120,22 +134,59 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
             }
         }
         SessionCmd::List => {
-            let sessions = store.list_sessions()?;
+            let sessions = store.session_summaries(50)?;
+            if _json {
+                println!("{}", serde_json::to_string(&sessions)?);
+                return Ok(());
+            }
             if sessions.is_empty() {
                 println!("No sessions found.");
                 return Ok(());
             }
-
-            println!("{:<40} | {:<20} | WORKSPACE", "SESSION ID", "STATUS");
-            println!("{:-<40}-+-{:-<20}-+-{:-<40}", "", "", "");
-            for s in sessions {
+            println!(
+                "{:<36}  {:<16}  {:<18}  TITLE",
+                "SESSION ID", "LAST ACTIVE", "STATUS"
+            );
+            for summary in sessions {
+                let when = chrono::DateTime::parse_from_rfc3339(&summary.updated_at)
+                    .map(|at| {
+                        at.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "{:<40} | {:<20} | {}",
-                    s.session_id.to_string(),
-                    format!("{:?}", s.status),
-                    s.workspace_root
+                    "{:<36}  {:<16}  {:<18}  {}",
+                    summary.session.session_id,
+                    when,
+                    format!("{:?}", summary.session.status),
+                    summary.title
                 );
             }
+        }
+        SessionCmd::Search {
+            query,
+            limit,
+            sessions,
+        } => {
+            let hits = store.search_sessions(&query.join(" "), sessions, limit)?;
+            if _json {
+                println!("{}", serde_json::to_string(&hits)?);
+                return Ok(());
+            }
+            if hits.is_empty() {
+                println!("No matches.");
+                return Ok(());
+            }
+            let mut last = None;
+            for hit in hits {
+                if last != Some(hit.session_id) {
+                    println!("\n{}  {}", hit.session_id, hit.title);
+                    last = Some(hit.session_id);
+                }
+                println!("  {:<9} {}", format!("{}:", hit.role), hit.snippet);
+            }
+            println!("\nResume with: codingbuddy --resume <session id>");
         }
         SessionCmd::Show { id } => {
             let session = match id {

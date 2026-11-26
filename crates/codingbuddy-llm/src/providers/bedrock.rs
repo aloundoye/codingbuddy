@@ -8,7 +8,7 @@ use codingbuddy_core::{
     TokenUsage, ToolChoice, TransportPart,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::Read};
+use std::collections::BTreeMap;
 
 const PROTOCOL: ChatProtocol = ChatProtocol::BedrockConverse;
 
@@ -141,7 +141,7 @@ pub(crate) fn encode(req: &ChatRequest) -> Result<Value> {
             };
             last["content"]
                 .as_array_mut()
-                .unwrap()
+                .ok_or_else(|| failure(FailureKind::UnsupportedFeature))?
                 .push(json!({"image":{
                     "format":format,"source":{"bytes":image.base64_data}
                 }}));
@@ -270,12 +270,14 @@ struct Block {
     complete: bool,
 }
 
-fn frame(input: &mut dyn Read, remaining: &mut usize) -> Result<Option<(String, Value)>> {
+async fn frame(
+    input: &mut crate::chat_transport::ByteStream<'_>,
+    remaining: &mut usize,
+) -> Result<Option<(String, Value)>> {
     let mut size = [0; 4];
-    if input.read(&mut size[..1])? == 0 {
+    if !input.read_exact(&mut size).await? {
         return Ok(None);
     }
-    input.read_exact(&mut size[1..])?;
     let length = u32::from_be_bytes(size) as usize;
     ensure!(
         (16..=16 * 1024 * 1024).contains(&length),
@@ -286,7 +288,7 @@ fn frame(input: &mut dyn Read, remaining: &mut usize) -> Result<Option<(String, 
         .context("Bedrock stream exceeds size limit")?;
     let mut bytes = vec![0; length];
     bytes[..4].copy_from_slice(&size);
-    input.read_exact(&mut bytes[4..])?;
+    input.read_exact(&mut bytes[4..]).await?;
     let message = aws_smithy_eventstream::frame::read_message_from(bytes.as_slice())
         .map_err(|_| failure(FailureKind::MalformedResponse))?;
     let header = |name| {
@@ -309,13 +311,16 @@ fn frame(input: &mut dyn Read, remaining: &mut usize) -> Result<Option<(String, 
     )))
 }
 
-pub(crate) fn stream(input: &mut dyn Read, cb: StreamCallback) -> Result<LlmResponse> {
+pub(crate) async fn stream(
+    input: &mut crate::chat_transport::ByteStream<'_>,
+    cb: StreamCallback,
+) -> Result<LlmResponse> {
     let mut blocks = BTreeMap::<u64, Block>::new();
     let mut started = false;
     let mut stopped = Value::Null;
     let mut usage = Value::Null;
     let mut remaining = 32 * 1024 * 1024;
-    while let Some((event, value)) = frame(input, &mut remaining).map_err(|error| {
+    while let Some((event, value)) = frame(input, &mut remaining).await.map_err(|error| {
         if error
             .downcast_ref::<std::io::Error>()
             .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
@@ -457,16 +462,13 @@ fn append_part(value: &mut Value, key: &str, fragment: &str) -> Result<()> {
         *value = json!({});
     }
     ensure!(
-        value.is_object()
-            && value
-                .as_object()
-                .unwrap()
-                .keys()
-                .all(|existing| existing == key
-                    || matches!(
-                        (existing.as_str(), key),
-                        ("text", "signature") | ("signature", "text")
-                    )),
+        value
+            .as_object()
+            .is_some_and(|object| object.keys().all(|existing| existing == key
+                || matches!(
+                    (existing.as_str(), key),
+                    ("text", "signature") | ("signature", "text")
+                ))),
         failure(FailureKind::MalformedResponse)
     );
     let text = &mut value[key];

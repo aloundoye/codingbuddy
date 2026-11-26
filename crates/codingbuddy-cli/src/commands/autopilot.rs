@@ -343,13 +343,13 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
             last_error.as_deref(),
         );
 
-        match engine.chat_with_options(
+        match codingbuddy_core::runtime::block_on(engine.chat_with_options(
             &iteration_prompt,
             codingbuddy_agent::ChatOptions {
                 tools: args.tools,
                 ..Default::default()
             },
-        ) {
+        )) {
             Ok(output) => {
                 completed_iterations += 1;
                 consecutive_failures = 0;

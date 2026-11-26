@@ -11,8 +11,11 @@ use std::sync::LazyLock;
 
 const MAX_RPC_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
-static HEADER_JSON: LazyLock<tiny_http::Header> =
-    LazyLock::new(|| "Content-Type: application/json".parse().unwrap());
+static HEADER_JSON: LazyLock<tiny_http::Header> = LazyLock::new(|| {
+    "Content-Type: application/json"
+        .parse()
+        .expect("constant Content-Type header is valid")
+});
 use crate::{Cli, CompletionsArgs, NativeHostArgs, ServeArgs};
 
 const MAX_NATIVE_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -24,6 +27,13 @@ pub(crate) fn run_completions(args: CompletionsArgs) -> Result<()> {
 }
 
 pub(crate) fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
+    if args.print_schema {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codingbuddy_jsonrpc::protocol::protocol_schema())?
+        );
+        return Ok(());
+    }
     match args.transport.as_str() {
         "stdio" => {
             if json_mode {
@@ -144,10 +154,10 @@ fn run_http_server(
                 );
             }
             ("GET", "/") if dist_dir.is_some() => {
-                serve_web_index(request, dist_dir.as_deref().unwrap())
+                serve_web_index(request, dist_dir.as_deref().unwrap_or(Path::new("")))
             }
             ("GET", path) if dist_dir.is_some() && path.starts_with("/assets/") => {
-                serve_web_asset(request, dist_dir.as_deref().unwrap(), path)
+                serve_web_asset(request, dist_dir.as_deref().unwrap_or(Path::new("")), path)
             }
             _ => {
                 let _ = request.respond(
@@ -230,7 +240,7 @@ fn serve_web_index(request: tiny_http::Request, dist: &Path) {
                 tiny_http::Response::from_string(html).with_header(
                     "Content-Type: text/html; charset=utf-8"
                         .parse::<tiny_http::Header>()
-                        .unwrap(),
+                        .expect("constant Content-Type header is valid"),
                 ),
             );
         }
@@ -263,7 +273,7 @@ fn serve_web_asset(request: tiny_http::Request, dist: &Path, path: &str) {
                 tiny_http::Response::from_data(data).with_header(
                     format!("Content-Type: {content_type}")
                         .parse::<tiny_http::Header>()
-                        .unwrap(),
+                        .expect("content types come from a fixed ASCII table"),
                 ),
             );
         }

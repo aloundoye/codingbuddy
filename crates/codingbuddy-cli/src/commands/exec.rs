@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codingbuddy_core::ToolHostBlockingExt;
 use codingbuddy_core::{
     AppConfig, ApprovedToolCall, EventKind, ToolCall, ToolHost, ToolPermission,
 };
@@ -49,7 +50,7 @@ pub(crate) fn run_exec(cwd: &Path, args: ExecArgs, json_mode: bool) -> Result<()
         }
         ToolPermission::Allow => {}
     }
-    let result = tool_host.execute(ApprovedToolCall {
+    let result = tool_host.execute_blocking(ApprovedToolCall {
         invocation_id: proposal.invocation_id,
         call: proposal.call,
     });

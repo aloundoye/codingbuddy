@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
@@ -882,15 +883,24 @@ fn delivery_three_background_private_bootstrap_survives_parent_exit() {
     );
     let mut pending = vec![ws.join(".codingbuddy")];
     while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path).unwrap();
+        // The worker may still be removing temporary files (SQLite journals,
+        // locks) as it exits; a file that is already gone holds nothing.
+        let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(error) if gone(&error) => continue,
+            other => other.unwrap(),
+        };
         if metadata.is_dir() {
-            pending.extend(
-                fs::read_dir(&path)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path()),
-            );
+            let entries = match fs::read_dir(&path) {
+                Err(error) if gone(&error) => continue,
+                other => other.unwrap(),
+            };
+            pending.extend(entries.map(|entry| entry.unwrap().path()));
         } else if metadata.is_file() {
-            let bytes = fs::read(&path).unwrap();
+            let bytes = match fs::read(&path) {
+                Err(error) if gone(&error) => continue,
+                other => other.unwrap(),
+            };
             let text = String::from_utf8_lossy(&bytes);
             assert!(
                 !text.contains("synthetic-provider-key")

@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "process", "io-util", "net", "time", "sync", "macros"] }
 anyhow.workspace = true
+tracing.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -39,3 +42,6 @@ tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[lints]
+workspace = true

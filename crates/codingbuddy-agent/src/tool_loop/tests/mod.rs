@@ -33,35 +33,36 @@ impl ScriptedLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for ScriptedLlm {
-    fn complete(&self, _req: &codingbuddy_core::LlmRequest) -> Result<LlmResponse> {
+    async fn complete(&self, _req: &codingbuddy_core::LlmRequest) -> Result<LlmResponse> {
         unimplemented!()
     }
-    fn complete_streaming(
+    async fn complete_streaming(
         &self,
         _req: &codingbuddy_core::LlmRequest,
         _cb: StreamCallback,
     ) -> Result<LlmResponse> {
         unimplemented!()
     }
-    fn complete_chat(&self, _req: &ChatRequest) -> Result<LlmResponse> {
+    async fn complete_chat(&self, _req: &ChatRequest) -> Result<LlmResponse> {
         self.responses
             .lock()
             .unwrap()
             .pop_front()
             .ok_or_else(|| anyhow!("no more scripted responses"))
     }
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         _cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.complete_chat(req)
+        self.complete_chat(req).await
     }
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+    async fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
         unimplemented!()
     }
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         _req: &codingbuddy_core::FimRequest,
         _cb: StreamCallback,
@@ -94,6 +95,7 @@ impl MockToolHost {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolHost for MockToolHost {
     fn propose(&self, call: ToolCall) -> ToolProposal {
         ToolProposal {
@@ -102,7 +104,7 @@ impl ToolHost for MockToolHost {
             approved: self.auto_approve,
         }
     }
-    fn execute(&self, _approved: ApprovedToolCall) -> ToolResult {
+    async fn execute(&self, _approved: ApprovedToolCall) -> ToolResult {
         self.execute_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.results

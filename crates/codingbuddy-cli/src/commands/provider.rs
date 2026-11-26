@@ -42,7 +42,7 @@ pub fn run(workspace: &Path, command: ProviderCommand, json_mode: bool) -> Resul
         ),
         ProviderCommand::Check { provider, model } => {
             select_route(&mut config.llm, provider, model)?;
-            codingbuddy_llm::probe_provider(&config.llm)?;
+            codingbuddy_core::runtime::block_on(codingbuddy_llm::probe_provider(&config.llm))?;
             certification::record_connectivity(&config.llm, workspace, &key)?;
             certification::live_status(
                 &config.llm,

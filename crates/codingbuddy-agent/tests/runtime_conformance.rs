@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};

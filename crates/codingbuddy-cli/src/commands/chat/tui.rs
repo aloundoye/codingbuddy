@@ -66,7 +66,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     ));
 
     // Create the channel for TUI stream events.
-    let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
+    let (tx, rx) = codingbuddy_ui::stream_channel();
 
     let menus = Arc::new(connections::Menus {
         cwd: cwd.to_path_buf(),
@@ -84,8 +84,10 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     // Set approval handler that routes through the TUI channel.
     {
         let approval_tx = tx.clone();
-        engine.set_approval_handler(Box::new(move |call| {
-            let (resp_tx, resp_rx) = mpsc::channel();
+        let reload_approvals = engine.approval_reloader();
+        let reload_approvals = Arc::new(reload_approvals);
+        engine.set_async_approval_handler(Arc::new(move |call| {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             let compact_args = serde_json::to_string(&call.args)
                 .unwrap_or_else(|_| "<unserializable>".to_string());
             let _ = approval_tx.send(TuiStreamEvent::ApprovalNeeded {
@@ -93,10 +95,18 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 args_summary: compact_args,
                 response_tx: resp_tx,
             });
-            // Block agent thread waiting for TUI user response.
-            resp_rx
-                .recv()
-                .map_err(|e| anyhow!("approval channel closed: {e}"))
+            let reload_approvals = Arc::clone(&reload_approvals);
+            Box::pin(async move {
+                // The turn awaits the answer; no thread waits for it.
+                let approved = resp_rx
+                    .await
+                    .map_err(|e| anyhow!("approval channel closed: {e}"))?;
+                if approved {
+                    // "Always" was saved before the answer was sent.
+                    reload_approvals();
+                }
+                Ok(approved)
+            })
         }));
     }
 
@@ -123,13 +133,35 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     let watch_digest_for_closure = Arc::clone(&last_watch_digest);
     let active_session_for_closure = Arc::clone(&active_session_id);
 
+    // Library notices (ignored project settings, failed hooks) appear as
+    // system lines in the conversation, once each, instead of being printed
+    // over the screen. Claude Code and opencode surface them in their UI too.
+    let _notice_sink = {
+        let tx_library_notices = tx.clone();
+        let shown = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
+        codingbuddy_core::logging::set_notice_sink(move |line| {
+            let first_time = shown
+                .lock()
+                .map(|mut shown| shown.insert(line.to_string()))
+                .unwrap_or(true);
+            if first_time {
+                let _ = tx_library_notices.send(TuiStreamEvent::SystemNotice {
+                    line: line.to_string(),
+                    error: false,
+                });
+            }
+        })
+    };
+
     {
         let tx_notices = tx.clone();
         let cwd_for_notices = cwd.to_path_buf();
         let active_session_for_notices = Arc::clone(&active_session_id);
-        thread::spawn(move || {
+        codingbuddy_core::runtime::runtime().spawn(async move {
             let mut watermarks = HashMap::<Uuid, u64>::new();
+            let mut poll = tokio::time::interval(Duration::from_millis(400));
             loop {
+                poll.tick().await;
                 let session_override = active_session_for_notices
                     .lock()
                     .map(|guard| *guard)
@@ -151,7 +183,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(400));
             }
         });
     }
@@ -799,7 +830,14 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         }
                         SlashCommand::Rename(name) => {
                             if let Some(n) = name {
-                                format!("Session renamed to: {n}")
+                                let current = active_session_for_closure
+                                    .lock()
+                                    .map(|guard| *guard)
+                                    .unwrap_or(None);
+                                match rename_session(cwd, current, &n) {
+                                    Ok(()) => format!("Session renamed to: {n}"),
+                                    Err(error) => format!("Could not rename session: {error:#}"),
+                                }
                             } else {
                                 "Usage: /rename <name>".to_string()
                             }
@@ -980,7 +1018,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
             }
 
             let llm_config = {
-                let state = connection.lock().unwrap();
+                let state = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !state.ready {
                     let _ = tx.send(TuiStreamEvent::Error(
                         "Connect a provider with /connect.".into(),
@@ -989,7 +1029,10 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 }
                 state.llm.clone()
             };
-            let token = turn_cancellation.lock().unwrap().clone();
+            let token = turn_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             // Agent prompt — expand @file mentions and set stream callback.
             let engine_clone = Arc::clone(&engine);
             let mut prompt = codingbuddy_ui::expand_at_mentions(prompt);
@@ -1099,6 +1142,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 StreamChunk::SecurityWarning { message } => {
                     let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: format!("Security: {message}"), error: true });
                 }
+                StreamChunk::ContextWarning { used_pct, compact_at_pct } => {
+                    let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: format!("Context {used_pct}% full; older messages will be compacted at {compact_at_pct}%. Use /compact to do it now."), error: false });
+                }
                 StreamChunk::Error { message, .. } => {
                     let _ = tx_stream.send(TuiStreamEvent::SystemNotice { line: message, error: true });
                 }
@@ -1149,30 +1195,42 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
 
             let connection_for_turn = Arc::clone(&connection);
             let prompt_repo_root_override = repo_root_override.clone();
-            thread::spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine_clone.chat_with_options(
-                        &prompt,
-                        ChatOptions {
-                            tools: allow_tools
-                                && !read_only_for_turn
-                                && mode_for_turn == ChatMode::Code,
-                            force_max_think: max_think,
-                            additional_dirs: prompt_additional_dirs,
-                            repo_root_override: prompt_repo_root_override.clone(),
-                            debug_context,
-                            mode: mode_for_turn,
-                            teammate_mode: teammate_mode_for_turn.clone(),
-                            detect_urls,
-                            watch_files: watch_files_enabled,
-                            images: images_for_turn,
-                            session_id: session_id_for_turn,
-                            llm_config: Some(llm_config),
-                            cancellation: Some(token),
-                            ..Default::default()
-                        },
-                    )
-                }));
+            // The turn is a task on the shared runtime; the UI thread only
+            // reads events. Esc cancels `token`, which the agent awaits on.
+            let runtime = codingbuddy_core::runtime::runtime();
+            runtime.spawn(async move {
+                let turn = runtime.spawn(async move {
+                    engine_clone
+                        .chat_with_options(
+                            &prompt,
+                            ChatOptions {
+                                tools: allow_tools
+                                    && !read_only_for_turn
+                                    && mode_for_turn == ChatMode::Code,
+                                force_max_think: max_think,
+                                additional_dirs: prompt_additional_dirs,
+                                repo_root_override: prompt_repo_root_override.clone(),
+                                debug_context,
+                                mode: mode_for_turn,
+                                teammate_mode: teammate_mode_for_turn.clone(),
+                                detect_urls,
+                                watch_files: watch_files_enabled,
+                                images: images_for_turn,
+                                session_id: session_id_for_turn,
+                                llm_config: Some(llm_config),
+                                cancellation: Some(token),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                let result = turn.await.map_err(|join_error| {
+                    if join_error.is_panic() {
+                        join_error.into_panic()
+                    } else {
+                        Box::new("turn task cancelled".to_string())
+                    }
+                });
                 match result {
                     Ok(Ok(output)) => {
                         let _ = tx_done.send(TuiStreamEvent::Done(output));

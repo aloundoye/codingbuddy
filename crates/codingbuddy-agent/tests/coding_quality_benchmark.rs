@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatOptions};
 use codingbuddy_core::{
@@ -21,33 +22,42 @@ use std::time::Instant;
 #[derive(Clone)]
 struct SharedScriptedLlm(Arc<ScriptedLlm>);
 
+#[async_trait::async_trait]
 impl LlmClient for SharedScriptedLlm {
-    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        self.0.complete(req)
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        self.0.complete(req).await
     }
 
-    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        self.0.complete_streaming(req, cb)
+    async fn complete_streaming(
+        &self,
+        req: &LlmRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_streaming(req, cb).await
     }
 
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        self.0.complete_chat(req)
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.0.complete_chat(req).await
     }
 
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.0.complete_chat_streaming(req, cb)
+        self.0.complete_chat_streaming(req, cb).await
     }
 
-    fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
-        self.0.complete_fim(req)
+    async fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
+        self.0.complete_fim(req).await
     }
 
-    fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        self.0.complete_fim_streaming(req, cb)
+    async fn complete_fim_streaming(
+        &self,
+        req: &FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_fim_streaming(req, cb).await
     }
 }
 
@@ -215,7 +225,7 @@ fn run_case(spec: BenchmarkCaseSpec, lane: BenchmarkLaneMode) -> Result<CodingBe
     engine.set_max_turns(Some(12));
 
     let started = Instant::now();
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         &spec.prompt,
         ChatOptions {
             tools: true,
@@ -223,7 +233,7 @@ fn run_case(spec: BenchmarkCaseSpec, lane: BenchmarkLaneMode) -> Result<CodingBe
             session_id: None,
             ..Default::default()
         },
-    )?;
+    ))?;
     let duration_ms = started.elapsed().as_millis();
 
     let store = Store::new(temp.path())?;

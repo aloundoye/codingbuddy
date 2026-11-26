@@ -3,6 +3,7 @@
 //! These tests use ScriptedLlm to drive the agent through actual file
 //! read/write/edit operations on real temp directories, verifying that
 //! the tool pipeline works end-to-end.
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::AgentEngine;
@@ -97,7 +98,7 @@ fn fs_edit_modifies_real_file() {
     )
     .unwrap();
 
-    let result = engine.chat("Edit main.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Edit main.rs"));
     assert!(result.is_ok(), "chat should succeed: {:?}", result);
 
     let content = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
@@ -131,7 +132,7 @@ fn fs_write_creates_new_file() {
     )
     .unwrap();
 
-    let result = engine.chat("Create lib.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Create lib.rs"));
     assert!(result.is_ok(), "fs_write should succeed: {:?}", result);
 
     let path = dir.path().join("src/lib.rs");
@@ -156,7 +157,7 @@ fn fs_read_returns_file_content() {
     )
     .unwrap();
 
-    let result = engine.chat("Read main.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Read main.rs"));
     assert!(result.is_ok());
 }
 
@@ -177,7 +178,7 @@ fn fs_glob_finds_files() {
     )
     .unwrap();
 
-    let result = engine.chat("Find Rust files");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Find Rust files"));
     assert!(result.is_ok());
 }
 
@@ -209,7 +210,7 @@ fn fuzzy_edit_handles_whitespace_mismatch() {
     )
     .unwrap();
 
-    let result = engine.chat("Edit with whitespace mismatch");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Edit with whitespace mismatch"));
     assert!(result.is_ok(), "fuzzy edit should succeed: {:?}", result);
 
     let content = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
@@ -245,9 +246,78 @@ fn multi_tool_sequence_read_then_edit() {
     )
     .unwrap();
 
-    let result = engine.chat("Read then edit main.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Read then edit main.rs"));
     assert!(result.is_ok());
 
     let content = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
     assert!(content.contains("multi-step"));
+}
+
+// ── Shell commands are rewindable ──
+
+#[cfg(unix)]
+#[test]
+fn file_moved_by_a_shell_command_can_be_rewound() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    fs::write(temp.path().join("notes.txt"), "keep me\n")?;
+    // Shell commands only run in a trusted workspace.
+    let mut cfg = codingbuddy_core::AppConfig {
+        workspace_trust: Some(true),
+        ..Default::default()
+    };
+    // The default policy only allows listed commands.
+    cfg.policy.allowlist = vec!["ls".to_string(), "mv".to_string()];
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(ScriptedLlm::new(vec![
+        tool_call_response(vec![("ls", "bash_run", r#"{"command":"ls"}"#)]),
+        tool_call_response(vec![(
+            "rm",
+            "bash_run",
+            r#"{"command":"mv notes.txt moved.txt"}"#,
+        )]),
+        text_response("Removed notes.txt."),
+    ]));
+    let mut engine = AgentEngine::new_with_config_and_llm(temp.path(), cfg, llm)?;
+    engine.set_permission_mode("bypassPermissions");
+    // Unsandboxed commands always ask; approve them here.
+    engine.set_approval_handler(Box::new(|_| Ok(true)));
+    codingbuddy_core::runtime::block_on(engine.chat_with_options(
+        "delete notes.txt",
+        codingbuddy_agent::ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    ))?;
+    assert!(
+        !temp.path().join("notes.txt").exists(),
+        "precondition: the command ran"
+    );
+
+    let memory = codingbuddy_memory::MemoryManager::new(temp.path())
+        .map_err(|e| anyhow!("memory manager: {e:#}"))?;
+    let shell_checkpoints: Vec<_> = memory
+        .list_checkpoints()
+        .map_err(|e| anyhow!("list checkpoints: {e:#}"))?
+        .into_iter()
+        .filter(|record| record.reason == "bash_run")
+        .collect();
+    assert_eq!(
+        shell_checkpoints.len(),
+        1,
+        "only the mutating command is checkpointed, not the read-only `ls`"
+    );
+
+    memory
+        .rewind_to_checkpoint(shell_checkpoints[0].checkpoint_id)
+        .map_err(|e| anyhow!("rewind failed: {e:#}"))?;
+    assert_eq!(
+        fs::read_to_string(temp.path().join("notes.txt"))
+            .map_err(|e| anyhow!("notes.txt after rewind: {e}"))?,
+        "keep me\n"
+    );
+    assert!(
+        !temp.path().join("moved.txt").exists(),
+        "files the command created are removed by the rewind"
+    );
+    Ok(())
 }

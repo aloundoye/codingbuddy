@@ -75,13 +75,14 @@ pub(crate) fn run_skills(cwd: &Path, cmd: SkillsCmd, json_mode: bool) -> Result<
             let run = manager.run(&args.skill_id, args.input.as_deref(), &paths)?;
             if args.execute {
                 ensure_llm_ready(cwd, json_mode)?;
-                let output = AgentEngine::new(cwd)?.chat_with_options(
+                let engine = AgentEngine::new(cwd)?;
+                let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
                     &run.rendered_prompt,
                     ChatOptions {
                         tools: false,
                         ..Default::default()
                     },
-                )?;
+                ))?;
                 if json_mode {
                     print_json(&json!({"skill": run, "output": output}))?;
                 } else {

@@ -8,28 +8,30 @@ use anyhow::{Context, Result};
 use azure_core::credentials::{Secret, TokenCredential};
 use std::time::Duration;
 
-pub(crate) fn bearer(
+pub(crate) async fn bearer(
     route: &ChatRoute,
     transport: &ChatTransport,
     timeout: Duration,
 ) -> Result<String> {
-    let token = transport.wait_with_timeout(timeout, async {
-        match route.auth {
-            AuthStrategy::AzureEntra => azure_token().await,
-            AuthStrategy::GoogleAdc => {
-                anyhow::ensure!(
-                    std::env::var_os("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES").as_deref()
-                        != Some(std::ffi::OsStr::new("1")),
-                    "Executable Google credential sources are disabled"
-                );
-                let credentials = google_cloud_auth::credentials::Builder::default()
-                    .with_scopes(["https://www.googleapis.com/auth/cloud-platform"])
-                    .build_access_token_credentials()?;
-                Ok(credentials.access_token().await?.token)
+    let token = transport
+        .wait_with_timeout(timeout, async {
+            match route.auth {
+                AuthStrategy::AzureEntra => azure_token().await,
+                AuthStrategy::GoogleAdc => {
+                    anyhow::ensure!(
+                        std::env::var_os("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES").as_deref()
+                            != Some(std::ffi::OsStr::new("1")),
+                        "Executable Google credential sources are disabled"
+                    );
+                    let credentials = google_cloud_auth::credentials::Builder::default()
+                        .with_scopes(["https://www.googleapis.com/auth/cloud-platform"])
+                        .build_access_token_credentials()?;
+                    Ok(credentials.access_token().await?.token)
+                }
+                _ => anyhow::bail!("Route does not use a cloud bearer credential"),
             }
-            _ => anyhow::bail!("Route does not use a cloud bearer credential"),
-        }
-    })?;
+        })
+        .await?;
     match token {
         Ok(Ok(token)) if !token.trim().is_empty() => Ok(token),
         Err(_) => Err(ProviderError::new(route.protocol, FailureKind::Transport).into()),
@@ -66,7 +68,7 @@ async fn azure_token() -> Result<String> {
     Ok(token.token.secret().to_owned())
 }
 
-pub(crate) fn bedrock_headers(
+pub(crate) async fn bedrock_headers(
     route: &ChatRoute,
     transport: &ChatTransport,
     timeout: Duration,
@@ -88,7 +90,8 @@ pub(crate) fn bedrock_headers(
     let credentials = transport
         .wait_with_timeout(timeout, async {
             provider.build().await.provide_credentials().await
-        })?
+        })
+        .await?
         .map_err(|_| ProviderError::new(route.protocol, FailureKind::Transport))?
         .map_err(|_| ProviderError::new(route.protocol, FailureKind::Authentication))?;
     sign_bedrock(
@@ -147,16 +150,19 @@ mod tests {
         let token = codingbuddy_core::CancellationToken::new();
         let transport = ChatTransport::new(Duration::from_secs(2), Some(token.clone()))?;
         assert!(
-            transport
-                .wait_with_timeout(Duration::from_millis(10), std::future::pending::<()>())?
-                .is_err()
+            codingbuddy_core::runtime::block_on(
+                transport
+                    .wait_with_timeout(Duration::from_millis(10), std::future::pending::<()>())
+            )?
+            .is_err()
         );
         let thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             token.cancel();
         });
-        let result =
-            transport.wait_with_timeout(Duration::from_secs(2), std::future::pending::<()>());
+        let result = codingbuddy_core::runtime::block_on(
+            transport.wait_with_timeout(Duration::from_secs(2), std::future::pending::<()>()),
+        );
         thread.join().expect("cancellation thread");
         assert!(result.is_err());
         Ok(())

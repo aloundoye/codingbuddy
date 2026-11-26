@@ -14,7 +14,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 /// A per-step file snapshot for undo capability.
 ///
@@ -529,7 +528,9 @@ impl MemoryManager {
             let id = match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(e) => {
-                    eprintln!("[memory] warning: invalid UUID in ref {ref_name}: {e}");
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[memory] warning: invalid UUID in ref {ref_name}: {e}"
+                    ));
                     continue;
                 }
             };
@@ -1154,6 +1155,58 @@ mod tests {
         let manager = MemoryManager::new(&workspace).expect("manager");
         let content = manager.read_memory().expect("read");
         assert!(content.contains("CODINGBUDDY.md"));
+    }
+
+    #[test]
+    fn whole_workspace_checkpoint_skips_gitignored_folders() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let workspace = dir.path();
+        fs::write(workspace.join(".gitignore"), "node_modules/\n*.log\n").expect("ignore");
+        fs::create_dir_all(workspace.join("node_modules/pkg")).expect("deps");
+        fs::write(workspace.join("node_modules/pkg/index.js"), "dep").expect("dep");
+        fs::write(workspace.join("debug.log"), "noise").expect("log");
+        fs::write(workspace.join(".env.example"), "KEY=").expect("hidden");
+        fs::create_dir_all(workspace.join("src")).expect("src");
+        fs::write(workspace.join("src/main.rs"), "fn main() {}").expect("src");
+
+        let manager = MemoryManager::new(workspace).expect("manager");
+        let checkpoint = manager.create_checkpoint("test").expect("checkpoint");
+        // .gitignore, .env.example and src/main.rs.
+        assert_eq!(checkpoint.files_count, 3);
+
+        // Changes under ignored paths are not reported as shell changes.
+        fs::write(workspace.join("node_modules/pkg/index.js"), "changed").expect("dep");
+        fs::write(workspace.join("src/new.rs"), "").expect("new");
+        let changed = manager
+            .changed_since_checkpoint(checkpoint.checkpoint_id)
+            .expect("diff");
+        assert_eq!(changed, vec![PathBuf::from("src/new.rs")]);
+    }
+
+    #[test]
+    fn unchanged_files_reuse_their_blob() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let workspace = dir.path();
+        fs::write(workspace.join("a.txt"), "same").expect("seed");
+        let manager = MemoryManager::new(workspace).expect("manager");
+        let files = WorkspaceFs::open(workspace).expect("fs");
+        let first = manager
+            .capture_state(&files, Path::new("a.txt"))
+            .expect("first");
+        let second = manager
+            .capture_state(&files, Path::new("a.txt"))
+            .expect("second");
+        assert_eq!(first, second);
+        // A changed file gets a new hash even with an identical length.
+        fs::write(workspace.join("a.txt"), "diff").expect("edit");
+        let third = manager
+            .capture_state(&files, Path::new("a.txt"))
+            .expect("third");
+        assert_ne!(first.hash, third.hash);
+        let blobs = fs::read_dir(workspace.join(".codingbuddy/checkpoint-blobs"))
+            .expect("blobs")
+            .count();
+        assert_eq!(blobs, 2, "no temporary files may be left behind");
     }
 
     #[test]

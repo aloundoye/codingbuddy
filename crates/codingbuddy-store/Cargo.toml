@@ -13,6 +13,10 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 codingbuddy-core = { path = "../codingbuddy-core" }
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

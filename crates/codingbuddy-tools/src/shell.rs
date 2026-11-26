@@ -1,12 +1,11 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_core::CancellationToken;
-use codingbuddy_core::execution::OwnedChild;
+use codingbuddy_core::execution::{AsyncChild, Ending, drain_into, finish_drain, supervise};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use wait_timeout::ChildExt;
 
 /// Whether to prefer PTY-based execution for colored output from programs
 /// that check `isatty()`. Falls back to pipe-based execution on failure.
@@ -25,15 +24,23 @@ pub struct ShellRunResult {
 /// Callback for streaming live output from a running command.
 pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Runs shell commands as async child processes: waiting holds no thread,
+/// and timeout or cancellation kills the whole process group.
+#[async_trait::async_trait]
 pub trait ShellRunner {
-    fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult>;
+    async fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult>;
 
-    fn run_verification(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
-        self.run(cmd, cwd, timeout)
+    async fn run_verification(
+        &self,
+        cmd: &str,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<ShellRunResult> {
+        self.run(cmd, cwd, timeout).await
     }
 
     /// Run with a progress callback that receives live output chunks.
-    fn run_with_progress(
+    async fn run_with_progress(
         &self,
         cmd: &str,
         cwd: &Path,
@@ -42,149 +49,95 @@ pub trait ShellRunner {
     ) -> Result<ShellRunResult> {
         // Default: ignore progress callback, just run normally
         let _ = on_progress;
-        self.run(cmd, cwd, timeout)
+        self.run(cmd, cwd, timeout).await
     }
 }
 
 #[derive(Debug, Default)]
 pub struct PlatformShellRunner;
 
+#[async_trait::async_trait]
 impl ShellRunner for PlatformShellRunner {
-    fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
-        run_shell(cmd, cwd, timeout, "shell")
+    async fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
+        run_shell(cmd, cwd, timeout, "shell").await
     }
 
-    fn run_verification(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
-        run_shell(cmd, cwd, timeout, "language_tools")
+    async fn run_verification(
+        &self,
+        cmd: &str,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<ShellRunResult> {
+        run_shell(cmd, cwd, timeout, "language_tools").await
     }
 }
 
-fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, consumer: &str) -> Result<ShellRunResult> {
+async fn run_shell(
+    cmd: &str,
+    cwd: &Path,
+    timeout: Duration,
+    consumer: &str,
+) -> Result<ShellRunResult> {
     let command = shell_command(cmd, cwd, consumer)?;
-    spawn_piped(command, cwd, timeout, false, None)
+    spawn_piped(command, cwd, timeout, None).await
 }
 
-pub(crate) fn run_command(
+pub(crate) async fn run_command(
     mut command: Command,
     args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ShellRunResult> {
     command.args(args);
-    spawn_piped(command, cwd, timeout, false, None)
+    spawn_piped(command, cwd, timeout, None).await
 }
 
-pub(crate) fn run_shell_launch(
-    mut command: Command,
+pub(crate) async fn run_shell_launch(
+    command: Command,
     cwd: &Path,
     timeout: Duration,
     cancellation: Option<&CancellationToken>,
     #[cfg(unix)] on_progress: Option<ProgressCallback>,
 ) -> Result<ShellRunResult> {
     #[cfg(unix)]
+    if let Some(callback) = on_progress
+        && USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
     {
-        use std::os::unix::process::CommandExt;
-        if let Some(callback) = on_progress
-            && USE_PTY.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return run_prepared_with_pty(command, cwd, timeout, Some(callback), cancellation);
-        }
-        command.process_group(0);
+        return run_prepared_with_pty(command, cwd, timeout, Some(callback), cancellation).await;
     }
-    spawn_piped(command, cwd, timeout, cfg!(unix), cancellation)
+    spawn_piped(command, cwd, timeout, cancellation).await
 }
 
-fn spawn_piped(
-    mut command: Command,
+/// A token that never fires, for callers without one.
+fn token_or_never(cancellation: Option<&CancellationToken>) -> CancellationToken {
+    cancellation.cloned().unwrap_or_default()
+}
+
+async fn spawn_piped(
+    command: Command,
     cwd: &Path,
     timeout: Duration,
-    process_group: bool,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ShellRunResult> {
+    let mut command = tokio::process::Command::from(command);
     command
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = OwnedChild::spawn(&mut command)?;
-    wait_for_output(child, timeout, process_group, cancellation)
-}
-
-fn wait_for_output(
-    mut child: OwnedChild,
-    timeout: Duration,
-    process_group: bool,
-    cancellation: Option<&CancellationToken>,
-) -> Result<ShellRunResult> {
-    use std::io::Read;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("missing child stdout"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("missing child stderr"))?;
-    std::thread::scope(|scope| {
-        fn drain(reader: &mut impl Read) -> std::io::Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            let mut buffer = [0u8; 8192];
-            loop {
-                let count = reader.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                let keep = count.min(2_000_000usize.saturating_sub(bytes.len()));
-                bytes.extend_from_slice(&buffer[..keep]);
-            }
-            Ok(bytes)
-        }
-        let stdout = scope.spawn(move || drain(&mut stdout));
-        let stderr = scope.spawn(move || drain(&mut stderr));
-        let deadline = std::time::Instant::now() + timeout;
-        let status = (|| -> Result<_> {
-            Ok(loop {
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    break None;
-                }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let interval = if cancellation.is_some() {
-                    remaining.min(Duration::from_millis(30))
-                } else {
-                    remaining
-                };
-                let status = child.wait_timeout(interval)?;
-                if status.is_some() || remaining <= interval {
-                    break status;
-                }
-            })
-        })();
-        #[cfg(unix)]
-        if process_group {
-            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-        }
-        #[cfg(not(unix))]
-        let _ = process_group;
-        child.terminate();
-        let status = status?;
-        let cancelled = cancellation.is_some_and(CancellationToken::is_cancelled);
-        let timed_out = status.is_none() && !cancelled;
-        let status = match status {
-            Some(status) => status,
-            None => {
-                let _ = child.kill();
-                child.wait()?
-            }
-        };
-        Ok(ShellRunResult {
-            status: status.code(),
-            stdout: String::from_utf8_lossy(&stdout.join().expect("stdout reader panicked")?)
-                .into_owned(),
-            stderr: String::from_utf8_lossy(&stderr.join().expect("stderr reader panicked")?)
-                .into_owned(),
-            timed_out,
-            cancelled,
-        })
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut child = AsyncChild::spawn(&mut command)?;
+    let out_sink = Arc::new(Mutex::new(Vec::new()));
+    let err_sink = Arc::new(Mutex::new(Vec::new()));
+    let stdout = tokio::spawn(drain_into(child.stdout.take(), out_sink.clone(), None));
+    let stderr = tokio::spawn(drain_into(child.stderr.take(), err_sink.clone(), None));
+    let (status, ending) = supervise(&mut child, &token_or_never(cancellation), deadline).await?;
+    Ok(ShellRunResult {
+        status: status.code(),
+        stdout: String::from_utf8_lossy(&finish_drain(stdout, out_sink).await?).into_owned(),
+        stderr: String::from_utf8_lossy(&finish_drain(stderr, err_sink).await?).into_owned(),
+        timed_out: ending == Ending::TimedOut,
+        cancelled: ending == Ending::Cancelled,
     })
 }
 
@@ -193,21 +146,29 @@ fn wait_for_output(
 #[derive(Debug, Default)]
 pub struct PtyShellRunner;
 
+#[async_trait::async_trait]
 impl ShellRunner for PtyShellRunner {
-    fn run_verification(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
-        PlatformShellRunner.run_verification(cmd, cwd, timeout)
+    async fn run_verification(
+        &self,
+        cmd: &str,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<ShellRunResult> {
+        PlatformShellRunner
+            .run_verification(cmd, cwd, timeout)
+            .await
     }
 
-    fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
+    async fn run(&self, cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellRunResult> {
         #[cfg(unix)]
         if USE_PTY.load(std::sync::atomic::Ordering::Relaxed) {
-            return run_with_pty(cmd, cwd, timeout, None);
+            return run_with_pty(cmd, cwd, timeout, None).await;
         }
         // Fallback to standard pipe-based execution
-        PlatformShellRunner.run(cmd, cwd, timeout)
+        PlatformShellRunner.run(cmd, cwd, timeout).await
     }
 
-    fn run_with_progress(
+    async fn run_with_progress(
         &self,
         cmd: &str,
         cwd: &Path,
@@ -216,15 +177,15 @@ impl ShellRunner for PtyShellRunner {
     ) -> Result<ShellRunResult> {
         #[cfg(unix)]
         if USE_PTY.load(std::sync::atomic::Ordering::Relaxed) {
-            return run_with_pty(cmd, cwd, timeout, Some(on_progress));
+            return run_with_pty(cmd, cwd, timeout, Some(on_progress)).await;
         }
-        PlatformShellRunner.run(cmd, cwd, timeout)
+        PlatformShellRunner.run(cmd, cwd, timeout).await
     }
 }
 
 /// Run a command with a pseudo-terminal so child process sees isatty()=true.
 #[cfg(unix)]
-fn run_with_pty(
+async fn run_with_pty(
     cmd: &str,
     cwd: &Path,
     timeout: Duration,
@@ -234,18 +195,47 @@ fn run_with_pty(
     command.arg("-c").arg(cmd);
     harden_command_env(&mut command, cwd, "shell");
     command.env("TERM", "xterm-256color");
-    run_prepared_with_pty(command, cwd, timeout, on_progress, None)
+    run_prepared_with_pty(command, cwd, timeout, on_progress, None).await
+}
+
+/// The master side of a PTY, readable without blocking a thread.
+#[cfg(unix)]
+struct PtyMaster(tokio::io::unix::AsyncFd<std::fs::File>);
+
+#[cfg(unix)]
+impl tokio::io::AsyncRead for PtyMaster {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::io::Read;
+        loop {
+            let mut guard = std::task::ready!(self.0.poll_read_ready(cx))?;
+            let unfilled = buf.initialize_unfilled();
+            match guard.try_io(|inner| {
+                let mut file: &std::fs::File = inner.get_ref();
+                file.read(unfilled)
+            }) {
+                Ok(Ok(count)) => {
+                    buf.advance(count);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                Ok(Err(error)) => return std::task::Poll::Ready(Err(error)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
-fn run_prepared_with_pty(
+async fn run_prepared_with_pty(
     mut command: Command,
     cwd: &Path,
     timeout: Duration,
     on_progress: Option<ProgressCallback>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ShellRunResult> {
-    use std::io::Read;
     use std::os::fd::FromRawFd;
 
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
@@ -253,6 +243,7 @@ fn run_prepared_with_pty(
     // Open a PTY pair
     let mut master_fd: libc::c_int = 0;
     let mut slave_fd: libc::c_int = 0;
+    // SAFETY: openpty writes two fds into the provided out-parameters.
     let ret = unsafe {
         libc::openpty(
             &mut master_fd,
@@ -265,111 +256,66 @@ fn run_prepared_with_pty(
     if ret != 0 {
         return Err(anyhow!("openpty failed"));
     }
+    // SAFETY: openpty just returned these fds; each is owned exactly once.
+    let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let slave = unsafe { std::os::fd::OwnedFd::from_raw_fd(slave_fd) };
 
-    let slave_fd_copy = slave_fd;
     command.current_dir(&cwd);
     command.stdin(Stdio::null());
 
+    let slave_raw = slave_fd;
+    // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
         use std::os::unix::process::CommandExt;
         command.pre_exec(move || {
             libc::setsid();
-            libc::dup2(slave_fd_copy, 1);
-            libc::dup2(slave_fd_copy, 2);
-            libc::close(slave_fd_copy);
+            libc::dup2(slave_raw, 1);
+            libc::dup2(slave_raw, 2);
+            libc::close(slave_raw);
             Ok(())
         });
     }
 
-    let mut child = match command.spawn() {
-        Ok(c) => OwnedChild::from_process_group(c),
-        Err(e) => {
-            unsafe {
-                libc::close(master_fd);
-                libc::close(slave_fd);
-            }
-            return Err(e.into());
-        }
-    };
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    // setsid makes the child its own process-group leader.
+    let mut child = AsyncChild::from_process_group(command.spawn()?);
+    // The child holds its copy; ours must close so EOF arrives on exit.
+    drop(slave);
 
-    unsafe {
-        libc::close(slave_fd);
-    }
-
-    // Read from master with timeout
-    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-    let mut output = Vec::new();
-    let mut buf = [0u8; 8192];
-    let deadline = std::time::Instant::now() + timeout;
-
-    // Set master to non-blocking
+    // SAFETY: plain fcntl on a valid fd we own.
     unsafe {
         let flags = libc::fcntl(master_fd, libc::F_GETFL);
         libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
+    // SAFETY: `master` owns the fd exclusively and AsyncFd owns `master`, so
+    // the fd stays open (and is not reused) for as long as it is registered.
+    let master = PtyMaster(unsafe { tokio::io::unix::AsyncFd::register(master) }?);
 
-    let mut timed_out = false;
-    loop {
-        if cancellation.is_some_and(CancellationToken::is_cancelled)
-            || std::time::Instant::now() >= deadline
-        {
-            timed_out = true;
-            unsafe {
-                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let token = token_or_never(cancellation);
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let on_chunk = on_progress.map(|callback| -> codingbuddy_core::execution::ChunkCallback {
+        Arc::new(move |bytes: &[u8]| {
+            // Raw lossy text; the final result does the authoritative strip.
+            let chunk = String::from_utf8_lossy(bytes);
+            let trimmed = chunk.trim();
+            if !trimmed.is_empty() {
+                callback(trimmed);
             }
-            let _ = child.kill();
-            break;
-        }
-        match master.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                output.extend_from_slice(&buf[..n]);
-                // Stream live progress to callback (raw lossy text —
-                // final result does the authoritative ANSI strip)
-                if let Some(ref cb) = on_progress {
-                    let chunk = String::from_utf8_lossy(&buf[..n]);
-                    let trimmed = chunk.trim();
-                    if !trimmed.is_empty() {
-                        cb(trimmed);
-                    }
-                }
-                if output.len() > 2_000_000 {
-                    let _ = child.kill();
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Check if child exited
-                if let Ok(Some(_)) = child.try_wait() {
-                    // Drain remaining output
-                    loop {
-                        match master.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => output.extend_from_slice(&buf[..n]),
-                        }
-                    }
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => break,
-        }
-    }
-
-    // Reap descendants even if the command exited while leaving pipes open.
-    unsafe {
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-    }
-    let status = child.wait().ok().and_then(|s| s.code());
+        })
+    });
+    let reader = tokio::spawn(drain_into(Some(master), sink.clone(), on_chunk));
+    let (status, ending) = supervise(&mut child, &token, deadline).await?;
+    let output = finish_drain(reader, sink).await?;
     let text = String::from_utf8_lossy(&output).to_string();
-    let clean = strip_ansi_escapes(&text);
 
     Ok(ShellRunResult {
-        status,
-        stdout: clean,
+        status: status.code(),
+        stdout: strip_ansi_escapes(&text),
         stderr: String::new(), // PTY merges stdout+stderr
-        timed_out: timed_out && !cancellation.is_some_and(CancellationToken::is_cancelled),
-        cancelled: cancellation.is_some_and(CancellationToken::is_cancelled),
+        timed_out: ending == Ending::TimedOut,
+        cancelled: ending == Ending::Cancelled,
     })
 }
 
@@ -489,10 +435,61 @@ mod tests {
     #[test]
     fn shell_runner_executes_command() {
         let runner = PlatformShellRunner;
-        let out = runner
-            .run("echo deepseek", Path::new("."), Duration::from_secs(2))
-            .expect("run command");
+        let out = codingbuddy_core::runtime::block_on(runner.run(
+            "echo deepseek",
+            Path::new("."),
+            Duration::from_secs(2),
+        ))
+        .expect("run command");
         assert!(!out.timed_out);
         assert!(out.stdout.to_lowercase().contains("deepseek"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_command_kills_its_whole_process_group_promptly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pid_file = dir.path().join("grandchild.pid");
+        // The shell backgrounds a long sleep (a grandchild of ours) and waits.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > '{}'; wait",
+            pid_file.display()
+        ));
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            canceller.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = codingbuddy_core::runtime::block_on(run_shell_launch(
+            command,
+            dir.path(),
+            Duration::from_secs(60),
+            Some(&token),
+            None,
+        ))?;
+        assert!(result.cancelled, "result should report cancellation");
+        assert!(!result.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cancellation took {:?}",
+            started.elapsed()
+        );
+
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+        // The grandchild was in the killed group; allow a moment for reaping.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "background grandchild {pid} survived cancellation"
+        );
+        Ok(())
     }
 }

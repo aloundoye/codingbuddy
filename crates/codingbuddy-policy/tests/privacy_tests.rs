@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // integration test helpers may panic
 use codingbuddy_policy::privacy::*;
 
 fn make_router(policy: PrivacyPolicy) -> PrivacyRouter {

@@ -51,7 +51,10 @@ pub fn load_custom_tools(workspace: &Path) -> Vec<CustomToolDef> {
             match load_custom_tool(&path) {
                 Ok(tool) => tools.push(tool),
                 Err(e) => {
-                    eprintln!("[custom-tools] failed to load {}: {e}", path.display());
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[custom-tools] failed to load {}: {e}",
+                        path.display()
+                    ));
                 }
             }
         }

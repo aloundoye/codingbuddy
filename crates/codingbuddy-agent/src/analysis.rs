@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::gather_context;
 use crate::{ChatMode, ChatOptions};
 
-pub fn analyze(
+pub async fn analyze(
     llm: &(dyn LlmClient + Send + Sync),
     cfg: &AppConfig,
     workspace: &Path,
@@ -17,14 +17,17 @@ pub fn analyze(
     stream_cb: Option<StreamCallback>,
 ) -> Result<LlmResponse> {
     let workspace = options.repo_root_override.as_deref().unwrap_or(workspace);
-    let bootstrap = gather_context::gather_for_prompt(
-        workspace,
-        cfg,
-        prompt,
-        options.mode,
-        &options.additional_dirs,
-        options.repo_root_override.as_deref(),
-    );
+    // Walks the repo and runs git: off the async worker.
+    let bootstrap = codingbuddy_core::runtime::blocking_section(|| {
+        gather_context::gather_for_prompt(
+            workspace,
+            cfg,
+            prompt,
+            options.mode,
+            &options.additional_dirs,
+            options.repo_root_override.as_deref(),
+        )
+    });
 
     if bootstrap.repoish && bootstrap.repo_root.is_none() {
         return Err(anyhow!(
@@ -37,7 +40,7 @@ pub fn analyze(
     }
 
     if gather_context::debug_context_enabled(options.debug_context) {
-        eprintln!("{}", bootstrap.debug_digest("InspectRepo", options.mode));
+        eprintln!("{}", bootstrap.debug_digest("InspectRepo", options.mode)); // guard: allow (--debug-context output)
     }
 
     let system_prompt =
@@ -100,9 +103,9 @@ pub fn analyze(
     };
 
     let response = if let Some(cb) = stream_cb {
-        llm.complete_chat_streaming(&request, cb)?
+        llm.complete_chat_streaming(&request, cb).await?
     } else {
-        llm.complete_chat(&request)?
+        llm.complete_chat(&request).await?
     };
     execution.check()?;
     Ok(response)

@@ -1,6 +1,7 @@
 //! Own-binary durable handoff. Credentials travel only over the private stdin pipe.
 use anyhow::{Context, Result, ensure};
-use codingbuddy_core::{AppConfig, CancellationToken, ToolHost, process_env};
+use codingbuddy_core::ToolHostBlockingExt;
+use codingbuddy_core::{AppConfig, CancellationToken, process_env};
 use codingbuddy_store::{BackgroundJobRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -217,7 +218,7 @@ pub(crate) fn run() -> Result<()> {
                     std::sync::Arc::new(codingbuddy_tools::PtyShellRunner),
                     &bootstrap.cfg,
                 )?;
-                let result = host.verify_command(
+                let result = host.verify_command_blocking(
                     &command,
                     &bootstrap.workspace,
                     120,
@@ -269,7 +270,7 @@ pub(crate) fn run() -> Result<()> {
                     .max_turns
                     .unwrap_or(bootstrap.cfg.agent_loop.tool_loop_max_turns);
                 engine.set_max_turns(Some(max_turns.unwrap_or(ceiling).min(ceiling)));
-                let result = engine.chat_with_options(
+                let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
                     &prompt,
                     codingbuddy_agent::ChatOptions {
                         tools,
@@ -291,7 +292,7 @@ pub(crate) fn run() -> Result<()> {
                         },
                         ..Default::default()
                     },
-                );
+                ));
                 let diff = wt.collect_for_parent()?;
                 let patch = if diff.is_empty() {
                     None

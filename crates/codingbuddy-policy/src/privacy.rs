@@ -119,7 +119,10 @@ impl PrivacyRouter {
                             err
                         ));
                     }
-                    eprintln!("[privacy] invalid regex pattern '{}': {}", pattern, err);
+                    codingbuddy_core::logging::notice(format_args!(
+                        "[privacy] invalid regex pattern '{}': {}",
+                        pattern, err
+                    ));
                 }
             }
         }
@@ -242,6 +245,7 @@ fn build_builtin_secret_patterns() -> Vec<(String, Regex)> {
         // AWS access key ID — require word boundary to avoid matching partial strings
         ("aws_key", r"\bAKIA[0-9A-Z]{16}\b"),
         ("google_api_key", r"AIza[a-zA-Z0-9_\-]{35}"),
+        ("google_api_key_aq", r"\bAQ\.[a-zA-Z0-9_\-]{40,}"),
         ("github_token", r"ghp_[a-zA-Z0-9]{36}"),
         ("gitlab_token", r"glpat-[a-zA-Z0-9\-]{20,}"),
         ("private_key", r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----"),
