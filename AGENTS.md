@@ -44,7 +44,7 @@ bash scripts/runtime_conformance_scan.sh
 
 **Infrastructure crates:**
 - `codingbuddy-store` — Session persistence (SQLite events and projections, legacy JSONL archive)
-- `codingbuddy-memory` — Long-term memory, shadow commits, checkpoints
+- `codingbuddy-memory` — Long-term memory, shadow commits, checkpoints. Whole-workspace checkpoints honour `.gitignore`, store content-addressed blobs once, and skip unchanged files through a stat cache (`tests/checkpoint_speed.rs` is the benchmark)
 - `codingbuddy-index` — Full-text code index (Tantivy), RAG retrieval
 - `codingbuddy-mcp` — MCP server management (JSON-RPC stdio/http), `list_prompts`, tool discovery
 - `codingbuddy-ui` — TUI rendering (ratatui/crossterm), autocomplete, vim mode, history suggestions

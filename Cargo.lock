@@ -1387,13 +1387,14 @@ dependencies = [
  "codingbuddy-policy",
  "codingbuddy-store",
  "glob",
+ "ignore",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
