@@ -1,10 +1,11 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_core::execution::{ExecutionContext, OwnedChild};
+use codingbuddy_core::execution::{AsyncChild, ExecutionContext};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+/// Starts a language server under policy. Runs inside the async runtime.
 pub type LanguageLauncher =
-    Arc<dyn Fn(&str, &[&str], &ExecutionContext) -> Result<OwnedChild> + Send + Sync>;
+    Arc<dyn Fn(&str, &[&str], &ExecutionContext) -> Result<AsyncChild> + Send + Sync>;
 
 use crate::client::{LspClient, format_hover, format_locations, format_symbols};
 use crate::language_map;
@@ -16,10 +17,13 @@ struct OpenedFile {
 }
 
 /// Manages multiple LSP server instances, one per language.
+///
+/// Clients are shared (`Arc`), so requests to one server run concurrently
+/// and only server startup is serialised.
 pub struct LspServerManager {
     workspace: PathBuf,
     launcher: Option<LanguageLauncher>,
-    servers: Mutex<HashMap<String, LspClient>>,
+    servers: tokio::sync::Mutex<HashMap<String, Arc<LspClient>>>,
     opened_files: Mutex<HashMap<PathBuf, OpenedFile>>,
 }
 
@@ -28,7 +32,7 @@ impl LspServerManager {
         Self {
             workspace: workspace.to_path_buf(),
             launcher: None,
-            servers: Mutex::new(HashMap::new()),
+            servers: tokio::sync::Mutex::new(HashMap::new()),
             opened_files: Mutex::new(HashMap::new()),
         }
     }
@@ -36,78 +40,67 @@ impl LspServerManager {
     pub fn set_launcher(&mut self, launcher: LanguageLauncher) {
         self.launcher = Some(launcher);
     }
+
     /// Get hover information. Returns formatted text for LLM consumption.
-    pub fn hover(&self, file_path: &Path, line: u32, col: u32) -> Result<String> {
-        self.hover_with_context(file_path, line, col, &ExecutionContext::default())
-    }
-    pub fn hover_with_context(
+    pub async fn hover_with_context(
         &self,
         file_path: &Path,
         line: u32,
         col: u32,
         context: &ExecutionContext,
     ) -> Result<String> {
-        self.with_client(file_path, context, |client, abs| {
-            let result = client.hover(abs, line, col)?;
-            Ok(format_hover(&result))
-        })
+        let Some((client, abs)) = self.client_for(file_path, context).await? else {
+            return Ok(String::no_server());
+        };
+        Ok(format_hover(&client.hover(&abs, line, col).await?))
     }
 
     /// Get goto-definition results. Returns formatted text for LLM consumption.
-    pub fn definition(&self, file_path: &Path, line: u32, col: u32) -> Result<String> {
-        self.definition_with_context(file_path, line, col, &ExecutionContext::default())
-    }
-    pub fn definition_with_context(
+    pub async fn definition_with_context(
         &self,
         file_path: &Path,
         line: u32,
         col: u32,
         context: &ExecutionContext,
     ) -> Result<String> {
-        self.with_client(file_path, context, |client, abs| {
-            let locs = client.definition(abs, line, col)?;
-            Ok(format_locations(&locs))
-        })
+        let Some((client, abs)) = self.client_for(file_path, context).await? else {
+            return Ok(String::no_server());
+        };
+        Ok(format_locations(&client.definition(&abs, line, col).await?))
     }
 
     /// Get all references. Returns formatted text for LLM consumption.
-    pub fn references(&self, file_path: &Path, line: u32, col: u32) -> Result<String> {
-        self.references_with_context(file_path, line, col, &ExecutionContext::default())
-    }
-    pub fn references_with_context(
+    pub async fn references_with_context(
         &self,
         file_path: &Path,
         line: u32,
         col: u32,
         context: &ExecutionContext,
     ) -> Result<String> {
-        self.with_client(file_path, context, |client, abs| {
-            let locs = client.references(abs, line, col)?;
-            Ok(format_locations(&locs))
-        })
+        let Some((client, abs)) = self.client_for(file_path, context).await? else {
+            return Ok(String::no_server());
+        };
+        Ok(format_locations(&client.references(&abs, line, col).await?))
     }
 
     /// Get document symbols. Returns formatted text for LLM consumption.
-    pub fn symbols(&self, file_path: &Path) -> Result<String> {
-        self.symbols_with_context(file_path, &ExecutionContext::default())
-    }
-    pub fn symbols_with_context(
+    pub async fn symbols_with_context(
         &self,
         file_path: &Path,
         context: &ExecutionContext,
     ) -> Result<String> {
-        self.with_client(file_path, context, |client, abs| {
-            let syms = client.document_symbols(abs)?;
-            let formatted = format_symbols(&syms, 0);
-            if formatted.is_empty() {
-                return Ok("No symbols found.".to_string());
-            }
-            Ok(formatted)
-        })
+        let Some((client, abs)) = self.client_for(file_path, context).await? else {
+            return Ok(String::no_server());
+        };
+        let formatted = format_symbols(&client.document_symbols(&abs).await?, 0);
+        if formatted.is_empty() {
+            return Ok("No symbols found.".to_string());
+        }
+        Ok(formatted)
     }
 
     /// Notify the server that a file changed (call after edits).
-    pub fn notify_file_changed(&self, file_path: &Path) -> Result<()> {
+    pub async fn notify_file_changed(&self, file_path: &Path) -> Result<()> {
         let abs_path = self.abs_path(file_path);
 
         let version = {
@@ -124,16 +117,16 @@ impl LspServerManager {
 
         let text = codingbuddy_core::workspace_fs::WorkspaceFs::open(&self.workspace)?
             .read_to_string(&abs_path)?;
-        let servers = self.servers.lock().map_err(|_| anyhow!("lock poisoned"))?;
-        if let Some(client) = servers.get(&version.0) {
-            client.did_change(&abs_path, version.1, &text)?;
+        let client = self.servers.lock().await.get(&version.0).cloned();
+        if let Some(client) = client {
+            client.did_change(&abs_path, version.1, &text).await?;
         }
         Ok(())
     }
 
     /// Shut down all running servers.
     pub fn shutdown_all(&self) {
-        if let Ok(mut servers) = self.servers.lock() {
+        if let Ok(mut servers) = self.servers.try_lock() {
             for (_, client) in servers.drain() {
                 let _ = client.shutdown();
             }
@@ -143,7 +136,7 @@ impl LspServerManager {
     /// List running server language IDs.
     pub fn running_servers(&self) -> Vec<String> {
         self.servers
-            .lock()
+            .try_lock()
             .ok()
             .map(|s| s.keys().cloned().collect())
             .unwrap_or_default()
@@ -151,61 +144,28 @@ impl LspServerManager {
 
     // ── Private helpers ──
 
-    fn lock_servers(
-        &self,
-        context: &ExecutionContext,
-    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, LspClient>>> {
-        loop {
-            context.check()?;
-            match self.servers.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
-                }
-                Err(_) => anyhow::bail!("Language registry unavailable"),
-            }
-        }
-    }
-    /// Ensure a server is available, the file is opened, then call `f` with the client.
-    /// Returns a "no server" message if no LSP is available for this file type.
-    fn with_client<T>(
+    /// Ensure a server is running and the file is open in it, then hand
+    /// back the client and the file's absolute path. `None` when no server
+    /// exists for this file type.
+    async fn client_for(
         &self,
         file_path: &Path,
         context: &ExecutionContext,
-        f: impl FnOnce(&LspClient, &Path) -> Result<T>,
-    ) -> Result<T>
-    where
-        T: NoServerFallback,
-    {
-        let lang_id = match self.ensure_server_for_file(file_path, context)? {
-            Some(id) => id,
-            None => return Ok(T::no_server()),
+    ) -> Result<Option<(Arc<LspClient>, PathBuf)>> {
+        let Some((lang_id, client)) = self.ensure_server_for_file(file_path, context).await? else {
+            return Ok(None);
         };
-        {
-            let servers = self
-                .servers
-                .lock()
-                .map_err(|_| anyhow!("Language registry unavailable"))?;
-            if let Some(client) = servers.get(&lang_id) {
-                client.set_context(context)?;
-            }
-        }
-        self.ensure_file_opened(file_path, &lang_id, context)?;
-
-        let abs_path = self.abs_path(file_path);
-        let servers = self.lock_servers(context)?;
-        let client = servers
-            .get(&lang_id)
-            .ok_or_else(|| anyhow!("server disappeared"))?;
         client.set_context(context)?;
-        f(client, &abs_path)
+        self.ensure_file_opened(file_path, &lang_id, &client)
+            .await?;
+        Ok(Some((client, self.abs_path(file_path))))
     }
 
-    fn ensure_server_for_file(
+    async fn ensure_server_for_file(
         &self,
         file_path: &Path,
         context: &ExecutionContext,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, Arc<LspClient>)>> {
         context.check()?;
         let launcher = self.launcher.as_ref().ok_or_else(|| {
             anyhow!("Language-server startup requires policy approval; no launcher is available")
@@ -219,10 +179,14 @@ impl LspServerManager {
 
         let lang_id = entry.language_id.to_string();
 
-        let mut servers = self.lock_servers(context)?;
+        let mut servers = codingbuddy_core::runtime::with_cancellation(
+            Some(&context.cancellation),
+            self.servers.lock(),
+        )
+        .await?;
         if let Some(existing) = servers.get(&lang_id) {
             if existing.is_alive() {
-                return Ok(Some(lang_id));
+                return Ok(Some((lang_id, existing.clone())));
             }
             servers.remove(&lang_id);
         }
@@ -232,23 +196,23 @@ impl LspServerManager {
         }
 
         let child = launcher(entry.server_command, entry.server_args, context)?;
-        let client = LspClient::from_owned(
+        let client = Arc::new(LspClient::from_owned(
             child,
             entry.server_command,
             &self.workspace,
             context.clone(),
-        )?;
-        client.initialize()?;
-        servers.insert(lang_id.clone(), client);
+        )?);
+        client.initialize().await?;
+        servers.insert(lang_id.clone(), client.clone());
 
-        Ok(Some(lang_id))
+        Ok(Some((lang_id, client)))
     }
 
-    fn ensure_file_opened(
+    async fn ensure_file_opened(
         &self,
         file_path: &Path,
         language_id: &str,
-        context: &ExecutionContext,
+        client: &LspClient,
     ) -> Result<()> {
         let abs_path = self.abs_path(file_path);
 
@@ -267,11 +231,7 @@ impl LspServerManager {
             .read_to_string(&abs_path)
             .map_err(|e| anyhow!("failed to read {}: {}", abs_path.display(), e))?;
 
-        let servers = self.lock_servers(context)?;
-        if let Some(client) = servers.get(language_id) {
-            client.did_open(&abs_path, language_id, &text)?;
-        }
-        drop(servers);
+        client.did_open(&abs_path, language_id, &text).await?;
 
         let mut opened = self
             .opened_files
@@ -298,7 +258,9 @@ impl LspServerManager {
 
 impl Drop for LspServerManager {
     fn drop(&mut self) {
-        self.shutdown_all();
+        for (_, client) in self.servers.get_mut().drain() {
+            let _ = client.shutdown();
+        }
     }
 }
 

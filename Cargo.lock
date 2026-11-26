@@ -1219,6 +1219,7 @@ dependencies = [
  "tempfile",
  "termimad",
  "tiny_http",
+ "tokio",
  "tracing",
  "unicode-width 0.2.3",
  "uuid",
@@ -1277,9 +1278,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "uuid",
- "wait-timeout",
 ]
 
 [[package]]
@@ -1310,11 +1311,13 @@ dependencies = [
  "codingbuddy-memory",
  "codingbuddy-policy",
  "codingbuddy-store",
+ "futures-util",
  "schemars 1.2.3",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 
@@ -1354,6 +1357,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "url",
 ]
 
@@ -1428,6 +1432,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 
@@ -1495,6 +1500,7 @@ dependencies = [
  "sha2 0.10.9",
  "strsim",
  "tempfile",
+ "tokio",
  "toml",
  "tracing",
  "tree-sitter",
@@ -1515,6 +1521,7 @@ dependencies = [
  "codingbuddy-policy",
  "codingbuddy-store",
  "crossterm",
+ "futures-util",
  "glob",
  "ratatui",
  "serde",
@@ -1522,6 +1529,7 @@ dependencies = [
  "shell-words",
  "signal-hook",
  "syntect",
+ "tokio",
  "uuid",
 ]
 
@@ -1753,6 +1761,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more 2.1.1",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",

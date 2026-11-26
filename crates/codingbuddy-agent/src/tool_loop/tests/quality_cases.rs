@@ -398,7 +398,7 @@ fn rewritten_tool_arguments_are_validated_and_approved() {
         let captured = approved.clone();
         loop_.set_approval_callback(Arc::new(move |call| {
             *captured.lock().unwrap() = call.args["path"].as_str().map(str::to_owned);
-            Ok(true)
+            Box::pin(async { Ok(true) })
         }));
         codingbuddy_core::runtime::block_on(loop_.run("Read a file")).unwrap();
         assert_eq!(approved.lock().unwrap().as_deref(), expected_path);

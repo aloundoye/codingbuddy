@@ -936,20 +936,15 @@ impl<'a> ToolUseLoop<'a> {
         self.stream_cb = Some(cb);
     }
 
-    /// Set the approval callback for tool permission prompts.
-    /// The callback blocks until the user answers; it runs inside
-    /// `blocking_section` so the turn's worker is released meanwhile.
+    /// Set the approval callback for tool permission prompts. The turn
+    /// awaits the answer.
     pub fn set_approval_callback(&mut self, cb: ApprovalCallback) {
-        self.approval_cb = Some(Arc::new(move |call| {
-            codingbuddy_core::runtime::blocking_section(|| cb(call))
-        }));
+        self.approval_cb = Some(cb);
     }
 
     /// Set the user question callback for interactive prompts.
     pub fn set_user_question_callback(&mut self, cb: UserQuestionCallback) {
-        self.user_question_cb = Some(Arc::new(move |question| {
-            codingbuddy_core::runtime::blocking_section(|| cb(question))
-        }));
+        self.user_question_cb = Some(cb);
     }
 
     /// Set the hook runtime for pre/post tool-use hooks.
@@ -958,8 +953,10 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Fire a hook event and log any failures.
-    fn fire_hook_logged(&self, hooks: &HookRuntime, event: HookEvent, input: &HookInput) {
-        let result = hooks.fire_with_context(event, input, &self.execution_context());
+    async fn fire_hook_logged(&self, hooks: &HookRuntime, event: HookEvent, input: &HookInput) {
+        let result = hooks
+            .fire_with_context(event, input, &self.execution_context())
+            .await;
         for run in &result.runs {
             if !run.success {
                 eprintln!(
@@ -1690,7 +1687,7 @@ impl<'a> ToolUseLoop<'a> {
                         }),
                         requires_approval: true,
                     };
-                    cb(&dummy_call).unwrap_or(false)
+                    cb(dummy_call).await.unwrap_or(false)
                 } else {
                     false
                 };

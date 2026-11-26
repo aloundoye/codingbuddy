@@ -147,10 +147,10 @@ impl ShellLaunch {
 
     #[cfg(test)]
     fn run(self, timeout: Duration) -> Result<ShellRunResult> {
-        self.run_with_progress(timeout, None, None)
+        codingbuddy_core::runtime::block_on(self.run_with_progress(timeout, None, None))
     }
 
-    pub(super) fn run_with_progress(
+    pub(super) async fn run_with_progress(
         self,
         timeout: Duration,
         on_progress: Option<crate::shell::ProgressCallback>,
@@ -181,6 +181,7 @@ impl ShellLaunch {
                 on_progress
             },
         )
+        .await
         .with_context(|| format!("could not launch {}", self.restrictions()))
     }
 
@@ -218,7 +219,7 @@ impl ShellLaunch {
     pub(super) fn spawn_stdio(
         self,
         context: &codingbuddy_core::execution::ExecutionContext,
-    ) -> Result<codingbuddy_core::execution::OwnedChild> {
+    ) -> Result<codingbuddy_core::execution::AsyncChild> {
         context.check()?;
         #[cfg(target_os = "macos")]
         let temp = self.is_isolated().then(tempfile::tempdir).transpose()?;
@@ -235,7 +236,8 @@ impl ShellLaunch {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        let mut child = codingbuddy_core::execution::OwnedChild::spawn(&mut command)?;
+        let mut command = tokio::process::Command::from(command);
+        let mut child = codingbuddy_core::execution::AsyncChild::spawn(&mut command)?;
         #[cfg(target_os = "macos")]
         if let Some(temp) = temp {
             child.retain_resource(temp);

@@ -66,7 +66,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     ));
 
     // Create the channel for TUI stream events.
-    let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
+    let (tx, rx) = codingbuddy_ui::stream_channel();
 
     let menus = Arc::new(connections::Menus {
         cwd: cwd.to_path_buf(),
@@ -85,8 +85,9 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     {
         let approval_tx = tx.clone();
         let reload_approvals = engine.approval_reloader();
-        engine.set_approval_handler(Box::new(move |call| {
-            let (resp_tx, resp_rx) = mpsc::channel();
+        let reload_approvals = Arc::new(reload_approvals);
+        engine.set_async_approval_handler(Arc::new(move |call| {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             let compact_args = serde_json::to_string(&call.args)
                 .unwrap_or_else(|_| "<unserializable>".to_string());
             let _ = approval_tx.send(TuiStreamEvent::ApprovalNeeded {
@@ -94,15 +95,18 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                 args_summary: compact_args,
                 response_tx: resp_tx,
             });
-            // Block agent thread waiting for TUI user response.
-            let approved = resp_rx
-                .recv()
-                .map_err(|e| anyhow!("approval channel closed: {e}"))?;
-            if approved {
-                // "Always" was saved before the answer was sent.
-                reload_approvals();
-            }
-            Ok(approved)
+            let reload_approvals = Arc::clone(&reload_approvals);
+            Box::pin(async move {
+                // The turn awaits the answer; no thread waits for it.
+                let approved = resp_rx
+                    .await
+                    .map_err(|e| anyhow!("approval channel closed: {e}"))?;
+                if approved {
+                    // "Always" was saved before the answer was sent.
+                    reload_approvals();
+                }
+                Ok(approved)
+            })
         }));
     }
 
@@ -133,9 +137,11 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
         let tx_notices = tx.clone();
         let cwd_for_notices = cwd.to_path_buf();
         let active_session_for_notices = Arc::clone(&active_session_id);
-        thread::spawn(move || {
+        codingbuddy_core::runtime::runtime().spawn(async move {
             let mut watermarks = HashMap::<Uuid, u64>::new();
+            let mut poll = tokio::time::interval(Duration::from_millis(400));
             loop {
+                poll.tick().await;
                 let session_override = active_session_for_notices
                     .lock()
                     .map(|guard| *guard)
@@ -157,7 +163,6 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(400));
             }
         });
     }

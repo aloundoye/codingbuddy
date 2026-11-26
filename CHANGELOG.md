@@ -42,6 +42,13 @@ Move it under a version heading when you cut a release.
   TUI turns, JSON-RPC background prompts, team lanes and subagents run as
   runtime tasks. Esc during a running shell command stops the turn and kills
   the command within seconds.
+- Nothing a turn waits on holds a thread any more. Shell commands (including
+  PTY output), hooks, language servers, stdio MCP servers and sandboxed
+  launches run as async child processes; model responses stream through an
+  async reader; approval prompts, user questions and subagents are awaited.
+  Several requests to the same language server or stdio MCP server now run
+  at once instead of queuing, and the TUI wakes on keys and agent events
+  instead of polling every 33 ms.
 - Checkpoints taken before shell commands are much faster (about 30 s →
   0.35 s for 8,000 files): they skip `.gitignore`d folders such as
   `node_modules`, reuse stored copies of unchanged files and flush them in

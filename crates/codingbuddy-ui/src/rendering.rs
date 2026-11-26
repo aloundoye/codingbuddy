@@ -136,7 +136,7 @@ pub enum TuiStreamEvent {
     ApprovalNeeded {
         tool_name: String,
         args_summary: String,
-        response_tx: mpsc::Sender<bool>,
+        response_tx: tokio::sync::oneshot::Sender<bool>,
     },
     /// The agent switched execution modes.
     ModeTransition {

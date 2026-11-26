@@ -46,18 +46,15 @@ impl ToolUseLoop<'_> {
             }
             let (reads, remaining) = calls.split_at(group);
             for chunk in reads.chunks(16) {
-                let ready = chunk
-                    .iter()
-                    .map(|call| {
-                        let start = self.messages.len();
-                        let preparation = self.prepare_tool_call(call, false)?;
-                        Ok((preparation, self.messages.split_off(start)))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut ready = Vec::with_capacity(chunk.len());
+                for call in chunk {
+                    let start = self.messages.len();
+                    let preparation = self.prepare_tool_call(call, false).await?;
+                    ready.push((preparation, self.messages.split_off(start)));
+                }
                 self.check_cancellation()?;
 
-                // Each read runs as its own task so the blocking work inside
-                // the host (block_in_place) overlaps across workers.
+                // Each read runs as its own task, so the reads overlap.
                 let mut pending = Vec::with_capacity(ready.len());
                 for (preparation, messages) in ready {
                     let worker = match &preparation {
@@ -193,7 +190,7 @@ impl ToolUseLoop<'_> {
             self.dispatch_durable_invocation(None)?;
             return self.handle_agent_level_tool(llm_call).await;
         }
-        let prepared = match self.prepare_tool_call(llm_call, batch_child)? {
+        let prepared = match self.prepare_tool_call(llm_call, batch_child).await? {
             ToolPreparation::Ready(prepared) => prepared,
             ToolPreparation::Complete(records) => return Ok(records),
         };
@@ -268,7 +265,7 @@ impl ToolUseLoop<'_> {
         Ok(())
     }
 
-    fn prepare_tool_call(
+    async fn prepare_tool_call(
         &mut self,
         llm_call: &LlmToolCall,
         batch_child: bool,
@@ -365,8 +362,9 @@ impl ToolUseLoop<'_> {
                 session_type: None,
                 workspace: self.workspace_str().to_string(),
             };
-            let hook_result =
-                hooks.fire_with_context(HookEvent::PreToolUse, &input, &self.execution_context());
+            let hook_result = hooks
+                .fire_with_context(HookEvent::PreToolUse, &input, &self.execution_context())
+                .await;
             if hook_result.blocked
                 || hook_result.permission_decision
                     == Some(codingbuddy_hooks::PermissionDecision::Deny)
@@ -456,11 +454,13 @@ impl ToolUseLoop<'_> {
                     session_type: None,
                     workspace: self.workspace_str().to_string(),
                 };
-                let result = hooks.fire_with_context(
-                    HookEvent::PermissionRequest,
-                    &perm_input,
-                    &self.execution_context(),
-                );
+                let result = hooks
+                    .fire_with_context(
+                        HookEvent::PermissionRequest,
+                        &perm_input,
+                        &self.execution_context(),
+                    )
+                    .await;
                 hook_decision = if result.blocked {
                     Some(codingbuddy_hooks::PermissionDecision::Deny)
                 } else {
@@ -482,7 +482,7 @@ impl ToolUseLoop<'_> {
                 if let Some(details) = host.approval_details(proposal.invocation_id) {
                     approval_call.args["effective_isolation"] = serde_json::Value::String(details);
                 }
-                match cb(&approval_call) {
+                match cb(approval_call).await {
                     Ok(v) => v,
                     Err(e) => {
                         host.discard_proposal(proposal.invocation_id);
@@ -769,8 +769,9 @@ impl ToolUseLoop<'_> {
                 session_type: None,
                 workspace: self.workspace_str().to_string(),
             };
-            let post_hook_result =
-                hooks.fire_with_context(HookEvent::PostToolUse, &input, &self.execution_context());
+            let post_hook_result = hooks
+                .fire_with_context(HookEvent::PostToolUse, &input, &self.execution_context())
+                .await;
             for run in &post_hook_result.runs {
                 if !run.success {
                     eprintln!(
@@ -787,7 +788,8 @@ impl ToolUseLoop<'_> {
                     event: HookEvent::PostToolUseFailure.as_str().to_string(),
                     ..input
                 };
-                self.fire_hook_logged(hooks, HookEvent::PostToolUseFailure, &fail_input);
+                self.fire_hook_logged(hooks, HookEvent::PostToolUseFailure, &fail_input)
+                    .await;
             }
         }
 

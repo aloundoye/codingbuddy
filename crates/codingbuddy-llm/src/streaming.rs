@@ -3,7 +3,7 @@
 use super::*;
 
 impl ApiClient {
-    pub(crate) fn complete_fim_streaming_inner(
+    pub(crate) async fn complete_fim_streaming_inner(
         &self,
         req: &FimRequest,
         api_key: Option<&str>,
@@ -17,20 +17,27 @@ impl ApiClient {
         let endpoint = self.resolved_endpoint(false, true, false);
         let headers = self.auth_headers(api_key)?;
         let max_retries = self.cfg.max_retries;
-        let resp = transport.send_with_retry(
-            &self.retry_policy(Some(&cb)),
-            || transport.post(&endpoint, headers.clone(), &payload),
-            |status, body, attempt| format_api_error(status, body, attempt, max_retries),
-            format_transport_error,
-        )?;
+        let resp = transport
+            .send_with_retry(
+                &self.retry_policy(Some(&cb)),
+                || transport.post(&endpoint, headers.clone(), &payload),
+                |status, body, attempt| format_api_error(status, body, attempt, max_retries),
+                format_transport_error,
+            )
+            .await?;
         let mut last_err: Option<anyhow::Error> = None;
 
         let mut content_out = String::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<codingbuddy_core::TokenUsage> = None;
 
-        let reader = std::io::BufReader::new(transport.reader(resp));
-        for line_result in std::io::BufRead::lines(reader) {
+        let mut reader = transport.stream(resp);
+        loop {
+            let line_result = match reader.next_line().await {
+                Ok(Some(line)) => Ok(line),
+                Ok(None) => break,
+                Err(error) => Err(error),
+            };
             if let Some(ref ct) = self.cancel_token
                 && ct.is_cancelled()
             {
@@ -93,7 +100,7 @@ impl ApiClient {
         Err(last_err.unwrap_or_else(|| anyhow!("fim stream request failed")))
     }
 
-    pub(crate) fn complete_chat_streaming_inner(
+    pub(crate) async fn complete_chat_streaming_inner(
         &self,
         req: &ChatRequest,
         api_key: Option<&str>,
@@ -101,7 +108,9 @@ impl ApiClient {
         route: &route::ChatRoute,
     ) -> Result<LlmResponse> {
         if let Some(adapter) = extension::registered_adapter(route.protocol) {
-            return self.complete_native_adapter(req, route, adapter, Some(cb));
+            return self
+                .complete_native_adapter(req, route, adapter, Some(cb))
+                .await;
         }
         let mut prepared = self.build_chat_payload_for_route(req, route)?;
         let capabilities = &route.capabilities;
@@ -128,19 +137,21 @@ impl ApiClient {
         }
         let cloud_token = match route.auth {
             protocol::AuthStrategy::AzureEntra | protocol::AuthStrategy::GoogleAdc => {
-                Some(self.chat_bearer(route, &transport)?)
+                Some(self.chat_bearer(route, &transport).await?)
             }
             _ => None,
         };
         let headers = route.headers(cloud_token.as_deref().or(api_key))?;
-        let resp = transport.send_with_retry(
-            &self.retry_policy(Some(&cb)),
-            || transport.post(stream_endpoint, headers.clone(), &prepared.payload),
-            |status, body, _| {
-                error::ProviderError::http(chat_protocol, status.as_u16(), body).into()
-            },
-            |_| error::ProviderError::new(chat_protocol, error::FailureKind::Transport).into(),
-        )?;
+        let resp = transport
+            .send_with_retry(
+                &self.retry_policy(Some(&cb)),
+                || transport.post(stream_endpoint, headers.clone(), &prepared.payload),
+                |status, body, _| {
+                    error::ProviderError::http(chat_protocol, status.as_u16(), body).into()
+                },
+                |_| error::ProviderError::new(chat_protocol, error::FailureKind::Transport).into(),
+            )
+            .await?;
         let status = resp.status();
 
         let mut content_out = String::new();
@@ -157,9 +168,10 @@ impl ApiClient {
         let mut native_usage = None;
         let mut anthropic_usage = json!({});
         let mut responses = providers::responses::Stream::default();
-        let mut reader = std::io::BufReader::new(transport.reader(resp));
-        while let Some(frame) =
-            chat_transport::next_frame(&mut reader).context("Provider stream read failed")?
+        let mut reader = transport.stream(resp);
+        while let Some(frame) = chat_transport::next_frame(&mut reader)
+            .await
+            .context("Provider stream read failed")?
         {
             let anthropic_event_type = frame.event;
             let chunk = frame.data.as_str();
@@ -455,7 +467,7 @@ impl ApiClient {
 
     /// Streaming variant: reads the SSE response line-by-line, invoking `cb`
     /// for each content/reasoning delta, then returns the assembled response.
-    pub(crate) fn complete_streaming_inner(
+    pub(crate) async fn complete_streaming_inner(
         &self,
         req: &LlmRequest,
         api_key: Option<&str>,
@@ -470,19 +482,24 @@ impl ApiClient {
         let endpoint = self.resolved_endpoint(false, false, false);
         let headers = self.auth_headers(api_key)?;
         let max_retries = self.cfg.max_retries;
-        let resp = transport.send_with_retry(
-            &self.retry_policy(Some(&cb)),
-            || transport.post(&endpoint, headers.clone(), &prepared.payload),
-            |status, body, attempt| {
-                with_compatibility_context(
-                    format_api_error(status, &redact_key(body, api_key), attempt, max_retries),
-                    &prepared.compatibility,
-                )
-            },
-            |error| {
-                with_compatibility_context(format_transport_error(error), &prepared.compatibility)
-            },
-        )?;
+        let resp = transport
+            .send_with_retry(
+                &self.retry_policy(Some(&cb)),
+                || transport.post(&endpoint, headers.clone(), &prepared.payload),
+                |status, body, attempt| {
+                    with_compatibility_context(
+                        format_api_error(status, &redact_key(body, api_key), attempt, max_retries),
+                        &prepared.compatibility,
+                    )
+                },
+                |error| {
+                    with_compatibility_context(
+                        format_transport_error(error),
+                        &prepared.compatibility,
+                    )
+                },
+            )
+            .await?;
         let mut last_err: Option<anyhow::Error> = None;
 
         // Read SSE line-by-line, invoking callback for each delta
@@ -493,8 +510,13 @@ impl ApiClient {
         let mut completed_tool_calls = Vec::new();
         let mut usage: Option<codingbuddy_core::TokenUsage> = None;
 
-        let reader = std::io::BufReader::new(transport.reader(resp));
-        for line_result in reader.lines() {
+        let mut reader = transport.stream(resp);
+        loop {
+            let line_result = match reader.next_line().await {
+                Ok(Some(line)) => Ok(line),
+                Ok(None) => break,
+                Err(error) => Err(error),
+            };
             if let Some(ref ct) = self.cancel_token
                 && ct.is_cancelled()
             {

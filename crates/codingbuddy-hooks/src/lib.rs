@@ -1,5 +1,5 @@
 use anyhow::Result;
-use codingbuddy_core::execution::{ExecutionContext, run_owned};
+use codingbuddy_core::execution::{ExecutionContext, run_owned_async};
 use codingbuddy_core::process_env::{self, Source};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -352,7 +352,7 @@ pub struct HookRuntime {
 }
 struct AsyncHook {
     token: codingbuddy_core::CancellationToken,
-    thread: std::thread::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 impl Drop for HookRuntime {
     fn drop(&mut self) {
@@ -360,11 +360,11 @@ impl Drop for HookRuntime {
             .async_jobs
             .get_mut()
             .unwrap_or_else(|error| error.into_inner());
-        for job in jobs.iter() {
-            job.token.cancel();
-        }
+        // Cancelling (and aborting) drops each hook's child, which kills
+        // its whole process group.
         for job in jobs.drain(..) {
-            let _ = job.thread.join();
+            job.token.cancel();
+            job.task.abort();
         }
     }
 }
@@ -411,22 +411,19 @@ impl HookRuntime {
             })
     }
 
-    /// Fire hooks for an event with the given input context.
-    pub fn fire(&self, event: HookEvent, input: &HookInput) -> HookResult {
-        self.fire_with_context(event, input, &ExecutionContext::default())
-    }
-    pub fn fire_with_context(
-        &self,
-        event: HookEvent,
-        input: &HookInput,
-        context: &ExecutionContext,
-    ) -> HookResult {
-        // Hooks run subprocesses; called from an async turn, let the
-        // worker hand off its other tasks while they run.
-        codingbuddy_core::runtime::blocking_section(|| self.fire_now(event, input, context))
+    /// [`HookRuntime::fire_with_context`] for standalone, synchronous
+    /// callers. Async code awaits `fire_with_context` instead.
+    pub fn fire_blocking(&self, event: HookEvent, input: &HookInput) -> HookResult {
+        codingbuddy_core::runtime::block_on(self.fire_with_context(
+            event,
+            input,
+            &ExecutionContext::default(),
+        ))
     }
 
-    fn fire_now(
+    /// Fire hooks for an event. Hook commands run as async child processes,
+    /// so a turn awaiting them holds no thread and stops them on cancel.
+    pub async fn fire_with_context(
         &self,
         event: HookEvent,
         input: &HookInput,
@@ -499,7 +496,9 @@ impl HookRuntime {
                     continue;
                 }
                 let started = std::time::Instant::now();
-                let run = self.execute_handler(handler, input, &consumer, source, context);
+                let run = self
+                    .execute_handler(handler, input, &consumer, source, context)
+                    .await;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 if run.success && !run.timed_out {
                     tracing::debug!(
@@ -559,7 +558,7 @@ impl HookRuntime {
     }
 
     /// Execute a single hook handler.
-    fn execute_handler(
+    async fn execute_handler(
         &self,
         handler: &HookHandler,
         input: &HookInput,
@@ -570,12 +569,14 @@ impl HookRuntime {
         match handler {
             HookHandler::Command { command, timeout } => {
                 self.run_command_handler(command, input, *timeout, consumer, source, context)
+                    .await
             }
             HookHandler::Async { command, timeout } => {
                 self.run_async_handler(command, *timeout, consumer, source, context)
             }
             HookHandler::Prompt { prompt, .. } => {
                 self.run_prompt_handler(prompt, input, consumer, source, context)
+                    .await
             }
             HookHandler::Agent {
                 agent,
@@ -620,40 +621,27 @@ impl HookRuntime {
         let mut context = context.clone();
         context.cancellation = context.cancellation.child_token();
         let token = context.cancellation.clone();
-        let spawned = std::thread::Builder::new()
-            .name("hook-supervisor".into())
-            .spawn(move || {
-                let _ = run_owned(
-                    &mut cmd,
-                    vec![],
-                    &context,
-                    Duration::from_secs(timeout_secs),
-                );
-            });
-        let spawned = match spawned {
-            Ok(thread) => {
-                let mut jobs = self
-                    .async_jobs
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                let mut index = 0;
-                while index < jobs.len() {
-                    if jobs[index].thread.is_finished() {
-                        let job = jobs.swap_remove(index);
-                        let _ = job.thread.join();
-                    } else {
-                        index += 1;
-                    }
-                }
-                jobs.push(AsyncHook { token, thread });
-                true
-            }
-            Err(_) => false,
-        };
+        let mut cmd = tokio::process::Command::from(cmd);
+        let task = codingbuddy_core::runtime::runtime().spawn(async move {
+            let _ = run_owned_async(
+                &mut cmd,
+                vec![],
+                &context,
+                Duration::from_secs(timeout_secs),
+            )
+            .await;
+        });
+        let mut jobs = self
+            .async_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        jobs.retain(|job| !job.task.is_finished());
+        jobs.push(AsyncHook { token, task });
+        drop(jobs);
 
         HookRun {
             handler_description: format!("async: {command}"),
-            success: spawned,
+            success: true,
             timed_out: false,
             exit_code: None,
             output: HookOutput::default(),
@@ -667,7 +655,7 @@ impl HookRuntime {
     /// NOTE: This is a framework implementation. The actual LLM call should be
     /// injected via a callback or trait in production. For now, it falls back to
     /// a command-based evaluation using the prompt as a shell script.
-    fn run_prompt_handler(
+    async fn run_prompt_handler(
         &self,
         prompt_template: &str,
         input: &HookInput,
@@ -691,6 +679,7 @@ impl HookRuntime {
             source,
             context,
         )
+        .await
     }
 
     /// Agent-based hook: delegates to a named subagent for evaluation.
@@ -725,7 +714,7 @@ impl HookRuntime {
     }
 
     /// Run a command hook handler: pipe JSON on stdin, parse stdout JSON for decisions.
-    fn run_command_handler(
+    async fn run_command_handler(
         &self,
         command: &str,
         input: &HookInput,
@@ -795,12 +784,13 @@ impl HookRuntime {
         cmd.stderr(Stdio::null());
 
         process_env::apply_for(&mut cmd, &self.workspace, consumer, source);
-        let result = run_owned(
-            &mut cmd,
+        let result = run_owned_async(
+            &mut tokio::process::Command::from(cmd),
             input_json.into_bytes(),
             context,
             Duration::from_secs(timeout_secs),
-        );
+        )
+        .await;
         let (timed_out, exit_code, output, cancelled) = match result {
             Ok(result) => (
                 result.timed_out,
@@ -829,15 +819,21 @@ impl HookRuntime {
         }
     }
 
-    /// Legacy compatibility: run file-based hooks with the old API.
+    /// Legacy compatibility: run file-based hooks with the old API, from
+    /// synchronous code.
     pub fn run_legacy(
         paths: &[PathBuf],
         ctx: &HookContext,
         timeout: Duration,
     ) -> Result<Vec<HookRun>> {
-        Self::run_legacy_with_context(paths, ctx, timeout, &ExecutionContext::default())
+        codingbuddy_core::runtime::block_on(Self::run_legacy_with_context(
+            paths,
+            ctx,
+            timeout,
+            &ExecutionContext::default(),
+        ))
     }
-    pub fn run_legacy_with_context(
+    pub async fn run_legacy_with_context(
         paths: &[PathBuf],
         ctx: &HookContext,
         timeout: Duration,
@@ -871,7 +867,13 @@ impl HookRuntime {
                 cmd.env("CODINGBUDDY_TOOL_RESULT_JSON", result);
             }
 
-            let result = run_owned(&mut cmd, vec![], context, timeout)?;
+            let result = run_owned_async(
+                &mut tokio::process::Command::from(cmd),
+                vec![],
+                context,
+                timeout,
+            )
+            .await?;
             let timed_out = result.timed_out;
             let status = result.status;
             out.push(HookRun {
@@ -1193,7 +1195,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert!(!result.blocked);
         assert!(result.runs.is_empty());
     }
@@ -1226,7 +1228,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PreToolUse, &input_no_match);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input_no_match);
         assert!(result.runs.is_empty());
 
         // Should match.
@@ -1239,7 +1241,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PreToolUse, &input_match);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input_match);
         assert_eq!(result.runs.len(), 1);
     }
 
@@ -1270,7 +1272,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert!(result.blocked);
     }
 
@@ -1301,7 +1303,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert!(!result.blocked);
         assert!(result.runs[0].success);
     }
@@ -1380,7 +1382,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::UserPromptSubmit, &input);
+        let result = rt.fire_blocking(HookEvent::UserPromptSubmit, &input);
         assert!(result.blocked, "UserPromptSubmit with exit 2 should block");
         assert!(
             result
@@ -1419,7 +1421,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert!(!result.blocked);
         assert!(result.updated_input.is_some(), "should have updated_input");
         let updated = result.updated_input.unwrap();
@@ -1457,7 +1459,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert!(
             result
                 .additional_context
@@ -1495,7 +1497,7 @@ mod tests {
             session_type: None,
             workspace: workspace.to_string_lossy().to_string(),
         };
-        let result = rt.fire(HookEvent::PostToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PostToolUse, &input);
         // PostToolUse does not support blocking (supports_blocking() returns false)
         assert!(
             !result.blocked,
@@ -1569,7 +1571,7 @@ mod tests {
             workspace: workspace.to_string_lossy().to_string(),
         };
         let start = std::time::Instant::now();
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -1613,11 +1615,11 @@ mod tests {
         };
 
         // First fire — should execute
-        let result1 = rt.fire(HookEvent::PreToolUse, &input);
+        let result1 = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert_eq!(result1.runs.len(), 1, "first fire should execute once-hook");
 
         // Second fire — should skip (already fired)
-        let result2 = rt.fire(HookEvent::PreToolUse, &input);
+        let result2 = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert_eq!(result2.runs.len(), 0, "second fire should skip once-hook");
     }
 
@@ -1648,7 +1650,7 @@ mod tests {
             workspace: workspace.to_string_lossy().to_string(),
         };
 
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         assert_eq!(result.runs.len(), 0, "disabled hook should be skipped");
     }
 
@@ -1695,7 +1697,7 @@ mod tests {
             workspace: temp.path().to_string_lossy().to_string(),
         };
 
-        let result = rt.fire(HookEvent::PermissionRequest, &input);
+        let result = rt.fire_blocking(HookEvent::PermissionRequest, &input);
         assert_eq!(
             result.permission_decision,
             Some(PermissionDecision::Allow),
@@ -1730,7 +1732,7 @@ mod tests {
             workspace: temp.path().to_string_lossy().to_string(),
         };
 
-        let result = rt.fire(HookEvent::PermissionRequest, &input);
+        let result = rt.fire_blocking(HookEvent::PermissionRequest, &input);
         assert_eq!(result.permission_decision, Some(PermissionDecision::Deny));
         assert!(result.blocked, "deny decision should also block");
     }
@@ -1786,7 +1788,7 @@ mod tests {
             workspace: workspace.to_string_lossy().to_string(),
         };
 
-        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let result = rt.fire_blocking(HookEvent::PreToolUse, &input);
         // Agent handler currently records delegation intent
         assert_eq!(result.runs.len(), 1);
         assert!(!result.blocked, "agent handler should not block by default");
@@ -1812,11 +1814,11 @@ mod delivery_three {
             cancellation: token,
             ..Default::default()
         };
-        let result = runtime.fire_with_context(
+        let result = codingbuddy_core::runtime::block_on(runtime.fire_with_context(
             HookEvent::PreToolUse,
             &HookInput::new(HookEvent::PreToolUse, workspace.path().to_str().unwrap()),
             &context,
-        );
+        ));
         assert!(result.blocked);
         assert!(result.runs.is_empty());
         assert!(!workspace.path().join("marker").exists());
@@ -1827,7 +1829,7 @@ mod delivery_three {
         let workspace = tempfile::tempdir().unwrap();
         let config:HooksConfig=serde_json::from_value(serde_json::json!({"PostToolUse":[{"hooks":[{"type":"async","command":"echo ready > ready; sleep 1; echo escaped > escaped","timeout":5}]}]})).unwrap();
         let runtime = HookRuntime::new(workspace.path(), config);
-        let result = runtime.fire(
+        let result = runtime.fire_blocking(
             HookEvent::PostToolUse,
             &HookInput::new(HookEvent::PostToolUse, workspace.path().to_str().unwrap()),
         );

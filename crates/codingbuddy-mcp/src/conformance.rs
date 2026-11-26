@@ -223,35 +223,54 @@ fn delivery_three_http_reuses_initialized_authenticated_session_and_fragmented_s
         let workspace = tempfile::tempdir()?;
         let fixture = Fixture::start(sse);
         let manager = manager(workspace.path(), &fixture)?;
-        let tools = manager.discover_tools()?;
+        let tools = codingbuddy_core::runtime::block_on(manager.discover_tools())?;
         if tools.len() != 1 {
             let server = manager.get_server("fixture")?.unwrap();
-            let diagnostic = manager.request_server(&server, "tools/list", json!({}), None);
+            let diagnostic = codingbuddy_core::runtime::block_on(manager.request_server(
+                &server,
+                "tools/list",
+                json!({}),
+                None,
+            ));
             anyhow::bail!("Discovery failed (SSE={sse}): {diagnostic:?}");
         }
         assert_eq!(tools[0].name, "café");
         let alias = "mcp__fixture__café";
         assert!(
-            manager
-                .call_tool(alias, &json!({"value":12}), Default::default())
-                .is_err()
+            codingbuddy_core::runtime::block_on(manager.call_tool(
+                alias,
+                &json!({"value":12}),
+                Default::default()
+            ))
+            .is_err()
         );
         assert_eq!(fixture.count("tools/call"), 0);
-        let output = manager.call_tool(
+        let output = codingbuddy_core::runtime::block_on(manager.call_tool(
             alias,
             &json!({"value":"direct-arguments"}),
             Default::default(),
-        )?;
+        ))?;
         assert_eq!(output["content"][0]["text"], "direct-arguments");
-        assert_eq!(manager.list_resources()?.len(), 1);
         assert_eq!(
-            manager.resolve_resource("@fixture:fixture://resource")?,
+            codingbuddy_core::runtime::block_on(manager.list_resources())?.len(),
+            1
+        );
+        assert_eq!(
+            codingbuddy_core::runtime::block_on(
+                manager.resolve_resource("@fixture:fixture://resource")
+            )?,
             "resource-content"
         );
-        assert_eq!(manager.list_prompts()?.len(), 1);
         assert_eq!(
-            manager.get_prompt("fixture", "fixture-prompt", &json!({}))?["messages"][0]["content"]
-                ["text"],
+            codingbuddy_core::runtime::block_on(manager.list_prompts())?.len(),
+            1
+        );
+        assert_eq!(
+            codingbuddy_core::runtime::block_on(manager.get_prompt(
+                "fixture",
+                "fixture-prompt",
+                &json!({})
+            ))?["messages"][0]["content"]["text"],
             "prompt-content"
         );
         assert_eq!(fixture.count("initialize"), 1);
@@ -265,7 +284,7 @@ fn delivery_three_remote_cancel_evicts_session_and_marks_unconfirmed_effect() ->
     let workspace = tempfile::tempdir()?;
     let fixture = Fixture::start(false);
     let manager = manager(workspace.path(), &fixture)?;
-    manager.discover_tools()?;
+    codingbuddy_core::runtime::block_on(manager.discover_tools())?;
     let token = CancellationToken::new();
     let cancellation = token.clone();
     let seen = fixture.requests.clone();
@@ -283,16 +302,15 @@ fn delivery_three_remote_cancel_evicts_session_and_marks_unconfirmed_effect() ->
         cancellation.cancel();
     });
     let started = Instant::now();
-    let error = manager
-        .call_tool(
-            "mcp__fixture__café",
-            &json!({"value":"stall"}),
-            ToolExecutionContext {
-                cancellation: Some(&token),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
+    let error = codingbuddy_core::runtime::block_on(manager.call_tool(
+        "mcp__fixture__café",
+        &json!({"value":"stall"}),
+        ToolExecutionContext {
+            cancellation: Some(&token),
+            ..Default::default()
+        },
+    ))
+    .unwrap_err();
     cancel.join().unwrap();
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(
@@ -302,13 +320,12 @@ fn delivery_three_remote_cancel_evicts_session_and_marks_unconfirmed_effect() ->
     );
     assert_eq!(fixture.count("tools/call"), 1);
     assert!(
-        manager
-            .call_tool(
-                "mcp__fixture__café",
-                &json!({"value":"again"}),
-                Default::default()
-            )
-            .is_err()
+        codingbuddy_core::runtime::block_on(manager.call_tool(
+            "mcp__fixture__café",
+            &json!({"value":"again"}),
+            Default::default()
+        ))
+        .is_err()
     );
     assert_eq!(fixture.count("tools/call"), 1);
     Ok(())
@@ -327,12 +344,15 @@ fn delivery_three_explicit_legacy_sse_initializes_once_and_calls_on_event_channe
         headers: vec![("Authorization".into(), "Bearer synthetic-mcp-key".into())],
         ..Default::default()
     })?;
-    assert_eq!(manager.discover_tools()?.len(), 1);
-    let result = manager.call_tool(
+    assert_eq!(
+        codingbuddy_core::runtime::block_on(manager.discover_tools())?.len(),
+        1
+    );
+    let result = codingbuddy_core::runtime::block_on(manager.call_tool(
         "mcp__legacy__café",
         &json!({"value":"legacy-result"}),
         Default::default(),
-    )?;
+    ))?;
     assert_eq!(result["content"][0]["text"], "legacy-result");
     assert_eq!(fixture.count("initialize"), 1);
     assert_eq!(fixture.count("notifications/initialized"), 1);

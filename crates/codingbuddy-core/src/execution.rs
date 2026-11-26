@@ -134,6 +134,24 @@ mod windows {
         }
     }
     pub fn spawn(command: &mut Command) -> Result<OwnedChild> {
+        let mut child = command.creation_flags(CREATE_SUSPENDED).spawn()?;
+        match attach(child.as_raw_handle() as HANDLE, child.id()) {
+            Ok(job) => Ok(OwnedChild {
+                child,
+                job,
+                resources: vec![],
+            }),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
+        }
+    }
+
+    /// Put a child that was started with `CREATE_SUSPENDED` into a fresh
+    /// kill-on-close job and resume it. On error the caller kills the child.
+    pub fn attach(process: HANDLE, pid: u32) -> Result<Job> {
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             ensure!(!handle.is_null(), "Cannot create owned process job");
@@ -149,17 +167,10 @@ mod windows {
                 ) != 0,
                 "Cannot configure owned process job"
             );
-            let mut child = command.creation_flags(CREATE_SUSPENDED).spawn()?;
-            if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("Cannot attach child to owned process job");
-            }
-            let mut owned = OwnedChild {
-                child,
-                job,
-                resources: vec![],
-            };
+            ensure!(
+                AssignProcessToJobObject(handle, process) != 0,
+                "Cannot attach child to owned process job"
+            );
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             ensure!(
                 snapshot != INVALID_HANDLE_VALUE,
@@ -170,7 +181,7 @@ mod windows {
             let mut found = false;
             let mut next = Thread32First(snapshot, &mut entry);
             while next != 0 {
-                if entry.th32OwnerProcessID == owned.id() {
+                if entry.th32OwnerProcessID == pid {
                     let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
                     if !thread.is_null() {
                         found = ResumeThread(thread) != u32::MAX;
@@ -182,10 +193,10 @@ mod windows {
             }
             CloseHandle(snapshot);
             if !found {
-                owned.terminate();
+                job.terminate();
                 anyhow::bail!("Cannot resume owned child");
             }
-            Ok(owned)
+            Ok(job)
         }
     }
 }
@@ -218,81 +229,270 @@ pub struct OwnedOutput {
     pub cancelled: bool,
     pub timed_out: bool,
 }
-/// Bounded capture, concurrent pipe draining, cancellation and descendant cleanup.
+/// Most output kept per stream; the rest is read and discarded so the child
+/// never blocks on a full pipe.
+pub const MAX_CAPTURE: usize = 2_000_000;
+
+/// A child process owned by async code: started in its own process group
+/// (a kill-on-close Job object on Windows) so cancelling or dropping it kills
+/// every descendant, not just the direct child.
+pub struct AsyncChild {
+    child: tokio::process::Child,
+    resources: Vec<Box<dyn std::any::Any + Send + Sync>>,
+    #[cfg(unix)]
+    group: Option<i32>,
+    #[cfg(windows)]
+    job: Option<windows::Job>,
+}
+
+impl AsyncChild {
+    /// Spawn `command` in a new process group.
+    pub fn spawn(command: &mut tokio::process::Command) -> Result<Self> {
+        command.kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+            let child = command.spawn()?;
+            let group = child.id().map(|pid| pid as i32);
+            Ok(Self {
+                child,
+                resources: vec![],
+                group,
+            })
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+            command.creation_flags(CREATE_SUSPENDED);
+            let mut child = command.spawn()?;
+            let attached = match (child.raw_handle(), child.id()) {
+                (Some(handle), Some(pid)) => windows::attach(handle as _, pid),
+                _ => Err(anyhow::anyhow!("Child exited before it could be owned")),
+            };
+            match attached {
+                Ok(job) => Ok(Self {
+                    child,
+                    resources: vec![],
+                    job: Some(job),
+                }),
+                Err(error) => {
+                    let _ = child.start_kill();
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            anyhow::bail!("Owned process execution unsupported on this platform")
+        }
+    }
+
+    /// Own a child the caller already placed in its own session or process
+    /// group (for example a PTY child that called `setsid`).
+    #[cfg(unix)]
+    pub fn from_process_group(child: tokio::process::Child) -> Self {
+        let group = child.id().map(|pid| pid as i32);
+        Self {
+            child,
+            resources: vec![],
+            group,
+        }
+    }
+
+    /// Keep `resource` alive as long as the child (for example a temporary
+    /// sandbox profile).
+    pub fn retain_resource(&mut self, resource: impl std::any::Any + Send + Sync) {
+        self.resources.push(Box::new(resource));
+    }
+
+    /// Kill the whole process tree now. Idempotent; reaping happens in
+    /// [`AsyncChild::wait`] or, after drop, in the background.
+    pub fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.group.take() {
+            // SAFETY: plain syscall; a stale group id only yields ESRCH.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+        let _ = self.child.start_kill();
+    }
+}
+
+impl std::ops::Deref for AsyncChild {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for AsyncChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for AsyncChild {
+    fn drop(&mut self) {
+        // `kill_on_drop` makes tokio reap the direct child in the background.
+        self.terminate();
+    }
+}
+
+/// Receives raw output chunks as they arrive.
+pub type ChunkCallback = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Read `reader` to the end into `sink`, keeping at most [`MAX_CAPTURE`]
+/// bytes. Shared so a caller can keep what arrived if it stops waiting.
+pub async fn drain_into(
+    reader: Option<impl tokio::io::AsyncRead + Unpin>,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    on_chunk: Option<ChunkCallback>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let Some(mut reader) = reader else {
+        return Ok(());
+    };
+    let mut buffer = [0u8; 8192];
+    loop {
+        let size = match reader.read(&mut buffer).await {
+            Ok(size) => size,
+            // A PTY master reports EIO once the last slave fd closes.
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => 0,
+            Err(error) => return Err(error),
+        };
+        if size == 0 {
+            return Ok(());
+        }
+        if let Some(on_chunk) = &on_chunk {
+            on_chunk(&buffer[..size]);
+        }
+        let mut output = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keep = size.min(MAX_CAPTURE.saturating_sub(output.len()));
+        output.extend_from_slice(&buffer[..keep]);
+    }
+}
+
+/// How long to keep reading pipes after the process tree is gone. Only a
+/// descendant that escaped the group (a daemon) can hold them open longer.
+const PIPE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Collect a drain task's output, giving up after [`PIPE_GRACE`].
+pub async fn finish_drain(
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    let abort = task.abort_handle();
+    match tokio::time::timeout(PIPE_GRACE, task).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(error)) if error.is_panic() => anyhow::bail!("Output reader failed"),
+        Ok(Err(_)) => {}
+        Err(_) => abort.abort(),
+    }
+    Ok(std::mem::take(
+        &mut *sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ))
+}
+
+/// How a supervised child ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    Exited,
+    Cancelled,
+    TimedOut,
+}
+
+/// Wait for `child` to exit, for `cancellation` to fire or for `deadline`,
+/// whichever comes first. The process tree is killed on every path, so no
+/// descendant outlives the call.
+pub async fn supervise(
+    child: &mut AsyncChild,
+    cancellation: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<(std::process::ExitStatus, Ending)> {
+    let ending = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(Ending::Cancelled),
+        () = tokio::time::sleep_until(deadline) => Err(Ending::TimedOut),
+        status = child.wait() => Ok(status?),
+    };
+    // Reap descendants even when the direct child exited on its own.
+    child.terminate();
+    Ok(match ending {
+        Ok(status) => (status, Ending::Exited),
+        Err(ending) => (child.wait().await?, ending),
+    })
+}
+
+/// The deadline for a call: `timeout` from now, or the context's own
+/// deadline if that comes first.
+pub fn deadline_for(
+    context: &ExecutionContext,
+    timeout: std::time::Duration,
+) -> tokio::time::Instant {
+    let by_timeout = tokio::time::Instant::now() + timeout;
+    context
+        .deadline
+        .map(tokio::time::Instant::from_std)
+        .map_or(by_timeout, |deadline| deadline.min(by_timeout))
+}
+
+/// Bounded capture, concurrent pipe draining, cancellation and descendant
+/// cleanup, without holding a thread while the child runs.
+pub async fn run_owned_async(
+    command: &mut tokio::process::Command,
+    input: Vec<u8>,
+    context: &ExecutionContext,
+    timeout: std::time::Duration,
+) -> Result<OwnedOutput> {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncWriteExt;
+    context.check()?;
+    let deadline = deadline_for(context, timeout);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = AsyncChild::spawn(command)?;
+    let stdin = child.stdin.take();
+    let writer = tokio::spawn(async move {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&input).await;
+        }
+    });
+    let out_sink = Arc::new(Mutex::new(Vec::new()));
+    let err_sink = Arc::new(Mutex::new(Vec::new()));
+    let out = tokio::spawn(drain_into(child.stdout.take(), out_sink.clone(), None));
+    let err = tokio::spawn(drain_into(child.stderr.take(), err_sink.clone(), None));
+    let (status, ending) = supervise(&mut child, &context.cancellation, deadline).await?;
+    writer.abort();
+    Ok(OwnedOutput {
+        status,
+        stdout: finish_drain(out, out_sink).await?,
+        stderr: finish_drain(err, err_sink).await?,
+        cancelled: ending == Ending::Cancelled,
+        timed_out: ending == Ending::TimedOut,
+    })
+}
+
+/// [`run_owned_async`] for standalone (non-async) callers.
 pub fn run_owned(
     command: &mut Command,
     input: Vec<u8>,
     context: &ExecutionContext,
     timeout: std::time::Duration,
 ) -> Result<OwnedOutput> {
-    use std::io::{Read, Write};
-    context.check()?;
-    command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = OwnedChild::spawn(command)?;
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    std::thread::scope(|scope| {
-        let writer = scope.spawn(move || {
-            if let Some(mut stdin) = stdin {
-                let _ = stdin.write_all(&input);
-            }
-        });
-        fn drain(reader: Option<impl Read>) -> std::io::Result<Vec<u8>> {
-            let mut output = Vec::new();
-            if let Some(mut reader) = reader {
-                let mut buffer = [0u8; 8192];
-                loop {
-                    let size = reader.read(&mut buffer)?;
-                    if size == 0 {
-                        break;
-                    }
-                    let keep = size.min(2_000_000usize.saturating_sub(output.len()));
-                    output.extend_from_slice(&buffer[..keep]);
-                }
-            }
-            Ok(output)
-        }
-        let out = scope.spawn(move || drain(stdout));
-        let err = scope.spawn(move || drain(stderr));
-        let started = Instant::now();
-        let mut cancelled = false;
-        let mut timed_out = false;
-        let status = (|| -> Result<_> {
-            Ok(loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                cancelled = context.cancellation.is_cancelled();
-                timed_out = started.elapsed() >= timeout
-                    || context
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline);
-                if cancelled || timed_out {
-                    child.terminate();
-                    break child.wait()?;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            })
-        })();
-        child.terminate();
-        let status = status?;
-        let _ = writer.join();
-        Ok(OwnedOutput {
-            status,
-            stdout: out
-                .join()
-                .map_err(|_| anyhow::anyhow!("Output reader failed"))??,
-            stderr: err
-                .join()
-                .map_err(|_| anyhow::anyhow!("Error reader failed"))??,
-            cancelled,
-            timed_out: timed_out && !cancelled,
-        })
-    })
+    let mut command = tokio::process::Command::from(std::mem::replace(command, Command::new("")));
+    crate::runtime::block_on(run_owned_async(&mut command, input, context, timeout))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -392,9 +592,9 @@ mod delivery_three_process {
     }
 }
 
+/// Cancels the context's token at its deadline until dropped.
 pub struct DeadlineGuard {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    task: tokio::task::JoinHandle<()>,
 }
 impl ExecutionContext {
     pub fn watch_deadline(&self) -> Result<Option<DeadlineGuard>> {
@@ -402,30 +602,15 @@ impl ExecutionContext {
             return Ok(None);
         };
         let token = self.cancellation.clone();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopped = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("execution-deadline".into())
-            .spawn(move || {
-                while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
-                    if Instant::now() >= deadline {
-                        token.cancel();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            })?;
-        Ok(Some(DeadlineGuard {
-            stop,
-            thread: Some(thread),
-        }))
+        let task = crate::runtime::runtime().spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            token.cancel();
+        });
+        Ok(Some(DeadlineGuard { task }))
     }
 }
 impl Drop for DeadlineGuard {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.task.abort();
     }
 }

@@ -22,7 +22,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::sync::mpsc;
+#[cfg(test)]
 use std::thread;
 use std::time::{Duration, Instant};
 pub use transport::*;
@@ -187,7 +189,7 @@ impl McpManager {
             .clone()
     }
 
-    pub fn request_server(
+    pub async fn request_server(
         &self,
         server: &McpServer,
         method: &str,
@@ -199,10 +201,12 @@ impl McpManager {
             deadline: Some(Instant::now() + Duration::from_secs(30)),
             ..Default::default()
         };
-        self.sessions.request(server, method, params, &context)
+        self.sessions
+            .request(server, method, params, &context)
+            .await
     }
 
-    fn request_list(
+    async fn request_list(
         &self,
         server: &McpServer,
         method: &str,
@@ -212,7 +216,7 @@ impl McpManager {
         let mut items = Vec::new();
         let mut cursors = BTreeSet::new();
         loop {
-            let response = self.request_server(server, method, params, None)?;
+            let response = self.request_server(server, method, params, None).await?;
             let result = response.get("result").context("MCP list result missing")?;
             items.extend(
                 result
@@ -233,14 +237,14 @@ impl McpManager {
             params = json!({"cursor":cursor});
         }
     }
-    pub fn call_tool(
+    pub async fn call_tool(
         &self,
         alias: &str,
         args: &serde_json::Value,
         context: codingbuddy_core::ToolExecutionContext<'_>,
     ) -> Result<serde_json::Value> {
         let started = std::time::Instant::now();
-        let result = self.call_tool_untraced(alias, args, context);
+        let result = self.call_tool_untraced(alias, args, context).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok(_) => tracing::debug!(tool = alias, elapsed_ms, "MCP tool call finished"),
@@ -254,7 +258,7 @@ impl McpManager {
         result
     }
 
-    fn call_tool_untraced(
+    async fn call_tool_untraced(
         &self,
         alias: &str,
         args: &serde_json::Value,
@@ -290,12 +294,15 @@ impl McpManager {
                 .deadline
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
         );
-        let result = self.sessions.request(
-            &server,
-            "tools/call",
-            json!({"name":tool.name,"arguments":args}),
-            &execution,
-        )?;
+        let result = self
+            .sessions
+            .request(
+                &server,
+                "tools/call",
+                json!({"name":tool.name,"arguments":args}),
+                &execution,
+            )
+            .await?;
         result
             .get("result")
             .cloned()
@@ -474,26 +481,29 @@ impl McpManager {
         Ok(removed)
     }
 
-    pub fn discover_tools(&self) -> Result<Vec<McpTool>> {
-        Ok(self.refresh_tools()?.0)
+    pub async fn discover_tools(&self) -> Result<Vec<McpTool>> {
+        Ok(self.refresh_tools().await?.0)
     }
 
     /// Refresh tools from all MCP servers. Servers whose cached tools are
     /// younger than `TOOL_CACHE_TTL_SECS` are skipped (use `force_refresh_tools`
     /// to bypass the TTL).
-    pub fn refresh_tools(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
-        self.refresh_tools_inner(false)
+    pub async fn refresh_tools(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
+        self.refresh_tools_inner(false).await
     }
 
     /// Force-refresh tools for all MCP servers, ignoring cache TTL.
-    pub fn force_refresh_tools(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
-        self.refresh_tools_inner(true)
+    pub async fn force_refresh_tools(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
+        self.refresh_tools_inner(true).await
     }
 
     /// MCP tool cache TTL in seconds (5 minutes).
     const TOOL_CACHE_TTL_SECS: i64 = 300;
 
-    fn refresh_tools_inner(&self, force: bool) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
+    async fn refresh_tools_inner(
+        &self,
+        force: bool,
+    ) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
         let mut tools = Vec::new();
         let mut refreshes = Vec::new();
         let cached_rows = self.store.list_mcp_tool_cache()?;
@@ -566,7 +576,7 @@ impl McpManager {
                 }
             }
 
-            let discovered = match self.request_list(&server, "tools/list", "tools") {
+            let discovered = match self.request_list(&server, "tools/list", "tools").await {
                 Ok(items) => parse_tools_array(&server.id, &items),
                 Err(_) => {
                     self.catalog
@@ -635,11 +645,11 @@ impl McpManager {
         Ok((tools, refreshes))
     }
 
-    pub fn discover_tools_with_notice(
+    pub async fn discover_tools_with_notice(
         &self,
         previous_fingerprint: Option<&str>,
     ) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>, McpToolChangeNotice)> {
-        let (tools, refreshes) = self.force_refresh_tools()?;
+        let (tools, refreshes) = self.force_refresh_tools().await?;
         let fingerprint = tool_fingerprint(&tools)?;
         let changed_servers = if previous_fingerprint.is_some_and(|value| value == fingerprint) {
             Vec::new()
@@ -662,7 +672,7 @@ impl McpManager {
 
     /// Resolve an MCP resource reference (`@server:protocol://path`).
     /// Returns the resource content as a string.
-    pub fn resolve_resource(&self, reference: &str) -> Result<String> {
+    pub async fn resolve_resource(&self, reference: &str) -> Result<String> {
         // Parse @server:uri format
         let stripped = reference.strip_prefix('@').unwrap_or(reference);
         let (server_id, uri) = stripped
@@ -681,7 +691,9 @@ impl McpManager {
             .ok_or_else(|| anyhow!("MCP server not found: {server_id}"))?;
         ensure_server_enabled(&server)?;
 
-        let response = self.request_server(&server, "resources/read", json!({"uri":uri}), None)?;
+        let response = self
+            .request_server(&server, "resources/read", json!({"uri":uri}), None)
+            .await?;
         extract_resource_text(
             response
                 .get("result")
@@ -701,12 +713,12 @@ impl McpManager {
 
     /// Search tools by relevance when >50 tools are registered.
     /// Uses keyword scoring to surface the most relevant subset.
-    pub fn search_tools_by_relevance(
+    pub async fn search_tools_by_relevance(
         &self,
         query: &str,
         max_results: usize,
     ) -> Result<Vec<McpTool>> {
-        let all_tools = self.discover_tools()?;
+        let all_tools = self.discover_tools().await?;
 
         // Below threshold, return all tools
         if all_tools.len() <= 50 {
@@ -760,11 +772,12 @@ impl McpManager {
     }
 
     /// List MCP resources from all enabled servers for autocomplete.
-    pub fn list_resources(&self) -> Result<Vec<McpResource>> {
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>> {
         let mut resources = Vec::new();
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
             let discovered = self
                 .request_list(&server, "resources/list", "resources")
+                .await
                 .ok();
             if let Some(items) = discovered {
                 for item in items {
@@ -797,8 +810,8 @@ impl McpManager {
     }
 
     /// Search resources by prefix for autocomplete (e.g. `@server:uri`).
-    pub fn autocomplete_resources(&self, prefix: &str) -> Result<Vec<McpResource>> {
-        let all = self.list_resources()?;
+    pub async fn autocomplete_resources(&self, prefix: &str) -> Result<Vec<McpResource>> {
+        let all = self.list_resources().await?;
         let prefix_lower = prefix.to_ascii_lowercase();
         let mut matches: Vec<McpResource> = all
             .into_iter()
@@ -814,7 +827,7 @@ impl McpManager {
 
     /// Returns tools appropriate for the current context usage.
     /// When `context_used_pct` > 10%, uses search-based filtering if a query is provided.
-    pub fn tools_for_context(
+    pub async fn tools_for_context(
         &self,
         context_used_pct: f64,
         query: Option<&str>,
@@ -823,9 +836,9 @@ impl McpManager {
         if context_used_pct > 10.0
             && let Some(q) = query
         {
-            return self.search_tools_by_relevance(q, max_results);
+            return self.search_tools_by_relevance(q, max_results).await;
         }
-        self.discover_tools()
+        self.discover_tools().await
     }
 
     /// P5-12: List all prompts from MCP servers.
@@ -833,10 +846,13 @@ impl McpManager {
     /// Queries each enabled server for its `prompts/list` endpoint and returns
     /// a flat list of `McpPrompt` records. These can be registered as slash
     /// commands like `/mcp-<server>-<prompt>` in the UI.
-    pub fn list_prompts(&self) -> Result<Vec<McpPrompt>> {
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>> {
         let mut prompts = Vec::new();
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
-            let discovered = self.request_list(&server, "prompts/list", "prompts").ok();
+            let discovered = self
+                .request_list(&server, "prompts/list", "prompts")
+                .await
+                .ok();
             if let Some(items) = discovered {
                 for item in items {
                     let arguments = item
@@ -887,14 +903,16 @@ impl McpManager {
     ///
     /// Re-discovers tools from all servers and returns the refresh results,
     /// allowing the caller to update tool definitions mid-session.
-    pub fn handle_list_changed_notification(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
-        self.refresh_tools()
+    pub async fn handle_list_changed_notification(
+        &self,
+    ) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
+        self.refresh_tools().await
     }
 
     /// Fetch a prompt template with resolved arguments from an MCP server.
     ///
     /// Returns the rendered prompt messages as a JSON array.
-    pub fn get_prompt(
+    pub async fn get_prompt(
         &self,
         server_id: &str,
         prompt_name: &str,
@@ -908,7 +926,9 @@ impl McpManager {
             "name": prompt_name,
             "arguments": arguments,
         });
-        let response = self.request_server(&server, "prompts/get", params, None)?;
+        let response = self
+            .request_server(&server, "prompts/get", params, None)
+            .await?;
         response
             .get("result")
             .cloned()

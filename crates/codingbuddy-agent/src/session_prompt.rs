@@ -297,11 +297,14 @@ impl AgentEngine {
             codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::SessionStart, &ws)
                 .with_prompt(prompt)
                 .with_session_type("startup");
-        let _ = self.hooks.fire_with_context(
-            codingbuddy_hooks::HookEvent::SessionStart,
-            &session_start_input,
-            &execution,
-        );
+        let _ = self
+            .hooks
+            .fire_with_context(
+                codingbuddy_hooks::HookEvent::SessionStart,
+                &session_start_input,
+                &execution,
+            )
+            .await;
 
         // Fire Setup hook once per session (not per turn)
         if !self
@@ -310,28 +313,35 @@ impl AgentEngine {
         {
             let setup_input =
                 codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Setup, &ws);
-            let _ = self.hooks.fire_with_context(
-                codingbuddy_hooks::HookEvent::Setup,
-                &setup_input,
-                &execution,
-            );
+            let _ = self
+                .hooks
+                .fire_with_context(
+                    codingbuddy_hooks::HookEvent::Setup,
+                    &setup_input,
+                    &execution,
+                )
+                .await;
         }
 
         // Fire UserPromptSubmit hook (blocking — can modify prompt)
         let user_submit_input =
             codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::UserPromptSubmit, &ws)
                 .with_prompt(prompt);
-        let submit_result = self.hooks.fire_with_context(
-            codingbuddy_hooks::HookEvent::UserPromptSubmit,
-            &user_submit_input,
-            &execution,
-        );
+        let submit_result = self
+            .hooks
+            .fire_with_context(
+                codingbuddy_hooks::HookEvent::UserPromptSubmit,
+                &user_submit_input,
+                &execution,
+            )
+            .await;
         if submit_result.blocked {
             return Err(anyhow!("prompt blocked by UserPromptSubmit hook"));
         }
 
         let prompt_enriched =
-            enrich_prompt_with_urls(prompt, options.detect_urls, Some(&execution.cancellation));
+            enrich_prompt_with_urls(prompt, options.detect_urls, Some(&execution.cancellation))
+                .await;
         let mut history = projection.chat_messages;
         // A prompt that failed, was cancelled, or whose process died leaves its
         // user turn (and possibly tool results) without a final answer. Close it
@@ -422,15 +432,19 @@ impl AgentEngine {
             .as_ref()
             .ok()
             .map(|s| serde_json::Value::String(s.clone()));
-        let _ = self.hooks.fire_with_context(
-            codingbuddy_hooks::HookEvent::SessionEnd,
-            &session_end_input,
-            &execution,
-        );
+        let _ = self
+            .hooks
+            .fire_with_context(
+                codingbuddy_hooks::HookEvent::SessionEnd,
+                &session_end_input,
+                &execution,
+            )
+            .await;
 
         let stop_input = codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Stop, &ws);
         self.hooks
-            .fire_with_context(codingbuddy_hooks::HookEvent::Stop, &stop_input, &execution);
+            .fire_with_context(codingbuddy_hooks::HookEvent::Stop, &stop_input, &execution)
+            .await;
 
         result
     }

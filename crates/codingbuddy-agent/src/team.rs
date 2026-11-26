@@ -29,7 +29,7 @@ struct LaneResult {
 }
 
 pub async fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<String> {
-    if !is_git_workspace(&engine.workspace) {
+    if !is_git_workspace(&engine.workspace).await {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
         return engine.run_tool_use_loop(prompt, &fallback).await;
@@ -48,6 +48,7 @@ pub async fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> R
     lanes.sort_by(|a, b| a.id.cmp(&b.id));
 
     let base_commit = git_stdout(&engine.workspace, &["rev-parse", "HEAD"])
+        .await
         .context("failed to read base commit for team lanes")?;
     let run_group = Uuid::now_v7();
     let lanes_root = runtime_dir(&engine.workspace)
@@ -112,7 +113,7 @@ pub async fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> R
         }
         validate_lane_patch_artifact(&lane.patch)
             .with_context(|| format!("invalid lane patch artifact for {}", lane.lane.id))?;
-        if !require_patch_approval(engine, &lane.patch, &lane.lane)? {
+        if !require_patch_approval(engine, &lane.patch, &lane.lane).await? {
             return Err(anyhow!("patch approval denied for lane {}", lane.lane.id));
         }
         let (applied, conflicts) = apply_lane_patch(
@@ -148,7 +149,8 @@ pub async fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> R
         &verify_commands,
         engine.cfg.agent_loop.verify_timeout_seconds,
         None,
-    );
+    )
+    .await;
     if !verify.success {
         let mut recovery_options = options.clone();
         recovery_options.disable_team_orchestration = true;
@@ -196,7 +198,7 @@ async fn execute_lane(
     if lane_root.exists() {
         let _ = fs::remove_dir_all(&lane_root);
     }
-    if let Err(err) = add_worktree(&workspace, &lane_root, base_commit) {
+    if let Err(err) = add_worktree(&workspace, &lane_root, base_commit).await {
         return Err((lane, run_id, err));
     }
 
@@ -225,6 +227,7 @@ async fn execute_lane(
             .chat_with_options(&lane_prompt, lane_options)
             .await?;
         let patch = git_stdout(&lane_root, &["diff", "--binary"])
+            .await
             .context("failed to collect lane patch artifact")?;
         Ok::<_, anyhow::Error>(LaneResult {
             lane: lane.clone(),
@@ -234,14 +237,14 @@ async fn execute_lane(
     }
     .await;
 
-    let _ = remove_worktree(&workspace, &lane_root);
+    let _ = remove_worktree(&workspace, &lane_root).await;
     match lane_result {
         Ok(result) => Ok(result),
         Err(err) => Err((lane, run_id, err)),
     }
 }
 
-fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> Result<bool> {
+async fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> Result<bool> {
     let stats = diff_stats(diff);
     let gate = &engine.cfg.agent_loop.safety_gate;
     let files_over = stats.touched_files as u64 > gate.max_files_without_approval;
@@ -267,7 +270,7 @@ fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> 
         | codingbuddy_policy::PermissionDryRunResult::Allowed => Ok(true),
         codingbuddy_policy::PermissionDryRunResult::NeedsApproval => {
             if call.requires_approval {
-                engine.request_approval(&call)
+                engine.request_approval(&call).await
             } else {
                 Ok(true)
             }
@@ -553,16 +556,17 @@ fn keyword_lane_groups(prompt: &str) -> BTreeMap<String, BTreeSet<String>> {
     grouped
 }
 
-fn is_git_workspace(workspace: &Path) -> bool {
+async fn is_git_workspace(workspace: &Path) -> bool {
     codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(workspace)
-        .output()
+        .pipe_output()
+        .await
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
-fn add_worktree(workspace: &Path, lane_path: &Path, base_commit: &str) -> Result<()> {
+async fn add_worktree(workspace: &Path, lane_path: &Path, base_commit: &str) -> Result<()> {
     let lane_path_str = lane_path.to_string_lossy().to_string();
     let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .arg("-C")
@@ -570,7 +574,8 @@ fn add_worktree(workspace: &Path, lane_path: &Path, base_commit: &str) -> Result
         .args(["worktree", "add", "--detach"])
         .arg(&lane_path_str)
         .arg(base_commit)
-        .output()
+        .pipe_output()
+        .await
         .context("failed to spawn git worktree add")?;
     if output.status.success() {
         return Ok(());
@@ -581,14 +586,15 @@ fn add_worktree(workspace: &Path, lane_path: &Path, base_commit: &str) -> Result
     ))
 }
 
-fn remove_worktree(workspace: &Path, lane_path: &Path) -> Result<()> {
+async fn remove_worktree(workspace: &Path, lane_path: &Path) -> Result<()> {
     let lane_path_str = lane_path.to_string_lossy().to_string();
     let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .arg("-C")
         .arg(workspace)
         .args(["worktree", "remove", "--force"])
         .arg(&lane_path_str)
-        .output()
+        .pipe_output()
+        .await
         .context("failed to spawn git worktree remove")?;
     if output.status.success() {
         return Ok(());
@@ -599,11 +605,12 @@ fn remove_worktree(workspace: &Path, lane_path: &Path) -> Result<()> {
     ))
 }
 
-fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
+async fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
     let output = codingbuddy_core::process_env::git_command(workspace, "git_worktree")
         .args(args)
         .current_dir(workspace)
-        .output()
+        .pipe_output()
+        .await
         .context("failed to spawn git command")?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
@@ -613,6 +620,23 @@ fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
         args,
         String::from_utf8_lossy(&output.stderr)
     ))
+}
+
+/// Run a prepared command as an async child and collect its output.
+trait PipeOutput {
+    fn pipe_output(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<std::process::Output>> + Send;
+}
+impl PipeOutput for std::process::Command {
+    fn pipe_output(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<std::process::Output>> + Send {
+        let mut command =
+            tokio::process::Command::from(std::mem::replace(self, std::process::Command::new("")));
+        command.kill_on_drop(true);
+        async move { command.output().await }
+    }
 }
 
 fn sanitize_name(value: &str) -> String {

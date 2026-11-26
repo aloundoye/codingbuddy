@@ -44,14 +44,21 @@ use std::time::Duration;
 use tool_surface::shape_tool_surface;
 use uuid::Uuid;
 
-/// Handler for spawn_task subagent workers. Retained for API compatibility,
-/// but the core loop does not dispatch subagents in this architecture.
-pub type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send + Sync>;
+/// Runs a spawn_task subagent: a whole child agent, awaited by the parent.
+pub type SubagentWorkerFn = Arc<
+    dyn Fn(SubagentTask) -> codingbuddy_core::runtime::BoxFuture<'static, Result<String>>
+        + Send
+        + Sync,
+>;
+/// An approval decision made on the spot (tests, policies, headless runs).
+/// It runs on the async runtime, so it must not wait for a person; use
+/// [`AgentEngine::set_async_approval_handler`] for that.
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
 fn install_mcp_executor(host: &mut LocalToolHost, manager: Arc<McpManager>) {
     host.set_context_mcp_executor(Arc::new(move |alias, args, context| {
-        manager.call_tool(alias, args, context)
+        let manager = manager.clone();
+        Box::pin(async move { manager.call_tool(alias, args, context).await })
     }));
 }
 
@@ -130,7 +137,7 @@ pub struct AgentEngine {
     stream_callback: Mutex<Option<codingbuddy_core::StreamCallback>>,
     max_turns: Option<u64>,
     max_budget_usd: Option<f64>,
-    approval_handler: Mutex<Option<Arc<Mutex<ApprovalHandler>>>>,
+    approval_handler: Mutex<Option<tool_loop::ApprovalCallback>>,
     user_question_handler: Mutex<Option<UserQuestionHandler>>,
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
     pub(crate) hooks: HookRuntime,
@@ -409,10 +416,21 @@ impl AgentEngine {
     }
 
     pub fn set_approval_handler(&self, handler: ApprovalHandler) {
+        let handler = Arc::new(Mutex::new(handler));
+        self.set_async_approval_handler(Arc::new(move |call| {
+            let decision = handler
+                .lock()
+                .map_err(|_| anyhow!("approval handler mutex poisoned"))
+                .and_then(|mut decide| decide(&call));
+            Box::pin(std::future::ready(decision))
+        }));
+    }
+
+    /// Install an approval handler that waits for a person (a UI prompt):
+    /// the turn awaits its answer without holding a thread.
+    pub fn set_async_approval_handler(&self, handler: tool_loop::ApprovalCallback) {
         match self.approval_handler.lock() {
-            Ok(mut guard) => {
-                *guard = Some(Arc::new(Mutex::new(handler)));
-            }
+            Ok(mut guard) => *guard = Some(handler),
             Err(_) => eprintln!("[agent] approval handler mutex poisoned; handler not installed"),
         }
     }
@@ -552,7 +570,7 @@ impl AgentEngine {
                     read_only_fallback: false,
                     custom_agent: None,
                 };
-                worker(&task)
+                worker(task)
             }));
         }
         None
@@ -643,7 +661,7 @@ impl AgentEngine {
 
     /// Fire PreToolUse hooks. Returns the aggregate result.
     /// Callers should check `result.blocked` to decide whether to skip tool execution.
-    pub fn fire_pre_tool_use(
+    pub async fn fire_pre_tool_use(
         &self,
         tool_name: &str,
         tool_input: &serde_json::Value,
@@ -653,14 +671,26 @@ impl AgentEngine {
             codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::PreToolUse, &ws)
                 .with_tool(tool_name, tool_input.clone());
         self.hooks
-            .fire(codingbuddy_hooks::HookEvent::PreToolUse, &input)
+            .fire_with_context(
+                codingbuddy_hooks::HookEvent::PreToolUse,
+                &input,
+                &Default::default(),
+            )
+            .await
     }
 
     /// Fire Stop hooks at end of agent execution.
-    pub fn fire_stop(&self) {
+    pub async fn fire_stop(&self) {
         let ws = self.workspace.display().to_string();
         let input = codingbuddy_hooks::HookInput::new(codingbuddy_hooks::HookEvent::Stop, &ws);
-        let _ = self.hooks.fire(codingbuddy_hooks::HookEvent::Stop, &input);
+        let _ = self
+            .hooks
+            .fire_with_context(
+                codingbuddy_hooks::HookEvent::Stop,
+                &input,
+                &Default::default(),
+            )
+            .await;
     }
 
     pub(crate) fn stream(&self, chunk: StreamChunk) {
@@ -797,17 +827,16 @@ impl AgentEngine {
         });
     }
 
-    pub(crate) fn request_approval(&self, call: &ToolCall) -> Result<bool> {
-        if let Ok(guard) = self.approval_handler.lock()
-            && let Some(ref handler) = *guard
-        {
-            let mut h = handler
-                .lock()
-                .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
-            // Waits for the user; release the worker meanwhile.
-            return codingbuddy_core::runtime::blocking_section(|| h(call));
+    pub(crate) async fn request_approval(&self, call: &ToolCall) -> Result<bool> {
+        let handler = self
+            .approval_handler
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        match handler {
+            Some(handler) => handler(call.clone()).await,
+            None => Ok(false),
         }
-        Ok(false)
     }
 
     #[deprecated(note = "resume returns a session summary only")]
@@ -1000,7 +1029,7 @@ fn should_run_team_orchestration(
 /// Fetch up to three URLs named in the prompt, concurrently, and append
 /// their text. Gives up (returning the prompt unchanged) as soon as the turn
 /// is cancelled; failed fetches are skipped.
-fn enrich_prompt_with_urls(
+async fn enrich_prompt_with_urls(
     prompt: &str,
     enabled: bool,
     cancellation: Option<&codingbuddy_core::CancellationToken>,
@@ -1019,7 +1048,7 @@ fn enrich_prompt_with_urls(
     else {
         return prompt.to_string();
     };
-    let fetched = codingbuddy_core::runtime::block_on_cancellable(cancellation, async move {
+    let fetched = codingbuddy_core::runtime::with_cancellation(cancellation, async move {
         let tasks: Vec<_> = urls
             .into_iter()
             .map(|url| {
@@ -1045,7 +1074,8 @@ fn enrich_prompt_with_urls(
             }
         }
         pages
-    });
+    })
+    .await;
     let Ok(pages) = fetched else {
         return prompt.to_string();
     };

@@ -10,7 +10,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -88,47 +87,108 @@ impl JsonRpcResponse {
     }
 }
 
+/// A future returned by [`RpcHandler::handle_async`]; it may borrow the
+/// handler and need not be `Send` (the stdio server drives it in place).
+pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
 /// Trait for handling JSON-RPC method dispatching.
 pub trait RpcHandler {
     fn handle(&self, method: &str, params: Value) -> Result<Value>;
+
+    /// Handle a request without blocking the server. Methods that wait
+    /// (running a prompt) override this so other requests, such as a
+    /// cancel, are served meanwhile. Defaults to [`RpcHandler::handle`].
+    fn handle_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> LocalBoxFuture<'a, Result<Value>> {
+        Box::pin(std::future::ready(self.handle(method, params)))
+    }
 }
 
 /// Run a JSON-RPC 2.0 server over stdio (newline-delimited JSON).
+///
+/// Requests are served concurrently: a long `prompt/execute` does not hold
+/// up a `cancel` or `status` sent after it. Each response carries its
+/// request's id and is written when ready, so responses can arrive out of
+/// order. `shutdown` waits for requests in flight, then answers and exits.
 pub fn run_stdio_server(handler: &dyn RpcHandler) -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let reader = stdin.lock();
-    let mut writer = stdout.lock();
+    codingbuddy_core::runtime::runtime().block_on(serve(
+        handler,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    ))
+}
 
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+/// The stdio server loop over any byte streams.
+pub async fn serve(
+    handler: &dyn RpcHandler,
+    input: impl tokio::io::AsyncRead + Unpin,
+    mut output: impl tokio::io::AsyncWrite + Unpin,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            Ok(req) => {
-                if req.method == "shutdown" {
-                    let resp = JsonRpcResponse::success(req.id, serde_json::json!({"ok": true}));
-                    let out = serde_json::to_string(&resp)?;
-                    writeln!(writer, "{out}")?;
-                    writer.flush()?;
-                    return Ok(());
-                }
-                match handler.handle(&req.method, req.params) {
-                    Ok(result) => JsonRpcResponse::success(req.id, result),
-                    Err(e) => JsonRpcResponse::error(req.id, ERR_INTERNAL, e.to_string()),
-                }
-            }
-            Err(_) => JsonRpcResponse::error(Value::Null, ERR_PARSE, "Parse error"),
-        };
-
-        let out = serde_json::to_string(&response)?;
-        writeln!(writer, "{out}")?;
-        writer.flush()?;
+    async fn send(
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+        response: &JsonRpcResponse,
+    ) -> Result<()> {
+        let mut line = serde_json::to_vec(response)?;
+        line.push(b'\n');
+        output.write_all(&line).await?;
+        output.flush().await?;
+        Ok(())
     }
 
+    let mut lines = tokio::io::BufReader::new(input).lines();
+    let mut in_flight = futures_util::stream::FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            Some(response) = in_flight.next(), if !in_flight.is_empty() => {
+                send(&mut output, &response).await?;
+            }
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let request = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        send(
+                            &mut output,
+                            &JsonRpcResponse::error(Value::Null, ERR_PARSE, "Parse error"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                if request.method == "shutdown" {
+                    while let Some(response) = in_flight.next().await {
+                        send(&mut output, &response).await?;
+                    }
+                    let response =
+                        JsonRpcResponse::success(request.id, serde_json::json!({"ok": true}));
+                    send(&mut output, &response).await?;
+                    return Ok(());
+                }
+                in_flight.push(async move {
+                    match handler.handle_async(&request.method, request.params).await {
+                        Ok(result) => JsonRpcResponse::success(request.id, result),
+                        Err(e) => JsonRpcResponse::error(request.id, ERR_INTERNAL, e.to_string()),
+                    }
+                });
+            }
+        }
+    }
+    // Input closed: finish what was asked.
+    while let Some(response) = in_flight.next().await {
+        send(&mut output, &response).await?;
+    }
     Ok(())
 }
 
@@ -248,6 +308,12 @@ impl IdeRpcHandler {
     }
 
     fn run_durable_prompt(&self, params: Value, background: bool) -> Result<Value> {
+        codingbuddy_core::runtime::block_on(self.run_durable_prompt_async(params, background))
+    }
+
+    /// Start a prompt. In the foreground the returned future runs it to
+    /// completion; in the background it is spawned and this returns at once.
+    async fn run_durable_prompt_async(&self, params: Value, background: bool) -> Result<Value> {
         let session_id = require_uuid(&params, "session_id")?;
         let request = if background {
             require_uuid(&params, "request_id")?
@@ -325,7 +391,7 @@ impl IdeRpcHandler {
                 serde_json::json!({"prompt_id":id,"session_id":session_id,"status":"running"}),
             );
         }
-        codingbuddy_core::runtime::block_on(run(self))
+        run(self).await
     }
 
     fn handle_prompt_events(&self, params: Value) -> Result<Value> {
@@ -1240,6 +1306,21 @@ impl IdeRpcHandler {
 }
 
 impl RpcHandler for IdeRpcHandler {
+    fn handle_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> LocalBoxFuture<'a, Result<Value>> {
+        if method == "prompt/execute" {
+            #[cfg(test)]
+            if let Err(problem) = protocol::check_params(method, &params) {
+                panic!("{problem}: {params}");
+            }
+            return Box::pin(self.run_durable_prompt_async(params, false));
+        }
+        Box::pin(std::future::ready(self.handle(method, params)))
+    }
+
     fn handle(&self, method: &str, params: Value) -> Result<Value> {
         // Every call made by the test suite must match the published
         // protocol, so `docs/protocol/jsonrpc.schema.json` cannot drift.

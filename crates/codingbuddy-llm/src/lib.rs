@@ -7,7 +7,6 @@ mod native_parts;
 mod route;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use codingbuddy_core::runtime::spawn_blocking;
 use codingbuddy_core::{
     AppliedCompatibility, CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig,
     LlmRequest, LlmResponse, LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
@@ -18,7 +17,6 @@ use reqwest::header::RETRY_AFTER;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
-use std::io::BufRead;
 use std::ops::Deref;
 
 use std::time::Duration;
@@ -227,7 +225,7 @@ impl ApiClient {
         Ok(route)
     }
 
-    fn chat_bearer(
+    async fn chat_bearer(
         &self,
         route: &route::ChatRoute,
         transport: &chat_transport::ChatTransport,
@@ -241,6 +239,7 @@ impl ApiClient {
             transport,
             Duration::from_secs(self.cfg.timeout_seconds),
         )
+        .await
     }
 
     /// Clear the cached API key (e.g. on logout). Subsequent requests will
@@ -273,7 +272,7 @@ impl ApiClient {
 
     /// Discover available models from the provider's /v1/models endpoint.
     /// Returns a list of model IDs. Fails gracefully (empty vec) on error.
-    fn discover_models_from_api(&self) -> Vec<String> {
+    async fn discover_models_from_api(&self) -> Vec<String> {
         let provider = self.provider_config();
         if provider.cloud.is_some() || route::custom_headers(&provider).is_err() {
             return Vec::new();
@@ -331,7 +330,8 @@ impl ApiClient {
                     .await?
                     .json::<serde_json::Value>()
                     .await
-            });
+            })
+            .await;
         let body = match fetched {
             Ok(Ok(Ok(body))) => body,
             _ => return Vec::new(),
@@ -484,26 +484,31 @@ impl ApiClient {
         resolved_endpoint(&self.cfg, is_chat, is_fim, is_strict_tools)
     }
 
-    fn complete_inner(&self, req: &LlmRequest, api_key: Option<&str>) -> Result<LlmResponse> {
+    async fn complete_inner(&self, req: &LlmRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let prepared = self.build_payload(req);
         let transport = self.transport();
         let endpoint = self.resolved_endpoint(false, false, false);
         let headers = self.auth_headers(api_key)?;
         let max_retries = self.cfg.max_retries;
-        let response = transport.send_with_retry(
-            &self.retry_policy(None),
-            || transport.post(&endpoint, headers.clone(), &prepared.payload),
-            |status, body, attempt| {
-                with_compatibility_context(
-                    format_api_error(status, &redact_key(body, api_key), attempt, max_retries),
-                    &prepared.compatibility,
-                )
-            },
-            |error| {
-                with_compatibility_context(format_transport_error(error), &prepared.compatibility)
-            },
-        )?;
-        let body = transport.text(response)?;
+        let response = transport
+            .send_with_retry(
+                &self.retry_policy(None),
+                || transport.post(&endpoint, headers.clone(), &prepared.payload),
+                |status, body, attempt| {
+                    with_compatibility_context(
+                        format_api_error(status, &redact_key(body, api_key), attempt, max_retries),
+                        &prepared.compatibility,
+                    )
+                },
+                |error| {
+                    with_compatibility_context(
+                        format_transport_error(error),
+                        &prepared.compatibility,
+                    )
+                },
+            )
+            .await?;
+        let body = transport.text(response).await?;
         let mut parsed = if self.cfg.stream {
             parse_streaming_payload(&body)?
         } else {
@@ -517,7 +522,7 @@ impl ApiClient {
         Ok(parsed)
     }
 
-    fn complete_native_adapter(
+    async fn complete_native_adapter(
         &self,
         req: &ChatRequest,
         route: &route::ChatRoute,
@@ -528,39 +533,47 @@ impl ApiClient {
         let bytes = serde_json::to_vec(&prepared.payload)?;
         let timeout = Duration::from_secs(self.cfg.timeout_seconds);
         let transport = self.transport();
-        let headers = adapter.authenticate(
-            &extension::ProviderRequest {
-                route,
-                transport: &transport,
-                timeout,
-                #[cfg(feature = "provider-fixtures")]
-                fixture: self.fixture_origin.is_some(),
-            },
-            &bytes,
-        )?;
-        let response = transport.post_bytes(&route.endpoint, headers, bytes)?;
+        let headers = adapter
+            .authenticate(
+                &extension::ProviderRequest {
+                    route,
+                    transport: &transport,
+                    timeout,
+                    #[cfg(feature = "provider-fixtures")]
+                    fixture: self.fixture_origin.is_some(),
+                },
+                &bytes,
+            )
+            .await?;
+        let response = transport
+            .post_bytes(&route.endpoint, headers, bytes)
+            .await?;
         let status = response.status();
         if !status.is_success() {
-            let body = transport.text(response)?;
+            let body = transport.text(response).await?;
             return Err(error::ProviderError::http(route.protocol, status.as_u16(), &body).into());
         }
         let mut result = if let Some(callback) = callback {
-            adapter.decode_stream(&mut transport.reader(response), callback)?
+            adapter
+                .decode_stream(&mut transport.stream(response), callback)
+                .await?
         } else {
-            adapter.decode_response(&serde_json::from_str(&transport.text(response)?)?)?
+            adapter.decode_response(&serde_json::from_str(&transport.text(response).await?)?)?
         };
         result.compatibility = Some(prepared.compatibility);
         Ok(result)
     }
 
-    fn complete_chat_inner(
+    async fn complete_chat_inner(
         &self,
         req: &ChatRequest,
         api_key: Option<&str>,
         route: &route::ChatRoute,
     ) -> Result<LlmResponse> {
         if let Some(adapter) = extension::registered_adapter(route.protocol) {
-            return self.complete_native_adapter(req, route, adapter, None);
+            return self
+                .complete_native_adapter(req, route, adapter, None)
+                .await;
         }
         let mut prepared = self.build_chat_payload_for_route(req, route)?;
         let capabilities = &route.capabilities;
@@ -572,21 +585,23 @@ impl ApiClient {
         }
         let cloud_token = match route.auth {
             protocol::AuthStrategy::AzureEntra | protocol::AuthStrategy::GoogleAdc => {
-                Some(self.chat_bearer(route, &transport)?)
+                Some(self.chat_bearer(route, &transport).await?)
             }
             _ => None,
         };
         let headers = route.headers(cloud_token.as_deref().or(api_key))?;
-        let response = transport.send_with_retry(
-            &self.retry_policy(None),
-            || transport.post(endpoint, headers.clone(), &prepared.payload),
-            |status, body, _| {
-                error::ProviderError::http(chat_protocol, status.as_u16(), body).into()
-            },
-            |_| error::ProviderError::new(chat_protocol, error::FailureKind::Transport).into(),
-        )?;
+        let response = transport
+            .send_with_retry(
+                &self.retry_policy(None),
+                || transport.post(endpoint, headers.clone(), &prepared.payload),
+                |status, body, _| {
+                    error::ProviderError::http(chat_protocol, status.as_u16(), body).into()
+                },
+                |_| error::ProviderError::new(chat_protocol, error::FailureKind::Transport).into(),
+            )
+            .await?;
         let status = response.status();
-        let body = transport.text(response)?;
+        let body = transport.text(response).await?;
         let envelope: Value = serde_json::from_str(&body)?;
         if !envelope["error"].is_null() {
             return Err(error::ProviderError::http(chat_protocol, status.as_u16(), &body).into());
@@ -614,19 +629,25 @@ impl ApiClient {
         Ok(response)
     }
 
-    fn complete_fim_inner(&self, req: &FimRequest, api_key: Option<&str>) -> Result<LlmResponse> {
+    async fn complete_fim_inner(
+        &self,
+        req: &FimRequest,
+        api_key: Option<&str>,
+    ) -> Result<LlmResponse> {
         let payload = self.build_fim_payload(req);
         let transport = self.transport();
         let endpoint = self.resolved_endpoint(false, true, false);
         let headers = self.auth_headers(api_key)?;
         let max_retries = self.cfg.max_retries;
-        let response = transport.send_with_retry(
-            &self.retry_policy(None),
-            || transport.post(&endpoint, headers.clone(), &payload),
-            |status, body, attempt| format_api_error(status, body, attempt, max_retries),
-            format_transport_error,
-        )?;
-        parse_fim_non_streaming_payload(&transport.text(response)?)
+        let response = transport
+            .send_with_retry(
+                &self.retry_policy(None),
+                || transport.post(&endpoint, headers.clone(), &payload),
+                |status, body, attempt| format_api_error(status, body, attempt, max_retries),
+                format_transport_error,
+            )
+            .await?;
+        parse_fim_non_streaming_payload(&transport.text(response).await?)
     }
 
     fn resolve_api_key(&self) -> Option<String> {
@@ -844,8 +865,7 @@ impl LlmClient for ApiClient {
     }
 
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        let (client, req) = (self.clone(), req.clone());
-        spawn_blocking(move || client.complete_sync(&req)).await
+        self.complete_body(req).await
     }
 
     async fn complete_streaming(
@@ -853,13 +873,11 @@ impl LlmClient for ApiClient {
         req: &LlmRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let (client, req) = (self.clone(), req.clone());
-        spawn_blocking(move || client.complete_streaming_sync(&req, cb)).await
+        self.complete_streaming_body(req, cb).await
     }
 
     async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        let (client, req) = (self.clone(), req.clone());
-        spawn_blocking(move || client.complete_chat_sync(&req)).await
+        self.complete_chat_body(req).await
     }
 
     async fn complete_chat_streaming(
@@ -867,13 +885,11 @@ impl LlmClient for ApiClient {
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let (client, req) = (self.clone(), req.clone());
-        spawn_blocking(move || client.complete_chat_streaming_sync(&req, cb)).await
+        self.complete_chat_streaming_body(req, cb).await
     }
 
     async fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
-        let (client, req) = (self.clone(), req.clone());
-        spawn_blocking(move || client.complete_fim_sync(&req)).await
+        self.complete_fim_body(req).await
     }
 
     async fn complete_fim_streaming(
@@ -881,38 +897,39 @@ impl LlmClient for ApiClient {
         req: &FimRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let (client, req) = (self.clone(), req.clone());
-        spawn_blocking(move || client.complete_fim_streaming_sync(&req, cb)).await
+        self.complete_fim_streaming_body(req, cb).await
     }
 
     async fn list_models(&self) -> Vec<String> {
-        let client = self.clone();
-        spawn_blocking(move || client.list_models_sync()).await
+        self.discover_models_from_api().await
     }
 }
 
-/// The request bodies behind [`LlmClient`]. They block on the shared
-/// runtime (`ChatTransport::wait`) and read response streams synchronously,
-/// so the trait runs them on the blocking pool; the turn's cancellation
-/// token still stops them mid-request.
+/// The request bodies behind [`LlmClient`]: plain async, awaited on the
+/// caller's task. The turn's cancellation token stops them mid-request.
 impl ApiClient {
-    fn complete_sync(&self, req: &LlmRequest) -> Result<LlmResponse> {
+    pub(crate) async fn complete_body(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
-        self.complete_inner(&normalized_req, key.as_deref())
+        self.complete_inner(&normalized_req, key.as_deref()).await
     }
 
-    fn complete_streaming_sync(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
+    pub(crate) async fn complete_streaming_body(
+        &self,
+        req: &LlmRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.complete_streaming_inner(&normalized_req, key.as_deref(), cb)
+            .await
     }
 
-    fn complete_chat_sync(&self, req: &ChatRequest) -> Result<LlmResponse> {
+    pub(crate) async fn complete_chat_body(&self, req: &ChatRequest) -> Result<LlmResponse> {
         let started = std::time::Instant::now();
         let protocol = protocol::select_chat_protocol(
             &self.cfg.active_provider(),
@@ -920,7 +937,7 @@ impl ApiClient {
                 .active_provider_kind()
                 .unwrap_or(ProviderKind::OpenAiCompatible),
         );
-        let result = (|| {
+        let result = async {
             let _provider = self.provider_kind()?;
             let mut normalized_req = req.clone();
             normalized_req.model = self.resolve_request_model(&req.model)?;
@@ -933,17 +950,19 @@ impl ApiClient {
             self.validate_chat_request_for_route(&normalized_req, &route)?;
             self.validate_thinking_params(&normalized_req, &route)?;
             confirmed_chat_response(
-                self.complete_chat_inner(&normalized_req, key.as_deref(), &route)?,
+                self.complete_chat_inner(&normalized_req, key.as_deref(), &route)
+                    .await?,
                 protocol,
                 &normalized_req.tools,
             )
-        })()
+        }
+        .await
         .map_err(|error| error::ProviderError::classify(protocol, error));
         log_llm_outcome("chat", &self.cfg.provider, &req.model, started, &result);
         result
     }
 
-    fn complete_chat_streaming_sync(
+    pub(crate) async fn complete_chat_streaming_body(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
@@ -967,7 +986,7 @@ impl ApiClient {
             }
             cb(chunk);
         });
-        let result = (|| {
+        let result = async {
             let _provider = self.provider_kind()?;
             let mut normalized_req = req.clone();
             normalized_req.model = self.resolve_request_model(&req.model)?;
@@ -981,17 +1000,20 @@ impl ApiClient {
             self.validate_thinking_params(&normalized_req, &route)?;
             if !self.cfg.stream {
                 return confirmed_chat_response(
-                    self.complete_chat_inner(&normalized_req, key.as_deref(), &route)?,
+                    self.complete_chat_inner(&normalized_req, key.as_deref(), &route)
+                        .await?,
                     protocol,
                     &normalized_req.tools,
                 );
             }
             confirmed_chat_response(
-                self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb, &route)?,
+                self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb, &route)
+                    .await?,
                 protocol,
                 &normalized_req.tools,
             )
-        })()
+        }
+        .await
         .map_err(|error| {
             let mut error = error::ProviderError::classify(protocol, error);
             if visible.load(std::sync::atomic::Ordering::SeqCst)
@@ -1019,7 +1041,7 @@ impl ApiClient {
         result
     }
 
-    fn complete_fim_sync(&self, req: &FimRequest) -> Result<LlmResponse> {
+    pub(crate) async fn complete_fim_body(&self, req: &FimRequest) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let resolution = self
             .cfg
@@ -1046,9 +1068,10 @@ impl ApiClient {
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.complete_fim_inner(&normalized_req, key.as_deref())
+            .await
     }
 
-    fn complete_fim_streaming_sync(
+    pub(crate) async fn complete_fim_streaming_body(
         &self,
         req: &FimRequest,
         cb: StreamCallback,
@@ -1079,10 +1102,7 @@ impl ApiClient {
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
         self.complete_fim_streaming_inner(&normalized_req, key.as_deref(), cb)
-    }
-
-    fn list_models_sync(&self) -> Vec<String> {
-        self.discover_models_from_api()
+            .await
     }
 }
 

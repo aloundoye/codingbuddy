@@ -925,7 +925,10 @@ pub struct UserQuestion {
 
 /// Handler invoked when the agent asks the user a question.
 /// Returns `Some(answer)` if the user provides an answer, or `None` on cancellation.
-pub type UserQuestionHandler = std::sync::Arc<dyn Fn(UserQuestion) -> Option<String> + Send + Sync>;
+/// Asks the user a question; resolves to `None` if they cancel.
+pub type UserQuestionHandler = std::sync::Arc<
+    dyn Fn(UserQuestion) -> runtime::BoxFuture<'static, Option<String>> + Send + Sync,
+>;
 
 // ── Chat-with-tools types (DeepSeek function calling) ──────────────────
 

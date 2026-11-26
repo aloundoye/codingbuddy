@@ -145,7 +145,7 @@ fn add_list_remove_server_round_trip() {
     let listed = manager.list_servers().expect("list");
     assert!(listed.iter().any(|s| s.id == "local"));
 
-    let tools = manager.discover_tools().expect("discover");
+    let tools = codingbuddy_core::runtime::block_on(manager.discover_tools()).expect("discover");
     assert!(tools.iter().any(|t| t.name == "hello"));
 
     let removed = manager.remove_server("local").expect("remove");
@@ -173,9 +173,9 @@ fn detects_toolset_changes_and_emits_notice_fingerprint() {
         })
         .expect("add");
 
-    let (_, first_refreshes, first_notice) = manager
-        .discover_tools_with_notice(None)
-        .expect("first refresh");
+    let (_, first_refreshes, first_notice) =
+        codingbuddy_core::runtime::block_on(manager.discover_tools_with_notice(None))
+            .expect("first refresh");
     let first = first_refreshes
         .iter()
         .find(|refresh| refresh.server_id == "notify")
@@ -199,9 +199,10 @@ fn detects_toolset_changes_and_emits_notice_fingerprint() {
         })
         .expect("replace");
 
-    let (_, second_refreshes, second_notice) = manager
-        .discover_tools_with_notice(Some(&first_notice.fingerprint))
-        .expect("second refresh");
+    let (_, second_refreshes, second_notice) = codingbuddy_core::runtime::block_on(
+        manager.discover_tools_with_notice(Some(&first_notice.fingerprint)),
+    )
+    .expect("second refresh");
     let second = second_refreshes
         .iter()
         .find(|refresh| refresh.server_id == "notify")
@@ -494,7 +495,7 @@ fn mcp_search_filters_by_name() {
         })
         .expect("add");
 
-    let tools = manager.discover_tools().expect("discover");
+    let tools = codingbuddy_core::runtime::block_on(manager.discover_tools()).expect("discover");
     assert_eq!(tools.len(), 3, "all three tools should be discovered");
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"alpha"));
@@ -524,7 +525,7 @@ fn unavailable_server_does_not_panic() {
         .expect("add");
 
     // discover_tools should return Ok even if the server command doesn't exist
-    let result = manager.discover_tools();
+    let result = codingbuddy_core::runtime::block_on(manager.discover_tools());
     assert!(
         result.is_ok(),
         "discover_tools should not panic/error on unavailable server: {:?}",
@@ -558,7 +559,7 @@ fn http_mcp_server_add_and_list() {
     assert!(http.is_some(), "HTTP server should be listed");
     assert!(matches!(http.unwrap().transport, McpTransport::Http));
 
-    let tools = manager.discover_tools().expect("discover");
+    let tools = codingbuddy_core::runtime::block_on(manager.discover_tools()).expect("discover");
     assert!(
         tools.is_empty(),
         "Disconnected metadata must never fabricate tools"
@@ -609,8 +610,7 @@ fn tools_for_context_returns_all_below_threshold() {
         .expect("add");
 
     // Below 10% threshold → returns all tools regardless of query
-    let tools = manager
-        .tools_for_context(5.0, Some("t1"), 10)
+    let tools = codingbuddy_core::runtime::block_on(manager.tools_for_context(5.0, Some("t1"), 10))
         .expect("tools");
     assert_eq!(tools.len(), 2);
 }
@@ -640,7 +640,8 @@ fn tools_for_context_no_query_above_threshold_returns_all() {
         .expect("add");
 
     // Above 10% but no query → returns all tools
-    let tools = manager.tools_for_context(15.0, None, 10).expect("tools");
+    let tools = codingbuddy_core::runtime::block_on(manager.tools_for_context(15.0, None, 10))
+        .expect("tools");
     assert_eq!(tools.len(), 2);
 }
 
@@ -671,9 +672,9 @@ fn tools_for_context_filters_above_threshold() {
     // Above 10% with query — search_tools_by_relevance is called.
     // Since there are only 2 tools (below the 50-tool threshold in search),
     // it returns all tools.
-    let tools = manager
-        .tools_for_context(15.0, Some("search"), 10)
-        .expect("tools");
+    let tools =
+        codingbuddy_core::runtime::block_on(manager.tools_for_context(15.0, Some("search"), 10))
+            .expect("tools");
     assert!(!tools.is_empty());
 }
 
@@ -738,7 +739,8 @@ fn autocomplete_resources_no_servers_returns_empty() {
     fs::create_dir_all(&workspace).expect("workspace");
     let manager = trusted_manager(&workspace);
 
-    let results = manager.autocomplete_resources("@").expect("autocomplete");
+    let results = codingbuddy_core::runtime::block_on(manager.autocomplete_resources("@"))
+        .expect("autocomplete");
     assert!(results.is_empty());
 }
 
@@ -749,7 +751,8 @@ fn autocomplete_resources_empty_prefix_returns_all() {
     let manager = trusted_manager(&workspace);
 
     // No servers → empty results (can't test with real servers in unit tests)
-    let results = manager.autocomplete_resources("").expect("autocomplete");
+    let results = codingbuddy_core::runtime::block_on(manager.autocomplete_resources(""))
+        .expect("autocomplete");
     assert!(results.is_empty());
 }
 

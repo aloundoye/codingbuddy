@@ -17,14 +17,17 @@ pub async fn analyze(
     stream_cb: Option<StreamCallback>,
 ) -> Result<LlmResponse> {
     let workspace = options.repo_root_override.as_deref().unwrap_or(workspace);
-    let bootstrap = gather_context::gather_for_prompt(
-        workspace,
-        cfg,
-        prompt,
-        options.mode,
-        &options.additional_dirs,
-        options.repo_root_override.as_deref(),
-    );
+    // Walks the repo and runs git: off the async worker.
+    let bootstrap = codingbuddy_core::runtime::blocking_section(|| {
+        gather_context::gather_for_prompt(
+            workspace,
+            cfg,
+            prompt,
+            options.mode,
+            &options.additional_dirs,
+            options.repo_root_override.as_deref(),
+        )
+    });
 
     if bootstrap.repoish && bootstrap.repo_root.is_none() {
         return Err(anyhow!(

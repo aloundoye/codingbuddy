@@ -98,7 +98,7 @@ fn last_changed(metadata: &std::fs::Metadata) -> Option<std::time::SystemTime> {
 
 /// GET `url` on the shared runtime, abandoning the request the moment the
 /// tool call is cancelled. Returns (status, content type, body).
-fn http_get_cancellable(
+async fn http_get_cancellable(
     url: &str,
     timeout: Duration,
     cancellation: Option<&codingbuddy_core::CancellationToken>,
@@ -108,7 +108,7 @@ fn http_get_cancellable(
         .user_agent(concat!("codingbuddy-cli/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let url = url.to_string();
-    let fetched = codingbuddy_core::runtime::block_on_cancellable(cancellation, async move {
+    let fetched = codingbuddy_core::runtime::with_cancellation(cancellation, async move {
         let response = client.get(url).send().await?;
         let status = response.status().as_u16();
         let content_type = response
@@ -119,7 +119,8 @@ fn http_get_cancellable(
             .to_string();
         let body = response.text().await?;
         Ok::<_, reqwest::Error>((status, content_type, body))
-    })?;
+    })
+    .await?;
     Ok(fetched?)
 }
 
@@ -144,17 +145,26 @@ fn extract_lsp_position(args: &serde_json::Value) -> Result<(&str, u32, u32)> {
     Ok((path, line, col))
 }
 
+use codingbuddy_core::runtime::BoxFuture;
+
 /// Callback type for executing MCP tool calls.
 /// Takes (server_id, tool_name, arguments) and returns the tool result.
-pub type McpExecutor =
-    Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<serde_json::Value> + Send + Sync>;
+pub type McpExecutor = Arc<
+    dyn for<'a> Fn(
+            &'a str,
+            &'a str,
+            &'a serde_json::Value,
+        ) -> BoxFuture<'a, Result<serde_json::Value>>
+        + Send
+        + Sync,
+>;
 
 pub type ContextMcpExecutor = Arc<
-    dyn Fn(
-            &str,
-            &serde_json::Value,
-            codingbuddy_core::ToolExecutionContext<'_>,
-        ) -> Result<serde_json::Value>
+    dyn for<'a> Fn(
+            &'a str,
+            &'a serde_json::Value,
+            codingbuddy_core::ToolExecutionContext<'a>,
+        ) -> BoxFuture<'a, Result<serde_json::Value>>
         + Send
         + Sync,
 >;
@@ -361,7 +371,7 @@ impl LocalToolHost {
         self.policy.ensure_allowed(&target)
     }
 
-    fn run_tool(
+    async fn run_tool(
         &self,
         call: &ToolCall,
         shell: Option<ShellLaunch>,
@@ -492,155 +502,159 @@ impl LocalToolHost {
                 }))
             }
             "fs.glob" => {
-                let pattern = call
-                    .args
-                    .get("pattern")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("pattern missing"))?;
-                let limit = call
-                    .args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(200) as usize;
-                let respect_gitignore = call
-                    .args
-                    .get("respectGitignore")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let base = call
-                    .args
-                    .get("base")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".");
-                let base_path = self
-                    .workspace
-                    .join(self.resolve_path(Path::new(base), false)?);
-                let mut matches = Vec::new();
-                let compiled = glob::Pattern::new(pattern)
-                    .map_err(|err| anyhow!("invalid glob pattern '{pattern}': {err}"))?;
-                for path in walk_paths(&base_path, &self.workspace, respect_gitignore) {
-                    let rel_path = match path.strip_prefix(&self.workspace) {
-                        Ok(rel) => rel,
-                        Err(_) => continue,
-                    };
-                    if should_skip_rel_path(rel_path) {
-                        continue;
-                    }
-                    let rel = normalize_rel_path(rel_path);
-                    let Ok(resolved) = self.resolve_path(rel_path, false) else {
-                        continue;
-                    };
-                    let rel_under_base = path
-                        .strip_prefix(&base_path)
-                        .map(normalize_rel_path)
-                        .unwrap_or_else(|_| rel.clone());
-                    if compiled.matches(&rel) || compiled.matches(&rel_under_base) {
-                        matches.push(json!({
-                            "path": rel,
-                            "is_dir": self.files.read_dir(&resolved).is_ok()
-                        }));
-                        if matches.len() >= limit {
-                            break;
+                codingbuddy_core::runtime::blocking_section(|| -> Result<serde_json::Value> {
+                    let pattern = call
+                        .args
+                        .get("pattern")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("pattern missing"))?;
+                    let limit = call
+                        .args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(200) as usize;
+                    let respect_gitignore = call
+                        .args
+                        .get("respectGitignore")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let base = call
+                        .args
+                        .get("base")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(".");
+                    let base_path = self
+                        .workspace
+                        .join(self.resolve_path(Path::new(base), false)?);
+                    let mut matches = Vec::new();
+                    let compiled = glob::Pattern::new(pattern)
+                        .map_err(|err| anyhow!("invalid glob pattern '{pattern}': {err}"))?;
+                    for path in walk_paths(&base_path, &self.workspace, respect_gitignore) {
+                        let rel_path = match path.strip_prefix(&self.workspace) {
+                            Ok(rel) => rel,
+                            Err(_) => continue,
+                        };
+                        if should_skip_rel_path(rel_path) {
+                            continue;
                         }
-                    }
-                }
-                Ok(json!({
-                    "pattern": pattern,
-                    "matches": matches
-                }))
-            }
-            "fs.grep" => {
-                let pattern = call
-                    .args
-                    .get("pattern")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("pattern missing"))?;
-                let limit = call
-                    .args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(200) as usize;
-                let glob_pattern = call
-                    .args
-                    .get("glob")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("**/*");
-                let base = call
-                    .args
-                    .get("base")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".");
-                let respect_gitignore = call
-                    .args
-                    .get("respectGitignore")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let case_sensitive = call
-                    .args
-                    .get("case_sensitive")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let compiled_glob = glob::Pattern::new(glob_pattern)
-                    .map_err(|err| anyhow!("invalid glob pattern '{glob_pattern}': {err}"))?;
-                let regex = regex::RegexBuilder::new(pattern)
-                    .case_insensitive(!case_sensitive)
-                    .build()?;
-                let mut matches = Vec::new();
-                let base_path = self
-                    .workspace
-                    .join(self.resolve_path(Path::new(base), false)?);
-                for path in walk_paths(&base_path, &self.workspace, respect_gitignore) {
-                    let rel_path = match path.strip_prefix(&self.workspace) {
-                        Ok(rel) => rel,
-                        Err(_) => continue,
-                    };
-                    if should_skip_rel_path(rel_path) {
-                        continue;
-                    }
-                    let rel = normalize_rel_path(rel_path);
-                    let Ok(resolved) = self.resolve_path(rel_path, false) else {
-                        continue;
-                    };
-                    let rel_under_base = path
-                        .strip_prefix(&base_path)
-                        .map(normalize_rel_path)
-                        .unwrap_or_else(|_| rel.clone());
-                    if !compiled_glob.matches(&rel) && !compiled_glob.matches(&rel_under_base) {
-                        continue;
-                    }
-                    let bytes = match self.files.read(&resolved) {
-                        Ok(bytes) => bytes,
-                        Err(_) => continue,
-                    };
-                    if is_binary(&bytes) {
-                        continue;
-                    }
-                    let content = match String::from_utf8(bytes) {
-                        Ok(content) => content,
-                        Err(_) => continue,
-                    };
-                    for (idx, line) in content.lines().enumerate() {
-                        if regex.is_match(line) {
+                        let rel = normalize_rel_path(rel_path);
+                        let Ok(resolved) = self.resolve_path(rel_path, false) else {
+                            continue;
+                        };
+                        let rel_under_base = path
+                            .strip_prefix(&base_path)
+                            .map(normalize_rel_path)
+                            .unwrap_or_else(|_| rel.clone());
+                        if compiled.matches(&rel) || compiled.matches(&rel_under_base) {
                             matches.push(json!({
                                 "path": rel,
-                                "line": idx + 1,
-                                "text": line
+                                "is_dir": self.files.read_dir(&resolved).is_ok()
                             }));
                             if matches.len() >= limit {
-                                return Ok(json!({
-                                    "pattern": pattern,
-                                    "glob": glob_pattern,
-                                    "matches": matches
-                                }));
+                                break;
                             }
                         }
                     }
-                }
-                Ok(json!({
-                    "pattern": pattern,
-                    "glob": glob_pattern,
-                    "matches": matches
-                }))
+                    Ok(json!({
+                        "pattern": pattern,
+                        "matches": matches
+                    }))
+                })
+            }
+            "fs.grep" => {
+                codingbuddy_core::runtime::blocking_section(|| -> Result<serde_json::Value> {
+                    let pattern = call
+                        .args
+                        .get("pattern")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("pattern missing"))?;
+                    let limit = call
+                        .args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(200) as usize;
+                    let glob_pattern = call
+                        .args
+                        .get("glob")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("**/*");
+                    let base = call
+                        .args
+                        .get("base")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(".");
+                    let respect_gitignore = call
+                        .args
+                        .get("respectGitignore")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let case_sensitive = call
+                        .args
+                        .get("case_sensitive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let compiled_glob = glob::Pattern::new(glob_pattern)
+                        .map_err(|err| anyhow!("invalid glob pattern '{glob_pattern}': {err}"))?;
+                    let regex = regex::RegexBuilder::new(pattern)
+                        .case_insensitive(!case_sensitive)
+                        .build()?;
+                    let mut matches = Vec::new();
+                    let base_path = self
+                        .workspace
+                        .join(self.resolve_path(Path::new(base), false)?);
+                    for path in walk_paths(&base_path, &self.workspace, respect_gitignore) {
+                        let rel_path = match path.strip_prefix(&self.workspace) {
+                            Ok(rel) => rel,
+                            Err(_) => continue,
+                        };
+                        if should_skip_rel_path(rel_path) {
+                            continue;
+                        }
+                        let rel = normalize_rel_path(rel_path);
+                        let Ok(resolved) = self.resolve_path(rel_path, false) else {
+                            continue;
+                        };
+                        let rel_under_base = path
+                            .strip_prefix(&base_path)
+                            .map(normalize_rel_path)
+                            .unwrap_or_else(|_| rel.clone());
+                        if !compiled_glob.matches(&rel) && !compiled_glob.matches(&rel_under_base) {
+                            continue;
+                        }
+                        let bytes = match self.files.read(&resolved) {
+                            Ok(bytes) => bytes,
+                            Err(_) => continue,
+                        };
+                        if is_binary(&bytes) {
+                            continue;
+                        }
+                        let content = match String::from_utf8(bytes) {
+                            Ok(content) => content,
+                            Err(_) => continue,
+                        };
+                        for (idx, line) in content.lines().enumerate() {
+                            if regex.is_match(line) {
+                                matches.push(json!({
+                                    "path": rel,
+                                    "line": idx + 1,
+                                    "text": line
+                                }));
+                                if matches.len() >= limit {
+                                    return Ok(json!({
+                                        "pattern": pattern,
+                                        "glob": glob_pattern,
+                                        "matches": matches
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    Ok(json!({
+                        "pattern": pattern,
+                        "glob": glob_pattern,
+                        "matches": matches
+                    }))
+                })
             }
             "fs.edit" => {
                 let path = call
@@ -679,7 +693,7 @@ impl LocalToolHost {
                 }
 
                 let diff = generate_unified_diff(path, &before, &after);
-                let checkpoint = self.create_checkpoint("fs_edit")?;
+                let checkpoint = self.create_checkpoint("fs_edit").await?;
                 self.record_file_receipt(context, &full, after.as_bytes())?;
                 self.files.write(&full, after.as_bytes(), false)?;
                 self.record_actual_postimage(&full)?;
@@ -687,9 +701,13 @@ impl LocalToolHost {
                 let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
 
                 // Auto-lint after edit (lint-fix loop)
-                let lint_output = self.lint_after_edit.as_ref().map(|command| {
-                    self.run_verification_command(command, &self.workspace, 30, context)
-                });
+                let lint_output = match &self.lint_after_edit {
+                    Some(command) => Some(
+                        self.run_verification_command(command, &self.workspace, 30, context)
+                            .await,
+                    ),
+                    None => None,
+                };
 
                 let mut result = json!({
                     "path": path,
@@ -708,52 +726,60 @@ impl LocalToolHost {
                 }
                 // Auto-diagnostics after edit
                 if self.diagnostics_after_edit {
-                    self.post_edit_checks(std::slice::from_ref(&full), context, &mut result);
+                    self.post_edit_checks(std::slice::from_ref(&full), context, &mut result)
+                        .await;
                 }
                 Ok(result)
             }
             "fs.search_rg" => {
-                let q = call
-                    .args
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("query missing"))?;
-                let limit = call
-                    .args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
-                let mut matches = Vec::new();
-                for path in walk_paths(&self.workspace, &self.workspace, true) {
-                    let rel_path = path.strip_prefix(&self.workspace)?;
-                    if should_skip_rel_path(rel_path) {
-                        continue;
-                    }
-                    let rel = rel_path.to_string_lossy().to_string();
-                    if let Ok(resolved) = self.resolve_path(rel_path, false)
-                        && let Ok(content) = self.files.read_to_string(&resolved)
-                    {
-                        for (idx, line) in content.lines().enumerate() {
-                            if line.contains(q) {
-                                matches.push(json!({"path": rel, "line": idx + 1, "text": line}));
-                                if matches.len() >= limit {
-                                    return Ok(json!({"matches": matches}));
+                codingbuddy_core::runtime::blocking_section(|| -> Result<serde_json::Value> {
+                    let q = call
+                        .args
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("query missing"))?;
+                    let limit = call
+                        .args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(20) as usize;
+                    let mut matches = Vec::new();
+                    for path in walk_paths(&self.workspace, &self.workspace, true) {
+                        let rel_path = path.strip_prefix(&self.workspace)?;
+                        if should_skip_rel_path(rel_path) {
+                            continue;
+                        }
+                        let rel = rel_path.to_string_lossy().to_string();
+                        if let Ok(resolved) = self.resolve_path(rel_path, false)
+                            && let Ok(content) = self.files.read_to_string(&resolved)
+                        {
+                            for (idx, line) in content.lines().enumerate() {
+                                if line.contains(q) {
+                                    matches
+                                        .push(json!({"path": rel, "line": idx + 1, "text": line}));
+                                    if matches.len() >= limit {
+                                        return Ok(json!({"matches": matches}));
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Ok(json!({"matches": matches}))
+                    Ok(json!({"matches": matches}))
+                })
             }
             "git.status" => {
                 self.run_git_inspection(&["status", "--short", "--ignore-submodules=all"])
+                    .await
             }
-            "git.diff" => self.run_git_inspection(&[
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=all",
-            ]),
+            "git.diff" => {
+                self.run_git_inspection(&[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=all",
+                ])
+                .await
+            }
             "git.show" => {
                 let spec = call
                     .args
@@ -771,24 +797,27 @@ impl LocalToolHost {
                     "git.show requires a revision or object"
                 );
                 self.run_git_inspection(&["show", "--no-ext-diff", "--no-textconv", spec, "--"])
+                    .await
             }
             "index.query" => {
-                let q = call
-                    .args
-                    .get("q")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("q missing"))?;
-                let top_k = call
-                    .args
-                    .get("top_k")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as usize;
-                let scope = call.args.get("scope").and_then(|v| v.as_str());
-                let mut response = self.index.query(q, top_k, scope)?;
-                response
-                    .results
-                    .retain(|result| self.resolve_path(Path::new(&result.path), false).is_ok());
-                Ok(serde_json::to_value(response)?)
+                codingbuddy_core::runtime::blocking_section(|| -> Result<serde_json::Value> {
+                    let q = call
+                        .args
+                        .get("q")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("q missing"))?;
+                    let top_k = call
+                        .args
+                        .get("top_k")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10) as usize;
+                    let scope = call.args.get("scope").and_then(|v| v.as_str());
+                    let mut response = self.index.query(q, top_k, scope)?;
+                    response
+                        .results
+                        .retain(|result| self.resolve_path(Path::new(&result.path), false).is_ok());
+                    Ok(serde_json::to_value(response)?)
+                })
             }
             "patch.stage" => {
                 let diff = call
@@ -865,7 +894,8 @@ impl LocalToolHost {
                             .collect::<Vec<_>>(),
                         context,
                         &mut result,
-                    );
+                    )
+                    .await;
                 }
                 Ok(result)
             }
@@ -881,7 +911,7 @@ impl LocalToolHost {
                     .get("content")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("content missing"))?;
-                let checkpoint = self.create_checkpoint("fs_write")?;
+                let checkpoint = self.create_checkpoint("fs_write").await?;
                 self.record_file_receipt(context, &full, content.as_bytes())?;
                 self.files.write(&full, content.as_bytes(), true)?;
                 self.record_actual_postimage(&full)?;
@@ -926,7 +956,7 @@ impl LocalToolHost {
                 {
                     None
                 } else {
-                    self.create_checkpoint("bash_run").unwrap_or_else(|error| {
+                    self.create_checkpoint("bash_run").await.unwrap_or_else(|error| {
                         tracing::warn!(error = %format!("{error:#}"), "checkpoint before shell command failed");
                         None
                     })
@@ -946,14 +976,16 @@ impl LocalToolHost {
                             .ok()
                             .and_then(|callback| callback.clone()),
                         context.cancellation,
-                    )?;
+                    )
+                    .await?;
                 // Record what the command changed so /rewind treats those
                 // changes as the agent's (and still protects later edits).
                 let command_finished = std::time::SystemTime::now();
                 let changed_files = match checkpoint {
-                    Some(id) => self
-                        .record_shell_changes(id, command_started, command_finished)
-                        .unwrap_or_else(|error| {
+                    Some(id) => codingbuddy_core::runtime::blocking_section(|| {
+                        self.record_shell_changes(id, command_started, command_finished)
+                    })
+                    .unwrap_or_else(|error| {
                         tracing::warn!(error = %format!("{error:#}"), "could not record shell command changes");
                         0
                     }),
@@ -998,7 +1030,8 @@ impl LocalToolHost {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(30);
                 let (status, content_type, body) =
-                    http_get_cancellable(url, Duration::from_secs(timeout), context.cancellation)?;
+                    http_get_cancellable(url, Duration::from_secs(timeout), context.cancellation)
+                        .await?;
                 let truncated = body.len() > max_bytes;
                 let text = if truncated {
                     &body[..body.floor_char_boundary(max_bytes)]
@@ -1056,7 +1089,8 @@ impl LocalToolHost {
                     &search_url,
                     Duration::from_secs(15),
                     context.cancellation,
-                )?;
+                )
+                .await?;
 
                 // Parse search results from HTML
                 let results = parse_search_results(&body, max_results);
@@ -1179,7 +1213,7 @@ impl LocalToolHost {
                     .get_mut("cells")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("notebook has no cells array"))?;
-                let checkpoint = self.create_checkpoint("notebook_edit")?;
+                let checkpoint = self.create_checkpoint("notebook_edit").await?;
                 match operation {
                     "replace" => {
                         if cell_index >= cells.len() {
@@ -1272,7 +1306,7 @@ impl LocalToolHost {
                         Ok((path, resolved))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let checkpoint = self.create_checkpoint("multi_edit")?;
+                let checkpoint = self.create_checkpoint("multi_edit").await?;
                 let mut results = Vec::new();
                 let mut total_replacements = 0usize;
                 let mut all_succeeded = true;
@@ -1322,9 +1356,13 @@ impl LocalToolHost {
                 }
 
                 // Run lint once after all edits
-                let lint_output = self.lint_after_edit.as_ref().map(|command| {
-                    self.run_verification_command(command, &self.workspace, 30, context)
-                });
+                let lint_output = match &self.lint_after_edit {
+                    Some(command) => Some(
+                        self.run_verification_command(command, &self.workspace, 30, context)
+                            .await,
+                    ),
+                    None => None,
+                };
 
                 let mut result = json!({
                     "results": results,
@@ -1343,7 +1381,7 @@ impl LocalToolHost {
                         .filter(|item| item["edited"] == true)
                         .filter_map(|item| item["path"].as_str().map(PathBuf::from))
                         .collect::<Vec<_>>();
-                    self.post_edit_checks(&paths, context, &mut result);
+                    self.post_edit_checks(&paths, context, &mut result).await;
                 }
                 Ok(result)
             }
@@ -1362,7 +1400,9 @@ impl LocalToolHost {
                     })
                     .transpose()?;
                 let (cmd, source) = detect_diagnostics_command(&self.workspace, target)?;
-                let result = self.run_verification_command(&cmd, &self.workspace, 60, context);
+                let result = self
+                    .run_verification_command(&cmd, &self.workspace, 60, context)
+                    .await;
                 let diagnostics = parse_diagnostics(
                     result["stdout"].as_str().unwrap_or(""),
                     result["stderr"].as_str().unwrap_or(""),
@@ -1378,38 +1418,47 @@ impl LocalToolHost {
             }
             "lsp.hover" | "lsp_hover" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.hover_with_context(
-                    &self
-                        .workspace
-                        .join(self.resolve_path(Path::new(path), false)?),
-                    line,
-                    col,
-                    &context.execution(),
-                )?;
+                let result = self
+                    .lsp_manager
+                    .hover_with_context(
+                        &self
+                            .workspace
+                            .join(self.resolve_path(Path::new(path), false)?),
+                        line,
+                        col,
+                        &context.execution(),
+                    )
+                    .await?;
                 Ok(json!({ "hover": result }))
             }
             "lsp.definition" | "lsp_definition" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.definition_with_context(
-                    &self
-                        .workspace
-                        .join(self.resolve_path(Path::new(path), false)?),
-                    line,
-                    col,
-                    &context.execution(),
-                )?;
+                let result = self
+                    .lsp_manager
+                    .definition_with_context(
+                        &self
+                            .workspace
+                            .join(self.resolve_path(Path::new(path), false)?),
+                        line,
+                        col,
+                        &context.execution(),
+                    )
+                    .await?;
                 Ok(json!({ "definition": result }))
             }
             "lsp.references" | "lsp_references" => {
                 let (path, line, col) = extract_lsp_position(&call.args)?;
-                let result = self.lsp_manager.references_with_context(
-                    &self
-                        .workspace
-                        .join(self.resolve_path(Path::new(path), false)?),
-                    line,
-                    col,
-                    &context.execution(),
-                )?;
+                let result = self
+                    .lsp_manager
+                    .references_with_context(
+                        &self
+                            .workspace
+                            .join(self.resolve_path(Path::new(path), false)?),
+                        line,
+                        col,
+                        &context.execution(),
+                    )
+                    .await?;
                 Ok(json!({ "references": result }))
             }
             "lsp.symbols" | "lsp_symbols" => {
@@ -1418,12 +1467,15 @@ impl LocalToolHost {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("missing required parameter 'path'"))?;
-                let result = self.lsp_manager.symbols_with_context(
-                    &self
-                        .workspace
-                        .join(self.resolve_path(Path::new(path), false)?),
-                    &context.execution(),
-                )?;
+                let result = self
+                    .lsp_manager
+                    .symbols_with_context(
+                        &self
+                            .workspace
+                            .join(self.resolve_path(Path::new(path), false)?),
+                        &context.execution(),
+                    )
+                    .await?;
                 Ok(json!({ "symbols": result }))
             }
             "github.create_pr" | "github_create_pr" => {
@@ -1450,7 +1502,7 @@ impl LocalToolHost {
                 if draft {
                     cmd.push_str(" --draft");
                 }
-                self.run_cmd(&cmd, 30, context)
+                self.run_cmd(&cmd, 30, context).await
             }
             "github.list_issues" | "github_list_issues" => {
                 let label = call.args.get("label").and_then(|v| v.as_str());
@@ -1471,7 +1523,7 @@ impl LocalToolHost {
                 if let Some(l) = label {
                     cmd.push_str(&format!(" --label {}", shell_quote(l)));
                 }
-                self.run_cmd(&cmd, 15, context)
+                self.run_cmd(&cmd, 15, context).await
             }
             "github.view_pr" | "github_view_pr" => {
                 let pr = call
@@ -1485,12 +1537,12 @@ impl LocalToolHost {
                         shell_quote(pr),
                     ),
                     15,context,
-                )
+                ).await
             }
             name if name.starts_with("plugin__") => self.run_plugin_tool(name, &call.args),
             name if name.starts_with("mcp__") => {
                 if let Some(executor) = &self.context_mcp_executor {
-                    return executor(name, &call.args, context);
+                    return executor(name, &call.args, context).await;
                 }
                 let rest = &name[5..]; // skip "mcp__"
                 let (server_id, tool_name) = rest
@@ -1498,7 +1550,7 @@ impl LocalToolHost {
                     .ok_or_else(|| anyhow!("invalid MCP tool name: {name}"))?;
                 let args = call.args.get("arguments").cloned().unwrap_or(json!({}));
                 match &self.mcp_executor {
-                    Some(executor) => executor(server_id, tool_name, &args),
+                    Some(executor) => executor(server_id, tool_name, &args).await,
                     None => Err(anyhow!(
                         "MCP tool '{name}' called but no MCP executor configured"
                     )),
@@ -1518,7 +1570,7 @@ impl LocalToolHost {
                     };
                     let proposal = self.propose(sub_call);
                     let sub_result = if proposal.approved {
-                        self.run_approved(
+                        Box::pin(self.run_approved(
                             ApprovedToolCall {
                                 invocation_id: proposal.invocation_id,
                                 call: proposal.call,
@@ -1527,7 +1579,8 @@ impl LocalToolHost {
                                 invocation_id: None,
                                 ..context
                             },
-                        )
+                        ))
+                        .await
                     } else {
                         self.discard_proposal(proposal.invocation_id);
                         ToolResult {
@@ -1617,20 +1670,21 @@ impl LocalToolHost {
         ))
     }
 
-    fn run_git_inspection(&self, args: &[&str]) -> Result<serde_json::Value> {
+    async fn run_git_inspection(&self, args: &[&str]) -> Result<serde_json::Value> {
         let command = codingbuddy_core::process_env::git_inspection(&self.workspace);
         let result = super::shell::run_command(
             command,
             args,
             &self.workspace,
             Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
-        )?;
+        )
+        .await?;
         Ok(
             json!({"status": result.status, "stdout": result.stdout, "stderr": result.stderr, "timed_out": result.timed_out}),
         )
     }
 
-    fn run_cmd(
+    async fn run_cmd(
         &self,
         cmd: &str,
         timeout_secs: u64,
@@ -1657,7 +1711,9 @@ impl LocalToolHost {
                 .unwrap_or(Duration::MAX),
         );
         context.execution().check()?;
-        let result = launch.run_with_progress(timeout, None, context.cancellation)?;
+        let result = launch
+            .run_with_progress(timeout, None, context.cancellation)
+            .await?;
         Ok(
             json!({"status":result.status,"stdout":result.stdout,"stderr":result.stderr,"timed_out":result.timed_out,"cancelled":result.cancelled}),
         )
@@ -1897,9 +1953,8 @@ impl ToolHost for LocalToolHost {
         timeout: u64,
         context: codingbuddy_core::ToolExecutionContext<'_>,
     ) -> serde_json::Value {
-        codingbuddy_core::runtime::blocking_section(|| {
-            self.run_verification_command(command, cwd, timeout, context)
-        })
+        self.run_verification_command(command, cwd, timeout, context)
+            .await
     }
 
     async fn execute_with_context(
@@ -1907,15 +1962,13 @@ impl ToolHost for LocalToolHost {
         approved: ApprovedToolCall,
         context: codingbuddy_core::ToolExecutionContext<'_>,
     ) -> ToolResult {
-        // Tools run subprocesses and file I/O synchronously; hand this
-        // worker's other tasks off while they do.
-        codingbuddy_core::runtime::blocking_section(|| self.run_approved(approved, context))
+        self.run_approved(approved, context).await
     }
 }
 
 impl LocalToolHost {
     /// Run an approved call to completion on the current thread.
-    pub fn run_approved(
+    pub async fn run_approved(
         &self,
         approved: ApprovedToolCall,
         context: codingbuddy_core::ToolExecutionContext<'_>,
@@ -1984,14 +2037,12 @@ impl LocalToolHost {
             self.validate(&call)
                 .and_then(|()| check_plan(shell.as_ref()))
         };
-        let precondition = context
-            .execution()
-            .check()
-            .and_then(|()| validate())
-            .and_then(|()| {
-                self.execute_hooks_with_context("pretooluse", Some(&call), None, context);
-                validate()
-            });
+        let mut precondition = context.execution().check().and_then(|()| validate());
+        if precondition.is_ok() {
+            self.execute_hooks_with_context("pretooluse", Some(&call), None, context)
+                .await;
+            precondition = validate();
+        }
         if let Err(error) = precondition {
             if tracked {
                 let _ =
@@ -2004,7 +2055,9 @@ impl LocalToolHost {
                 output: json!({"error": error.to_string()}),
             };
         }
-        let execution = self.run_tool(&call, shell.map(|(_, launch)| launch), context);
+        let execution = self
+            .run_tool(&call, shell.map(|(_, launch)| launch), context)
+            .await;
         let (mut success, mut output) = match execution {
             Ok(output) => (
                 output["isError"] != true
@@ -2050,14 +2103,16 @@ impl LocalToolHost {
             .is_some_and(codingbuddy_core::CancellationToken::is_cancelled)
         {
             if success {
-                self.execute_hooks_with_context("posttooluse", Some(&call), Some(&output), context);
+                self.execute_hooks_with_context("posttooluse", Some(&call), Some(&output), context)
+                    .await;
             } else {
                 self.execute_hooks_with_context(
                     "posttooluse_failure",
                     Some(&call),
                     Some(&output),
                     context,
-                );
+                )
+                .await;
             }
         }
         ToolResult {
@@ -2149,24 +2204,25 @@ impl LocalToolHost {
     }
 
     /// Fire "stop" hooks when the agent run completes.
-    pub fn fire_stop_hooks(&self) {
-        self.execute_hooks("stop", None, None);
+    pub async fn fire_stop_hooks(&self) {
+        self.execute_hooks("stop", None, None).await;
     }
 
     /// Fire hooks for a specific lifecycle phase (sessionstart, notification, etc.).
-    pub fn fire_session_hooks(&self, phase: &str) {
-        self.execute_hooks(phase, None, None);
+    pub async fn fire_session_hooks(&self, phase: &str) {
+        self.execute_hooks(phase, None, None).await;
     }
 
-    fn execute_hooks(
+    async fn execute_hooks(
         &self,
         phase: &str,
         call: Option<&ToolCall>,
         result: Option<&serde_json::Value>,
     ) {
-        self.execute_hooks_with_context(phase, call, result, Default::default());
+        self.execute_hooks_with_context(phase, call, result, Default::default())
+            .await;
     }
-    fn execute_hooks_with_context(
+    async fn execute_hooks_with_context(
         &self,
         phase: &str,
         call: Option<&ToolCall>,
@@ -2200,7 +2256,9 @@ impl LocalToolHost {
             &context,
             Duration::from_secs(30),
             &execution_context.execution(),
-        ) {
+        )
+        .await
+        {
             Ok(runs) => {
                 for run in runs {
                     self.emit_hook_event(
@@ -2303,9 +2361,11 @@ impl LocalToolHost {
         Ok(attributed)
     }
 
-    fn create_checkpoint(&self, reason: &str) -> Result<Option<Uuid>> {
+    async fn create_checkpoint(&self, reason: &str) -> Result<Option<Uuid>> {
         let manager = MemoryManager::new(&self.workspace)?;
-        let checkpoint = manager.create_checkpoint(reason)?;
+        // Walks and hashes the workspace: hand this worker's tasks off.
+        let checkpoint =
+            codingbuddy_core::runtime::blocking_section(|| manager.create_checkpoint(reason))?;
         let Ok(Some(session)) = self.store.load_latest_session() else {
             return Ok(Some(checkpoint.checkpoint_id));
         };
@@ -2321,15 +2381,15 @@ impl LocalToolHost {
             },
         };
         self.store.append_event(&event)?;
-        self.fire_session_hooks("checkpointcreated");
+        self.fire_session_hooks("checkpointcreated").await;
         Ok(Some(checkpoint.checkpoint_id))
     }
 }
 
-pub type VerificationApproval<'a> = Option<&'a mut dyn FnMut(&ToolCall) -> Result<bool>>;
+pub type VerificationApproval<'a> = Option<&'a mut (dyn FnMut(&ToolCall) -> Result<bool> + Send)>;
 
 impl LocalToolHost {
-    pub fn run_verification_command(
+    pub async fn run_verification_command(
         &self,
         command: &str,
         cwd: &Path,
@@ -2337,9 +2397,10 @@ impl LocalToolHost {
         context: codingbuddy_core::ToolExecutionContext<'_>,
     ) -> serde_json::Value {
         self.run_verification_with_approval(command, cwd, timeout, context, None)
+            .await
     }
 
-    pub fn run_verification_with_approval(
+    pub async fn run_verification_with_approval(
         &self,
         command: &str,
         cwd: &Path,
@@ -2399,7 +2460,8 @@ impl LocalToolHost {
                 self.discard_proposal(proposal.invocation_id);
                 result["status"] = json!("denied");
             } else {
-                let output = self.run_approved(
+                // Boxed: run_approved -> run_tool -> verification recurses.
+                let output = Box::pin(self.run_approved(
                     ApprovedToolCall {
                         invocation_id: proposal.invocation_id,
                         call: proposal.call,
@@ -2408,7 +2470,8 @@ impl LocalToolHost {
                         parent_run_id: Some(id),
                         ..context
                     },
-                );
+                ))
+                .await;
                 result["stdout"] = output.output["stdout"].clone();
                 result["stderr"] = output.output["stderr"].clone();
                 result["status"] = json!(if output.output["cancelled"] == true {
@@ -2457,7 +2520,7 @@ impl LocalToolHost {
         }
         result
     }
-    fn post_edit_checks(
+    async fn post_edit_checks(
         &self,
         paths: &[PathBuf],
         context: codingbuddy_core::ToolExecutionContext<'_>,
@@ -2465,18 +2528,18 @@ impl LocalToolHost {
     ) {
         let validator =
             codingbuddy_lsp::EditValidator::new(self.workspace.clone(), Default::default());
-        let checks = validator
-            .command_plans(paths)
-            .into_iter()
-            .map(|plan| {
+        let mut checks = Vec::new();
+        for plan in validator.command_plans(paths) {
+            checks.push(
                 self.run_verification_command(
                     &plan.command,
                     &plan.cwd,
                     plan.timeout_seconds,
                     context,
                 )
-            })
-            .collect::<Vec<_>>();
+                .await,
+            );
+        }
         result["verification"] = json!(checks);
     }
 }
@@ -2502,8 +2565,12 @@ mod web_cancellation_tests {
         });
 
         let started = std::time::Instant::now();
-        let error = http_get_cancellable(&url, Duration::from_secs(30), Some(&token))
-            .expect_err("cancelled fetch must fail");
+        let error = codingbuddy_core::runtime::block_on(http_get_cancellable(
+            &url,
+            Duration::from_secs(30),
+            Some(&token),
+        ))
+        .expect_err("cancelled fetch must fail");
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "fetch kept running for {:?}",

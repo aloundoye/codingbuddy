@@ -218,11 +218,16 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
         bounded.timeout_seconds = bounded.timeout_seconds.clamp(1, 30);
         bounded.stream = streaming;
         let client = ApiClient::new(bounded)?;
-        let response = if streaming {
-            client.complete_chat_streaming_sync(&request, std::sync::Arc::new(|_| {}))?
-        } else {
-            client.complete_chat_sync(&request)?
-        };
+        // A standalone command: block this thread on the request.
+        let response = codingbuddy_core::runtime::block_on(async {
+            if streaming {
+                client
+                    .complete_chat_streaming_body(&request, std::sync::Arc::new(|_| {}))
+                    .await
+            } else {
+                client.complete_chat_body(&request).await
+            }
+        })?;
         usage.push(json!(response.usage));
         if step == 2 {
             ensure!(

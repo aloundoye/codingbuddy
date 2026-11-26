@@ -20,9 +20,8 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -613,14 +612,17 @@ pub(crate) fn run_chat(
                             } else {
                                 json!({})
                             };
-                            let result = codingbuddy_mcp::execute_mcp_stdio_request(
-                                &mcp.get_server(server_id)?.ok_or_else(|| {
-                                    anyhow::anyhow!("MCP server not found: {server_id}")
-                                })?,
-                                "prompts/get",
-                                json!({"name": prompt_name, "arguments": prompt_args}),
-                                3,
-                                std::time::Duration::from_secs(10),
+                            let server = mcp.get_server(server_id)?.ok_or_else(|| {
+                                anyhow::anyhow!("MCP server not found: {server_id}")
+                            })?;
+                            let result = codingbuddy_core::runtime::block_on(
+                                codingbuddy_mcp::execute_mcp_stdio_request(
+                                    &server,
+                                    "prompts/get",
+                                    json!({"name": prompt_name, "arguments": prompt_args}),
+                                    3,
+                                    std::time::Duration::from_secs(10),
+                                ),
                             )?;
                             if json_mode {
                                 print_json(&result)?;

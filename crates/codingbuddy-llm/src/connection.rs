@@ -136,7 +136,7 @@ pub fn validate_base_url(value: &str) -> Result<String> {
     Ok(url.as_str().trim_end_matches('/').into())
 }
 
-pub fn probe_provider(cfg: &LlmConfig) -> Result<()> {
+pub async fn probe_provider(cfg: &LlmConfig) -> Result<()> {
     check_provider(cfg)?;
     let is_gemini = cfg.active_provider_kind().is_some_and(|kind| {
         protocol::select_chat_protocol(&cfg.active_provider(), kind)
@@ -165,6 +165,6 @@ pub fn probe_provider(cfg: &LlmConfig) -> Result<()> {
         provider_options: Default::default(),
         response_format: None,
     };
-    ApiClient::new(cfg)?.complete_chat_sync(&request)?;
+    ApiClient::new(cfg)?.complete_chat_body(&request).await?;
     Ok(())
 }

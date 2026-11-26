@@ -11,6 +11,10 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// A boxed, `Send` future: the return type of async callbacks stored as
+/// trait objects.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Returned when a [`CancellationToken`] fires before the work finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;

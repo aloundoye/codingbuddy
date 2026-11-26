@@ -110,35 +110,39 @@ impl McpConnectionPool {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn execute(
+    pub async fn execute(
         &self,
         server: &McpServer,
         method: &str,
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value> {
-        self.sessions.request(
-            server,
-            method,
-            params,
-            &codingbuddy_core::execution::ExecutionContext {
-                deadline: Some(Instant::now() + timeout),
-                ..Default::default()
-            },
-        )
+        self.sessions
+            .request(
+                server,
+                method,
+                params,
+                &codingbuddy_core::execution::ExecutionContext {
+                    deadline: Some(Instant::now() + timeout),
+                    ..Default::default()
+                },
+            )
+            .await
     }
     pub fn shutdown(&self) {
         self.sessions.shutdown();
     }
 }
-pub fn execute_mcp_stdio_request(
+pub async fn execute_mcp_stdio_request(
     server: &McpServer,
     method: &str,
     params: serde_json::Value,
     _request_id: u64,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
-    McpConnectionPool::new().execute(server, method, params, timeout)
+    McpConnectionPool::new()
+        .execute(server, method, params, timeout)
+        .await
 }
 
 #[cfg(test)]
@@ -256,6 +260,59 @@ pub(crate) fn read_mcp_frame<R: BufRead>(reader: &mut R) -> Result<Option<serde_
     anyhow::ensure!(length <= 16 * 1024 * 1024, "MCP frame limit exceeded");
     let mut buf = vec![0_u8; length];
     reader.read_exact(&mut buf)?;
+    Ok(Some(serde_json::from_slice(&buf)?))
+}
+
+/// Async [`read_mcp_frame`]: newline-delimited JSON or `Content-Length`
+/// framing. `Ok(None)` at EOF.
+pub(crate) async fn read_mcp_frame_async(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> Result<Option<serde_json::Value>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let n = (&mut *reader)
+            .take(16 * 1024 * 1024 + 1)
+            .read_line(&mut line)
+            .await?;
+        anyhow::ensure!(n <= 16 * 1024 * 1024, "MCP frame limit exceeded");
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with('{') {
+            return Ok(Some(serde_json::from_str(trimmed)?));
+        }
+        if trimmed.is_empty() {
+            if content_length.is_some() {
+                break;
+            } else {
+                continue;
+            }
+        }
+        #[cfg(test)]
+        if trimmed == "running 1 test" {
+            continue;
+        }
+        let (header, value) = trimmed
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Malformed MCP frame"))?;
+        if header.eq_ignore_ascii_case("Content-Length") {
+            anyhow::ensure!(content_length.is_none(), "Duplicate MCP frame length");
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .context("invalid Content-Length")?,
+            );
+        }
+    }
+
+    let length = content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
+    anyhow::ensure!(length <= 16 * 1024 * 1024, "MCP frame limit exceeded");
+    let mut buf = vec![0_u8; length];
+    reader.read_exact(&mut buf).await?;
     Ok(Some(serde_json::from_slice(&buf)?))
 }
 

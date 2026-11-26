@@ -1186,7 +1186,7 @@ fn spawn_task_calls_worker() -> Result<()> {
     // Wire a subagent worker
     let worker: codingbuddy_agent::SubagentWorkerFn = Arc::new(move |task| {
         *worker_called_clone.lock().unwrap() = true;
-        Ok(format!("Subagent completed: {}", task.goal))
+        Box::pin(async move { Ok(format!("Subagent completed: {}", task.goal)) })
     });
     engine.set_subagent_worker(worker);
 
@@ -1262,7 +1262,7 @@ fn spawn_task_role_maps_correctly() -> Result<()> {
 
     let worker: codingbuddy_agent::SubagentWorkerFn = Arc::new(move |task| {
         *captured_role_clone.lock().unwrap() = format!("{:?}", task.role);
-        Ok("Done".to_string())
+        Box::pin(async { Ok("Done".to_string()) })
     });
     engine.set_subagent_worker(worker);
 
@@ -1299,8 +1299,9 @@ fn spawn_task_persists_child_session_and_run_metadata() -> Result<()> {
         ],
     )?;
 
-    let worker: codingbuddy_agent::SubagentWorkerFn =
-        Arc::new(move |task| Ok(format!("Subagent completed: {}", task.goal)));
+    let worker: codingbuddy_agent::SubagentWorkerFn = Arc::new(move |task| {
+        Box::pin(async move { Ok(format!("Subagent completed: {}", task.goal)) })
+    });
     engine.set_subagent_worker(worker);
 
     let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
@@ -1357,11 +1358,13 @@ fn spawn_task_background_keeps_task_running() -> Result<()> {
     )?;
 
     let worker: codingbuddy_agent::SubagentWorkerFn = Arc::new(move |_task| {
-        Ok(serde_json::json!({
-            "job_id": job_id,
-            "status": "running",
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "job_id": job_id,
+                "status": "running",
+            })
+            .to_string())
         })
-        .to_string())
     });
     engine.set_subagent_worker(worker);
 

@@ -129,7 +129,8 @@ impl ToolUseLoop<'_> {
         if let Some(ref hooks) = self.hooks {
             let mut input = HookInput::new(HookEvent::PreCompact, self.workspace_str());
             input.tool_result = Some(serde_json::Value::String(summary.clone()));
-            self.fire_hook_logged(hooks, HookEvent::PreCompact, &input);
+            self.fire_hook_logged(hooks, HookEvent::PreCompact, &input)
+                .await;
         }
 
         // Scan compacted messages for any directives we haven't captured yet
@@ -213,7 +214,8 @@ impl ToolUseLoop<'_> {
         // Fire PostCompact hook if configured
         if let Some(ref hooks) = self.hooks {
             let input = HookInput::new(HookEvent::PostCompact, self.workspace_str());
-            self.fire_hook_logged(hooks, HookEvent::PostCompact, &input);
+            self.fire_hook_logged(hooks, HookEvent::PostCompact, &input)
+                .await;
         }
 
         true

@@ -1,7 +1,7 @@
 use super::*;
 use codingbuddy_core::{LlmConfig, Session, SessionBudgets, SessionState};
 use codingbuddy_ui::{TerminalMenu, TuiStreamEvent};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 
 const PROVIDERS: &[(&str, &str)] = &[
     ("openai-compatible", "OpenAI"),
@@ -73,7 +73,7 @@ pub(super) struct Menus {
     pub chat_mode: Arc<Mutex<ChatMode>>,
     pub read_only: Arc<std::sync::atomic::AtomicBool>,
     pub allow_tools: bool,
-    pub tx: mpsc::Sender<TuiStreamEvent>,
+    pub tx: codingbuddy_ui::StreamSender,
 }
 
 impl Menus {
@@ -669,8 +669,8 @@ impl Menus {
             &format!("Verifying {}/{}…", llm.provider, llm.active_base_model()),
             Vec::new(),
         ));
-        codingbuddy_core::runtime::runtime().spawn_blocking(move || {
-            let result = codingbuddy_llm::probe_provider(&llm);
+        codingbuddy_core::runtime::runtime().spawn(async move {
+            let result = codingbuddy_llm::probe_provider(&llm).await;
             if result.is_ok() {
                 let _ = codingbuddy_store::Store::new(&controller.cwd)
                     .and_then(|store| store.route_key())

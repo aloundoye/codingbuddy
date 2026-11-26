@@ -20,6 +20,8 @@ codingbuddy-policy = { path = "../codingbuddy-policy" }
 codingbuddy-store = { path = "../codingbuddy-store" }
 codingbuddy-llm = { path = "../codingbuddy-llm" }
 codingbuddy-agent = { path = "../codingbuddy-agent" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { workspace = true, features = ["rt", "io-std", "io-util", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"

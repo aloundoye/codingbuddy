@@ -657,3 +657,61 @@ fn every_advertised_method_is_published() {
         );
     }
 }
+
+/// Answers "slow" after 400 ms and everything else at once.
+struct SlowHandler;
+impl RpcHandler for SlowHandler {
+    fn handle(&self, method: &str, _params: Value) -> Result<Value> {
+        Ok(serde_json::json!({ "method": method }))
+    }
+    fn handle_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> LocalBoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            if method == "slow" {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            self.handle(method, params)
+        })
+    }
+}
+
+#[test]
+fn stdio_server_answers_a_quick_request_while_a_slow_one_runs() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    // The server future is not Send (like the real stdio server), so drive
+    // it on the runtime from this thread.
+    codingbuddy_core::runtime::runtime().block_on(async {
+        let (client, server) = tokio::io::duplex(4096);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let serving = async { serve(&SlowHandler, server_read, server_write).await };
+        let talking = async {
+            for (id, method) in [(1, "slow"), (2, "status"), (3, "shutdown")] {
+                let request =
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}});
+                client_write
+                    .write_all(format!("{request}\n").as_bytes())
+                    .await?;
+            }
+            let mut lines = tokio::io::BufReader::new(client_read).lines();
+            let mut order = Vec::new();
+            while let Some(line) = lines.next_line().await? {
+                let response: Value = serde_json::from_str(&line)?;
+                order.push(response["id"].as_i64().unwrap_or_default());
+                if response["id"] == 3 {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(order)
+        };
+        let (served, order) = tokio::join!(serving, talking);
+        served?;
+        // The quick request is answered before the slow one it followed;
+        // shutdown waits for both.
+        assert_eq!(order?, [2, 1, 3]);
+        Ok(())
+    })
+}

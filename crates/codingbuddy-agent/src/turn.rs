@@ -20,15 +20,23 @@ impl AgentEngine {
             Some(client) => client.as_ref(),
             None => self.llm.as_ref(),
         };
-        let project_memory = codingbuddy_memory::MemoryManager::new(&self.workspace)
-            .ok()
-            .and_then(|mm| mm.read_combined_memory().ok());
+        let project_memory = codingbuddy_core::runtime::blocking_section(|| {
+            codingbuddy_memory::MemoryManager::new(&self.workspace)
+                .ok()
+                .and_then(|mm| mm.read_combined_memory().ok())
+        });
 
         // Build workspace context for environment section in system prompt
-        let git_branch = codingbuddy_core::process_env::git_inspection(&self.workspace)
+        let mut branch = tokio::process::Command::from(
+            codingbuddy_core::process_env::git_inspection(&self.workspace),
+        );
+        branch
             .args(["branch", "--show-current"])
             .current_dir(&self.workspace)
+            .kill_on_drop(true);
+        let git_branch = branch
             .output()
+            .await
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
@@ -44,12 +52,15 @@ impl AgentEngine {
         // Build repo map for Complex tasks so the model knows the project structure
         let repo_map_summary =
             if complexity == codingbuddy_core::complexity::PromptComplexity::Complex {
-                Some(shared::build_repo_map(
-                    &self.workspace,
-                    prompt,
-                    40, // top 40 files
-                    &options.additional_dirs,
-                ))
+                // Lists and reads files: off the async worker.
+                Some(codingbuddy_core::runtime::blocking_section(|| {
+                    shared::build_repo_map(
+                        &self.workspace,
+                        prompt,
+                        40, // top 40 files
+                        &options.additional_dirs,
+                    )
+                }))
             } else {
                 None
             };
@@ -161,8 +172,9 @@ impl AgentEngine {
 
         // Gather lightweight bootstrap context so the model starts with project awareness.
         // Budget: ~15% of context window to leave room for conversation.
-        let initial_context =
-            self.build_bootstrap_context(prompt, options, cfg.llm.context_window_tokens);
+        let initial_context = codingbuddy_core::runtime::blocking_section(|| {
+            self.build_bootstrap_context(prompt, options, cfg.llm.context_window_tokens)
+        });
         let initial_phase = match session.status {
             SessionState::Planning | SessionState::AwaitingApproval => Some(TaskPhase::Plan),
             SessionState::ExecutingStep => Some(TaskPhase::Execute),
@@ -253,7 +265,7 @@ impl AgentEngine {
         register_tool_definitions_metadata(&mut runtime_tool_metadata, &tools);
         register_tool_definitions_metadata(&mut runtime_tool_metadata, &discoverable_tools);
         if let Some(ref mcp) = self.mcp
-            && let Ok(mcp_tools) = mcp.discover_tools()
+            && let Ok(mcp_tools) = mcp.discover_tools().await
         {
             for mt in mcp_tools {
                 let tool_name = format!("mcp__{}__{}", mt.server_id, mt.name);
@@ -333,13 +345,7 @@ impl AgentEngine {
                 .lock()
                 .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
             if let Some(ref handler) = *guard {
-                let handler = handler.clone();
-                loop_.set_approval_callback(Arc::new(move |call| {
-                    let mut h = handler
-                        .lock()
-                        .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
-                    h(call)
-                }));
+                loop_.set_approval_callback(handler.clone());
             }
         }
 

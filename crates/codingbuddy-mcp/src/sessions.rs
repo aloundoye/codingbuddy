@@ -1,21 +1,27 @@
 //! A single initialized transport for discovery and invocation. No call replay.
+//!
+//! Sessions are shared: a stdio server's reader task routes each response to
+//! its request by JSON-RPC id, so several calls to one server run at once.
 use super::*;
 use codingbuddy_core::{
     CancellationToken,
-    execution::{ExecutionContext, OwnedChild},
+    execution::{AsyncChild, ExecutionContext},
 };
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
+type Slot = Arc<tokio::sync::Mutex<Option<Arc<Session>>>>;
+
 #[derive(Default)]
 pub struct Sessions {
-    entries: Mutex<BTreeMap<String, Arc<Mutex<Option<Session>>>>>,
+    entries: Mutex<BTreeMap<String, Slot>>,
     pub states: Mutex<BTreeMap<String, String>>,
 }
 impl Sessions {
@@ -28,8 +34,8 @@ impl Sessions {
                 Ok(guard) => guard
                     .as_ref()
                     .is_none_or(|session| session.changed.load(Ordering::SeqCst)),
-                Err(std::sync::TryLockError::WouldBlock) => false,
-                Err(_) => true,
+                // Connecting right now.
+                Err(_) => false,
             })
     }
 
@@ -39,7 +45,15 @@ impl Sessions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
-    pub fn request(
+
+    fn set_state(&self, server: &McpServer, state: &str) {
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(server.id.clone(), state.into());
+    }
+
+    pub async fn request(
         &self,
         server: &McpServer,
         method: &str,
@@ -55,42 +69,30 @@ impl Sessions {
             .entry(server.id.clone())
             .or_default()
             .clone();
-        let mut guard = loop {
-            context.check()?;
-            match slot.try_lock() {
-                Ok(guard) => break guard,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    thread::sleep(Duration::from_millis(20))
-                }
-                Err(_) => return Err(anyhow!("MCP session unavailable")),
+        let session = {
+            // Only connecting is serialised; requests share the session.
+            let mut guard = bounded(context, slot.lock()).await?;
+            let fingerprint = fingerprint(server)?;
+            if guard
+                .as_ref()
+                .is_some_and(|session| session.fingerprint != fingerprint)
+            {
+                *guard = None;
             }
+            if guard.is_none() {
+                self.set_state(server, "connecting");
+                match Session::connect(server, fingerprint, context).await {
+                    Ok(session) => *guard = Some(Arc::new(session)),
+                    Err(error) => {
+                        self.set_state(server, "failed");
+                        return Err(error);
+                    }
+                }
+            }
+            guard
+                .clone()
+                .ok_or_else(|| anyhow!("MCP session is not connected"))?
         };
-        let fingerprint = fingerprint(server)?;
-        if guard
-            .as_ref()
-            .is_some_and(|session| session.fingerprint != fingerprint)
-        {
-            *guard = None;
-        }
-        if guard.is_none() {
-            self.states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(server.id.clone(), "connecting".into());
-            match Session::connect(server, fingerprint, context) {
-                Ok(session) => *guard = Some(session),
-                Err(error) => {
-                    self.states
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(server.id.clone(), "failed".into());
-                    return Err(error);
-                }
-            }
-        }
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("MCP session is not connected"))?;
         if method == "tools/call" {
             anyhow::ensure!(
                 session.capabilities.get("tools").is_some(),
@@ -101,29 +103,31 @@ impl Sessions {
                 "MCP tool registry changed before dispatch; refresh and approve again"
             );
         }
-        let result = session.request(method, params, context);
+        let result = session.request(method, params, context).await;
         if result.is_ok() && method == "tools/list" {
             session.changed.store(false, Ordering::SeqCst);
         }
         if result.is_err() {
-            *guard = None;
-            self.states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(
-                    server.id.clone(),
-                    if context.cancellation.is_cancelled() {
-                        "cancelled"
-                    } else {
-                        "failed"
-                    }
-                    .into(),
-                );
+            // Evict this session (not a newer one another call made); calls
+            // still in flight on it finish first, then it shuts down.
+            let mut guard = slot.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                *guard = None;
+            }
+            drop(guard);
+            self.set_state(
+                server,
+                if context.cancellation.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+            );
         } else {
-            self.states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(server.id.clone(), "ready".into());
+            self.set_state(server, "ready");
         }
         if result.is_err() && method == "tools/call" {
             return Err(codingbuddy_core::execution::UnconfirmedSideEffect.into());
@@ -151,20 +155,130 @@ struct Session {
     capabilities: Value,
     fingerprint: Vec<u8>,
     transport: Transport,
-    next: u64,
+    next: AtomicU64,
     changed: Arc<AtomicBool>,
 }
 enum Transport {
-    Stdio {
-        child: OwnedChild,
-        input: std::process::ChildStdin,
-        rx: mpsc::Receiver<Value>,
-        reader: Option<std::thread::JoinHandle<()>>,
-    },
-    Remote(Box<Remote>),
+    Stdio(Box<StdioPeer>),
+    Remote(Box<tokio::sync::Mutex<Remote>>),
 }
+
+type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
+
+/// A stdio server: one writer task, one reader task that routes responses.
+struct StdioPeer {
+    // Held for its Drop: killing the server's process group.
+    _child: AsyncChild,
+    writes: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pending: Pending,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl StdioPeer {
+    fn start(server: &McpServer, changed: Arc<AtomicBool>) -> Result<Self> {
+        use tokio::io::AsyncWriteExt;
+        let mut cmd = tokio::process::Command::from(stdio_command(server)?);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = AsyncChild::spawn(&mut cmd)?;
+        let mut input = child.stdin.take().context("Missing MCP input")?;
+        let output = child.stdout.take().context("Missing MCP output")?;
+        let (writes, mut queued) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let writer = tokio::spawn(async move {
+            while let Some(line) = queued.recv().await {
+                if input.write_all(&line).await.is_err() || input.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let pending: Pending = Arc::default();
+        let routes = pending.clone();
+        let reader = tokio::spawn(async move {
+            let mut output = tokio::io::BufReader::new(output);
+            while let Ok(Some(frame)) = read_mcp_frame_async(&mut output).await {
+                if frame["method"] == "notifications/tools/list_changed" {
+                    changed.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                // Server-initiated requests and notifications are not routed.
+                if frame.get("method").is_some() {
+                    continue;
+                }
+                let Some(id) = frame.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let waiter = routes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(frame);
+                }
+            }
+            // The server is gone: fail every waiting request.
+            routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        });
+        Ok(Self {
+            _child: child,
+            writes,
+            pending,
+            reader,
+            writer,
+        })
+    }
+
+    async fn send(&self, value: &Value) -> Result<()> {
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        self.writes
+            .send(line)
+            .await
+            .map_err(|_| anyhow!("MCP connection closed"))
+    }
+
+    async fn request(&self, id: u64, value: Value, context: &ExecutionContext) -> Result<Value> {
+        let (respond, response) = tokio::sync::oneshot::channel();
+        self.pending
+            .lock()
+            .map_err(|_| anyhow!("MCP response routes unavailable"))?
+            .insert(id, respond);
+        let exchange = async {
+            self.send(&value).await?;
+            response
+                .await
+                .map_err(|_| anyhow!("MCP connection closed before response"))
+        };
+        let result = bounded(context, exchange).await.and_then(|result| result);
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        if result.is_err() && value["method"] != "initialize" {
+            // Best effort; the server may already be gone.
+            let cancelled = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}});
+            if let Ok(mut line) = serde_json::to_vec(&cancelled) {
+                line.push(b'\n');
+                let _ = self.writes.try_send(line);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for StdioPeer {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
+}
+
 impl Session {
-    fn connect(
+    async fn connect(
         server: &McpServer,
         fingerprint: Vec<u8>,
         context: &ExecutionContext,
@@ -172,44 +286,26 @@ impl Session {
         let changed = Arc::new(AtomicBool::new(false));
         let transport = match server.transport {
             McpTransport::Stdio => {
-                let mut cmd = stdio_command(server)?;
-                cmd.stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null());
-                let mut child = OwnedChild::spawn(&mut cmd)?;
-                let input = child.stdin.take().context("Missing MCP input")?;
-                let output = child.stdout.take().context("Missing MCP output")?;
-                let (tx, rx) = mpsc::sync_channel(64);
-                let notifications = changed.clone();
-                let reader_thread = thread::spawn(move || {
-                    let mut reader = BufReader::new(output);
-                    while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
-                        if value["method"] == "notifications/tools/list_changed" {
-                            notifications.store(true, Ordering::SeqCst);
-                            continue;
-                        }
-                        if tx.try_send(value).is_err() {
-                            break;
-                        }
-                    }
-                });
-                Transport::Stdio {
-                    child,
-                    input,
-                    rx,
-                    reader: Some(reader_thread),
-                }
+                Transport::Stdio(Box::new(StdioPeer::start(server, changed.clone())?))
             }
-            _ => Transport::Remote(Box::new(Remote::new(server, context, changed.clone())?)),
+            _ => Transport::Remote(Box::new(tokio::sync::Mutex::new(
+                Remote::new(server, context, changed.clone()).await?,
+            ))),
         };
         let mut session = Self {
             capabilities: json!({}),
             fingerprint,
             transport,
-            next: 1,
+            next: AtomicU64::new(1),
             changed,
         };
-        let initialized=session.request("initialize",json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codingbuddy","version":env!("CARGO_PKG_VERSION")}}),context)?;
+        let initialized = session
+            .request(
+                "initialize",
+                json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codingbuddy","version":env!("CARGO_PKG_VERSION")}}),
+                context,
+            )
+            .await?;
         let version = initialized
             .pointer("/result/protocolVersion")
             .and_then(Value::as_str)
@@ -224,30 +320,26 @@ impl Session {
             .cloned()
             .context("MCP initialization lacks server capabilities")?;
         if let Transport::Remote(remote) = &mut session.transport {
-            remote.version = version.to_owned();
+            remote.get_mut().version = version.to_owned();
         }
-        session.notify("notifications/initialized", json!({}), context)?;
+        session
+            .notify("notifications/initialized", json!({}), context)
+            .await?;
         Ok(session)
     }
-    fn notify(&mut self, method: &str, params: Value, context: &ExecutionContext) -> Result<()> {
+    async fn notify(&self, method: &str, params: Value, context: &ExecutionContext) -> Result<()> {
         let value = json!({"jsonrpc":"2.0","method":method,"params":params});
-        match &mut self.transport {
-            Transport::Stdio { input, .. } => {
-                serde_json::to_writer(&mut *input, &value)?;
-                input.write_all(b"\n")?;
-                input.flush()?;
-                Ok(())
-            }
-            Transport::Remote(remote) => remote.notify(value, context),
+        match &self.transport {
+            Transport::Stdio(peer) => bounded(context, peer.send(&value)).await?,
+            Transport::Remote(remote) => remote.lock().await.notify(value, context).await,
         }
     }
-    fn request(
-        &mut self,
+    async fn request(
+        &self,
         method: &str,
         params: Value,
         context: &ExecutionContext,
     ) -> Result<Value> {
-        context.check()?;
         context.check()?;
         if let Some((capability, _)) = method.split_once('/')
             && matches!(capability, "tools" | "resources" | "prompts")
@@ -257,39 +349,16 @@ impl Session {
                 "MCP method was not negotiated with this server"
             );
         }
-        let id = self.next;
-        self.next += 1;
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
         let value = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        let result = match &mut self.transport {
-            Transport::Stdio { input, rx, .. } => {
-                serde_json::to_writer(&mut *input, &value)?;
-                input.write_all(b"\n")?;
-                input.flush()?;
-                loop {
-                    if let Err(error) = context.check() {
-                        if method != "initialize" {
-                            let _ = writeln!(
-                                input,
-                                "{}",
-                                json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}})
-                            );
-                            let _ = input.flush();
-                        }
-                        break Err(error);
-                    }
-                    match rx.recv_timeout(Duration::from_millis(20)) {
-                        Ok(frame) if frame["id"] == id => break Ok(frame),
-                        Ok(frame) => {
-                            if frame["method"] == "notifications/tools/list_changed" {
-                                self.changed.store(true, Ordering::SeqCst);
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(_) => break Err(anyhow!("MCP connection closed before response")),
-                    }
-                }
+        let result = match &self.transport {
+            Transport::Stdio(peer) => peer.request(id, value, context).await,
+            Transport::Remote(remote) => {
+                // HTTP sessions keep per-connection state (session id, event
+                // stream); their requests take turns.
+                let mut remote = bounded(context, remote.lock()).await?;
+                remote.request(value, context).await
             }
-            Transport::Remote(remote) => remote.request(value, context),
         }?;
         anyhow::ensure!(result["error"].is_null(), "MCP returned a protocol error");
         anyhow::ensure!(
@@ -297,17 +366,6 @@ impl Session {
             "MCP response missing result"
         );
         Ok(result)
-    }
-}
-impl Drop for Session {
-    fn drop(&mut self) {
-        if let Transport::Stdio { child, reader, .. } = &mut self.transport {
-            child.terminate();
-            let _ = child.wait();
-            if let Some(reader) = reader.take() {
-                let _ = reader.join();
-            }
-        }
     }
 }
 struct Remote {
@@ -321,30 +379,28 @@ struct Remote {
     buffer: Vec<u8>,
     changed: Arc<AtomicBool>,
 }
-/// Drive `future` on the shared runtime, stopping the moment the context is
-/// cancelled or its deadline passes (no polling). The error is whatever
-/// `context.check()` reports, so callers see the same messages as before.
-fn wait<T>(context: &ExecutionContext, future: impl Future<Output = T>) -> Result<T> {
-    codingbuddy_core::runtime::runtime().block_on(async {
-        context.check()?;
-        let deadline = async {
-            match context.deadline {
-                Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            biased;
-            () = context.cancellation.cancelled() => {}
-            () = deadline => {}
-            value = future => return Ok(value),
+/// Await `future`, stopping the moment the context is cancelled or its
+/// deadline passes. The error is whatever `context.check()` reports, so
+/// callers see the same messages as before.
+async fn bounded<T>(context: &ExecutionContext, future: impl Future<Output = T>) -> Result<T> {
+    context.check()?;
+    let deadline = async {
+        match context.deadline {
+            Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+            None => std::future::pending().await,
         }
-        context.check()?;
-        Err(anyhow!("MCP request interrupted"))
-    })
+    };
+    tokio::select! {
+        biased;
+        () = context.cancellation.cancelled() => {}
+        () = deadline => {}
+        value = future => return Ok(value),
+    }
+    context.check()?;
+    Err(anyhow!("MCP request interrupted"))
 }
 impl Remote {
-    fn new(
+    async fn new(
         server: &McpServer,
         context: &ExecutionContext,
         changed: Arc<AtomicBool>,
@@ -374,10 +430,12 @@ impl Remote {
             changed,
         };
         if remote.legacy {
-            let response = wait(context, remote.builder(false).send())??.error_for_status()?;
+            let response = bounded(context, remote.builder(false).send())
+                .await??
+                .error_for_status()?;
             remote.events = Some(response);
             loop {
-                let (event, data) = remote.event(context)?;
+                let (event, data) = remote.event(context).await?;
                 if event == "endpoint" {
                     let endpoint = parsed.join(&data)?;
                     anyhow::ensure!(
@@ -408,11 +466,13 @@ impl Remote {
         }
         request.header("Accept", "application/json, text/event-stream")
     }
-    fn notify(&mut self, value: Value, context: &ExecutionContext) -> Result<()> {
-        wait(context, self.builder(true).json(&value).send())??.error_for_status()?;
+    async fn notify(&mut self, value: Value, context: &ExecutionContext) -> Result<()> {
+        bounded(context, self.builder(true).json(&value).send())
+            .await??
+            .error_for_status()?;
         Ok(())
     }
-    fn event(&mut self, context: &ExecutionContext) -> Result<(String, String)> {
+    async fn event(&mut self, context: &ExecutionContext) -> Result<(String, String)> {
         loop {
             if let Some((end, separator)) = self
                 .buffer
@@ -447,8 +507,9 @@ impl Remote {
                 continue;
             }
             let response = self.events.as_mut().context("MCP event stream missing")?;
-            let bytes =
-                wait(context, response.chunk())??.context("MCP stream closed before response")?;
+            let bytes = bounded(context, response.chunk())
+                .await??
+                .context("MCP stream closed before response")?;
             self.buffer.extend_from_slice(&bytes);
             anyhow::ensure!(
                 self.buffer.len() <= 16 * 1024 * 1024,
@@ -456,11 +517,12 @@ impl Remote {
             );
         }
     }
-    fn request(&mut self, value: Value, context: &ExecutionContext) -> Result<Value> {
+    async fn request(&mut self, value: Value, context: &ExecutionContext) -> Result<Value> {
         let id = value["id"].clone();
-        let result = (|| {
-            let response =
-                wait(context, self.builder(true).json(&value).send())??.error_for_status()?;
+        let result = async {
+            let response = bounded(context, self.builder(true).json(&value).send())
+                .await??
+                .error_for_status()?;
             if let Some(session) = response.headers().get("Mcp-Session-Id") {
                 self.session = Some(session.to_str()?.to_owned());
             }
@@ -472,7 +534,7 @@ impl Remote {
             if !self.legacy && !is_events {
                 let mut response = response;
                 let mut bytes = Vec::new();
-                while let Some(chunk) = wait(context, response.chunk())?? {
+                while let Some(chunk) = bounded(context, response.chunk()).await?? {
                     anyhow::ensure!(
                         bytes.len() + chunk.len() <= 16 * 1024 * 1024,
                         "MCP response limit exceeded"
@@ -492,7 +554,7 @@ impl Remote {
                 self.buffer.clear();
             }
             loop {
-                let (_, data) = self.event(context)?;
+                let (_, data) = self.event(context).await?;
                 let result: Value = serde_json::from_str(&data)?;
                 if result["method"] == "notifications/tools/list_changed" {
                     self.changed.store(true, Ordering::SeqCst);
@@ -505,7 +567,8 @@ impl Remote {
                     return Ok(result);
                 }
             }
-        })();
+        }
+        .await;
         if result.is_err() && value["method"] != "initialize" && context.cancellation.is_cancelled()
         {
             let cleanup = ExecutionContext {
@@ -513,12 +576,161 @@ impl Remote {
                 cancellation: CancellationToken::new(),
                 ..Default::default()
             };
-            let _=self.notify(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}}),&cleanup);
+            let _ = self
+                .notify(
+                    json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}}),
+                    &cleanup,
+                )
+                .await;
         }
         if !self.legacy {
             self.events = None;
             self.buffer.clear();
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod stdio_fixture {
+    use super::*;
+    use std::io::{BufRead, Write};
+
+    /// A stdio MCP server that answers `tools/call` after 400 ms, from its
+    /// own thread per request, so replies can arrive out of order.
+    #[test]
+    fn server() {
+        if std::env::var_os("CODINGBUDDY_MCP_FIXTURE").is_none() {
+            return;
+        }
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let reply = |stdout: &Mutex<std::io::Stdout>, value: Value| {
+            let mut out = stdout.lock().unwrap();
+            writeln!(out, "{value}").unwrap();
+            out.flush().unwrap();
+        };
+        for line in std::io::stdin().lock().lines() {
+            let Ok(request) = serde_json::from_str::<Value>(&line.unwrap()) else {
+                continue;
+            };
+            let id = request["id"].clone();
+            match request["method"].as_str() {
+                Some("initialize") => reply(
+                    &stdout,
+                    json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}),
+                ),
+                Some("ping") => reply(&stdout, json!({"jsonrpc":"2.0","id":id,"result":{}})),
+                Some("tools/call") => {
+                    let stdout = stdout.clone();
+                    let text = request["params"]["arguments"]["value"].clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(400));
+                        reply(
+                            &stdout,
+                            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":text}]}}),
+                        );
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn fixture_server() -> Result<McpServer> {
+        let mut child_env = codingbuddy_core::process_env::variables(
+            Path::new("."),
+            "",
+            codingbuddy_core::process_env::Source::User,
+        );
+        child_env.insert("CODINGBUDDY_MCP_FIXTURE".into(), "1".into());
+        Ok(McpServer {
+            id: "fixture".into(),
+            name: "fixture".into(),
+            transport: McpTransport::Stdio,
+            command: Some(std::env::current_exe()?.to_string_lossy().into_owned()),
+            args: [
+                "--exact",
+                "sessions::stdio_fixture::server",
+                "--nocapture",
+                "--quiet",
+            ]
+            .map(String::from)
+            .to_vec(),
+            child_env,
+            ..Default::default()
+        })
+    }
+
+    fn call(value: &str) -> Value {
+        json!({"name":"echo","arguments":{"value":value}})
+    }
+
+    #[test]
+    fn calls_to_one_stdio_server_run_concurrently() -> Result<()> {
+        codingbuddy_core::runtime::block_on(async {
+            let sessions = Sessions::default();
+            let server = fixture_server()?;
+            let context = ExecutionContext {
+                deadline: Some(Instant::now() + Duration::from_secs(10)),
+                ..Default::default()
+            };
+            // Connect first so the timing below measures only the calls.
+            sessions
+                .request(&server, "ping", json!({}), &context)
+                .await?;
+            let started = Instant::now();
+            let (a, b) = tokio::join!(
+                sessions.request(&server, "tools/call", call("a"), &context),
+                sessions.request(&server, "tools/call", call("b"), &context),
+            );
+            assert_eq!(a?["result"]["content"][0]["text"], "a");
+            assert_eq!(b?["result"]["content"][0]["text"], "b");
+            // Two 400 ms calls in sequence would take 800 ms.
+            assert!(
+                started.elapsed() < Duration::from_millis(700),
+                "calls were serialised: {:?}",
+                started.elapsed()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cancelling_a_stdio_call_returns_at_once_and_the_next_call_reconnects() -> Result<()> {
+        codingbuddy_core::runtime::block_on(async {
+            let sessions = Sessions::default();
+            let server = fixture_server()?;
+            let token = CancellationToken::new();
+            let context = ExecutionContext {
+                cancellation: token.clone(),
+                deadline: Some(Instant::now() + Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let canceller = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                token.cancel();
+            });
+            let started = Instant::now();
+            let error = sessions
+                .request(&server, "tools/call", call("slow"), &context)
+                .await
+                .unwrap_err();
+            canceller.await?;
+            assert!(started.elapsed() < Duration::from_millis(350));
+            assert!(
+                error
+                    .downcast_ref::<codingbuddy_core::execution::UnconfirmedSideEffect>()
+                    .is_some()
+            );
+            let fresh = ExecutionContext {
+                deadline: Some(Instant::now() + Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let result = sessions
+                .request(&server, "tools/call", call("again"), &fresh)
+                .await?;
+            assert_eq!(result["result"]["content"][0]["text"], "again");
+            Ok(())
+        })
     }
 }

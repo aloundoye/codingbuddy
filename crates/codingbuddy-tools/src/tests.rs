@@ -944,7 +944,7 @@ fn mcp_tool_routing_splits_name_correctly() {
         *cs.lock().unwrap() = server_id.to_string();
         *ct.lock().unwrap() = tool_name.to_string();
         *ca.lock().unwrap() = args.clone();
-        Ok(json!({"result": "ok"}))
+        Box::pin(async { Ok(json!({"result": "ok"})) })
     }));
 
     let result = host.execute_blocking(ApprovedToolCall {
@@ -986,7 +986,9 @@ fn mcp_tool_without_executor_returns_error() {
 #[test]
 fn mcp_tool_invalid_name_returns_error() {
     let (workspace, mut host) = temp_host();
-    host.set_mcp_executor(Arc::new(|_, _, _| Ok(json!({"ok": true}))));
+    host.set_mcp_executor(Arc::new(|_, _, _| {
+        Box::pin(async { Ok(json!({"ok": true})) })
+    }));
 
     // "mcp__noseparator" has no second "__" — should fail to split
     let result = host.execute_blocking(ApprovedToolCall {
@@ -1299,7 +1301,11 @@ fn delivery_zero_denies_persisted_commands_mcp_and_batch_children() -> Result<()
         Arc::new(PlatformShellRunner),
         &config,
     )?;
-    host.set_mcp_executor(Arc::new(|_, _, _| panic!("denied MCP executed")));
+    host.set_mcp_executor(Arc::new(
+        |_, _, _| -> codingbuddy_core::runtime::BoxFuture<'_, Result<serde_json::Value>> {
+            panic!("denied MCP executed")
+        },
+    ));
     for (name, args) in [
         ("bash.run", json!({"cmd":"git status"})),
         ("bash.run", json!({"cmd":"git diff | git status"})),
@@ -1370,12 +1376,12 @@ fn delivery_three_verification_does_not_turn_missing_approval_into_success() -> 
             Arc::new(PlatformShellRunner),
             &cfg,
         )?;
-        let result = host.run_verification_command(
+        let result = codingbuddy_core::runtime::block_on(host.run_verification_command(
             "echo must-not-run",
             workspace.path(),
             5,
             Default::default(),
-        );
+        ));
         assert_eq!(result["success"], false);
         assert_eq!(result["status"], "denied");
         assert_eq!(result["stdout"], "");
@@ -1406,22 +1412,22 @@ fn delivery_three_verification_approval_is_fresh_and_explicit_denies_never_promp
         assert!(call.args["effective_isolation"].is_string());
         Ok(true)
     };
-    let result = host.run_verification_with_approval(
+    let result = codingbuddy_core::runtime::block_on(host.run_verification_with_approval(
         "echo approved-once",
         workspace.path(),
         5,
         Default::default(),
         Some(&mut approve),
-    );
+    ));
     assert_eq!(result["status"], "passed", "{result}");
     assert!(result["stdout"].as_str().unwrap().contains("approved-once"));
     assert_eq!(
-        host.run_verification_command(
+        codingbuddy_core::runtime::block_on(host.run_verification_command(
             "echo approved-once",
             workspace.path(),
             5,
             Default::default()
-        )["status"],
+        ))["status"],
         "denied"
     );
     assert_eq!(prompts, 1);
@@ -1438,13 +1444,13 @@ fn delivery_three_verification_approval_is_fresh_and_explicit_denies_never_promp
     )?;
     let mut never =
         |_: &ToolCall| -> Result<bool> { panic!("Explicit deny opened an approval prompt") };
-    let result = host.run_verification_with_approval(
+    let result = codingbuddy_core::runtime::block_on(host.run_verification_with_approval(
         "echo forbidden",
         workspace.path(),
         5,
         Default::default(),
         Some(&mut never),
-    );
+    ));
     assert_eq!(result["status"], "denied");
     assert_eq!(result["stdout"], "");
     Ok(())
