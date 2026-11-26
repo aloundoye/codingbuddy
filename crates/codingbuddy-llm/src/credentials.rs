@@ -11,13 +11,21 @@ pub fn resolve_key_from_config(cfg: &LlmConfig) -> Option<String> {
         return None;
     }
     let env_key = provider.api_key_env.trim();
-    let env_value = if env_key.is_empty() {
-        None
-    } else {
-        std::env::var(env_key)
+    let read_env = |name: &str| {
+        std::env::var(name)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+    };
+    let env_value = if env_key.is_empty() {
+        None
+    } else {
+        // Google's own tools read GEMINI_API_KEY; accept it for GOOGLE_API_KEY.
+        read_env(env_key).or_else(|| {
+            (env_key == "GOOGLE_API_KEY")
+                .then(|| read_env("GEMINI_API_KEY"))
+                .flatten()
+        })
     };
     cfg.api_key
         .as_deref()

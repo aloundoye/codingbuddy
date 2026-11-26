@@ -617,7 +617,10 @@ fn published_schema_is_up_to_date() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &generated).unwrap();
     }
-    let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+    // Windows checkouts may convert the file to CRLF; compare the content.
+    let checked_in = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     assert!(
         checked_in == generated,
         "docs/protocol/jsonrpc.schema.json is stale; regenerate with \

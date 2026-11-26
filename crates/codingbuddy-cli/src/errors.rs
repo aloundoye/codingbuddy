@@ -202,6 +202,9 @@ impl ErrorHandler {
         // Auth errors (401, unauthorized, invalid key)
         if lower_error.contains("status: 401")
             || lower_error.contains("status 401")
+            || lower_error.contains("http 401")
+            || lower_error.contains("http 403")
+            || lower_error.contains("authentication failed")
             || lower_error.contains("unauthorized")
             || lower_error.contains("invalid api key")
             || lower_error.contains("invalid_api_key")
@@ -224,6 +227,26 @@ impl ErrorHandler {
                 .with_suggestions(vec![
                     "You've hit the API rate limit — wait a moment and retry".to_string(),
                     "Consider using a model with higher rate limits".to_string(),
+                ]);
+        }
+
+        // Provider overloaded (503/529): the key and connection are fine.
+        if lower_error.contains("overloaded") {
+            return EnhancedError::new("Model Overloaded", error_message, ErrorType::Network)
+                .with_suggestions(vec![
+                    "The provider is under high demand; your API key and connection work"
+                        .to_string(),
+                    "Try again in a minute, or pick another model with `/model` or `--model`"
+                        .to_string(),
+                ]);
+        }
+
+        // Unknown model (404)
+        if lower_error.contains("model not found") {
+            return EnhancedError::new("Model Not Found", error_message, ErrorType::Network)
+                .with_suggestions(vec![
+                    "This model name is not available to your API key".to_string(),
+                    "Run `codingbuddy models` to list the models you can use".to_string(),
                 ]);
         }
 
@@ -279,6 +302,23 @@ mod tests {
         let err = anyhow!("Connection refused");
         let output = handler.handle(&err);
         assert!(output.contains("Network Error") || output.contains("Error"));
+    }
+
+    #[test]
+    fn provider_http_failures_get_specific_advice() {
+        let handler = ErrorHandler::new();
+        let message = |status: u16, body: &str| {
+            let error = codingbuddy_llm::error::ProviderError::http(
+                codingbuddy_llm::protocol::ChatProtocol::GeminiGenerateContent,
+                status,
+                body,
+            );
+            handler.handle(&anyhow::Error::from(error))
+        };
+        let busy = message(503, r#"{"error":{"code":503,"status":"UNAVAILABLE"}}"#);
+        assert!(busy.contains("Model Overloaded"), "{busy}");
+        assert!(message(404, "{}").contains("Model Not Found"));
+        assert!(message(401, "{}").contains("Authentication Error"));
     }
 
     #[test]

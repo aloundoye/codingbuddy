@@ -62,7 +62,28 @@ impl ProviderError {
                         | "invalid_request_error"
                 )
             })
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .or_else(|| {
+                // Google reports a gRPC-style status name next to a numeric code.
+                value
+                    .pointer("/error/status")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|status| {
+                        matches!(
+                            *status,
+                            "UNAVAILABLE"
+                                | "NOT_FOUND"
+                                | "RESOURCE_EXHAUSTED"
+                                | "PERMISSION_DENIED"
+                                | "UNAUTHENTICATED"
+                                | "INVALID_ARGUMENT"
+                                | "FAILED_PRECONDITION"
+                                | "DEADLINE_EXCEEDED"
+                                | "INTERNAL"
+                        )
+                    })
+                    .map(str::to_owned)
+            });
         error
     }
 
@@ -116,6 +137,15 @@ impl fmt::Display for ProviderError {
             }
             FailureKind::IncompleteStream => "Provider stream ended before a terminal response",
             FailureKind::IncompleteResponse => "Provider response incomplete",
+            FailureKind::ProviderFailure if matches!(http_error, Some(503 | 529)) => {
+                "Model is overloaded right now (the provider is busy, not a key problem)"
+            }
+            FailureKind::ProviderFailure if http_error == Some(404) => {
+                "Model not found or not enabled for this key"
+            }
+            FailureKind::ProviderFailure if matches!(http_error, Some(500 | 502 | 504)) => {
+                "Provider server error"
+            }
             FailureKind::ProviderFailure if http_error.is_some() => {
                 "Provider reported a request failure"
             }
@@ -136,4 +166,29 @@ pub fn diagnostic(error: &anyhow::Error) -> Option<serde_json::Value> {
     error
         .downcast_ref::<ProviderError>()
         .and_then(|error| serde_json::to_value(error).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_failures_name_the_likely_cause_and_keep_only_known_codes() {
+        let protocol = ChatProtocol::GeminiGenerateContent;
+        let busy = ProviderError::http(
+            protocol,
+            503,
+            r#"{"error":{"code":503,"message":"high demand","status":"UNAVAILABLE"}}"#,
+        );
+        assert!(busy.to_string().contains("overloaded"), "{busy}");
+        assert_eq!(busy.provider_code.as_deref(), Some("UNAVAILABLE"));
+        assert!(busy.retryable);
+
+        let missing = ProviderError::http(protocol, 404, "{}");
+        assert!(missing.to_string().contains("Model not found"), "{missing}");
+
+        // Free text in the status field is never copied.
+        let odd = ProviderError::http(protocol, 400, r#"{"error":{"status":"key=AQ.secret"}}"#);
+        assert_eq!(odd.provider_code, None);
+    }
 }
