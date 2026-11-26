@@ -421,6 +421,17 @@ impl HookRuntime {
         input: &HookInput,
         context: &ExecutionContext,
     ) -> HookResult {
+        // Hooks run subprocesses; called from an async turn, let the
+        // worker hand off its other tasks while they run.
+        codingbuddy_core::runtime::blocking_section(|| self.fire_now(event, input, context))
+    }
+
+    fn fire_now(
+        &self,
+        event: HookEvent,
+        input: &HookInput,
+        context: &ExecutionContext,
+    ) -> HookResult {
         if context.check().is_err() {
             return HookResult {
                 blocked: true,

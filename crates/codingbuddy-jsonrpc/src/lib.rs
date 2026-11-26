@@ -693,7 +693,9 @@ impl IdeRpcHandler {
                 ..Default::default()
             };
 
-            match engine.chat_with_options(&prompt, chat_options) {
+            match codingbuddy_core::runtime::block_on(
+                engine.chat_with_options(&prompt, chat_options),
+            ) {
                 Ok(output) => ("completed".to_string(), output, None),
                 Err(err) => {
                     provider_error =

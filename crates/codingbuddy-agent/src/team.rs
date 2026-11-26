@@ -7,12 +7,10 @@ use codingbuddy_core::{
     runtime_dir,
 };
 use codingbuddy_diff::{GitApplyStrategy, PatchStore};
-use codingbuddy_llm::LlmClientBlockingExt;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::thread;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -30,21 +28,21 @@ struct LaneResult {
     patch: String,
 }
 
-pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<String> {
+pub async fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<String> {
     if !is_git_workspace(&engine.workspace) {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return engine.run_tool_use_loop(prompt, &fallback);
+        return engine.run_tool_use_loop(prompt, &fallback).await;
     }
 
     let max_lanes = engine.cfg.agent_loop.team.max_lanes.max(1) as usize;
     let max_concurrency = engine.cfg.agent_loop.team.max_concurrency.max(1) as usize;
-    let mut lanes = plan_lanes(engine, prompt, max_lanes, options);
+    let mut lanes = plan_lanes(engine, prompt, max_lanes, options).await;
     if lanes.len() <= 1 {
         // Single lane: fall back to standard routing (tool-use loop or pipeline).
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return engine.run_tool_use_loop(prompt, &fallback);
+        return engine.run_tool_use_loop(prompt, &fallback).await;
     }
     lanes.truncate(max_lanes);
     lanes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -76,7 +74,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             lane_options.mode = ChatMode::Code;
             lane_options.disable_team_orchestration = true;
 
-            handles.push(thread::spawn(move || {
+            handles.push(codingbuddy_core::runtime::runtime().spawn(async move {
                 execute_lane(
                     workspace,
                     lanes_root,
@@ -86,12 +84,13 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                     lane,
                     run_id,
                 )
+                .await
             }));
         }
 
         for handle in handles {
             let lane_result = handle
-                .join()
+                .await
                 .map_err(|_| anyhow!("team lane worker panicked"))?;
             match lane_result {
                 Ok(result) => {
@@ -136,7 +135,9 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                 "Lane merge conflict while applying {} ({})\n\nConflict details:\n{}\n\nOriginal request:\n{}\n\nResolve with a single unified patch and re-verify.",
                 lane.lane.id, lane.lane.name, conflict_text, prompt
             );
-            return engine.run_tool_use_loop(&recovery_prompt, &recovery_options);
+            return engine
+                .run_tool_use_loop(&recovery_prompt, &recovery_options)
+                .await;
         }
     }
 
@@ -156,7 +157,9 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             "Global verify failed after deterministic lane merge.\n\nVerify summary:\n{}\n\nOriginal request:\n{}\n\nProduce a corrective unified diff and pass verification.",
             verify.summary, prompt
         );
-        return engine.run_tool_use_loop(&recovery_prompt, &recovery_options);
+        return engine
+            .run_tool_use_loop(&recovery_prompt, &recovery_options)
+            .await;
     }
 
     let non_empty = results
@@ -180,7 +183,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     Ok(response)
 }
 
-fn execute_lane(
+async fn execute_lane(
     workspace: std::path::PathBuf,
     lanes_root: std::path::PathBuf,
     base_commit: &str,
@@ -215,18 +218,21 @@ fn execute_lane(
         }
     );
 
-    let lane_result = (|| -> Result<LaneResult> {
+    let lane_result = async {
         let lane_engine = AgentEngine::new(&lane_root)?;
         lane_engine.set_approval_handler(Box::new(|call| Ok(call.args["fresh_approval"] != true)));
-        let _ = lane_engine.chat_with_options(&lane_prompt, lane_options)?;
+        let _ = lane_engine
+            .chat_with_options(&lane_prompt, lane_options)
+            .await?;
         let patch = git_stdout(&lane_root, &["diff", "--binary"])
             .context("failed to collect lane patch artifact")?;
-        Ok(LaneResult {
+        Ok::<_, anyhow::Error>(LaneResult {
             lane: lane.clone(),
             run_id,
             patch,
         })
-    })();
+    }
+    .await;
 
     let _ = remove_worktree(&workspace, &lane_root);
     match lane_result {
@@ -363,7 +369,7 @@ fn validate_lane_patch_artifact(patch: &str) -> Result<()> {
 
 /// Use a lightweight LLM call to identify files relevant to a task.
 /// Returns a list of workspace-relative file paths extracted from the model response.
-fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>> {
+async fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>> {
     let system = "You are a planning assistant. Given a user request, list the workspace-relative file paths that need to be modified or created. Return ONLY one file path per line, no other text.";
     let req = ChatRequest {
         model: engine.cfg.llm.active_base_model(),
@@ -389,7 +395,7 @@ fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>>
         provider_options: Default::default(),
         response_format: None,
     };
-    let response = engine.llm.complete_chat_blocking(&req)?;
+    let response = engine.llm.complete_chat(&req).await?;
     let files: Vec<String> = response
         .text
         .lines()
@@ -399,7 +405,7 @@ fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>>
     Ok(files)
 }
 
-fn plan_lanes(
+async fn plan_lanes(
     engine: &AgentEngine,
     prompt: &str,
     max_lanes: usize,
@@ -407,7 +413,7 @@ fn plan_lanes(
 ) -> Vec<LaneSpec> {
     let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // Use a lightweight LLM call to plan lanes (files → lane categories)
-    if let Ok(files) = plan_files_via_llm(engine, prompt) {
+    if let Ok(files) = plan_files_via_llm(engine, prompt).await {
         for path in &files {
             let lane = classify_lane_for_path(path);
             grouped.entry(lane).or_default().insert(path.clone());

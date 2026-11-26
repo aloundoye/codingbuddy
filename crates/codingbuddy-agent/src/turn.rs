@@ -9,7 +9,11 @@ impl AgentEngine {
     /// fluid think→act→observe behavior. Bootstrap context (project structure,
     /// repo map, manifests) is injected on the first turn so the model starts
     /// with project awareness instead of blind.
-    pub(crate) fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
+    pub(crate) async fn run_tool_use_loop(
+        &self,
+        prompt: &str,
+        options: &ChatOptions,
+    ) -> Result<String> {
         let cfg = self.effective_config(options);
         let routed_llm = self.routed_llm_for_options(&cfg, options)?;
         let llm = match routed_llm.as_ref() {
@@ -390,7 +394,7 @@ impl AgentEngine {
             loop_ = loop_.with_history(options.chat_history.clone());
         }
 
-        let result = loop_.run(prompt)?;
+        let result = loop_.run(prompt).await?;
 
         if !result.tool_calls_made.is_empty() {
             self.observer.verbose_log(&format!(

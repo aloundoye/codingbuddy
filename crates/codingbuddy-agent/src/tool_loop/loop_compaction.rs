@@ -65,7 +65,7 @@ impl ToolUseLoop<'_> {
     /// Walks backward from the end, keeping complete exchange groups (User + Assistant + Tool
     /// messages form a group). Never orphans a Tool message from its corresponding Assistant
     /// tool_calls. Respects `target_tokens` budget for kept messages.
-    pub(crate) fn compact_messages(&mut self, target_tokens: u64) -> bool {
+    pub(crate) async fn compact_messages(&mut self, target_tokens: u64) -> bool {
         if self.messages.len() <= 7 {
             return false;
         }
@@ -105,7 +105,7 @@ impl ToolUseLoop<'_> {
         let middle_count = keep_from - 1;
         let compacted_msgs = &self.messages[1..keep_from];
         // Try LLM-based compaction first, fall back to code-based extraction on any error.
-        let summary = match build_compaction_summary_with_llm(self.llm, compacted_msgs) {
+        let summary = match build_compaction_summary_with_llm(self.llm, compacted_msgs).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(

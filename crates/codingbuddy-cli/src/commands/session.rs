@@ -95,8 +95,10 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
             retry,
         } => {
             if retry {
-                let (id, result) = codingbuddy_agent::AgentEngine::new(workspace)?
-                    .retry_interrupted_tool(session_id, invocation_id)?;
+                let engine = codingbuddy_agent::AgentEngine::new(workspace)?;
+                let (id, result) = codingbuddy_core::runtime::block_on(
+                    engine.retry_interrupted_tool(session_id, invocation_id),
+                )?;
                 println!("Retry invocation {id}. Success: {}", result.success);
                 return Ok(());
             }

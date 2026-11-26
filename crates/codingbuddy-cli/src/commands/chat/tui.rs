@@ -1172,7 +1172,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
             let prompt_repo_root_override = repo_root_override.clone();
             thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine_clone.chat_with_options(
+                    codingbuddy_core::runtime::block_on(engine_clone.chat_with_options(
                         &prompt,
                         ChatOptions {
                             tools: allow_tools
@@ -1192,7 +1192,7 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
                             cancellation: Some(token),
                             ..Default::default()
                         },
-                    )
+                    ))
                 }));
                 match result {
                     Ok(Ok(output)) => {

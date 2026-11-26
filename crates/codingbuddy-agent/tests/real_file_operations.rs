@@ -98,7 +98,7 @@ fn fs_edit_modifies_real_file() {
     )
     .unwrap();
 
-    let result = engine.chat("Edit main.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Edit main.rs"));
     assert!(result.is_ok(), "chat should succeed: {:?}", result);
 
     let content = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
@@ -132,7 +132,7 @@ fn fs_write_creates_new_file() {
     )
     .unwrap();
 
-    let result = engine.chat("Create lib.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Create lib.rs"));
     assert!(result.is_ok(), "fs_write should succeed: {:?}", result);
 
     let path = dir.path().join("src/lib.rs");
@@ -157,7 +157,7 @@ fn fs_read_returns_file_content() {
     )
     .unwrap();
 
-    let result = engine.chat("Read main.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Read main.rs"));
     assert!(result.is_ok());
 }
 
@@ -178,7 +178,7 @@ fn fs_glob_finds_files() {
     )
     .unwrap();
 
-    let result = engine.chat("Find Rust files");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Find Rust files"));
     assert!(result.is_ok());
 }
 
@@ -210,7 +210,7 @@ fn fuzzy_edit_handles_whitespace_mismatch() {
     )
     .unwrap();
 
-    let result = engine.chat("Edit with whitespace mismatch");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Edit with whitespace mismatch"));
     assert!(result.is_ok(), "fuzzy edit should succeed: {:?}", result);
 
     let content = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
@@ -246,7 +246,7 @@ fn multi_tool_sequence_read_then_edit() {
     )
     .unwrap();
 
-    let result = engine.chat("Read then edit main.rs");
+    let result = codingbuddy_core::runtime::block_on(engine.chat("Read then edit main.rs"));
     assert!(result.is_ok());
 
     let content = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
@@ -281,13 +281,13 @@ fn file_moved_by_a_shell_command_can_be_rewound() -> Result<()> {
     engine.set_permission_mode("bypassPermissions");
     // Unsandboxed commands always ask; approve them here.
     engine.set_approval_handler(Box::new(|_| Ok(true)));
-    engine.chat_with_options(
+    codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "delete notes.txt",
         codingbuddy_agent::ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
     assert!(
         !temp.path().join("notes.txt").exists(),
         "precondition: the command ran"

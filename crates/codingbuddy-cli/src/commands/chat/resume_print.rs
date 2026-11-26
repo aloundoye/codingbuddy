@@ -80,7 +80,7 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     }
 
     let options = chat_options_from_cli(cli, true, ChatMode::Code);
-    let output = engine.chat_with_options(&prompt, options);
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(&prompt, options));
     plain_stream.event(StreamChunk::Done { reason: None });
     let output = output?;
 

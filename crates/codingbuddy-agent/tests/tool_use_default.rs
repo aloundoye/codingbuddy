@@ -230,7 +230,10 @@ fn prompt_stream_replaces_discarded_draft_and_completes_after_tools() -> Result<
         move |chunk| chunks.lock().unwrap().push(chunk)
     }));
 
-    assert_eq!(engine.chat("Read the main source")?, "Read it.");
+    assert_eq!(
+        codingbuddy_core::runtime::block_on(engine.chat("Read the main source"))?,
+        "Read it."
+    );
     let chunks = chunks.lock().unwrap();
     let presentation: Vec<_> = chunks
         .iter()
@@ -280,7 +283,10 @@ fn long_answer_after_tools_is_kept_on_screen() -> Result<()> {
         move |chunk| chunks.lock().unwrap().push(chunk)
     }));
 
-    assert_eq!(engine.chat("Read the main source")?, answer);
+    assert_eq!(
+        codingbuddy_core::runtime::block_on(engine.chat("Read the main source"))?,
+        answer
+    );
     let chunks = chunks.lock().unwrap();
     assert!(
         !chunks
@@ -301,8 +307,11 @@ fn failed_prompt_is_closed_before_the_next_prompt() -> Result<()> {
     let llm = Arc::new(ScriptedLlm::new(vec![truncated, text_response("Done.")]));
     let engine = AgentEngine::new_with_llm(temp.path(), Box::new(SharedScriptedLlm(llm.clone())))?;
 
-    assert!(engine.chat("Explain lifetimes").is_err());
-    assert_eq!(engine.chat("Say done")?, "Done.");
+    assert!(codingbuddy_core::runtime::block_on(engine.chat("Explain lifetimes")).is_err());
+    assert_eq!(
+        codingbuddy_core::runtime::block_on(engine.chat("Say done"))?,
+        "Done."
+    );
 
     let captured = llm.captured_messages();
     let second = captured.last().unwrap();
@@ -360,14 +369,14 @@ fn failed_and_cancelled_prompts_do_not_emit_done() -> Result<()> {
                 chunks.lock().unwrap().push(chunk);
             }
         }));
-        let result = engine.chat_with_options(
+        let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "Read the main source",
             ChatOptions {
                 tools: true,
                 cancellation: Some(cancellation),
                 ..Default::default()
             },
-        );
+        ));
         assert!(result.is_err());
         let chunks = chunks.lock().unwrap();
         assert!(
@@ -412,13 +421,13 @@ fn default_code_mode_uses_tool_loop() -> Result<()> {
         ],
     )?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "What's in hello.txt?",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert_eq!(output, "The file contains a greeting.");
     Ok(())
@@ -451,13 +460,13 @@ fn tool_loop_reads_then_edits_file() -> Result<()> {
     // Bypass permissions so fs_edit goes through in tests
     engine.set_permission_mode("bypassPermissions");
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Replace 'old content' with 'new content' in demo.txt",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Updated"));
     // Verify the edit was applied
@@ -488,13 +497,13 @@ fn tool_loop_runs_bash_command() -> Result<()> {
 
     // bash_run requires approval — without an approval handler, it gets denied
     // so the LLM gets a denial feedback and should respond accordingly
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Run echo hello",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     // The loop ran and returned a text response
     assert!(!output.is_empty());
@@ -518,13 +527,13 @@ fn tool_loop_denied_tool_feeds_back() -> Result<()> {
     )?;
 
     // No approval handler set → denial by default
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Delete everything",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("cannot execute"));
     Ok(())
@@ -547,13 +556,13 @@ fn tool_loop_multi_turn_conversation() -> Result<()> {
         ],
     )?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Read a.txt",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("aaa"));
     Ok(())
@@ -575,14 +584,14 @@ fn ask_mode_restricts_to_read_only() -> Result<()> {
         ],
     )?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "What's in src/main.rs?",
         ChatOptions {
             tools: true,
             mode: ChatMode::Ask,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("main function"));
     Ok(())
@@ -599,14 +608,14 @@ fn context_mode_restricts_to_read_only() -> Result<()> {
         vec![text_response("Here's the project overview.")],
     )?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Describe this project",
         ChatOptions {
             tools: true,
             mode: ChatMode::Context,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("project overview"));
     Ok(())
@@ -693,13 +702,13 @@ fn tool_loop_handles_max_turns() -> Result<()> {
     let mut engine = build_engine(temp.path(), responses)?;
     engine.set_max_turns(Some(3));
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Keep reading forever",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     // Should have stopped due to max turns, returning empty response
     // (max_turns stop doesn't produce text)
@@ -722,13 +731,13 @@ fn tool_descriptions_are_enriched_in_request() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Read file",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(
@@ -767,13 +776,13 @@ fn first_turn_tool_choice_required() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "What's in this project?",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
@@ -806,13 +815,13 @@ fn subsequent_turns_tool_choice_auto() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Read test.txt and other.txt",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(requests.len() >= 3, "should have at least 3 LLM calls");
@@ -841,14 +850,14 @@ fn ask_mode_uses_read_only_tools() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "What language is this?",
         ChatOptions {
             tools: true,
             mode: ChatMode::Ask,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
@@ -884,14 +893,14 @@ fn context_mode_uses_read_only_tools() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Describe this project",
         ChatOptions {
             tools: true,
             mode: ChatMode::Context,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
@@ -920,13 +929,13 @@ fn code_mode_build_profile_uses_smaller_tool_surface() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Fix the bug in src/main.rs",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
@@ -971,13 +980,13 @@ fn tool_search_enables_matching_tools_for_followup_turns() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Inspect this repository",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Planning mode entered"));
     let requests = captured.lock().unwrap();
@@ -1017,13 +1026,13 @@ fn tools_false_uses_analysis_path() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "What is 2+2?",
         ChatOptions {
             tools: false,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Analysis complete"));
     // Analysis path should have been used (check captured requests)
@@ -1050,13 +1059,13 @@ fn default_tool_loop_has_thinking_enabled() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_config_and_llm(temp.path(), AppConfig::default(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "What's in this project?",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
@@ -1085,14 +1094,14 @@ fn force_max_think_overrides_budget() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_config_and_llm(temp.path(), AppConfig::default(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "fix typo",
         ChatOptions {
             tools: true,
             force_max_think: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
@@ -1128,13 +1137,13 @@ fn tool_loop_with_thinking_mode() -> Result<()> {
 
     let engine = build_engine(temp.path(), vec![response, final_response])?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "What does the main function do?",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("prints hello"));
     Ok(())
@@ -1181,13 +1190,13 @@ fn spawn_task_calls_worker() -> Result<()> {
     });
     engine.set_subagent_worker(worker);
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Analyze this project",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(
         *worker_called.lock().unwrap(),
@@ -1218,13 +1227,13 @@ fn spawn_task_without_worker_falls_back() -> Result<()> {
     )?;
 
     // No worker set — should fall back gracefully
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Explore the code",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(!output.is_empty());
     Ok(())
@@ -1257,13 +1266,13 @@ fn spawn_task_role_maps_correctly() -> Result<()> {
     });
     engine.set_subagent_worker(worker);
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Plan the implementation",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let role = captured_role.lock().unwrap();
     assert_eq!(
@@ -1294,13 +1303,13 @@ fn spawn_task_persists_child_session_and_run_metadata() -> Result<()> {
         Arc::new(move |task| Ok(format!("Subagent completed: {}", task.goal)));
     engine.set_subagent_worker(worker);
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Analyze this project",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Delegated task complete"));
     let store = Store::new(temp.path())?;
@@ -1356,13 +1365,13 @@ fn spawn_task_background_keeps_task_running() -> Result<()> {
     });
     engine.set_subagent_worker(worker);
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Analyze this project in background",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Delegated task queued"));
     let store = Store::new(temp.path())?;
@@ -1438,13 +1447,13 @@ fn task_output_tool_surfaces_persisted_run_payload() -> Result<()> {
     ]));
     let engine = build_engine_with_shared_llm(temp.path(), scripted.clone())?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Read the delegated task output",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Read task output"));
     let captured = scripted.captured_messages();
@@ -1541,13 +1550,13 @@ fn task_stop_cancels_background_run() -> Result<()> {
         ],
     )?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Stop the background task",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Stopped the task"));
     let task = store.load_task(task_id)?.expect("task");
@@ -1580,13 +1589,13 @@ fn task_create_persists_to_store() -> Result<()> {
         ],
     )?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Create a task for parser auditing",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Created"));
     let store = Store::new(temp.path())?;
@@ -1618,13 +1627,13 @@ fn exit_plan_mode_persists_plan_and_session_state() -> Result<()> {
         ],
     )?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Plan the parser refactor",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Plan saved"));
     let store = Store::new(temp.path())?;
@@ -1673,13 +1682,13 @@ fn complex_prompt_auto_enters_plan_and_persists_draft_state() -> Result<()> {
         }
     }));
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Refactor the parser across multiple files and verify the result carefully.",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(output.contains("Plan saved"));
     let phases = phase_chunks.lock().unwrap().clone();
@@ -1735,27 +1744,27 @@ fn approved_plan_execution_emits_full_phase_path_and_loads_plan_context() -> Res
         }
     }));
 
-    let planning_output = engine.chat_with_options(
+    let planning_output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Refactor the parser across multiple steps, then verify the result.",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
     assert!(planning_output.contains("Plan saved"));
 
     let store = Store::new(temp.path())?;
     let session = store.load_latest_session()?.expect("session");
     assert_eq!(session.status, SessionState::AwaitingApproval);
 
-    let final_output = engine.chat_with_options(
+    let final_output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Go ahead and implement the approved plan.",
         ChatOptions {
             tools: true,
             session_id: Some(session.session_id),
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(final_output.contains("Verified the change"));
     assert!(fs::read_to_string(temp.path().join("src/main.rs"))?.contains("println!(\"ok\")"));
@@ -1810,13 +1819,13 @@ fn openai_compatible_surface_prefers_patch_direct_in_requests() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_config_and_llm(temp.path(), cfg, llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Fix a bug in src/main.rs.",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     let tool_names = requests[0]
@@ -1842,13 +1851,13 @@ fn ollama_surface_clamps_request_tool_count() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_config_and_llm(temp.path(), cfg.clone(), llm)?;
 
-    let _output = engine.chat_with_options(
+    let _output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Refactor src/main.rs and add verification.",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     let requests = captured.lock().unwrap();
     let tool_names = requests[0]
@@ -1910,13 +1919,13 @@ fn p0_untrusted_shell_needs_an_explicit_approval() -> Result<()> {
                 Ok(true)
             }));
         }
-        engine.chat_with_options(
+        codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "Run the requested approval fixture.",
             ChatOptions {
                 tools: true,
                 ..Default::default()
             },
-        )?;
+        ))?;
         let store = Store::new(workspace.path())?;
         let session = store.load_latest_session()?.expect("session");
         let projection = store.rebuild_from_events(session.session_id)?;
@@ -1967,13 +1976,13 @@ fn p0_untrusted_edit_skips_automatic_verification() -> Result<()> {
     ]));
     let mut engine = AgentEngine::new_with_config_and_llm(workspace.path(), config, llm)?;
     engine.set_permission_mode("bypassPermissions");
-    engine.chat_with_options(
+    codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Make the fixture edit.",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
     assert!(fs::read_to_string(workspace.path().join("src/main.rs"))?.contains("edited"));
     assert!(!workspace.path().join("build-marker").exists());
     assert!(!workspace.path().join("lint-marker").exists());
@@ -2026,13 +2035,13 @@ fn delivery_zero_explicit_deny_survives_bypass_and_hooks() -> Result<()> {
         engine.set_approval_handler(Box::new(|_| {
             panic!("denied tool opened an approval prompt")
         }));
-        engine.chat_with_options(
+        codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "Run the permission fixture.",
             ChatOptions {
                 tools: true,
                 ..Default::default()
             },
-        )?;
+        ))?;
         let store = Store::new(workspace.path())?;
         let session = store.load_latest_session()?.expect("session");
         let projection = store.rebuild_from_events(session.session_id)?;
@@ -2094,13 +2103,13 @@ fn delivery_three_worktree_executes_scoped_and_legacy_merge_only_stages() -> Res
     let mut engine =
         AgentEngine::new_with_config_and_llm(root, config, Box::new(ScriptedLlm::new(responses)))?;
     engine.set_permission_mode("bypassPermissions");
-    engine.chat_with_options(
+    codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "Use an isolated worktree to update this Rust file, then stage its output.",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    ))?;
     assert_eq!(
         fs::read_to_string(root.join("src/main.rs"))?,
         "fn current_input() {}\n"

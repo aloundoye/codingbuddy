@@ -37,7 +37,7 @@ fn test_verbose_response_gets_conciseness_nudge() {
         default_tools(),
     );
 
-    let result = loop_.run("explain something").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("explain something")).unwrap();
     // Should get the concise response after verbosity nudge
     assert_eq!(result.response, "Short answer.");
     // 3 hallucination nudges + 1 verbosity nudge + final = 5 turns
@@ -105,7 +105,7 @@ fn test_parallel_tool_duration_nonzero() {
         default_tools(),
     );
 
-    let result = loop_.run("read both files").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("read both files")).unwrap();
     assert_eq!(result.tool_calls_made.len(), 2, "should have 2 tool calls");
     // Duration is captured per-thread. Even with fast mock execution,
     // the timing code should produce a non-negative value (could be 0 if
@@ -200,7 +200,7 @@ fn test_compaction_validation_catches_empty_summary() {
     }
 
     let messages_before = loop_.messages.clone();
-    let compacted = loop_.compact_messages(200);
+    let compacted = codingbuddy_core::runtime::block_on(loop_.compact_messages(200));
 
     // The LLM returns empty text, code-based fallback produces very short summary.
     // If the summary is < 50 chars, compaction should be rejected.
@@ -285,7 +285,7 @@ fn hook_denial_blocks_tool_execution() {
                 &serde_json::json!("cached data"),
             );
         }
-        let result = loop_.run("Read test.txt").unwrap();
+        let result = codingbuddy_core::runtime::block_on(loop_.run("Read test.txt")).unwrap();
         assert_eq!(host.executed_count(), 0);
         assert_eq!(result.response, "OK, I won't use that tool.");
         let messages: Vec<_> = loop_
@@ -350,7 +350,7 @@ fn blocking_permission_hook_stops_approval_and_execution() {
     .collect();
     loop_.set_hooks(HookRuntime::new(workspace.path(), HooksConfig { events }));
     loop_.set_approval_callback(Arc::new(|_| panic!("blocked request reached approval")));
-    loop_.run("Read a file").unwrap();
+    codingbuddy_core::runtime::block_on(loop_.run("Read a file")).unwrap();
     assert_eq!(host.executed_count(), 0);
 }
 
@@ -400,7 +400,7 @@ fn rewritten_tool_arguments_are_validated_and_approved() {
             *captured.lock().unwrap() = call.args["path"].as_str().map(str::to_owned);
             Ok(true)
         }));
-        loop_.run("Read a file").unwrap();
+        codingbuddy_core::runtime::block_on(loop_.run("Read a file")).unwrap();
         assert_eq!(approved.lock().unwrap().as_deref(), expected_path);
         assert_eq!(host.executed_count(), usize::from(expected_path.is_some()));
     }
@@ -467,7 +467,7 @@ fn authorized_reads_overlap_and_preserve_response_order() {
         "system".to_owned(),
         default_tools(),
     );
-    let result = loop_.run("Read both files").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Read both files")).unwrap();
     assert!(result.tool_calls_made.iter().all(|record| record.success));
     let messages: Vec<_> = result
         .messages

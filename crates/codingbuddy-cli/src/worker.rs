@@ -270,7 +270,7 @@ pub(crate) fn run() -> Result<()> {
                     .max_turns
                     .unwrap_or(bootstrap.cfg.agent_loop.tool_loop_max_turns);
                 engine.set_max_turns(Some(max_turns.unwrap_or(ceiling).min(ceiling)));
-                let result = engine.chat_with_options(
+                let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
                     &prompt,
                     codingbuddy_agent::ChatOptions {
                         tools,
@@ -292,7 +292,7 @@ pub(crate) fn run() -> Result<()> {
                         },
                         ..Default::default()
                     },
-                );
+                ));
                 let diff = wt.collect_for_parent()?;
                 let patch = if diff.is_empty() {
                     None

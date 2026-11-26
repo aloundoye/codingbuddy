@@ -53,7 +53,7 @@ fn compaction_preserves_tool_result_pairing() {
     });
 
     // Force compaction with a tight budget
-    let compacted = loop_.compact_messages(200);
+    let compacted = codingbuddy_core::runtime::block_on(loop_.compact_messages(200));
     assert!(compacted, "should have compacted");
 
     // Verify no orphaned Tool messages (every Tool must follow an Assistant with tool_calls)
@@ -100,7 +100,7 @@ fn compaction_respects_target_tokens() {
     }
 
     let before_len = loop_.messages.len();
-    let compacted = loop_.compact_messages(2000);
+    let compacted = codingbuddy_core::runtime::block_on(loop_.compact_messages(2000));
     assert!(compacted, "should compact");
     assert!(
         loop_.messages.len() < before_len,
@@ -192,7 +192,7 @@ fn compaction_appends_at_most_one_followup_user_prompt() {
         });
     }
 
-    let compacted = loop_.compact_messages(240);
+    let compacted = codingbuddy_core::runtime::block_on(loop_.compact_messages(240));
     assert!(compacted);
 
     let followup_count = loop_
@@ -243,7 +243,7 @@ fn compaction_followup_replays_last_actionable_user_prompt() {
         });
     }
 
-    let compacted = loop_.compact_messages(220);
+    let compacted = codingbuddy_core::runtime::block_on(loop_.compact_messages(220));
     assert!(compacted);
 
     let replay = loop_
@@ -369,7 +369,7 @@ fn compaction_injects_active_work_state_snapshot() {
         });
     }
 
-    let compacted = loop_.compact_messages(240);
+    let compacted = codingbuddy_core::runtime::block_on(loop_.compact_messages(240));
     assert!(compacted);
 
     let snapshot = loop_

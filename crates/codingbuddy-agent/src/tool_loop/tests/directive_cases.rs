@@ -89,7 +89,9 @@ fn directives_survive_compaction() {
     );
 
     // First turn with a directive
-    let _ = tool_loop.run("Always use snake_case for variables. Read the file.");
+    let _ = codingbuddy_core::runtime::block_on(
+        tool_loop.run("Always use snake_case for variables. Read the file."),
+    );
 
     // Verify directive was collected
     assert!(
@@ -106,7 +108,9 @@ fn directives_survive_compaction() {
     let directives_before = tool_loop.pinned_directives.clone();
 
     // Second turn
-    let _ = tool_loop.continue_with("Now prefer tabs over spaces. Fix the bug.");
+    let _ = codingbuddy_core::runtime::block_on(
+        tool_loop.continue_with("Now prefer tabs over spaces. Fix the bug."),
+    );
 
     // Directives from both turns should be present
     assert!(

@@ -1,5 +1,4 @@
 //! Context compaction: pruning old tool outputs and building compaction summaries.
-use codingbuddy_llm::LlmClientBlockingExt;
 
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{ChatMessage, ChatRequest, ToolChoice};
@@ -140,7 +139,7 @@ pub(crate) fn build_compaction_summary(messages: &[ChatMessage]) -> String {
 ///
 /// Sends the conversation to `deepseek-chat` with a structured template.
 /// Falls back to code-based extraction on any error.
-pub(crate) fn build_compaction_summary_with_llm(
+pub(crate) async fn build_compaction_summary_with_llm(
     llm: &(dyn LlmClient + Send + Sync),
     messages: &[ChatMessage],
 ) -> Result<String> {
@@ -214,7 +213,7 @@ pub(crate) fn build_compaction_summary_with_llm(
         response_format: None,
     };
 
-    let response = llm.complete_chat_blocking(&request)?;
+    let response = llm.complete_chat(&request).await?;
     let text = response.text.trim().to_string();
 
     // Validate the response has at least some structure

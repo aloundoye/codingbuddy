@@ -9,7 +9,7 @@ license.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

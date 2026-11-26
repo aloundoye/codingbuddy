@@ -1552,24 +1552,25 @@ pub(crate) fn run_chat(
                             println!("{rendered}");
                         } else {
                             // Feed rendered prompt into the agent
-                            let output = engine.chat_with_options(
-                                &rendered,
-                                ChatOptions {
-                                    tools: allow_tools && !read_only_mode,
-                                    force_max_think,
-                                    additional_dirs: additional_dirs.clone(),
-                                    repo_root_override: repo_root_override.clone(),
-                                    debug_context,
-                                    mode: active_chat_mode,
-                                    teammate_mode: teammate_mode.clone(),
-                                    detect_urls,
-                                    watch_files: watch_files_enabled,
-                                    session_id: selected_session_id,
-                                    profile_override: active_profile_override.clone(),
-                                    model_spec: active_model_spec.clone(),
-                                    ..Default::default()
-                                },
-                            )?;
+                            let output =
+                                codingbuddy_core::runtime::block_on(engine.chat_with_options(
+                                    &rendered,
+                                    ChatOptions {
+                                        tools: allow_tools && !read_only_mode,
+                                        force_max_think,
+                                        additional_dirs: additional_dirs.clone(),
+                                        repo_root_override: repo_root_override.clone(),
+                                        debug_context,
+                                        mode: active_chat_mode,
+                                        teammate_mode: teammate_mode.clone(),
+                                        detect_urls,
+                                        watch_files: watch_files_enabled,
+                                        session_id: selected_session_id,
+                                        profile_override: active_profile_override.clone(),
+                                        model_spec: active_model_spec.clone(),
+                                        ..Default::default()
+                                    },
+                                ))?;
                             last_assistant_response = Some(output);
                         }
                     } else if json_mode {
@@ -1798,7 +1799,7 @@ pub(crate) fn run_chat(
                 &active_model_for_display(&cfg, active_model_spec.as_deref(), force_max_think),
             );
         }
-        let output = engine.chat_with_options(
+        let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             prompt,
             ChatOptions {
                 tools: allow_tools && !read_only_mode,
@@ -1816,7 +1817,7 @@ pub(crate) fn run_chat(
                 model_spec: active_model_spec.clone(),
                 ..Default::default()
             },
-        );
+        ));
         if let Some(renderer) = md_renderer
             && let Ok(mut renderer) = renderer.lock()
         {
@@ -1882,24 +1883,25 @@ pub(crate) fn run_chat(
                     auto_prompt.push_str(&hints);
                     auto_prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
 
-                    let auto_output = engine.chat_with_options(
-                        &auto_prompt,
-                        ChatOptions {
-                            tools: allow_tools && !read_only_mode,
-                            force_max_think,
-                            additional_dirs: additional_dirs.clone(),
-                            repo_root_override: repo_root_override.clone(),
-                            debug_context,
-                            mode: active_chat_mode,
-                            teammate_mode: teammate_mode.clone(),
-                            detect_urls,
-                            watch_files: true,
-                            session_id: selected_session_id,
-                            profile_override: active_profile_override.clone(),
-                            model_spec: active_model_spec.clone(),
-                            ..Default::default()
-                        },
-                    )?;
+                    let auto_output =
+                        codingbuddy_core::runtime::block_on(engine.chat_with_options(
+                            &auto_prompt,
+                            ChatOptions {
+                                tools: allow_tools && !read_only_mode,
+                                force_max_think,
+                                additional_dirs: additional_dirs.clone(),
+                                repo_root_override: repo_root_override.clone(),
+                                debug_context,
+                                mode: active_chat_mode,
+                                teammate_mode: teammate_mode.clone(),
+                                detect_urls,
+                                watch_files: true,
+                                session_id: selected_session_id,
+                                profile_override: active_profile_override.clone(),
+                                model_spec: active_model_spec.clone(),
+                                ..Default::default()
+                            },
+                        ))?;
                     last_assistant_response = Some(auto_output);
                 } else {
                     break;

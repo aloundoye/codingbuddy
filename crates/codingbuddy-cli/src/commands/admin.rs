@@ -1412,13 +1412,13 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
                 args.input.as_deref(),
             )?;
             let engine = AgentEngine::new(cwd)?;
-            let output = engine.chat_with_options(
+            let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
                 &rendered.prompt,
                 ChatOptions {
                     tools: args.tools,
                     ..Default::default()
                 },
-            )?;
+            ))?;
             if json_mode {
                 print_json(&json!({
                     "plugin_id": rendered.plugin_id,

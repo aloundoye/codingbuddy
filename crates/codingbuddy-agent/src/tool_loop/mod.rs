@@ -18,7 +18,6 @@
 //! - [`anti_hallucination`] — File reference validation, shell command detection, directive extraction
 //! - [`compaction`] — Context pruning and compaction summaries
 //! - [`helpers`] — Small utility functions
-use codingbuddy_llm::LlmClientBlockingExt;
 
 pub mod types;
 
@@ -938,13 +937,19 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Set the approval callback for tool permission prompts.
+    /// The callback blocks until the user answers; it runs inside
+    /// `blocking_section` so the turn's worker is released meanwhile.
     pub fn set_approval_callback(&mut self, cb: ApprovalCallback) {
-        self.approval_cb = Some(cb);
+        self.approval_cb = Some(Arc::new(move |call| {
+            codingbuddy_core::runtime::blocking_section(|| cb(call))
+        }));
     }
 
     /// Set the user question callback for interactive prompts.
     pub fn set_user_question_callback(&mut self, cb: UserQuestionCallback) {
-        self.user_question_cb = Some(cb);
+        self.user_question_cb = Some(Arc::new(move |question| {
+            codingbuddy_core::runtime::blocking_section(|| cb(question))
+        }));
     }
 
     /// Set the hook runtime for pre/post tool-use hooks.
@@ -972,7 +977,9 @@ impl<'a> ToolUseLoop<'a> {
 
     /// Set the checkpoint callback invoked before destructive tool calls.
     pub fn set_checkpoint_callback(&mut self, cb: CheckpointCallback) {
-        self.checkpoint_cb = Some(cb);
+        self.checkpoint_cb = Some(Arc::new(move |reason, paths| {
+            codingbuddy_core::runtime::blocking_section(|| cb(reason, paths))
+        }));
     }
 
     /// Set the config watcher for hot-reload polling between tool-use turns.
@@ -993,17 +1000,17 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Run the loop with a user message.
-    pub fn run(&mut self, user_message: &str) -> Result<ToolLoopResult> {
-        self.add_user_turn(user_message, false)
+    pub async fn run(&mut self, user_message: &str) -> Result<ToolLoopResult> {
+        self.add_user_turn(user_message, false).await
     }
 
     /// Continue the conversation with additional user input (multi-turn).
-    pub fn continue_with(&mut self, user_message: &str) -> Result<ToolLoopResult> {
-        self.add_user_turn(user_message, true)
+    pub async fn continue_with(&mut self, user_message: &str) -> Result<ToolLoopResult> {
+        self.add_user_turn(user_message, true).await
     }
 
     /// Shared logic for adding a user turn and executing the loop.
-    fn add_user_turn(
+    async fn add_user_turn(
         &mut self,
         user_message: &str,
         is_continuation: bool,
@@ -1025,9 +1032,9 @@ impl<'a> ToolUseLoop<'a> {
 
         self.collect_directives(user_message);
 
-        let _span = tracing::info_span!("turn", continuation = is_continuation).entered();
+        let span = tracing::info_span!("turn", continuation = is_continuation);
         let started = std::time::Instant::now();
-        let result = self.execute_loop();
+        let result = tracing::Instrument::instrument(self.execute_loop(), span).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok(outcome) => tracing::info!(
@@ -1061,7 +1068,7 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// The main loop: call LLM, execute tools, feed results back, repeat.
-    fn execute_loop(&mut self) -> Result<ToolLoopResult> {
+    async fn execute_loop(&mut self) -> Result<ToolLoopResult> {
         let mut tool_calls_made = Vec::new();
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
@@ -1107,7 +1114,7 @@ impl<'a> ToolUseLoop<'a> {
                     provider_options: Default::default(),
                     response_format: None,
                 };
-                let summary_text = match self.llm.complete_chat_blocking(&summary_request) {
+                let summary_text = match self.llm.complete_chat(&summary_request).await {
                     Ok(resp) => {
                         if let Some(u) = &resp.usage {
                             total_usage.prompt_tokens += u.prompt_tokens;
@@ -1187,7 +1194,7 @@ impl<'a> ToolUseLoop<'a> {
                 if post_prune_tokens > compact_threshold {
                     // Phase 2: Full compaction with structured summary
                     let pre_msg_count = self.messages.len() as u64;
-                    let compacted = self.compact_messages(compact_target);
+                    let compacted = self.compact_messages(compact_target).await;
                     if compacted {
                         let post_tokens = estimate_message_tokens(&self.messages) + tool_def_tokens;
                         if let Some(ref cb) = self.event_cb {
@@ -1228,16 +1235,18 @@ impl<'a> ToolUseLoop<'a> {
 
             let response = if let Some(ref cb) = self.stream_cb {
                 let cb = cb.clone();
-                self.llm.complete_chat_streaming_blocking(
-                    &request,
-                    Arc::new(move |chunk| {
-                        if !matches!(chunk, StreamChunk::Done { .. }) {
-                            cb(chunk);
-                        }
-                    }),
-                )?
+                self.llm
+                    .complete_chat_streaming(
+                        &request,
+                        Arc::new(move |chunk| {
+                            if !matches!(chunk, StreamChunk::Done { .. }) {
+                                cb(chunk);
+                            }
+                        }),
+                    )
+                    .await?
             } else {
-                self.llm.complete_chat_blocking(&request)?
+                self.llm.complete_chat(&request).await?
             };
 
             self.check_cancellation()?;
@@ -1551,7 +1560,7 @@ impl<'a> ToolUseLoop<'a> {
                     self.check_cancellation()?;
                     self.durable_invocation = Some((id, false));
                     let from = self.messages.len();
-                    let outcome = self.execute_tool_calls(std::slice::from_ref(call));
+                    let outcome = self.execute_tool_calls(std::slice::from_ref(call)).await;
                     let (_, dispatched) = self
                         .durable_invocation
                         .take()
@@ -1586,7 +1595,7 @@ impl<'a> ToolUseLoop<'a> {
                 }
                 records
             } else {
-                self.execute_tool_calls(&response.tool_calls)?
+                self.execute_tool_calls(&response.tool_calls).await?
             };
             let batch_had_success = records.iter().any(|record| record.success);
             let batch_had_failure = records.iter().any(|record| !record.success);
@@ -1768,8 +1777,11 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Handle agent-level tools (user_question, spawn_task, extended_thinking, etc.)
-    fn handle_agent_level_tool(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
-        agent_tools::handle_agent_level_tool(self, llm_call)
+    async fn handle_agent_level_tool(
+        &mut self,
+        llm_call: &LlmToolCall,
+    ) -> Result<Vec<ToolCallRecord>> {
+        agent_tools::handle_agent_level_tool(self, llm_call).await
     }
 
     fn apply_phase_transition(&mut self, new_phase: codingbuddy_core::TaskPhase) {

@@ -80,14 +80,14 @@ fn run_engine(workspace: &Path, cfg: AppConfig, prompt: &str) -> Result<Run> {
             }
         }
     }));
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         prompt,
         ChatOptions {
             tools: true,
             disable_team_orchestration: true,
             ..Default::default()
         },
-    )?;
+    ))?;
     drop(engine);
     let chunks = Arc::try_unwrap(chunks)
         .map_err(|_| anyhow::anyhow!("stream callback still referenced"))?

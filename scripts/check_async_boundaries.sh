@@ -26,4 +26,15 @@ if [ -n "$hits" ]; then
   echo "$hits" >&2
   exit 1
 fi
-echo "No blocking HTTP on the turn path"
+
+# The agent is async end to end: inside it, model and tool calls are
+# awaited. The *_blocking wrappers (LlmClientBlockingExt,
+# ToolHostBlockingExt) are for standalone commands and tests only.
+hits=$(grep -rn --include='*.rs' -E 'LlmClientBlockingExt|ToolHostBlockingExt|\.(complete(_chat)?(_streaming)?|complete_fim(_streaming)?|list_models|execute(_with_context)?|verify_command)_blocking\(' \
+  crates/codingbuddy-agent/src | grep -vE '/tests?\.rs:|/tests/' || true)
+if [ -n "$hits" ]; then
+  echo "Blocking model/tool calls inside the async agent (await them instead):" >&2
+  echo "$hits" >&2
+  exit 1
+fi
+echo "No blocking HTTP on the turn path; agent awaits model and tool calls"

@@ -97,7 +97,7 @@ fn privacy_router_redacts_in_tool_loop() {
         }
     }));
 
-    let result = loop_.run("Read secret.txt");
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Read secret.txt"));
     assert!(result.is_ok());
 
     // Check that privacy warning was emitted

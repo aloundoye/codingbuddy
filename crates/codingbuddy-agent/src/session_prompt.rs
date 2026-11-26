@@ -1,10 +1,25 @@
 //! Durable session prompts: chat entry point, interrupted-tool retry, invocation reconciliation.
-use codingbuddy_core::ToolHostBlockingExt;
-
 use super::*;
 
 impl AgentEngine {
-    pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
+    /// Run one prompt to completion.
+    ///
+    /// Returns a boxed `Send` future: team mode runs lanes that call back
+    /// into this method on other tasks, and naming the type breaks the
+    /// cycle the compiler would otherwise have to resolve to prove `Send`.
+    pub fn chat_with_options<'a>(
+        &'a self,
+        prompt: &'a str,
+        options: ChatOptions,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(self.chat_with_options_inner(prompt, options))
+    }
+
+    async fn chat_with_options_inner(
+        &self,
+        prompt: &str,
+        mut options: ChatOptions,
+    ) -> Result<String> {
         let session = self.ensure_session_record_for(options.session_id)?;
         options.session_id = Some(session.session_id);
         if options.deadline.is_none() && self.cfg.budgets.max_turn_duration_secs > 0 {
@@ -28,7 +43,9 @@ impl AgentEngine {
             None => Arc::new(self.store.session_lease(session.session_id)?),
         };
         if !owned_prompt {
-            let output = self.execute_session_prompt(prompt, options, session, &lease)?;
+            let output = self
+                .execute_session_prompt(prompt, options, session, &lease)
+                .await?;
             self.stream(StreamChunk::Done { reason: None });
             return Ok(output);
         }
@@ -43,7 +60,9 @@ impl AgentEngine {
             self.store.attach_operation_parent(id, parent)?;
         }
         let cancellation = options.cancellation.clone();
-        let result = self.execute_session_prompt(prompt, options, session, &lease);
+        let result = self
+            .execute_session_prompt(prompt, options, session, &lease)
+            .await;
         let output = result.as_ref().ok().map(String::as_str);
         if let Some(provider_error) = result
             .as_ref()
@@ -71,7 +90,7 @@ impl AgentEngine {
         result
     }
 
-    pub fn retry_interrupted_tool(
+    pub async fn retry_interrupted_tool(
         &self,
         session: Uuid,
         previous: Uuid,
@@ -100,18 +119,21 @@ impl AgentEngine {
         let invocation = self
             .store
             .retry_invocation(&lease, session, previous, &proposal.call)?;
-        let result = self.tool_host.execute_with_context_blocking(
-            ApprovedToolCall {
-                invocation_id: proposal.invocation_id,
-                call: proposal.call,
-            },
-            ToolExecutionContext {
-                session_id: Some(session),
-                invocation_id: Some(invocation.id),
-                cancellation: None,
-                ..Default::default()
-            },
-        );
+        let result = self
+            .tool_host
+            .execute_with_context(
+                ApprovedToolCall {
+                    invocation_id: proposal.invocation_id,
+                    call: proposal.call,
+                },
+                ToolExecutionContext {
+                    session_id: Some(session),
+                    invocation_id: Some(invocation.id),
+                    cancellation: None,
+                    ..Default::default()
+                },
+            )
+            .await;
         anyhow::ensure!(
             result.output["recovery_status"] != "ambiguous",
             "Retry invocation {} may have changed the workspace. Resolve it locally before continuing.",
@@ -189,7 +211,7 @@ impl AgentEngine {
         Ok(())
     }
 
-    pub(crate) fn execute_session_prompt(
+    pub(crate) async fn execute_session_prompt(
         &self,
         prompt: &str,
         mut options: ChatOptions,
@@ -360,11 +382,11 @@ impl AgentEngine {
             && (options.cancellation.is_some()
                 || !should_run_team_orchestration(self, &prompt_enriched, &options));
         let result = if !options.tools {
-            self.analyze_prompt(&prompt_enriched, options)
+            self.analyze_prompt(&prompt_enriched, options).await
         } else if !tool_loop {
-            team::run(self, &prompt_enriched, &options)
+            team::run(self, &prompt_enriched, &options).await
         } else {
-            self.run_tool_use_loop(&prompt_enriched, &options)
+            self.run_tool_use_loop(&prompt_enriched, &options).await
         };
 
         let result = result.and_then(|text| {

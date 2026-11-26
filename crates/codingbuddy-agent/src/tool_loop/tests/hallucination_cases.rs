@@ -19,7 +19,7 @@ fn hallucination_nudge_triggers_on_long_first_response() {
         default_tools(),
     );
 
-    let result = loop_.run("analyze this project").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("analyze this project")).unwrap();
     // Should get the second (post-nudge) response, not the hallucinated one
     assert_eq!(result.response, "Let me check with tools.");
     // Should have used 2 turns
@@ -49,7 +49,7 @@ fn hallucination_nudge_skips_short_responses() {
         default_tools(),
     );
 
-    let result = loop_.run("hello").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("hello")).unwrap();
     assert_eq!(result.response, "Done.");
     assert_eq!(result.turns, 1); // no nudge, single turn
 }
@@ -133,7 +133,7 @@ fn hallucination_nudge_triggers_at_threshold() {
         default_tools(),
     );
 
-    let result = loop_.run("describe the project").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("describe the project")).unwrap();
     assert_eq!(result.response, "OK");
     assert_eq!(result.turns, 2, "nudge should have triggered an extra turn");
 
@@ -150,7 +150,7 @@ fn hallucination_nudge_triggers_at_threshold() {
         default_tools(),
     );
 
-    let result2 = loop2.run("describe the project").unwrap();
+    let result2 = codingbuddy_core::runtime::block_on(loop2.run("describe the project")).unwrap();
     assert_eq!(
         result2.turns, 1,
         "at-threshold response should not trigger nudge"
@@ -283,7 +283,7 @@ fn evidence_driven_escalation_on_tool_failures() {
         default_tools(),
     );
 
-    let result = loop_.run("Read those files").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("Read those files")).unwrap();
     assert_eq!(result.response, "Got it.");
     assert_eq!(result.turns, 3);
     // Evidence-driven: escalation detected from tool output content
@@ -321,7 +321,7 @@ fn hallucination_nudge_fires_in_ask_mode() {
         default_tools(),
     );
 
-    let result = loop_.run("where is the config?").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("where is the config?")).unwrap();
     assert_eq!(result.response, "OK");
     assert_eq!(result.turns, 2, "nudge should fire in read_only/Ask mode");
 }
@@ -346,7 +346,8 @@ fn hallucination_nudge_fires_up_to_3_times() {
         default_tools(),
     );
 
-    let result = loop_.run("what does this project do?").unwrap();
+    let result =
+        codingbuddy_core::runtime::block_on(loop_.run("what does this project do?")).unwrap();
     assert_eq!(result.turns, 4, "should fire 3 nudges then let 4th through");
     assert_eq!(result.response.len(), HALLUCINATION_NUDGE_THRESHOLD + 1);
 }
@@ -384,13 +385,13 @@ fn nudge_fires_even_after_prior_tool_use() {
         default_tools(),
     );
 
-    let r1 = loop_.run("read the readme").unwrap();
+    let r1 = codingbuddy_core::runtime::block_on(loop_.run("read the readme")).unwrap();
     assert_eq!(r1.response, "README content is...");
 
     // Second question — model hallucinates even though it used tools before
-    let r2 = loop_
-        .continue_with("what else is in this project?")
-        .unwrap();
+    let r2 =
+        codingbuddy_core::runtime::block_on(loop_.continue_with("what else is in this project?"))
+            .unwrap();
     assert_eq!(r2.response, "Let me check properly.");
     // The nudge message should be in the conversation
     let has_nudge = r2.messages.iter().any(|m| {
@@ -511,7 +512,7 @@ fn shell_blocks_trigger_nudge_to_use_tools() {
         default_tools(),
     );
 
-    let result = loop_.run("bump the version").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("bump the version")).unwrap();
     assert_eq!(result.response, "OK, I used the tool.");
     assert_eq!(result.turns, 2, "shell nudge should trigger a retry");
     // The nudge message should be in the conversation
@@ -570,10 +571,10 @@ fn multi_turn_tool_use_across_questions() {
         default_tools(),
     );
 
-    let r1 = loop_.run("read lib.rs").unwrap();
+    let r1 = codingbuddy_core::runtime::block_on(loop_.run("read lib.rs")).unwrap();
     assert_eq!(r1.response, "Found it.");
 
-    let r2 = loop_.continue_with("now read main.rs").unwrap();
+    let r2 = codingbuddy_core::runtime::block_on(loop_.continue_with("now read main.rs")).unwrap();
     assert_eq!(r2.response, "Found that too.");
 }
 
@@ -622,7 +623,7 @@ fn disabled_heuristics_keep_the_first_answer() {
         default_tools(),
     );
 
-    let result = loop_.run("explain the build").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("explain the build")).unwrap();
     assert_eq!(result.response, answer);
     assert_eq!(result.turns, 1, "no corrective retry should be requested");
     assert!(

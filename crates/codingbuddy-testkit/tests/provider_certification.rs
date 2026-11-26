@@ -468,14 +468,14 @@ fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
                 cfg.clone(),
                 Box::new(fixture_client(cfg.llm.clone(), &server)?),
             )?;
-            let output = engine.chat_with_options(
+            let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
                 "Read first.txt then second.txt.",
                 ChatOptions {
                     tools: true,
                     disable_team_orchestration: true,
                     ..Default::default()
                 },
-            )?;
+            ))?;
             ensure!(
                 output == "Certification complete.",
                 "unexpected output for {}",
@@ -556,7 +556,7 @@ fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
             let client = fixture_client(cfg.llm.clone(), &server)?;
             let resumed =
                 AgentEngine::new_with_config_and_llm(workspace.path(), cfg, Box::new(client))?;
-            resumed.chat_with_options(
+            codingbuddy_core::runtime::block_on(resumed.chat_with_options(
                 "Continue.",
                 ChatOptions {
                     tools: true,
@@ -564,7 +564,7 @@ fn routes_complete_two_tool_rounds_and_restart() -> Result<()> {
                     disable_team_orchestration: true,
                     ..Default::default()
                 },
-            )?;
+            ))?;
             ensure!(
                 server.requests.lock().unwrap().len() == 4,
                 "duplicate model request"
@@ -692,16 +692,15 @@ fn unfinished_responses_never_dispatch_tools() -> Result<()> {
         cfg.agent_loop.phase_loop_enabled = false;
         let engine = AgentEngine::new_with_config(workspace.path(), cfg)?;
         ensure!(
-            engine
-                .chat_with_options(
-                    "Read first.txt.",
-                    ChatOptions {
-                        tools: true,
-                        disable_team_orchestration: true,
-                        ..Default::default()
-                    }
-                )
-                .is_err(),
+            codingbuddy_core::runtime::block_on(engine.chat_with_options(
+                "Read first.txt.",
+                ChatOptions {
+                    tools: true,
+                    disable_team_orchestration: true,
+                    ..Default::default()
+                }
+            ))
+            .is_err(),
             "unfinished response accepted"
         );
         let store = Store::new(workspace.path())?;
@@ -761,13 +760,13 @@ fn incomplete_cloud_streams_never_dispatch_tools() -> Result<()> {
         cfg.agent_loop.phase_loop_enabled = false;
         let client = fixture_client(cfg.llm.clone(), &server)?;
         let engine = AgentEngine::new_with_config_and_llm(workspace.path(), cfg, Box::new(client))?;
-        let result = engine.chat_with_options(
+        let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "Read first.txt.",
             ChatOptions {
                 tools: true,
                 ..Default::default()
             },
-        );
+        ));
         ensure!(result.is_err(), "{} accepted incomplete output", route.id);
         let store = Store::new(workspace.path())?;
         let session = store.load_latest_session()?.context("missing session")?;

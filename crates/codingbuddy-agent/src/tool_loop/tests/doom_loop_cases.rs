@@ -178,7 +178,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
         default_tools(),
     );
 
-    let result = loop_.run("show me the main file").unwrap();
+    let result = codingbuddy_core::runtime::block_on(loop_.run("show me the main file")).unwrap();
 
     // The loop should terminate at doom loop detection (blocking gate)
     assert_eq!(

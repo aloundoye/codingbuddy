@@ -225,7 +225,7 @@ fn run_case(spec: BenchmarkCaseSpec, lane: BenchmarkLaneMode) -> Result<CodingBe
     engine.set_max_turns(Some(12));
 
     let started = Instant::now();
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         &spec.prompt,
         ChatOptions {
             tools: true,
@@ -233,7 +233,7 @@ fn run_case(spec: BenchmarkCaseSpec, lane: BenchmarkLaneMode) -> Result<CodingBe
             session_id: None,
             ..Default::default()
         },
-    )?;
+    ))?;
     let duration_ms = started.elapsed().as_millis();
 
     let store = Store::new(temp.path())?;

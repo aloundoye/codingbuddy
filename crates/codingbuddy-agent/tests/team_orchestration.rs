@@ -67,14 +67,14 @@ fn teammate_mode_uses_shared_durable_tool_use_loop() -> Result<()> {
     let mut engine = AgentEngine::new_with_config_and_llm(dir.path(), cfg, llm)?;
     engine.set_permission_mode("bypassPermissions");
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "perform a quick core patch",
         ChatOptions {
             tools: true,
             teammate_mode: Some("on".to_string()),
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert!(
         output.contains("Task completed") || output.contains("successfully"),

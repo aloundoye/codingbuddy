@@ -289,13 +289,13 @@ pub fn fake_session() -> codingbuddy_core::Session {
 
 pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
     let engine = AgentEngine::new(workspace)?;
-    engine.chat_with_options(
+    codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "replay test",
         ChatOptions {
             tools: false,
             ..Default::default()
         },
-    )
+    ))
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1258,13 +1258,13 @@ mod tests {
         let mock = start_mock_llm_server();
         configure_runtime_for_mock_llm(&workspace, &mock.endpoint);
         let result = mock_engine(&workspace, &mock.endpoint).and_then(|engine| {
-            engine.chat_with_options(
+            codingbuddy_core::runtime::block_on(engine.chat_with_options(
                 "replay test",
                 ChatOptions {
                     tools: false,
                     ..Default::default()
                 },
-            )
+            ))
         });
         assert!(result.is_ok(), "replay smoke failed: {:?}", result.err());
     }
@@ -1350,21 +1350,21 @@ mod tests {
     fn replay_deterministic_output() {
         let (dir, mock) = temp_workspace_with_mock();
         let engine = mock_engine(dir.path(), &mock.endpoint).expect("engine");
-        let r1 = engine.chat_with_options(
+        let r1 = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "determinism test",
             ChatOptions {
                 tools: false,
                 ..Default::default()
             },
-        );
+        ));
         assert!(r1.is_ok(), "first chat failed: {:?}", r1.err());
-        let r2 = engine.chat_with_options(
+        let r2 = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "determinism test",
             ChatOptions {
                 tools: false,
                 ..Default::default()
             },
-        );
+        ));
         assert!(r2.is_ok(), "second chat failed: {:?}", r2.err());
         assert_eq!(r1.unwrap_or_default(), r2.unwrap_or_default());
     }
@@ -1373,13 +1373,13 @@ mod tests {
     fn replay_with_tool_calls_journals_events() {
         let (dir, mock) = temp_workspace_with_mock();
         let engine = mock_engine(dir.path(), &mock.endpoint).expect("engine");
-        let r = engine.chat_with_options(
+        let r = codingbuddy_core::runtime::block_on(engine.chat_with_options(
             "journal test",
             ChatOptions {
                 tools: false,
                 ..Default::default()
             },
-        );
+        ));
         assert!(r.is_ok(), "chat failed: {:?}", r.err());
         assert!(r.unwrap_or_default().contains("Mock response"));
         let store = codingbuddy_store::Store::new(dir.path()).expect("store");

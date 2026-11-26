@@ -1574,7 +1574,9 @@ fn run() -> Result<()> {
                 .as_deref()
                 .map(uuid::Uuid::parse_str)
                 .transpose()?;
-            let output = engine.chat_with_options(&args.prompt, options);
+            let output = codingbuddy_core::runtime::block_on(
+                engine.chat_with_options(&args.prompt, options),
+            );
             let finalize_result = match output.as_ref() {
                 Ok(text) => finalize_background_subagent_run(&cwd, Ok(text.as_str())),
                 Err(err) => {
@@ -1602,7 +1604,9 @@ fn run() -> Result<()> {
                 "Create a detailed implementation plan for: {}\n\nReturn ONLY a structured plan with steps, files, and verification commands. Do NOT implement any changes.",
                 args.prompt
             );
-            let result = engine.chat_with_options(&plan_prompt, options)?;
+            let result = codingbuddy_core::runtime::block_on(
+                engine.chat_with_options(&plan_prompt, options),
+            )?;
             if cli.json {
                 print_json(&json!({"plan": result}))?;
             } else {

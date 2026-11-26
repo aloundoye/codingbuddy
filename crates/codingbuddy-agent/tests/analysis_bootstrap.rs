@@ -153,14 +153,14 @@ fn repoish_prompt_injects_auto_context_bootstrap_packet() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(CapturingLlm::new(state.clone()));
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "analyze this project",
         ChatOptions {
             tools: false,
             mode: ChatMode::Ask,
             ..Default::default()
         },
-    )?;
+    ))?;
 
     assert_eq!(output, "The repo looks healthy.");
 
@@ -193,14 +193,14 @@ fn vague_codebase_prompt_runs_audit_and_streams_answer_once() -> Result<()> {
         move |chunk| chunks.lock().unwrap().push(chunk)
     }));
 
-    let output = engine.chat_with_options(
+    let output = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         "check the codebase",
         ChatOptions {
             tools: false,
             mode: ChatMode::Ask,
             ..Default::default()
         },
-    )?;
+    ))?;
     assert_eq!(output, answer);
 
     assert!(matches!(
@@ -241,16 +241,15 @@ fn repoish_prompt_outside_repo_returns_explicit_error() -> Result<()> {
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(CapturingLlm::new(state.clone()));
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
-    let err = engine
-        .chat_with_options(
-            "analyze this project",
-            ChatOptions {
-                tools: false,
-                mode: ChatMode::Ask,
-                ..Default::default()
-            },
-        )
-        .expect_err("expected explicit no-repo error");
+    let err = codingbuddy_core::runtime::block_on(engine.chat_with_options(
+        "analyze this project",
+        ChatOptions {
+            tools: false,
+            mode: ChatMode::Ask,
+            ..Default::default()
+        },
+    ))
+    .expect_err("expected explicit no-repo error");
     assert_eq!(
         err.to_string(),
         "No repository detected. Run from project root or pass --repo <path>."

@@ -1,4 +1,3 @@
-use codingbuddy_llm::LlmClientBlockingExt;
 pub mod agent_profiles;
 mod analysis;
 pub mod apply;
@@ -321,7 +320,7 @@ impl AgentEngine {
         }
     }
 
-    pub fn validate_api_key(&self) -> Result<()> {
+    pub async fn validate_api_key(&self) -> Result<()> {
         let provider = self.cfg.llm.active_provider();
         let model = self.cfg.llm.active_base_model();
         let test_request = ChatRequest {
@@ -344,7 +343,7 @@ impl AgentEngine {
             response_format: None,
         };
 
-        match self.llm.complete_chat_blocking(&test_request) {
+        match self.llm.complete_chat(&test_request).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 let err_str = e.to_string().to_ascii_lowercase();
@@ -463,8 +462,8 @@ impl AgentEngine {
     }
 
     /// Discover available models from the active provider's API.
-    pub fn discover_models(&self) -> Vec<String> {
-        self.llm.list_models_blocking()
+    pub async fn discover_models(&self) -> Vec<String> {
+        self.llm.list_models().await
     }
 
     fn active_plan_prompt_addendum(&self, session: &Session) -> Result<Option<String>> {
@@ -674,7 +673,7 @@ impl AgentEngine {
         }
     }
 
-    pub fn chat(&self, prompt: &str) -> Result<String> {
+    pub async fn chat(&self, prompt: &str) -> Result<String> {
         self.chat_with_options(
             prompt,
             ChatOptions {
@@ -682,15 +681,16 @@ impl AgentEngine {
                 ..Default::default()
             },
         )
+        .await
     }
 
-    pub fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
-        let result = self.analyze_prompt(prompt, options)?;
+    pub async fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        let result = self.analyze_prompt(prompt, options).await?;
         self.stream(StreamChunk::Done { reason: None });
         Ok(result)
     }
 
-    fn analyze_prompt(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+    async fn analyze_prompt(&self, prompt: &str, options: ChatOptions) -> Result<String> {
         let cfg = self.effective_config(&options);
         let routed_llm = self.routed_llm_for_options(&cfg, &options)?;
         let llm = match routed_llm.as_ref() {
@@ -708,7 +708,8 @@ impl AgentEngine {
             prompt,
             &options,
             stream_cb.clone(),
-        )?;
+        )
+        .await?;
 
         if let Some(compatibility) = response.compatibility.as_ref()
             && (!compatibility.transforms.is_empty() || !compatibility.degraded_inputs.is_empty())

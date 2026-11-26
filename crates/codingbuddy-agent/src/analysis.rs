@@ -3,13 +3,12 @@ use codingbuddy_core::{
     AppConfig, ChatMessage, ChatRequest, LlmResponse, StreamCallback, ToolChoice,
 };
 use codingbuddy_llm::LlmClient;
-use codingbuddy_llm::LlmClientBlockingExt;
 use std::path::Path;
 
 use crate::gather_context;
 use crate::{ChatMode, ChatOptions};
 
-pub fn analyze(
+pub async fn analyze(
     llm: &(dyn LlmClient + Send + Sync),
     cfg: &AppConfig,
     workspace: &Path,
@@ -101,9 +100,9 @@ pub fn analyze(
     };
 
     let response = if let Some(cb) = stream_cb {
-        llm.complete_chat_streaming_blocking(&request, cb)?
+        llm.complete_chat_streaming(&request, cb).await?
     } else {
-        llm.complete_chat_blocking(&request)?
+        llm.complete_chat(&request).await?
     };
     execution.check()?;
     Ok(response)

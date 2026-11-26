@@ -231,7 +231,8 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
             }
 
             options.system_prompt_append = Some(delegated_prompt);
-            let result = engine.chat_with_options(&task.goal, options);
+            let result =
+                codingbuddy_core::runtime::block_on(engine.chat_with_options(&task.goal, options));
             let diff = worktree.collect_for_parent()?;
             let artifact = if diff.is_empty() {
                 None

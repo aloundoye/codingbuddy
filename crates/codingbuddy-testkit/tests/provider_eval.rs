@@ -145,7 +145,7 @@ fn run_case(case: &str, llm: Option<&LlmConfig>) -> Result<Value> {
             cfg.clone(),
             scripted.then(|| vec![scripted_text_response("Recorded ROUTE-731.")]),
         )?;
-        first.chat_with_options(
+        codingbuddy_core::runtime::block_on(first.chat_with_options(
             &format!(
                 "Remember decision code ROUTE-731. Reply with an acknowledgement. {}",
                 "Routing documentation. ".repeat(512)
@@ -154,7 +154,7 @@ fn run_case(case: &str, llm: Option<&LlmConfig>) -> Result<Value> {
                 tools: true,
                 ..Default::default()
             },
-        )?;
+        ))?;
         Some(
             store
                 .load_latest_session()?
@@ -185,7 +185,7 @@ fn run_case(case: &str, llm: Option<&LlmConfig>) -> Result<Value> {
     if cancelling && scripted {
         cancellation.cancel();
     }
-    let result = engine.chat_with_options(
+    let result = codingbuddy_core::runtime::block_on(engine.chat_with_options(
         &prompt,
         ChatOptions {
             tools: true,
@@ -195,7 +195,7 @@ fn run_case(case: &str, llm: Option<&LlmConfig>) -> Result<Value> {
             disable_team_orchestration: true,
             ..Default::default()
         },
-    );
+    ));
 
     let session = store.load_latest_session()?;
     let history = session

@@ -1,10 +1,9 @@
 use super::*;
 use codingbuddy_core::{RuntimeToolMetadata, ToolDefinition, ToolName, ToolTier};
-use codingbuddy_llm::LlmClientBlockingExt;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-pub(super) fn handle_agent_level_tool(
+pub(super) async fn handle_agent_level_tool(
     tool_loop: &mut ToolUseLoop<'_>,
     llm_call: &LlmToolCall,
 ) -> Result<Vec<ToolCallRecord>> {
@@ -28,7 +27,7 @@ pub(super) fn handle_agent_level_tool(
         "extended_thinking" | "think_deeply" => {
             let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
             let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
-            handle_extended_thinking(tool_loop, question, context)?
+            handle_extended_thinking(tool_loop, question, context).await?
         }
         "tool_search" => handle_tool_search(tool_loop, &args),
         "user_question" => {
@@ -75,7 +74,7 @@ pub(super) fn handle_agent_level_tool(
         {
             "This tool requires a trusted workspace.".to_string()
         }
-        "spawn_task" => handle_spawn_task(tool_loop, &args)?,
+        "spawn_task" => handle_spawn_task(tool_loop, &args).await?,
         "send_message" => handle_send_message(tool_loop, &args)?,
         "enter_plan_mode" => handle_enter_plan_mode(tool_loop)?,
         "exit_plan_mode" => handle_exit_plan_mode(tool_loop, &args)?,
@@ -287,7 +286,7 @@ fn tool_search_priority(name: &str) -> (u8, u8, String) {
     (primary, tier, name.to_string())
 }
 
-pub(super) fn handle_extended_thinking(
+pub(super) async fn handle_extended_thinking(
     tool_loop: &ToolUseLoop<'_>,
     question: &str,
     context: &str,
@@ -321,7 +320,7 @@ pub(super) fn handle_extended_thinking(
         provider_options: Default::default(),
         response_format: None,
     };
-    let response = tool_loop.llm.complete_chat_blocking(&request)?;
+    let response = tool_loop.llm.complete_chat(&request).await?;
     Ok(response.text)
 }
 
@@ -818,7 +817,7 @@ pub(super) fn handle_task_stop(
     Ok(serde_json::json!({"task_id":task_id,"run_id":run.run_id,"background_job_id":background_job.job_id,"status":"cancelling"}).to_string())
 }
 
-pub(super) fn handle_spawn_task(
+pub(super) async fn handle_spawn_task(
     tool_loop: &ToolUseLoop<'_>,
     args: &serde_json::Value,
 ) -> Result<String> {
@@ -933,14 +932,16 @@ pub(super) fn handle_spawn_task(
         }
         // Auto-promote: if foreground agent takes >60s, report as backgrounded
         let result = if !run_in_background {
-            let (tx, rx) = std::sync::mpsc::channel();
+            // The worker runs a whole child agent synchronously: give it a
+            // blocking-pool thread. On timeout the task keeps running
+            // detached and reports through the store.
             let worker_clone = worker.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(worker_clone(request));
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
-                Ok(result) => result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let child =
+                codingbuddy_core::runtime::runtime().spawn_blocking(move || worker_clone(request));
+            match tokio::time::timeout(std::time::Duration::from_secs(60), child).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(anyhow!("subagent worker panicked")),
+                Err(_) => {
                     // Auto-promoted to background — record as running
                     let _ = store.update_task_status(task_id, "running", None);
                     let _ = store.upsert_subagent_run(&codingbuddy_store::SubagentRunRecord {
@@ -968,12 +969,9 @@ pub(super) fn handle_spawn_task(
                         "message": "Agent exceeded 60s timeout, running in background. Results will arrive as a notification."
                     }).to_string());
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    Err(anyhow!("subagent worker disconnected"))
-                }
             }
         } else {
-            worker(request)
+            codingbuddy_core::runtime::blocking_section(|| worker(request))
         };
         let result = match result {
             Ok(result) => {
