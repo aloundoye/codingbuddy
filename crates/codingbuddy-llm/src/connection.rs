@@ -165,6 +165,6 @@ pub fn probe_provider(cfg: &LlmConfig) -> Result<()> {
         provider_options: Default::default(),
         response_format: None,
     };
-    ApiClient::new(cfg)?.complete_chat(&request)?;
+    ApiClient::new(cfg)?.complete_chat_sync(&request)?;
     Ok(())
 }

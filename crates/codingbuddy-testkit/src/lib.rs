@@ -46,16 +46,21 @@ impl ScriptedLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for ScriptedLlm {
-    fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
+    async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
         Err(anyhow::anyhow!("complete() not used in scripted tests"))
     }
-    fn complete_streaming(&self, _req: &LlmRequest, _cb: StreamCallback) -> Result<LlmResponse> {
+    async fn complete_streaming(
+        &self,
+        _req: &LlmRequest,
+        _cb: StreamCallback,
+    ) -> Result<LlmResponse> {
         Err(anyhow::anyhow!(
             "complete_streaming() not used in scripted tests"
         ))
     }
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
         self.captured
             .lock()
             .expect("captured lock")
@@ -66,17 +71,17 @@ impl LlmClient for ScriptedLlm {
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("scripted llm exhausted"))
     }
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         _cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.complete_chat(req)
+        self.complete_chat(req).await
     }
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+    async fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
         Err(anyhow::anyhow!("complete_fim() not used in scripted tests"))
     }
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         _req: &codingbuddy_core::FimRequest,
         _cb: StreamCallback,

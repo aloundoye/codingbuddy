@@ -18,6 +18,7 @@
 //! - [`anti_hallucination`] — File reference validation, shell command detection, directive extraction
 //! - [`compaction`] — Context pruning and compaction summaries
 //! - [`helpers`] — Small utility functions
+use codingbuddy_llm::LlmClientBlockingExt;
 
 pub mod types;
 
@@ -1106,7 +1107,7 @@ impl<'a> ToolUseLoop<'a> {
                     provider_options: Default::default(),
                     response_format: None,
                 };
-                let summary_text = match self.llm.complete_chat(&summary_request) {
+                let summary_text = match self.llm.complete_chat_blocking(&summary_request) {
                     Ok(resp) => {
                         if let Some(u) = &resp.usage {
                             total_usage.prompt_tokens += u.prompt_tokens;
@@ -1227,7 +1228,7 @@ impl<'a> ToolUseLoop<'a> {
 
             let response = if let Some(ref cb) = self.stream_cb {
                 let cb = cb.clone();
-                self.llm.complete_chat_streaming(
+                self.llm.complete_chat_streaming_blocking(
                     &request,
                     Arc::new(move |chunk| {
                         if !matches!(chunk, StreamChunk::Done { .. }) {
@@ -1236,7 +1237,7 @@ impl<'a> ToolUseLoop<'a> {
                     }),
                 )?
             } else {
-                self.llm.complete_chat(&request)?
+                self.llm.complete_chat_blocking(&request)?
             };
 
             self.check_cancellation()?;

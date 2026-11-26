@@ -1,5 +1,5 @@
 //! Versioned fixture scope and local, route-bound live verification evidence.
-use crate::{ApiClient, LlmClient};
+use crate::ApiClient;
 use anyhow::{Context, Result, ensure};
 use codingbuddy_core::{
     ChatMessage, ChatRequest, FunctionDefinition, LlmConfig, NativeParts, ToolChoice,
@@ -219,9 +219,9 @@ pub fn live_probe(cfg: &LlmConfig, streaming: bool) -> Result<LiveEvidence> {
         bounded.stream = streaming;
         let client = ApiClient::new(bounded)?;
         let response = if streaming {
-            client.complete_chat_streaming(&request, std::sync::Arc::new(|_| {}))?
+            client.complete_chat_streaming_sync(&request, std::sync::Arc::new(|_| {}))?
         } else {
-            client.complete_chat(&request)?
+            client.complete_chat_sync(&request)?
         };
         usage.push(json!(response.usage));
         if step == 2 {

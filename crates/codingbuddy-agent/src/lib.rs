@@ -1,3 +1,4 @@
+use codingbuddy_llm::LlmClientBlockingExt;
 pub mod agent_profiles;
 mod analysis;
 pub mod apply;
@@ -343,7 +344,7 @@ impl AgentEngine {
             response_format: None,
         };
 
-        match self.llm.complete_chat(&test_request) {
+        match self.llm.complete_chat_blocking(&test_request) {
             Ok(_) => Ok(()),
             Err(e) => {
                 let err_str = e.to_string().to_ascii_lowercase();
@@ -463,7 +464,7 @@ impl AgentEngine {
 
     /// Discover available models from the active provider's API.
     pub fn discover_models(&self) -> Vec<String> {
-        self.llm.list_models()
+        self.llm.list_models_blocking()
     }
 
     fn active_plan_prompt_addendum(&self, session: &Session) -> Result<Option<String>> {

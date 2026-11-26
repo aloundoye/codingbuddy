@@ -611,10 +611,11 @@ impl Menus {
         state.pending = Some(llm.clone());
         let menu = models_menu(&cwd, &llm, &[], code, "Discovering available models…");
         let _ = self.tx.send(TuiStreamEvent::Menu(Some(menu)));
-        thread::spawn(move || {
-            let ids = codingbuddy_llm::ApiClient::new(llm.clone())
-                .map(|client| codingbuddy_llm::LlmClient::list_models(&client))
-                .unwrap_or_default();
+        codingbuddy_core::runtime::runtime().spawn(async move {
+            let ids = match codingbuddy_llm::ApiClient::new(llm.clone()) {
+                Ok(client) => codingbuddy_llm::LlmClient::list_models(&client).await,
+                Err(_) => Vec::new(),
+            };
             let menu = models_menu(
                 &cwd,
                 &llm,

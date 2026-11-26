@@ -1134,6 +1134,7 @@ name = "codingbuddy-agent"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "codingbuddy-core",
@@ -1321,6 +1322,7 @@ name = "codingbuddy-llm"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-config",
  "aws-credential-types",
  "aws-sigv4",
@@ -1448,6 +1450,7 @@ name = "codingbuddy-testkit"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-smithy-eventstream",
  "aws-smithy-types",
  "codingbuddy-agent",

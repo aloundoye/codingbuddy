@@ -1,4 +1,5 @@
 use super::*;
+use crate::LlmClientBlockingExt;
 use codingbuddy_core::ChatMessage;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -112,7 +113,7 @@ fn truly_unsupported_provider_is_rejected() {
     };
     let client = ApiClient::new(cfg).expect("client");
     let err = client
-        .complete(&LlmRequest {
+        .complete_blocking(&LlmRequest {
             unit: codingbuddy_core::LlmUnit::Planner,
             prompt: "hello".to_string(),
             model: "any".to_string(),
@@ -152,7 +153,7 @@ fn thinking_mode_rejects_logprobs() {
         response_format: None,
     };
     let err = client
-        .complete_chat(&req)
+        .complete_chat_blocking(&req)
         .expect_err("logprobs with thinking should fail");
     assert_eq!(
         err.downcast_ref::<error::ProviderError>()
@@ -189,7 +190,7 @@ fn thinking_mode_rejects_top_logprobs() {
         response_format: None,
     };
     let err = client
-        .complete_chat(&req)
+        .complete_chat_blocking(&req)
         .expect_err("top_logprobs with thinking should fail");
     assert_eq!(
         err.downcast_ref::<error::ProviderError>()
@@ -1097,7 +1098,7 @@ fn missing_api_key_is_rejected() {
     };
     let client = ApiClient::new(cfg).expect("client");
     let err = client
-        .complete(&LlmRequest {
+        .complete_blocking(&LlmRequest {
             unit: codingbuddy_core::LlmUnit::Planner,
             prompt: "hello".to_string(),
             model: "deepseek-chat".to_string(),
@@ -1328,7 +1329,7 @@ fn complete_retries_transient_status_then_succeeds() {
     let client = local_mock_client(cfg);
 
     let out = client
-        .complete(&LlmRequest {
+        .complete_blocking(&LlmRequest {
             unit: codingbuddy_core::LlmUnit::Planner,
             prompt: "retry test".to_string(),
             model: "deepseek-chat".to_string(),
@@ -1362,7 +1363,7 @@ fn complete_stops_after_bounded_retries() {
     let client = local_mock_client(cfg);
 
     let err = client
-        .complete(&LlmRequest {
+        .complete_blocking(&LlmRequest {
             unit: codingbuddy_core::LlmUnit::Planner,
             prompt: "retry limit test".to_string(),
             model: "deepseek-chat".to_string(),
@@ -1396,7 +1397,7 @@ fn complete_returns_clear_instructions_on_401() {
     let client = local_mock_client(cfg);
 
     let err = client
-        .complete(&LlmRequest {
+        .complete_blocking(&LlmRequest {
             unit: codingbuddy_core::LlmUnit::Planner,
             prompt: "hello".to_string(),
             model: "deepseek-chat".to_string(),
@@ -1628,7 +1629,7 @@ fn complete_streaming_invokes_callback_per_chunk() {
     });
 
     let resp = client
-        .complete_streaming(
+        .complete_streaming_blocking(
             &LlmRequest {
                 unit: codingbuddy_core::LlmUnit::Planner,
                 prompt: "hello".to_string(),
@@ -2120,7 +2121,7 @@ fn cancelling_during_retry_backoff_returns_immediately() {
 
     let started = std::time::Instant::now();
     let error = client
-        .complete(&LlmRequest {
+        .complete_blocking(&LlmRequest {
             unit: codingbuddy_core::LlmUnit::Planner,
             prompt: "hello".to_string(),
             model: "deepseek-chat".to_string(),

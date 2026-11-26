@@ -1,5 +1,6 @@
 use super::*;
 use codingbuddy_core::{RuntimeToolMetadata, ToolDefinition, ToolName, ToolTier};
+use codingbuddy_llm::LlmClientBlockingExt;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -320,7 +321,7 @@ pub(super) fn handle_extended_thinking(
         provider_options: Default::default(),
         response_format: None,
     };
-    let response = tool_loop.llm.complete_chat(&request)?;
+    let response = tool_loop.llm.complete_chat_blocking(&request)?;
     Ok(response.text)
 }
 

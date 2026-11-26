@@ -1,5 +1,6 @@
 //! E2E tests for multi-provider payload formats.
 #![allow(clippy::unwrap_used)] // integration test helpers may panic
+use codingbuddy_llm::LlmClientBlockingExt;
 
 use codingbuddy_core::{
     ChatMessage, ChatRequest, FunctionDefinition, LlmToolCall, ToolChoice, ToolDefinition,
@@ -307,7 +308,7 @@ fn gemini_round_trips_thought_signature_with_the_function_result() {
 
 #[test]
 fn openai_compatible_presets_stream_from_their_own_endpoint() {
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::ApiClient;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
@@ -382,7 +383,7 @@ fn openai_compatible_presets_stream_from_their_own_endpoint() {
         );
         let response = ApiClient::new(cfg)
             .unwrap()
-            .complete_chat_streaming(&request, std::sync::Arc::new(|_| {}));
+            .complete_chat_streaming_blocking(&request, std::sync::Arc::new(|_| {}));
         server.join().unwrap();
         assert_eq!(response.unwrap().text, "ready");
     }
@@ -390,7 +391,7 @@ fn openai_compatible_presets_stream_from_their_own_endpoint() {
 
 #[test]
 fn cancellation_releases_the_turn_while_waiting_for_response_headers() {
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::ApiClient;
     use std::{net::TcpListener, sync::mpsc, time::Duration};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut cfg = codingbuddy_core::LlmConfig::default();
@@ -417,7 +418,7 @@ fn cancellation_releases_the_turn_while_waiting_for_response_headers() {
     client.set_cancel_token(token.clone());
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let result = client.complete_chat_streaming(&request, std::sync::Arc::new(|_| {}));
+        let result = client.complete_chat_streaming_blocking(&request, std::sync::Arc::new(|_| {}));
         let _ = done_tx.send(result);
     });
     accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -438,7 +439,7 @@ fn cancellation_releases_the_turn_while_waiting_for_response_headers() {
 #[test]
 fn delivery_one_requires_complete_calls_and_preserves_interleaving() {
     use codingbuddy_core::TransportPart;
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::ApiClient;
 
     let valid = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"before\",\"tool_calls\":[{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"fs_read\",\"arguments\":\"{\"}}]}}]}\n\n",
@@ -483,7 +484,7 @@ fn delivery_one_requires_complete_calls_and_preserves_interleaving() {
         );
         let result = ApiClient::new(cfg)
             .unwrap()
-            .complete_chat_streaming(&request, std::sync::Arc::new(|_| {}));
+            .complete_chat_streaming_blocking(&request, std::sync::Arc::new(|_| {}));
         server.join().unwrap();
         if !failure.is_empty() {
             assert!(
@@ -539,7 +540,7 @@ fn delivery_one_loopback(events: impl Into<String>) -> (String, std::thread::Joi
 #[test]
 fn gemini_stream_preserves_terminal_text_usage_and_tool_order() {
     use codingbuddy_core::{StreamChunk, TransportPart};
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::ApiClient;
 
     let first = json!({"candidates": [{"content": {"parts": [
         {"thought": true, "text": "private"},
@@ -567,7 +568,7 @@ fn gemini_stream_preserves_terminal_text_usage_and_tool_order() {
     let captured = chunks.clone();
     let response = ApiClient::new(config)
         .unwrap()
-        .complete_chat_streaming(
+        .complete_chat_streaming_blocking(
             &request,
             std::sync::Arc::new(move |event| {
                 captured.lock().unwrap().push(event);
@@ -595,7 +596,7 @@ fn gemini_stream_preserves_terminal_text_usage_and_tool_order() {
 #[test]
 fn gemini_incomplete_stream_emits_visible_text_without_completion() {
     use codingbuddy_core::StreamChunk;
-    use codingbuddy_llm::{ApiClient, LlmClient, error};
+    use codingbuddy_llm::{ApiClient, error};
 
     for finish in [Some("MAX_TOKENS"), Some("SAFETY"), None] {
         let mut frame = json!({"candidates": [{"content": {"parts": [
@@ -625,7 +626,7 @@ fn gemini_incomplete_stream_emits_visible_text_without_completion() {
         let captured = chunks.clone();
         let failure = ApiClient::new(config)
             .unwrap()
-            .complete_chat_streaming(
+            .complete_chat_streaming_blocking(
                 &request,
                 std::sync::Arc::new(move |event| {
                     captured.lock().unwrap().push(event);
@@ -654,7 +655,7 @@ fn gemini_incomplete_stream_emits_visible_text_without_completion() {
 
 #[test]
 fn delivery_one_cancellation_closes_a_stalled_response_body() {
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::ApiClient;
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
@@ -710,7 +711,7 @@ fn delivery_one_cancellation_closes_a_stalled_response_body() {
         );
         let mut client = ApiClient::new(cfg).unwrap();
         client.set_cancel_token(token.clone());
-        let response = client.complete_chat_streaming(
+        let response = client.complete_chat_streaming_blocking(
             &request,
             std::sync::Arc::new(move |chunk| {
                 if matches!(chunk, codingbuddy_core::StreamChunk::ContentDelta(_)) {
@@ -760,7 +761,7 @@ fn delivery_one_route_scopes_endpoint_model_and_account() {
 #[test]
 fn delivery_one_anthropic_replays_signed_interleaved_blocks() {
     use codingbuddy_core::TransportPart;
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::ApiClient;
     let events = concat!(
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private-fixture\"}}\n\n",
@@ -787,7 +788,7 @@ fn delivery_one_anthropic_replays_signed_interleaved_blocks() {
     let request = make_request(&model, vec![user.clone()], vec![sample_tool()]);
     let response = ApiClient::new(config)
         .unwrap()
-        .complete_chat_streaming(&request, std::sync::Arc::new(|_| {}))
+        .complete_chat_streaming_blocking(&request, std::sync::Arc::new(|_| {}))
         .unwrap();
     server.join().unwrap();
     assert!(response.text.is_empty());
@@ -960,7 +961,7 @@ fn responses_reject_changed_item_ids_and_arguments() {
 #[test]
 fn responses_errors_are_typed_and_sanitized_over_real_transport() {
     use codingbuddy_llm::{
-        ApiClient, LlmClient,
+        ApiClient,
         error::{FailureKind, ProviderError},
     };
     for (events, expected) in [
@@ -1000,7 +1001,7 @@ fn responses_errors_are_typed_and_sanitized_over_real_transport() {
         );
         let error = ApiClient::new(cfg)
             .unwrap()
-            .complete_chat_streaming(&req, std::sync::Arc::new(|_| {}))
+            .complete_chat_streaming_blocking(&req, std::sync::Arc::new(|_| {}))
             .unwrap_err();
         worker.join().unwrap();
         assert!(!error.to_string().contains("SECRET"));
@@ -1014,7 +1015,7 @@ fn responses_errors_are_typed_and_sanitized_over_real_transport() {
 #[test]
 fn responses_publish_confirmed_text_when_the_provider_sends_no_text_deltas() {
     use codingbuddy_core::StreamChunk;
-    use codingbuddy_llm::{ApiClient, LlmClient};
+    use codingbuddy_llm::ApiClient;
 
     let item = json!({
         "id": "message", "type": "message", "status": "completed",
@@ -1051,7 +1052,7 @@ fn responses_publish_confirmed_text_when_the_provider_sends_no_text_deltas() {
 
     let response = ApiClient::new(cfg)
         .unwrap()
-        .complete_chat_streaming(
+        .complete_chat_streaming_blocking(
             &req,
             std::sync::Arc::new(move |chunk| captured.lock().unwrap().push(chunk)),
         )
@@ -1102,7 +1103,7 @@ fn responses_output_limit_and_refusal_have_distinct_outcomes() {
 #[test]
 fn unreachable_route_reports_transport_failure_without_provider_text() {
     use codingbuddy_llm::{
-        ApiClient, LlmClient,
+        ApiClient,
         error::{FailureKind, ProviderError},
     };
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1123,9 +1124,9 @@ fn unreachable_route_reports_transport_failure_without_provider_text() {
     let client = ApiClient::new(cfg).unwrap();
     for streaming in [false, true] {
         let error = if streaming {
-            client.complete_chat_streaming(&req, std::sync::Arc::new(|_| {}))
+            client.complete_chat_streaming_blocking(&req, std::sync::Arc::new(|_| {}))
         } else {
-            client.complete_chat(&req)
+            client.complete_chat_blocking(&req)
         }
         .unwrap_err();
         assert_eq!(

@@ -37,12 +37,13 @@ impl CapturingLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for CapturingLlm {
-    fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+    async fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
         Err(anyhow!("complete() not used in analysis bootstrap tests"))
     }
 
-    fn complete_streaming(
+    async fn complete_streaming(
         &self,
         _req: &LlmRequest,
         _cb: StreamCallback,
@@ -52,7 +53,7 @@ impl LlmClient for CapturingLlm {
         ))
     }
 
-    fn complete_chat(&self, req: &ChatRequest) -> anyhow::Result<LlmResponse> {
+    async fn complete_chat(&self, req: &ChatRequest) -> anyhow::Result<LlmResponse> {
         if let Ok(mut guard) = self.state.lock() {
             guard.chat_requests.push(req.clone());
         }
@@ -67,12 +68,12 @@ impl LlmClient for CapturingLlm {
         })
     }
 
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> anyhow::Result<LlmResponse> {
-        let response = self.complete_chat(req)?;
+        let response = self.complete_chat(req).await?;
         cb(StreamChunk::ContentDelta(response.text.clone()));
         cb(StreamChunk::Done {
             reason: Some(response.finish_reason.clone()),
@@ -80,13 +81,16 @@ impl LlmClient for CapturingLlm {
         Ok(response)
     }
 
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> anyhow::Result<LlmResponse> {
+    async fn complete_fim(
+        &self,
+        _req: &codingbuddy_core::FimRequest,
+    ) -> anyhow::Result<LlmResponse> {
         Err(anyhow!(
             "complete_fim() not used in analysis bootstrap tests"
         ))
     }
 
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         _req: &codingbuddy_core::FimRequest,
         _cb: StreamCallback,

@@ -9,6 +9,7 @@ license.workspace = true
 provider-fixtures = []
 
 [dependencies]
+async-trait.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 keyring.workspace = true

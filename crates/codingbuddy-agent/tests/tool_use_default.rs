@@ -118,37 +118,42 @@ fn build_engine(path: &Path, responses: Vec<LlmResponse>) -> Result<AgentEngine>
 #[derive(Clone)]
 struct SharedScriptedLlm(Arc<ScriptedLlm>);
 
+#[async_trait::async_trait]
 impl LlmClient for SharedScriptedLlm {
-    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        self.0.complete(req)
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        self.0.complete(req).await
     }
 
-    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        self.0.complete_streaming(req, cb)
+    async fn complete_streaming(
+        &self,
+        req: &LlmRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_streaming(req, cb).await
     }
 
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        self.0.complete_chat(req)
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.0.complete_chat(req).await
     }
 
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.0.complete_chat_streaming(req, cb)
+        self.0.complete_chat_streaming(req, cb).await
     }
 
-    fn complete_fim(&self, req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
-        self.0.complete_fim(req)
+    async fn complete_fim(&self, req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+        self.0.complete_fim(req).await
     }
 
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         req: &codingbuddy_core::FimRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.0.complete_fim_streaming(req, cb)
+        self.0.complete_fim_streaming(req, cb).await
     }
 }
 
@@ -160,37 +165,42 @@ fn build_engine_with_shared_llm(path: &Path, llm: Arc<ScriptedLlm>) -> Result<Ag
 /// Stream the scripted responses the same way as a live provider, including per-step Done.
 struct StreamingScript(ScriptedLlm);
 
+#[async_trait::async_trait]
 impl LlmClient for StreamingScript {
-    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        self.0.complete(req)
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        self.0.complete(req).await
     }
 
-    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        self.0.complete_streaming(req, cb)
+    async fn complete_streaming(
+        &self,
+        req: &LlmRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_streaming(req, cb).await
     }
 
-    fn complete_fim(&self, req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
-        self.0.complete_fim(req)
+    async fn complete_fim(&self, req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+        self.0.complete_fim(req).await
     }
 
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         req: &codingbuddy_core::FimRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.0.complete_fim_streaming(req, cb)
+        self.0.complete_fim_streaming(req, cb).await
     }
 
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        self.0.complete_chat(req)
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.0.complete_chat(req).await
     }
 
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let response = self.complete_chat(req)?;
+        let response = self.complete_chat(req).await?;
         cb(StreamChunk::ContentDelta(response.text.clone()));
         cb(StreamChunk::Done {
             reason: Some(response.finish_reason.clone()),
@@ -622,14 +632,19 @@ impl CapturingLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for CapturingLlm {
-    fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
+    async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
         Err(anyhow!("complete() not used"))
     }
-    fn complete_streaming(&self, _req: &LlmRequest, _cb: StreamCallback) -> Result<LlmResponse> {
+    async fn complete_streaming(
+        &self,
+        _req: &LlmRequest,
+        _cb: StreamCallback,
+    ) -> Result<LlmResponse> {
         Err(anyhow!("complete_streaming() not used"))
     }
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
         self.captured_requests.lock().unwrap().push(req.clone());
         self.responses
             .lock()
@@ -637,17 +652,17 @@ impl LlmClient for CapturingLlm {
             .pop_front()
             .ok_or_else(|| anyhow!("capturing llm exhausted"))
     }
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         _cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.complete_chat(req)
+        self.complete_chat(req).await
     }
-    fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
+    async fn complete_fim(&self, _req: &codingbuddy_core::FimRequest) -> Result<LlmResponse> {
         Err(anyhow!("complete_fim() not used"))
     }
-    fn complete_fim_streaming(
+    async fn complete_fim_streaming(
         &self,
         _req: &codingbuddy_core::FimRequest,
         _cb: StreamCallback,

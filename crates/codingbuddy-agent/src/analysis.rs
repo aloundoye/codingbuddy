@@ -3,6 +3,7 @@ use codingbuddy_core::{
     AppConfig, ChatMessage, ChatRequest, LlmResponse, StreamCallback, ToolChoice,
 };
 use codingbuddy_llm::LlmClient;
+use codingbuddy_llm::LlmClientBlockingExt;
 use std::path::Path;
 
 use crate::gather_context;
@@ -100,9 +101,9 @@ pub fn analyze(
     };
 
     let response = if let Some(cb) = stream_cb {
-        llm.complete_chat_streaming(&request, cb)?
+        llm.complete_chat_streaming_blocking(&request, cb)?
     } else {
-        llm.complete_chat(&request)?
+        llm.complete_chat_blocking(&request)?
     };
     execution.check()?;
     Ok(response)

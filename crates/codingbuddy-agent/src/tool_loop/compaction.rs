@@ -1,4 +1,5 @@
 //! Context compaction: pruning old tool outputs and building compaction summaries.
+use codingbuddy_llm::LlmClientBlockingExt;
 
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{ChatMessage, ChatRequest, ToolChoice};
@@ -213,7 +214,7 @@ pub(crate) fn build_compaction_summary_with_llm(
         response_format: None,
     };
 
-    let response = llm.complete_chat(&request)?;
+    let response = llm.complete_chat_blocking(&request)?;
     let text = response.text.trim().to_string();
 
     // Validate the response has at least some structure

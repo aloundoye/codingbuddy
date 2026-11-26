@@ -22,33 +22,42 @@ use std::time::Instant;
 #[derive(Clone)]
 struct SharedScriptedLlm(Arc<ScriptedLlm>);
 
+#[async_trait::async_trait]
 impl LlmClient for SharedScriptedLlm {
-    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        self.0.complete(req)
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        self.0.complete(req).await
     }
 
-    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        self.0.complete_streaming(req, cb)
+    async fn complete_streaming(
+        &self,
+        req: &LlmRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_streaming(req, cb).await
     }
 
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        self.0.complete_chat(req)
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.0.complete_chat(req).await
     }
 
-    fn complete_chat_streaming(
+    async fn complete_chat_streaming(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        self.0.complete_chat_streaming(req, cb)
+        self.0.complete_chat_streaming(req, cb).await
     }
 
-    fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
-        self.0.complete_fim(req)
+    async fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
+        self.0.complete_fim(req).await
     }
 
-    fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        self.0.complete_fim_streaming(req, cb)
+    async fn complete_fim_streaming(
+        &self,
+        req: &FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.0.complete_fim_streaming(req, cb).await
     }
 }
 

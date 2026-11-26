@@ -7,6 +7,7 @@ mod native_parts;
 mod route;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
+use codingbuddy_core::runtime::spawn_blocking;
 use codingbuddy_core::{
     AppliedCompatibility, CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig,
     LlmRequest, LlmResponse, LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
@@ -53,6 +54,10 @@ impl Deref for PreparedPayload {
 /// Base delay for network/transport error retries (1s, 2s, 4s exponential backoff).
 const NETWORK_RETRY_BASE_MS: u64 = 1000;
 
+/// A model provider. Request methods are async; implementations must not
+/// block the calling task (run blocking work with
+/// `codingbuddy_core::runtime::spawn_blocking`).
+#[async_trait::async_trait]
 pub trait LlmClient {
     /// Preserve the selected transport and cached account while attaching turn cancellation.
     fn with_cancellation(
@@ -61,19 +66,23 @@ pub trait LlmClient {
     ) -> Option<Box<dyn LlmClient + Send + Sync>> {
         None
     }
-    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse>;
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse>;
 
     /// Streaming variant that invokes `cb` for each token chunk as it arrives.
     /// Returns the fully assembled `LlmResponse` once the stream ends.
-    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse>;
+    async fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback)
+    -> Result<LlmResponse>;
 
     /// Chat completion with tool definitions (function calling).
     /// Sends a multi-turn conversation with tool schemas and returns the response.
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse>;
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse>;
 
     /// Streaming chat completion with tool definitions.
-    fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback)
-    -> Result<LlmResponse>;
+    async fn complete_chat_streaming(
+        &self,
+        req: &ChatRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse>;
 
     /// Return the actual route of a client whose credential may already be cached.
     fn pinned_session_route(&self, _model: &str, _local_key: &[u8]) -> Option<Result<String>> {
@@ -82,16 +91,60 @@ pub trait LlmClient {
 
     /// Discover available models from the provider's API.
     /// Default: returns empty (no discovery support).
-    fn list_models(&self) -> Vec<String> {
+    async fn list_models(&self) -> Vec<String> {
         Vec::new()
     }
 
     /// Beta FIM completion (Fill-In-The-Middle)
-    fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse>;
+    async fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse>;
 
     /// Beta FIM completion streaming (Fill-In-The-Middle)
-    fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse>;
+    async fn complete_fim_streaming(
+        &self,
+        req: &FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse>;
 }
+
+/// Blocking wrappers around [`LlmClient`] for synchronous callers outside a
+/// turn: standalone commands and tests. Never call these from async code.
+pub trait LlmClientBlockingExt: LlmClient + Sync {
+    fn complete_blocking(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        codingbuddy_core::runtime::block_on(self.complete(req))
+    }
+    fn complete_streaming_blocking(
+        &self,
+        req: &LlmRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        codingbuddy_core::runtime::block_on(self.complete_streaming(req, cb))
+    }
+    fn complete_chat_blocking(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        codingbuddy_core::runtime::block_on(self.complete_chat(req))
+    }
+    fn complete_chat_streaming_blocking(
+        &self,
+        req: &ChatRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        codingbuddy_core::runtime::block_on(self.complete_chat_streaming(req, cb))
+    }
+    fn complete_fim_blocking(&self, req: &FimRequest) -> Result<LlmResponse> {
+        codingbuddy_core::runtime::block_on(self.complete_fim(req))
+    }
+    fn complete_fim_streaming_blocking(
+        &self,
+        req: &FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        codingbuddy_core::runtime::block_on(self.complete_fim_streaming(req, cb))
+    }
+    fn list_models_blocking(&self) -> Vec<String> {
+        codingbuddy_core::runtime::block_on(self.list_models())
+    }
+}
+
+impl<T: LlmClient + Sync + ?Sized> LlmClientBlockingExt for T {}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -771,6 +824,7 @@ fn log_llm_outcome(
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for ApiClient {
     fn with_cancellation(
         &self,
@@ -789,7 +843,60 @@ impl LlmClient for ApiClient {
         ))
     }
 
-    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+    async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        let (client, req) = (self.clone(), req.clone());
+        spawn_blocking(move || client.complete_sync(&req)).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        req: &LlmRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let (client, req) = (self.clone(), req.clone());
+        spawn_blocking(move || client.complete_streaming_sync(&req, cb)).await
+    }
+
+    async fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        let (client, req) = (self.clone(), req.clone());
+        spawn_blocking(move || client.complete_chat_sync(&req)).await
+    }
+
+    async fn complete_chat_streaming(
+        &self,
+        req: &ChatRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let (client, req) = (self.clone(), req.clone());
+        spawn_blocking(move || client.complete_chat_streaming_sync(&req, cb)).await
+    }
+
+    async fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
+        let (client, req) = (self.clone(), req.clone());
+        spawn_blocking(move || client.complete_fim_sync(&req)).await
+    }
+
+    async fn complete_fim_streaming(
+        &self,
+        req: &FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let (client, req) = (self.clone(), req.clone());
+        spawn_blocking(move || client.complete_fim_streaming_sync(&req, cb)).await
+    }
+
+    async fn list_models(&self) -> Vec<String> {
+        let client = self.clone();
+        spawn_blocking(move || client.list_models_sync()).await
+    }
+}
+
+/// The request bodies behind [`LlmClient`]. They block on the shared
+/// runtime (`ChatTransport::wait`) and read response streams synchronously,
+/// so the trait runs them on the blocking pool; the turn's cancellation
+/// token still stops them mid-request.
+impl ApiClient {
+    fn complete_sync(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
@@ -797,7 +904,7 @@ impl LlmClient for ApiClient {
         self.complete_inner(&normalized_req, key.as_deref())
     }
 
-    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
+    fn complete_streaming_sync(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
@@ -805,7 +912,7 @@ impl LlmClient for ApiClient {
         self.complete_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
-    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+    fn complete_chat_sync(&self, req: &ChatRequest) -> Result<LlmResponse> {
         let started = std::time::Instant::now();
         let protocol = protocol::select_chat_protocol(
             &self.cfg.active_provider(),
@@ -836,7 +943,7 @@ impl LlmClient for ApiClient {
         result
     }
 
-    fn complete_chat_streaming(
+    fn complete_chat_streaming_sync(
         &self,
         req: &ChatRequest,
         cb: StreamCallback,
@@ -912,7 +1019,7 @@ impl LlmClient for ApiClient {
         result
     }
 
-    fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
+    fn complete_fim_sync(&self, req: &FimRequest) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let resolution = self
             .cfg
@@ -941,7 +1048,11 @@ impl LlmClient for ApiClient {
         self.complete_fim_inner(&normalized_req, key.as_deref())
     }
 
-    fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse> {
+    fn complete_fim_streaming_sync(
+        &self,
+        req: &FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
         let _provider = self.provider_kind()?;
         let resolution = self
             .cfg
@@ -970,7 +1081,7 @@ impl LlmClient for ApiClient {
         self.complete_fim_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
-    fn list_models(&self) -> Vec<String> {
+    fn list_models_sync(&self) -> Vec<String> {
         self.discover_models_from_api()
     }
 }

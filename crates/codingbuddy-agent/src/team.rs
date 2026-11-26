@@ -7,6 +7,7 @@ use codingbuddy_core::{
     runtime_dir,
 };
 use codingbuddy_diff::{GitApplyStrategy, PatchStore};
+use codingbuddy_llm::LlmClientBlockingExt;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -388,7 +389,7 @@ fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>>
         provider_options: Default::default(),
         response_format: None,
     };
-    let response = engine.llm.complete_chat(&req)?;
+    let response = engine.llm.complete_chat_blocking(&req)?;
     let files: Vec<String> = response
         .text
         .lines()
