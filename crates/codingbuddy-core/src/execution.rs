@@ -118,7 +118,11 @@ mod windows {
         System::{Diagnostics::ToolHelp::*, JobObjects::*, Threading::*},
     };
     pub struct Job(HANDLE);
+    // SAFETY: the handle is owned exclusively by this value and only closed
+    // in Drop. Through `&Job` it is only passed to TerminateJobObject, which
+    // the Win32 API allows from any thread concurrently.
     unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
     impl Job {
         pub fn terminate(&self) {
             unsafe {
