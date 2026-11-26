@@ -678,6 +678,10 @@ impl ToolExecutionContext<'_> {
     }
 }
 
+/// Executes tool calls. `execute*` and `verify_command` are async: an
+/// implementation that blocks (subprocesses, file I/O) must wrap that work
+/// in `runtime::blocking_section` or `runtime::spawn_blocking`.
+#[async_trait::async_trait]
 pub trait ToolHost {
     fn scoped_workspace(
         &self,
@@ -685,7 +689,7 @@ pub trait ToolHost {
     ) -> anyhow::Result<std::sync::Arc<dyn ToolHost + Send + Sync>> {
         anyhow::bail!("This tool transport cannot change execution workspace")
     }
-    fn verify_command(
+    async fn verify_command(
         &self,
         _command: &str,
         _cwd: &Path,
@@ -728,16 +732,42 @@ pub trait ToolHost {
     }
 
     fn propose(&self, call: ToolCall) -> ToolProposal;
-    fn execute(&self, approved: ApprovedToolCall) -> ToolResult;
+    async fn execute(&self, approved: ApprovedToolCall) -> ToolResult;
 
-    fn execute_with_context(
+    async fn execute_with_context(
         &self,
         approved: ApprovedToolCall,
         _context: ToolExecutionContext<'_>,
     ) -> ToolResult {
-        self.execute(approved)
+        self.execute(approved).await
     }
 }
+
+/// Blocking wrappers around [`ToolHost`] for synchronous callers outside a
+/// turn (standalone commands and tests). Never call these from async code.
+pub trait ToolHostBlockingExt: ToolHost + Sync {
+    fn execute_blocking(&self, approved: ApprovedToolCall) -> ToolResult {
+        runtime::block_on(self.execute(approved))
+    }
+    fn execute_with_context_blocking(
+        &self,
+        approved: ApprovedToolCall,
+        context: ToolExecutionContext<'_>,
+    ) -> ToolResult {
+        runtime::block_on(self.execute_with_context(approved, context))
+    }
+    fn verify_command_blocking(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout: u64,
+        context: ToolExecutionContext<'_>,
+    ) -> serde_json::Value {
+        runtime::block_on(self.verify_command(command, cwd, timeout, context))
+    }
+}
+
+impl<T: ToolHost + Sync + ?Sized> ToolHostBlockingExt for T {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageContent {

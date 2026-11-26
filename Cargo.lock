@@ -1229,6 +1229,7 @@ name = "codingbuddy-core"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "cap-fs-ext",
  "cap-std",
  "chrono",
@@ -1469,6 +1470,7 @@ name = "codingbuddy-tools"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "codingbuddy-core",

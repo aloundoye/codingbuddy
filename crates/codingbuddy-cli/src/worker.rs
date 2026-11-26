@@ -1,6 +1,7 @@
 //! Own-binary durable handoff. Credentials travel only over the private stdin pipe.
 use anyhow::{Context, Result, ensure};
-use codingbuddy_core::{AppConfig, CancellationToken, ToolHost, process_env};
+use codingbuddy_core::ToolHostBlockingExt;
+use codingbuddy_core::{AppConfig, CancellationToken, process_env};
 use codingbuddy_store::{BackgroundJobRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -217,7 +218,7 @@ pub(crate) fn run() -> Result<()> {
                     std::sync::Arc::new(codingbuddy_tools::PtyShellRunner),
                     &bootstrap.cfg,
                 )?;
-                let result = host.verify_command(
+                let result = host.verify_command_blocking(
                     &command,
                     &bootstrap.workspace,
                     120,

@@ -1,4 +1,5 @@
 use super::*;
+use codingbuddy_core::ToolHostBlockingExt;
 
 pub(super) fn slash_help_payload() -> serde_json::Value {
     let commands = slash_command_catalog_entries()
@@ -278,7 +279,7 @@ pub(super) fn local_tool_output(cwd: &Path, call: ToolCall) -> Result<serde_json
     let policy = PolicyEngine::from_app_config(&cfg.policy);
     let tool_host = LocalToolHost::new(cwd, policy)?;
     let proposal = tool_host.propose(call);
-    let result = tool_host.execute(ApprovedToolCall {
+    let result = tool_host.execute_blocking(ApprovedToolCall {
         invocation_id: proposal.invocation_id,
         call: proposal.call,
     });

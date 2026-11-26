@@ -1,4 +1,5 @@
 //! Durable session prompts: chat entry point, interrupted-tool retry, invocation reconciliation.
+use codingbuddy_core::ToolHostBlockingExt;
 
 use super::*;
 
@@ -99,7 +100,7 @@ impl AgentEngine {
         let invocation = self
             .store
             .retry_invocation(&lease, session, previous, &proposal.call)?;
-        let result = self.tool_host.execute_with_context(
+        let result = self.tool_host.execute_with_context_blocking(
             ApprovedToolCall {
                 invocation_id: proposal.invocation_id,
                 call: proposal.call,

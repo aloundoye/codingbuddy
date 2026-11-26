@@ -1,5 +1,6 @@
 //! Shared tool preparation, execution, and result handling.
 use super::*;
+use codingbuddy_core::ToolHostBlockingExt;
 use std::time::Instant;
 
 struct PreparedToolCall {
@@ -70,7 +71,7 @@ impl ToolUseLoop<'_> {
                                     let deadline = self.deadline;
                                     let parent_run_id = self.parent_run_id;
                                     Some(scope.spawn(move || {
-                                        host.execute_with_context(
+                                        host.execute_with_context_blocking(
                                             approved,
                                             codingbuddy_core::ToolExecutionContext {
                                                 session_id: session,
@@ -214,7 +215,7 @@ impl ToolUseLoop<'_> {
         let result = if prepared.approved.call.name == "batch" {
             self.execute_batch(&prepared.approved)?
         } else {
-            host.execute_with_context(
+            host.execute_with_context_blocking(
                 prepared.approved.clone(),
                 codingbuddy_core::ToolExecutionContext {
                     session_id: self.durable_session.as_ref().map(|(_, session)| *session),

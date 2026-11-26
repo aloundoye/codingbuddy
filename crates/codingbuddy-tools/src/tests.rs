@@ -1,4 +1,5 @@
 use super::*;
+use codingbuddy_core::ToolHostBlockingExt;
 use codingbuddy_core::{
     AppConfig, ApprovedToolCall, Session, SessionBudgets, SessionState, ToolCall, ToolHost,
 };
@@ -49,7 +50,7 @@ fn hooks_receive_phase_and_tool_context() {
         &cfg,
     )
     .expect("trusted tool host");
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.list".to_string(),
@@ -136,7 +137,7 @@ fn plugin_tool_renders_prompt() {
         &cfg,
     )
     .expect("untrusted tool host");
-    assert!(!untrusted.execute(call.clone()).success);
+    assert!(!untrusted.execute_blocking(call.clone()).success);
     cfg.workspace_trust = Some(true);
     let host = LocalToolHost::with_config(
         &workspace,
@@ -145,7 +146,7 @@ fn plugin_tool_renders_prompt() {
         &cfg,
     )
     .expect("trusted tool host");
-    let result = host.execute(call);
+    let result = host.execute_blocking(call);
     assert!(result.success, "plugin tool execution should succeed");
     assert_eq!(result.output["plugin_id"], "phase-c-plugin");
     assert_eq!(result.output["command_name"], "review");
@@ -162,7 +163,7 @@ fn fs_read_supports_line_ranges_and_mime_metadata() {
     let (workspace, host) = temp_host();
     fs::write(workspace.join("note.txt"), "a\nb\nc\n").expect("seed");
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.read".to_string(),
@@ -186,7 +187,7 @@ fn fs_glob_grep_and_edit_work() {
     fs::write(workspace.join("src/main.rs"), "fn old_name() {}\n").expect("seed");
     fs::write(workspace.join("src/lib.rs"), "pub fn helper() {}\n").expect("seed");
 
-    let globbed = host.execute(ApprovedToolCall {
+    let globbed = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.glob".to_string(),
@@ -201,7 +202,7 @@ fn fs_glob_grep_and_edit_work() {
             .is_some_and(|items| items.len() >= 2)
     );
 
-    let grepped = host.execute(ApprovedToolCall {
+    let grepped = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.grep".to_string(),
@@ -215,7 +216,7 @@ fn fs_glob_grep_and_edit_work() {
         1
     );
 
-    let edited = host.execute(ApprovedToolCall {
+    let edited = host.execute_blocking(ApprovedToolCall {
             invocation_id: Uuid::now_v7(),
             call: ToolCall {
                 name: "fs.edit".to_string(),
@@ -240,7 +241,7 @@ fn fs_glob_and_grep_skip_denied_secret_paths() {
     )
     .expect("seed");
 
-    let globbed = host.execute(ApprovedToolCall {
+    let globbed = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.glob".to_string(),
@@ -258,7 +259,7 @@ fn fs_glob_and_grep_skip_denied_secret_paths() {
     assert!(!glob_paths.contains(&".env"));
     assert!(glob_paths.contains(&"src/main.rs"));
 
-    let grepped = host.execute(ApprovedToolCall {
+    let grepped = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.grep".to_string(),
@@ -282,7 +283,7 @@ fn fs_edit_includes_unified_diff_in_result() {
     let (workspace, host) = temp_host();
     fs::write(workspace.join("demo.rs"), "fn old() {}\n").expect("seed");
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.edit".to_string(),
@@ -308,7 +309,7 @@ fn fs_glob_respects_gitignore_rules() {
     fs::write(workspace.join("ignored/secret.txt"), "secret\n").expect("secret");
     fs::write(workspace.join("src/main.rs"), "fn main() {}\n").expect("main");
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.glob".to_string(),
@@ -367,7 +368,7 @@ fn fs_read_emits_visual_artifact_event_when_enabled() {
         &cfg,
     )
     .expect("trusted tool host");
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "fs.read".to_string(),
@@ -393,7 +394,7 @@ fn multi_edit_modifies_multiple_files() {
     fs::write(workspace.join("a.txt"), "hello world\n").expect("seed a");
     fs::write(workspace.join("b.txt"), "foo bar\n").expect("seed b");
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "multi_edit".to_string(),
@@ -424,7 +425,7 @@ fn multi_edit_returns_diffs_and_shas() {
     let (workspace, host) = temp_host();
     fs::write(workspace.join("c.txt"), "old value\n").expect("seed c");
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "multi_edit".to_string(),
@@ -452,7 +453,7 @@ fn multi_edit_blocked_in_review_mode() {
     host.set_review_mode(true);
     fs::write(workspace.join("d.txt"), "data\n").expect("seed d");
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "multi_edit".to_string(),
@@ -479,7 +480,7 @@ fn multi_edit_skips_unmodified_files() {
     fs::write(workspace.join("e.txt"), "keep me\n").expect("seed e");
     fs::write(workspace.join("f.txt"), "change me\n").expect("seed f");
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "multi_edit".to_string(),
@@ -769,7 +770,7 @@ fn fuzz_random_json_args_do_not_panic() {
                 },
             };
             // Should not panic — Ok or Err are both fine
-            let _result = host.execute(approved);
+            let _result = host.execute_blocking(approved);
         }
     }
     let _ = fs::remove_dir_all(&workspace);
@@ -946,7 +947,7 @@ fn mcp_tool_routing_splits_name_correctly() {
         Ok(json!({"result": "ok"}))
     }));
 
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "mcp__github__search".to_string(),
@@ -965,7 +966,7 @@ fn mcp_tool_routing_splits_name_correctly() {
 fn mcp_tool_without_executor_returns_error() {
     let (workspace, host) = temp_host();
     // No MCP executor set — should fail
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "mcp__github__search".to_string(),
@@ -988,7 +989,7 @@ fn mcp_tool_invalid_name_returns_error() {
     host.set_mcp_executor(Arc::new(|_, _, _| Ok(json!({"ok": true}))));
 
     // "mcp__noseparator" has no second "__" — should fail to split
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: Uuid::now_v7(),
         call: ToolCall {
             name: "mcp__noseparator".to_string(),
@@ -1141,7 +1142,7 @@ fn workspace_file_tools_confine_links() {
 
     let host = LocalToolHost::new(&workspace, PolicyEngine::default()).unwrap();
     let execute = |name: &str, args| {
-        host.execute(ApprovedToolCall {
+        host.execute_blocking(ApprovedToolCall {
             invocation_id: Uuid::now_v7(),
             call: ToolCall {
                 name: name.to_string(),
@@ -1212,7 +1213,7 @@ fn workspace_file_tools_reject_dangling_and_blocked_aliases() {
             json!({"path": "dangling", "content": "invalid"}),
         ),
     ] {
-        let result = host.execute(ApprovedToolCall {
+        let result = host.execute_blocking(ApprovedToolCall {
             invocation_id: Uuid::now_v7(),
             call: ToolCall {
                 name: name.to_owned(),
@@ -1265,16 +1266,16 @@ fn delivery_zero_fresh_launch_cannot_be_changed_or_replayed() -> Result<()> {
         invocation_id: proposal.invocation_id,
         call: changed,
     };
-    assert!(!host.execute(request).success);
+    assert!(!host.execute_blocking(request).success);
     let (proposal, _) = host.propose_with_permission(call);
     let request = ApprovedToolCall {
         invocation_id: proposal.invocation_id,
         call: proposal.call,
     };
-    let result = host.execute(request.clone());
+    let result = host.execute_blocking(request.clone());
     assert!(result.success, "{:?}", result.output);
     assert_eq!(result.output["status"], 0);
-    assert!(!host.execute(request).success);
+    assert!(!host.execute_blocking(request).success);
     Ok(())
 }
 
@@ -1316,7 +1317,7 @@ fn delivery_zero_denies_persisted_commands_mcp_and_batch_children() -> Result<()
         ));
         assert!(
             !host
-                .execute(ApprovedToolCall {
+                .execute_blocking(ApprovedToolCall {
                     invocation_id: proposal.invocation_id,
                     call: proposal.call
                 })
@@ -1335,7 +1336,7 @@ fn delivery_zero_denies_persisted_commands_mcp_and_batch_children() -> Result<()
         args: json!({"tool_calls":[{"tool":"fs_read","parameters":{"path":path}}]}),
         requires_approval: false,
     });
-    let result = host.execute(ApprovedToolCall {
+    let result = host.execute_blocking(ApprovedToolCall {
         invocation_id: batch.invocation_id,
         call: batch.call,
     });
@@ -1346,7 +1347,7 @@ fn delivery_zero_denies_persisted_commands_mcp_and_batch_children() -> Result<()
     ]}), requires_approval: false });
     assert!(
         !host
-            .execute(ApprovedToolCall {
+            .execute_blocking(ApprovedToolCall {
                 invocation_id: nested.invocation_id,
                 call: nested.call
             })

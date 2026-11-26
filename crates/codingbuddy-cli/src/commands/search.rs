@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codingbuddy_core::ToolHostBlockingExt;
 use codingbuddy_core::{AppConfig, ApprovedToolCall, ToolCall, ToolHost};
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
@@ -21,7 +22,7 @@ pub(crate) fn run_search(cwd: &Path, args: SearchArgs, json_mode: bool) -> Resul
         requires_approval: false,
     };
     let proposal = tool_host.propose(call);
-    let result = tool_host.execute(ApprovedToolCall {
+    let result = tool_host.execute_blocking(ApprovedToolCall {
         invocation_id: proposal.invocation_id,
         call: proposal.call,
     });

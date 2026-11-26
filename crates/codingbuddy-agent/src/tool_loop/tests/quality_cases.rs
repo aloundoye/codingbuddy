@@ -415,6 +415,7 @@ fn authorized_reads_overlap_and_preserve_response_order() {
         sent: mpsc::Sender<()>,
         received: Mutex<mpsc::Receiver<()>>,
     }
+    #[async_trait::async_trait]
     impl ToolHost for ConcurrentHost {
         fn propose(&self, call: ToolCall) -> ToolProposal {
             ToolProposal {
@@ -423,7 +424,7 @@ fn authorized_reads_overlap_and_preserve_response_order() {
                 approved: true,
             }
         }
-        fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
+        async fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
             let path = approved.call.args["path"].clone();
             let success = if path == "first.txt" {
                 self.received

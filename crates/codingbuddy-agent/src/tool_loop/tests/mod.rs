@@ -95,6 +95,7 @@ impl MockToolHost {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolHost for MockToolHost {
     fn propose(&self, call: ToolCall) -> ToolProposal {
         ToolProposal {
@@ -103,7 +104,7 @@ impl ToolHost for MockToolHost {
             approved: self.auto_approve,
         }
     }
-    fn execute(&self, _approved: ApprovedToolCall) -> ToolResult {
+    async fn execute(&self, _approved: ApprovedToolCall) -> ToolResult {
         self.execute_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.results

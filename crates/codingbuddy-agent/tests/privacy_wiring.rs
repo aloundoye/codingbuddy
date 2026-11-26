@@ -53,6 +53,7 @@ fn privacy_router_redacts_in_tool_loop() {
 
     // Tool host that returns content with a custom secret pattern
     struct SensitiveToolHost;
+    #[async_trait::async_trait]
     impl codingbuddy_core::ToolHost for SensitiveToolHost {
         fn propose(&self, call: codingbuddy_core::ToolCall) -> codingbuddy_core::ToolProposal {
             codingbuddy_core::ToolProposal {
@@ -61,7 +62,7 @@ fn privacy_router_redacts_in_tool_loop() {
                 approved: true,
             }
         }
-        fn execute(
+        async fn execute(
             &self,
             _approved: codingbuddy_core::ApprovedToolCall,
         ) -> codingbuddy_core::ToolResult {

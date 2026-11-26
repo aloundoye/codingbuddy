@@ -1518,7 +1518,7 @@ impl LocalToolHost {
                     };
                     let proposal = self.propose(sub_call);
                     let sub_result = if proposal.approved {
-                        self.execute_with_context(
+                        self.run_approved(
                             ApprovedToolCall {
                                 invocation_id: proposal.invocation_id,
                                 call: proposal.call,
@@ -1734,6 +1734,7 @@ impl LocalToolHost {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolHost for LocalToolHost {
     fn scoped_workspace(&self, workspace: &Path) -> Result<Arc<dyn ToolHost + Send + Sync>> {
         let mut host = Self::with_config(
@@ -1884,21 +1885,37 @@ impl ToolHost for LocalToolHost {
         (proposal, permission)
     }
 
-    fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
+    async fn execute(&self, approved: ApprovedToolCall) -> ToolResult {
         self.execute_with_context(approved, Default::default())
+            .await
     }
 
-    fn verify_command(
+    async fn verify_command(
         &self,
         command: &str,
         cwd: &Path,
         timeout: u64,
         context: codingbuddy_core::ToolExecutionContext<'_>,
     ) -> serde_json::Value {
-        self.run_verification_command(command, cwd, timeout, context)
+        codingbuddy_core::runtime::blocking_section(|| {
+            self.run_verification_command(command, cwd, timeout, context)
+        })
     }
 
-    fn execute_with_context(
+    async fn execute_with_context(
+        &self,
+        approved: ApprovedToolCall,
+        context: codingbuddy_core::ToolExecutionContext<'_>,
+    ) -> ToolResult {
+        // Tools run subprocesses and file I/O synchronously; hand this
+        // worker's other tasks off while they do.
+        codingbuddy_core::runtime::blocking_section(|| self.run_approved(approved, context))
+    }
+}
+
+impl LocalToolHost {
+    /// Run an approved call to completion on the current thread.
+    pub fn run_approved(
         &self,
         approved: ApprovedToolCall,
         context: codingbuddy_core::ToolExecutionContext<'_>,
@@ -2382,7 +2399,7 @@ impl LocalToolHost {
                 self.discard_proposal(proposal.invocation_id);
                 result["status"] = json!("denied");
             } else {
-                let output = self.execute_with_context(
+                let output = self.run_approved(
                     ApprovedToolCall {
                         invocation_id: proposal.invocation_id,
                         call: proposal.call,
