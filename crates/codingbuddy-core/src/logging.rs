@@ -67,14 +67,46 @@ pub fn terminal_claimed() -> bool {
     TERMINAL_CLAIMED.load(Ordering::SeqCst)
 }
 
+/// Where notices go while a UI shows them itself.
+type NoticeSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+static NOTICE_SINK: std::sync::Mutex<Option<NoticeSink>> = std::sync::Mutex::new(None);
+
+/// Route [`notice`]s to a UI (the TUI shows them as system lines) for as
+/// long as the returned guard lives.
+#[must_use = "notices go back to stderr when this guard is dropped"]
+pub fn set_notice_sink(sink: impl Fn(&str) + Send + Sync + 'static) -> NoticeSinkGuard {
+    *NOTICE_SINK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(sink));
+    NoticeSinkGuard(())
+}
+
+pub struct NoticeSinkGuard(());
+
+impl Drop for NoticeSinkGuard {
+    fn drop(&mut self) {
+        *NOTICE_SINK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 /// Tell the user about something worth knowing (an ignored setting, a failed
-/// hook): always logged, and printed to stderr unless a full-screen UI owns
-/// the terminal, where a stray line would be drawn over the screen. Library
-/// code uses this instead of `eprintln!`.
+/// hook). Always logged; then shown by the UI's notice sink if one is set,
+/// otherwise printed to stderr unless a full-screen UI owns the terminal
+/// (a stray line would be drawn over the screen). Library code uses this
+/// instead of `eprintln!`.
 pub fn notice(message: impl std::fmt::Display) {
+    let message = message.to_string();
     tracing::warn!(target: "codingbuddy::notice", "{message}");
-    if !terminal_claimed() {
-        eprintln!("{message}"); // guard: allow (crash notice or notice() itself)
+    let sink = NOTICE_SINK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(sink) = sink {
+        sink(&message);
+    } else if !terminal_claimed() {
+        eprintln!("{message}"); // guard: allow (this is notice() itself)
     }
 }
 
@@ -397,6 +429,19 @@ mod tests {
         notice("[test] notice while the terminal is claimed");
         drop(claim);
         assert!(!terminal_claimed());
+    }
+
+    #[test]
+    fn notices_reach_the_sink_while_it_is_set() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        let guard = set_notice_sink(move |line| recorder.lock().unwrap().push(line.to_string()));
+        notice(format_args!("[test] sink {}", 1));
+        drop(guard);
+        notice("[test] after the sink is gone");
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|line| line == "[test] sink 1"), "{seen:?}");
+        assert!(!seen.iter().any(|line| line.contains("after the sink")));
     }
     use super::*;
 

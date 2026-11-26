@@ -133,6 +133,26 @@ pub(crate) fn run_chat_tui(args: ChatTuiArgs<'_>) -> Result<()> {
     let watch_digest_for_closure = Arc::clone(&last_watch_digest);
     let active_session_for_closure = Arc::clone(&active_session_id);
 
+    // Library notices (ignored project settings, failed hooks) appear as
+    // system lines in the conversation, once each, instead of being printed
+    // over the screen. Claude Code and opencode surface them in their UI too.
+    let _notice_sink = {
+        let tx_library_notices = tx.clone();
+        let shown = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
+        codingbuddy_core::logging::set_notice_sink(move |line| {
+            let first_time = shown
+                .lock()
+                .map(|mut shown| shown.insert(line.to_string()))
+                .unwrap_or(true);
+            if first_time {
+                let _ = tx_library_notices.send(TuiStreamEvent::SystemNotice {
+                    line: line.to_string(),
+                    error: false,
+                });
+            }
+        })
+    };
+
     {
         let tx_notices = tx.clone();
         let cwd_for_notices = cwd.to_path_buf();
